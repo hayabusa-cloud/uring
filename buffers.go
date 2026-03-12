@@ -141,7 +141,7 @@ func (p *RegisterBufferPool) Fill(factory func() RegisterBuffer) {
 func maximizeMemoryLock() {
 	var rlim resourceLimit
 	_, errno := zcall.Syscall6(
-		zcall.SYS_PRLIMIT64,
+		prlimit64Sysno,
 		0,
 		resourceLimitMemlock,
 		0,
@@ -157,7 +157,7 @@ func maximizeMemoryLock() {
 	}
 	rlim.Cur = rlim.Max
 	_, errno = zcall.Syscall6(
-		zcall.SYS_PRLIMIT64,
+		prlimit64Sysno,
 		0,
 		resourceLimitMemlock,
 		uintptr(unsafe.Pointer(&rlim)),
