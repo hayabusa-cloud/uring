@@ -1,0 +1,435 @@
+// ©Hayabusa Cloud Co., Ltd. 2026. All rights reserved.
+// Use of this source code is governed by a MIT-style
+// license that can be found in the LICENSE file.
+
+//go:build linux
+
+package uring
+
+// This file is part of the `uring` package refactored from `code.hybscloud.com/sox`.
+
+var defaultUringOptions = UringOptions{
+	Entries:                 UringEntriesMedium,
+	LockedBufferMem:         registerBufferDefaultMem,
+	ReadBufferSize:          bufferSizeDefault,
+	ReadBufferNum:           UringEntriesMedium * 2,
+	WriteBufferSize:         bufferSizeDefault,
+	WriteBufferNum:          UringEntriesMedium,
+	MultiIssuers:            false,
+	NotifySucceed:           false,
+	IndirectSubmissionQueue: false,
+}
+
+type UringOptionFunc func(opt *UringOptions)
+
+func (uo *UringOptions) Apply(opts ...UringOptionFunc) {
+	for _, f := range opts {
+		f(uo)
+	}
+}
+
+var (
+	// UringLargeLockedBufferMemOptions uses the maximum registered buffer memory (128 MiB).
+	// This equals the default; kept for backward compatibility.
+	UringLargeLockedBufferMemOptions UringOptionFunc = func(opt *UringOptions) {
+		opt.LockedBufferMem = registerBufferSize * registerBufferNum
+	}
+	// UringMultiSizeBufferOptions enables multi-size buffer groups.
+	UringMultiSizeBufferOptions UringOptionFunc = func(opt *UringOptions) {
+		opt.MultiSizeBuffer = 1
+	}
+)
+
+func (ur *Uring) operationOptions(opts []OpOptionFunc) (flags uint8) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+	return opt.Flags
+}
+
+func (ur *Uring) readFixedOptions(bufIndex int, opts []OpOptionFunc) (flags uint8, offset int64, n int) {
+	if len(opts) < 1 {
+		bufSize := len(ur.ioUring.bufs[bufIndex])
+		return uringOpFlagsNone, 0, bufSize
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+
+	bufSize := len(ur.ioUring.bufs[bufIndex])
+	readSize := bufSize
+	if opt.N != nil && *opt.N < bufSize {
+		readSize = *opt.N
+	}
+
+	return opt.Flags, opt.Offset, readSize
+}
+
+func (ur *Uring) writeFixedOptions(opts []OpOptionFunc) (flags uint8, offset int64) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone, 0
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+
+	return opt.Flags, opt.Offset
+}
+
+func (ur *Uring) pollAddOptions(opts []OpOptionFunc) (flags uint8) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+	return opt.Flags
+}
+
+func (ur *Uring) pollRemoveOptions(opts []OpOptionFunc) (flags uint8) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+	return opt.Flags
+}
+
+func (ur *Uring) syncFileRangeOptions(opts []OpOptionFunc) (flags uint8, offset int64, n int) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone, 0, bufferSizeDefault
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+
+	size := bufferSizeDefault
+	if opt.N != nil {
+		size = *opt.N
+	}
+	return opt.Flags, opt.Offset, size
+}
+func (ur *Uring) sendmsgOptions(iovs [][]byte, opts []OpOptionFunc) (flags uint8, ioprio uint16) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone, uringOpIOPrioNone
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+	return opt.Flags, opt.IOPrio
+}
+
+func (ur *Uring) recvmsgOptions(iovs [][]byte, opts []OpOptionFunc) (flags uint8, ioprio uint16) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone, uringOpIOPrioNone
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+	return opt.Flags, opt.IOPrio
+}
+
+func (ur *Uring) timeoutOptions(opts []OpOptionFunc) (flags uint8, cnt int) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone, 1
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+	return opt.Flags, opt.Count
+}
+
+func (ur *Uring) timeoutRemoveOptions(opts []OpOptionFunc) (flags uint8) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+	return opt.Flags
+}
+
+func (ur *Uring) acceptOptions(opts []OpOptionFunc) (flags uint8, ioprio uint16) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone, uringOpIOPrioNone
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+	return opt.Flags, opt.IOPrio
+}
+func (ur *Uring) asyncCancelOptions(opts []OpOptionFunc) (flags uint8) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+	return opt.Flags
+}
+
+func (ur *Uring) connectOptions(opts []OpOptionFunc) (flags uint8) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+	return opt.Flags
+}
+
+func (ur *Uring) openAtOptions(opts []OpOptionFunc) (flags uint8) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+	return opt.Flags
+}
+
+func (ur *Uring) closeOptions(opts []OpOptionFunc) (flags uint8) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+	return opt.Flags
+}
+
+func (ur *Uring) statxOptions(opts []OpOptionFunc) (flags uint8) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+	return opt.Flags
+}
+
+func (ur *Uring) readOptions(b []byte, opts []OpOptionFunc) (flags uint8, ioprio uint16, offset int64, n int) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone, uringOpIOPrioNone, 0, len(b)
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+
+	readSize := len(b)
+	if opt.N != nil && *opt.N < len(b) {
+		readSize = *opt.N
+	}
+
+	return opt.Flags, opt.IOPrio, opt.Offset, readSize
+}
+
+func (ur *Uring) writeOptions(b []byte, opts []OpOptionFunc) (flags uint8, ioprio uint16, offset int64, n int) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone, uringOpIOPrioNone, 0, len(b)
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+
+	writeSize := len(b)
+	if opt.N != nil && *opt.N < len(b) {
+		writeSize = *opt.N
+	}
+
+	return opt.Flags, opt.IOPrio, opt.Offset, writeSize
+}
+
+func (ur *Uring) fadviseOptions(b []byte, opts []OpOptionFunc) (flags uint8, offset int64, n int, advice int) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone, 0, len(b), 0
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+
+	size := len(b)
+	if opt.N != nil && *opt.N < len(b) {
+		size = *opt.N
+	}
+
+	return opt.Flags, opt.Offset, size, opt.Fadvise
+}
+
+func (ur *Uring) madviseOptions(b []byte, opts []OpOptionFunc) (flags uint8, advice int) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone, 0
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+	return opt.Flags, opt.Fadvise
+}
+
+func (ur *Uring) sendOptions(b []byte, opts []OpOptionFunc) (flags uint8, ioprio uint16, offset int64, n int) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone, uringOpIOPrioNone, 0, len(b)
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+
+	n = len(b)
+	if opt.N != nil && *opt.N < len(b) {
+		n = *opt.N
+	}
+
+	return opt.Flags, opt.IOPrio, opt.Offset, n
+}
+
+func (ur *Uring) receiveOptions(b []byte, opts []OpOptionFunc) (flags uint8, ioprio uint16, offset int64, n int) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone, uringOpIOPrioNone, 0, len(b)
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+
+	n = len(b)
+	if opt.N != nil && *opt.N < len(b) {
+		n = *opt.N
+	}
+
+	return opt.Flags, opt.IOPrio, opt.Offset, n
+}
+
+func (ur *Uring) openAt2Options(opts []OpOptionFunc) (flags uint8) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+	return opt.Flags
+}
+
+func (ur *Uring) epollCtlOptions(opts []OpOptionFunc) (flags uint8) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+	return opt.Flags
+}
+
+func (ur *Uring) spliceOptions(opts []OpOptionFunc) (flags uint8, n int) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone, bufferSizeDefault
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+
+	size := bufferSizeDefault
+	if opt.N != nil {
+		size = *opt.N
+	}
+	return opt.Flags, size
+}
+
+func (ur *Uring) teeOptions(opts []OpOptionFunc) (flags uint8, n int) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone, bufferSizeDefault
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+
+	size := bufferSizeDefault
+	if opt.N != nil {
+		size = *opt.N
+	}
+	return opt.Flags, size
+}
+
+func (ur *Uring) shutdownOptions(opts []OpOptionFunc) (flags uint8) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+	return opt.Flags
+}
+
+func (ur *Uring) renameAtOptions(opts []OpOptionFunc) (flags uint8) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+	return opt.Flags
+}
+
+func (ur *Uring) unlinkAtOptions(opts []OpOptionFunc) (flags uint8) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+	return opt.Flags
+}
+
+func (ur *Uring) mkdirAtOptions(opts []OpOptionFunc) (flags uint8) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+	return opt.Flags
+}
+
+func (ur *Uring) symlinkAtOptions(opts []OpOptionFunc) (flags uint8) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+	return opt.Flags
+}
+
+func (ur *Uring) linkAtOptions(opts []OpOptionFunc) (flags uint8) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+	return opt.Flags
+}
+
+func (ur *Uring) receiveWithBufferSelectOptions(f PollFd, opts []OpOptionFunc) (flags uint8, ioprio uint16, bufferSize int, bufferGroup uint16) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone, uringOpIOPrioNone, bufferSizeDefault, ur.getBufferGid(f, bufferSizeDefault)
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+	return opt.Flags, opt.IOPrio, opt.ReadBufferSize, ur.getBufferGid(f, opt.ReadBufferSize)
+}
+
+func (ur *Uring) socketOptions(opts []OpOptionFunc) (flags uint8, callback uint8, i uint32) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone, uringOpCallbackKindNone, 0
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+	return opt.Flags, opt.CallbackKind, opt.FileIndex
+}
+
+func (ur *Uring) bindOptions(opts []OpOptionFunc) (flags uint8, callback uint8) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone, uringOpCallbackKindNone
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+	return opt.Flags, opt.CallbackKind
+}
+
+func (ur *Uring) listenOptions(opts []OpOptionFunc) (flags uint8, backlog int) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone, defaultBacklog
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+	return opt.Flags, opt.Backlog
+}
+
+func (ur *Uring) getBufferGid(f PollFd, size int) uint16 {
+	if ur.buffers != nil {
+		return ur.buffers.bufGroup(f)
+	} else if ur.bufferGroups != nil {
+		return ur.bufferGroups.bufGroupBySize(f, size)
+	}
+	panic("Uring has neither buffers nor bufferGroups set")
+}
+
+func (ur *Uring) buf(bufGroup bufferGroupIndex, bufIndex uint32) []byte {
+	if ur.buffers != nil {
+		return ur.buffers.buf(bufGroup, bufIndex)
+	} else if ur.bufferGroups != nil {
+		return ur.bufferGroups.buf(bufGroup, bufIndex)
+	}
+	panic("Uring has neither buffers nor bufferGroups set")
+}

@@ -6,6 +6,8 @@
 
 package uring
 
+// This file is part of the `uring` package refactored from `code.hybscloud.com/sox`.
+
 import (
 	"context"
 	"net"

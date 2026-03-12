@@ -3,7 +3,7 @@ module code.hybscloud.com/uring
 go 1.26
 
 require (
-	code.hybscloud.com/atomix v0.1.3
+	code.hybscloud.com/dwcas v0.1.4
 	code.hybscloud.com/framer v0.1.4
 	code.hybscloud.com/iobuf v0.3.1
 	code.hybscloud.com/iofd v0.3.4
