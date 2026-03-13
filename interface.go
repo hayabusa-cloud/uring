@@ -606,6 +606,17 @@ func (ur *Uring) ReceiveBundleMultiShot(sqeCtx SQEContext, so PollFd, options ..
 	return ur.receiveBundle(ctx, ioprio|IORING_RECV_MULTISHOT, bufSize, bufGroup)
 }
 
+// BundleIterator constructs a BundleIterator for the given CQE and buffer group.
+// The group parameter is the group ID as used during buffer ring registration.
+// Returns nil if the group is not registered or the CQE has no data.
+//
+// The returned iterator borrows ring-owned backing memory. Process the buffers
+// before calling Recycle, and call Recycle from a single goroutine without
+// racing other buffer-ring recycle/advance activity on the same Uring.
+func (ur *Uring) BundleIterator(cqe CQEView, group uint16) *BundleIterator {
+	return ur.bufferRings.bundleIterator(cqe, int(group)-ur.ReadBufferGidOffset, uint16(ur.ReadBufferGidOffset), group)
+}
+
 // Send writes data to a socket.
 func (ur *Uring) Send(sqeCtx SQEContext, so PollFd, p []byte, options ...OpOptionFunc) error {
 	flags, ioprio, offset, n := ur.sendOptions(p, options)

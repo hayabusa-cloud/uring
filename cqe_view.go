@@ -201,9 +201,11 @@ func (c *CQEView) BundleCount(bufferSize int) int {
 	return (int(c.Res) + bufferSize - 1) / bufferSize
 }
 
-// BundleBuffers returns the range of buffer IDs consumed [startID, startID+count).
-// The mask parameter should be (bufferRingSize - 1) for proper wrap-around.
-// Returns startID and the count of buffers consumed.
+// BundleBuffers returns the logical range of buffer IDs consumed.
+// The returned startID is the first buffer ID; count is the number of buffers.
+// The range [startID, startID+count) is logical and may wrap around the ring.
+// Callers must apply (id & ringMask) to obtain physical buffer IDs, or use
+// BundleIterator which handles wrap-around automatically.
 //
 //go:nosplit
 func (c *CQEView) BundleBuffers(bufferSize int) (startID uint16, count int) {

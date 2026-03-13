@@ -22,6 +22,8 @@ func newUringBufferRings() *uringBufferRings {
 		backings: make([][]byte, 0),
 		counts:   make([]uintptr, 0),
 		masks:    make([]uintptr, 0),
+		sizes:    make([]int, 0),
+		buffers:  make([][]byte, 0),
 	}
 	return &ret
 }
@@ -43,20 +45,26 @@ type uringBufferRings struct {
 	locks    []spin.Lock
 	counts   []uintptr
 	masks    []uintptr
+	sizes    []int    // per-group buffer size
+	buffers  [][]byte // per-group buffer memory (GC-safe)
+}
+
+func (rings *uringBufferRings) appendGroup(br *ioUringBufRing, n int) {
+	rings.rings = append(rings.rings, br)
+	rings.locks = append(rings.locks, spin.Lock{})
+	rings.counts = append(rings.counts, uintptr(n))
+	rings.masks = append(rings.masks, uintptr(n-1))
 }
 
 func (rings *uringBufferRings) registerBuffers(ur *ioUring, b *uringProvideBuffers) error {
 	for i := range b.gn {
 		gid := uint16(i) + b.gidOffset
-		ptr := unsafe.Add(b.ptr, b.size*b.n*i)
-		br, err := rings.registerGroup(ur, b.n, gid, ptr, b.size)
+		buf := b.mem[b.size*b.n*i : b.size*b.n*(i+1)]
+		br, err := rings.registerGroup(ur, b.n, gid, buf, b.size)
 		if err != nil {
 			return err
 		}
-		rings.rings = append(rings.rings, br)
-		rings.locks = append(rings.locks, spin.Lock{})
-		rings.counts = append(rings.counts, uintptr(b.n))
-		rings.masks = append(rings.masks, uintptr(b.n-1))
+		rings.appendGroup(br, b.n)
 	}
 	return nil
 }
@@ -65,173 +73,139 @@ func (rings *uringBufferRings) registerGroups(ur *ioUring, g *uringProvideBuffer
 	for i := range g.scale {
 		if g.cfg.PicoNum > 0 {
 			gid := uint16(i)*bufferGroupIndexEnd + bufferGroupIndexPico + g.gidOffset
-			ptr := unsafe.Pointer(&g.picoBuffers[i*g.cfg.PicoNum])
-			br, err := rings.registerGroup(ur, g.cfg.PicoNum, gid, ptr, BufferSizePico)
+			buf := g.picoMem[BufferSizePico*g.cfg.PicoNum*i : BufferSizePico*g.cfg.PicoNum*(i+1)]
+			br, err := rings.registerGroup(ur, g.cfg.PicoNum, gid, buf, BufferSizePico)
 			if err != nil {
 				return err
 			}
-			rings.rings = append(rings.rings, br)
-			rings.locks = append(rings.locks, spin.Lock{})
-			rings.counts = append(rings.counts, uintptr(g.cfg.PicoNum))
-			rings.masks = append(rings.masks, uintptr(g.cfg.PicoNum-1))
+			rings.appendGroup(br, g.cfg.PicoNum)
 		}
 
 		if g.cfg.NanoNum > 0 {
 			gid := uint16(i)*bufferGroupIndexEnd + bufferGroupIndexNano + g.gidOffset
-			ptr := unsafe.Pointer(&g.nanoBuffers[i*g.cfg.NanoNum])
-			br, err := rings.registerGroup(ur, g.cfg.NanoNum, gid, ptr, BufferSizeNano)
+			buf := g.nanoMem[BufferSizeNano*g.cfg.NanoNum*i : BufferSizeNano*g.cfg.NanoNum*(i+1)]
+			br, err := rings.registerGroup(ur, g.cfg.NanoNum, gid, buf, BufferSizeNano)
 			if err != nil {
 				return err
 			}
-			rings.rings = append(rings.rings, br)
-			rings.locks = append(rings.locks, spin.Lock{})
-			rings.counts = append(rings.counts, uintptr(g.cfg.NanoNum))
-			rings.masks = append(rings.masks, uintptr(g.cfg.NanoNum-1))
+			rings.appendGroup(br, g.cfg.NanoNum)
 		}
 
 		if g.cfg.MicroNum > 0 {
 			gid := uint16(i)*bufferGroupIndexEnd + bufferGroupIndexMicro + g.gidOffset
-			ptr := unsafe.Pointer(&g.microBuffers[i*g.cfg.MicroNum])
-			br, err := rings.registerGroup(ur, g.cfg.MicroNum, gid, ptr, BufferSizeMicro)
+			buf := g.microMem[BufferSizeMicro*g.cfg.MicroNum*i : BufferSizeMicro*g.cfg.MicroNum*(i+1)]
+			br, err := rings.registerGroup(ur, g.cfg.MicroNum, gid, buf, BufferSizeMicro)
 			if err != nil {
 				return err
 			}
-			rings.rings = append(rings.rings, br)
-			rings.locks = append(rings.locks, spin.Lock{})
-			rings.counts = append(rings.counts, uintptr(g.cfg.MicroNum))
-			rings.masks = append(rings.masks, uintptr(g.cfg.MicroNum-1))
+			rings.appendGroup(br, g.cfg.MicroNum)
 		}
 
 		if g.cfg.SmallNum > 0 {
 			gid := uint16(i)*bufferGroupIndexEnd + bufferGroupIndexSmall + g.gidOffset
-			ptr := unsafe.Pointer(&g.smallBuffers[i*g.cfg.SmallNum])
-			br, err := rings.registerGroup(ur, g.cfg.SmallNum, gid, ptr, BufferSizeSmall)
+			buf := g.smallMem[BufferSizeSmall*g.cfg.SmallNum*i : BufferSizeSmall*g.cfg.SmallNum*(i+1)]
+			br, err := rings.registerGroup(ur, g.cfg.SmallNum, gid, buf, BufferSizeSmall)
 			if err != nil {
 				return err
 			}
-			rings.rings = append(rings.rings, br)
-			rings.locks = append(rings.locks, spin.Lock{})
-			rings.counts = append(rings.counts, uintptr(g.cfg.SmallNum))
-			rings.masks = append(rings.masks, uintptr(g.cfg.SmallNum-1))
+			rings.appendGroup(br, g.cfg.SmallNum)
 		}
 
 		if g.cfg.MediumNum > 0 {
 			gid := uint16(i)*bufferGroupIndexEnd + bufferGroupIndexMedium + g.gidOffset
-			ptr := unsafe.Pointer(&g.mediumBuffers[i*g.cfg.MediumNum])
-			br, err := rings.registerGroup(ur, g.cfg.MediumNum, gid, ptr, BufferSizeMedium)
+			buf := g.mediumMem[BufferSizeMedium*g.cfg.MediumNum*i : BufferSizeMedium*g.cfg.MediumNum*(i+1)]
+			br, err := rings.registerGroup(ur, g.cfg.MediumNum, gid, buf, BufferSizeMedium)
 			if err != nil {
 				return err
 			}
-			rings.rings = append(rings.rings, br)
-			rings.locks = append(rings.locks, spin.Lock{})
-			rings.counts = append(rings.counts, uintptr(g.cfg.MediumNum))
-			rings.masks = append(rings.masks, uintptr(g.cfg.MediumNum-1))
+			rings.appendGroup(br, g.cfg.MediumNum)
 		}
 
 		if g.cfg.BigNum > 0 {
 			gid := uint16(i)*bufferGroupIndexEnd + bufferGroupIndexBig + g.gidOffset
-			ptr := unsafe.Pointer(&g.bigBuffers[i*g.cfg.BigNum])
-			br, err := rings.registerGroup(ur, g.cfg.BigNum, gid, ptr, BufferSizeBig)
+			buf := g.bigMem[BufferSizeBig*g.cfg.BigNum*i : BufferSizeBig*g.cfg.BigNum*(i+1)]
+			br, err := rings.registerGroup(ur, g.cfg.BigNum, gid, buf, BufferSizeBig)
 			if err != nil {
 				return err
 			}
-			rings.rings = append(rings.rings, br)
-			rings.locks = append(rings.locks, spin.Lock{})
-			rings.counts = append(rings.counts, uintptr(g.cfg.BigNum))
-			rings.masks = append(rings.masks, uintptr(g.cfg.BigNum-1))
+			rings.appendGroup(br, g.cfg.BigNum)
 		}
 
 		if g.cfg.LargeNum > 0 {
 			gid := uint16(i)*bufferGroupIndexEnd + bufferGroupIndexLarge + g.gidOffset
-			ptr := unsafe.Pointer(&g.largeBuffers[i*g.cfg.LargeNum])
-			br, err := rings.registerGroup(ur, g.cfg.LargeNum, gid, ptr, BufferSizeLarge)
+			buf := g.largeMem[BufferSizeLarge*g.cfg.LargeNum*i : BufferSizeLarge*g.cfg.LargeNum*(i+1)]
+			br, err := rings.registerGroup(ur, g.cfg.LargeNum, gid, buf, BufferSizeLarge)
 			if err != nil {
 				return err
 			}
-			rings.rings = append(rings.rings, br)
-			rings.locks = append(rings.locks, spin.Lock{})
-			rings.counts = append(rings.counts, uintptr(g.cfg.LargeNum))
-			rings.masks = append(rings.masks, uintptr(g.cfg.LargeNum-1))
+			rings.appendGroup(br, g.cfg.LargeNum)
 		}
 
 		if g.cfg.GreatNum > 0 {
 			gid := uint16(i)*bufferGroupIndexEnd + bufferGroupIndexGreat + g.gidOffset
-			ptr := unsafe.Pointer(&g.greatBuffers[i*g.cfg.GreatNum])
-			br, err := rings.registerGroup(ur, g.cfg.GreatNum, gid, ptr, BufferSizeGreat)
+			buf := g.greatMem[BufferSizeGreat*g.cfg.GreatNum*i : BufferSizeGreat*g.cfg.GreatNum*(i+1)]
+			br, err := rings.registerGroup(ur, g.cfg.GreatNum, gid, buf, BufferSizeGreat)
 			if err != nil {
 				return err
 			}
-			rings.rings = append(rings.rings, br)
-			rings.locks = append(rings.locks, spin.Lock{})
-			rings.counts = append(rings.counts, uintptr(g.cfg.GreatNum))
-			rings.masks = append(rings.masks, uintptr(g.cfg.GreatNum-1))
+			rings.appendGroup(br, g.cfg.GreatNum)
 		}
 
 		if g.cfg.HugeNum > 0 {
 			gid := uint16(i)*bufferGroupIndexEnd + bufferGroupIndexHuge + g.gidOffset
-			ptr := unsafe.Pointer(&g.hugeBuffers[i*g.cfg.HugeNum])
-			br, err := rings.registerGroup(ur, g.cfg.HugeNum, gid, ptr, BufferSizeHuge)
+			buf := g.hugeMem[BufferSizeHuge*g.cfg.HugeNum*i : BufferSizeHuge*g.cfg.HugeNum*(i+1)]
+			br, err := rings.registerGroup(ur, g.cfg.HugeNum, gid, buf, BufferSizeHuge)
 			if err != nil {
 				return err
 			}
-			rings.rings = append(rings.rings, br)
-			rings.locks = append(rings.locks, spin.Lock{})
-			rings.counts = append(rings.counts, uintptr(g.cfg.HugeNum))
-			rings.masks = append(rings.masks, uintptr(g.cfg.HugeNum-1))
+			rings.appendGroup(br, g.cfg.HugeNum)
 		}
 
 		if g.cfg.VastNum > 0 {
 			gid := uint16(i)*bufferGroupIndexEnd + bufferGroupIndexVast + g.gidOffset
-			ptr := unsafe.Pointer(&g.vastBuffers[i*g.cfg.VastNum])
-			br, err := rings.registerGroup(ur, g.cfg.VastNum, gid, ptr, BufferSizeVast)
+			buf := g.vastMem[BufferSizeVast*g.cfg.VastNum*i : BufferSizeVast*g.cfg.VastNum*(i+1)]
+			br, err := rings.registerGroup(ur, g.cfg.VastNum, gid, buf, BufferSizeVast)
 			if err != nil {
 				return err
 			}
-			rings.rings = append(rings.rings, br)
-			rings.locks = append(rings.locks, spin.Lock{})
-			rings.counts = append(rings.counts, uintptr(g.cfg.VastNum))
-			rings.masks = append(rings.masks, uintptr(g.cfg.VastNum-1))
+			rings.appendGroup(br, g.cfg.VastNum)
 		}
 
 		if g.cfg.GiantNum > 0 {
 			gid := uint16(i)*bufferGroupIndexEnd + bufferGroupIndexGiant + g.gidOffset
-			ptr := unsafe.Pointer(&g.giantBuffers[i*g.cfg.GiantNum])
-			br, err := rings.registerGroup(ur, g.cfg.GiantNum, gid, ptr, BufferSizeGiant)
+			buf := g.giantMem[BufferSizeGiant*g.cfg.GiantNum*i : BufferSizeGiant*g.cfg.GiantNum*(i+1)]
+			br, err := rings.registerGroup(ur, g.cfg.GiantNum, gid, buf, BufferSizeGiant)
 			if err != nil {
 				return err
 			}
-			rings.rings = append(rings.rings, br)
-			rings.locks = append(rings.locks, spin.Lock{})
-			rings.counts = append(rings.counts, uintptr(g.cfg.GiantNum))
-			rings.masks = append(rings.masks, uintptr(g.cfg.GiantNum-1))
+			rings.appendGroup(br, g.cfg.GiantNum)
 		}
 
 		if g.cfg.TitanNum > 0 {
 			gid := uint16(i)*bufferGroupIndexEnd + bufferGroupIndexTitan + g.gidOffset
-			ptr := unsafe.Pointer(&g.titanBuffers[i*g.cfg.TitanNum])
-			br, err := rings.registerGroup(ur, g.cfg.TitanNum, gid, ptr, BufferSizeTitan)
+			buf := g.titanMem[BufferSizeTitan*g.cfg.TitanNum*i : BufferSizeTitan*g.cfg.TitanNum*(i+1)]
+			br, err := rings.registerGroup(ur, g.cfg.TitanNum, gid, buf, BufferSizeTitan)
 			if err != nil {
 				return err
 			}
-			rings.rings = append(rings.rings, br)
-			rings.locks = append(rings.locks, spin.Lock{})
-			rings.counts = append(rings.counts, uintptr(g.cfg.TitanNum))
-			rings.masks = append(rings.masks, uintptr(g.cfg.TitanNum-1))
+			rings.appendGroup(br, g.cfg.TitanNum)
 		}
 	}
 	return nil
 }
 
-func (rings *uringBufferRings) registerGroup(ur *ioUring, entries int, gid uint16, ptr unsafe.Pointer, size int) (*ioUringBufRing, error) {
+func (rings *uringBufferRings) registerGroup(ur *ioUring, entries int, gid uint16, buf []byte, size int) (*ioUringBufRing, error) {
 	r, backing, err := ur.registerBufRing(entries, gid)
 	if err != nil {
 		return nil, err
 	}
 	// Store backing slice to prevent GC (nil for mmap mode)
 	rings.backings = append(rings.backings, backing)
+	rings.sizes = append(rings.sizes, size)
+	rings.buffers = append(rings.buffers, buf)
 	ur.bufRingInit(r)
 	mask := entries - 1
-	base := uintptr(ptr)
+	base := uintptr(unsafe.Pointer(unsafe.SliceData(buf)))
 	for i := range entries {
 		ur.bufRingAdd(r, base+uintptr(i*size), size, uint16(i), uintptr(mask), uintptr(i))
 	}
@@ -266,4 +240,25 @@ func (rings *uringBufferRings) advance(ur *ioUring) {
 		rings.counts[i] = 0
 		rings.locks[i].Unlock()
 	}
+}
+
+// bundleIterator constructs a BundleIterator from a CQE and the internal index
+// of the buffer ring group. The index is the position in the rings slice
+// (i.e., group - gidOffset). gidOffset and group are captured in the
+// iterator for use by Recycle.
+func (rings *uringBufferRings) bundleIterator(cqe CQEView, index int, gidOffset, group uint16) *BundleIterator {
+	if index < 0 || index >= len(rings.rings) {
+		return nil
+	}
+	it := newBundleIterator(
+		cqe,
+		unsafe.Pointer(unsafe.SliceData(rings.buffers[index])),
+		rings.sizes[index],
+		uint16(rings.masks[index]),
+	)
+	if it != nil {
+		it.gidOffset = gidOffset
+		it.group = group
+	}
+	return it
 }
