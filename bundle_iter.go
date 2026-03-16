@@ -4,6 +4,8 @@
 
 //go:build linux
 
+// Refactored from code.hybscloud.com/sox.
+
 package uring
 
 import (
@@ -111,30 +113,31 @@ func (it *BundleIterator) All() iter.Seq[[]byte] {
 	}
 }
 
-// AllWithID returns an iterator that yields both buffer data and buffer ID.
-// Useful when you need to track which buffer IDs were consumed.
+// AllWithSlotID returns an iterator that yields both buffer data and masked
+// ring slot ID.
+// Useful when you need to track which ring slots were consumed.
 //
 // Usage:
 //
-//	for id, buf := range iter.AllWithID() {
-//	    fmt.Printf("Buffer ID %d: %d bytes\n", id, len(buf))
+//	for id, buf := range iter.AllWithSlotID() {
+//	    fmt.Printf("Slot ID %d: %d bytes\n", id, len(buf))
 //	}
-func (it *BundleIterator) AllWithID() iter.Seq2[uint16, []byte] {
+func (it *BundleIterator) AllWithSlotID() iter.Seq2[uint16, []byte] {
 	return func(yield func(uint16, []byte) bool) {
 		for pos := range it.count {
-			if !yield(it.BufferID(pos), it.bufAt(pos)) {
+			if !yield(it.SlotID(pos), it.bufAt(pos)) {
 				return
 			}
 		}
 	}
 }
 
-// BufferID returns the masked buffer ID at the given index in the bundle.
+// SlotID returns the masked ring slot ID at the given index in the bundle.
 // Handles ring wrap-around automatically.
 // Index must be in range [0, Count()).
 //
 //go:nosplit
-func (it *BundleIterator) BufferID(index int) uint16 {
+func (it *BundleIterator) SlotID(index int) uint16 {
 	return (it.startID + uint16(index)) & it.ringMask
 }
 
@@ -183,7 +186,7 @@ func (it *BundleIterator) CopyTo(dst []byte) int {
 // The group info (gidOffset, group) is captured at construction time.
 func (it *BundleIterator) Recycle(ur *Uring) {
 	for pos := range it.count {
-		id := it.BufferID(pos)
+		id := it.SlotID(pos)
 		bufPtr := unsafe.Add(it.bufBacking, int(id)*it.bufSize)
 		ur.bufferRings.provide(ur.ioUring, it.gidOffset, it.group, bufPtr, it.bufSize, uint32(id))
 	}

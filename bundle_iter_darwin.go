@@ -29,13 +29,13 @@ func (it *BundleIterator) All() iter.Seq[[]byte] {
 	return func(yield func([]byte) bool) {}
 }
 
-// AllWithID returns an iterator yielding buffer ID and data.
-func (it *BundleIterator) AllWithID() iter.Seq2[uint16, []byte] {
+// AllWithSlotID returns an iterator yielding masked ring slot ID and data.
+func (it *BundleIterator) AllWithSlotID() iter.Seq2[uint16, []byte] {
 	return func(yield func(uint16, []byte) bool) {}
 }
 
-// BufferID returns the masked buffer ID at the given index.
-func (it *BundleIterator) BufferID(index int) uint16 { return 0 }
+// SlotID returns the masked ring slot ID at the given index.
+func (it *BundleIterator) SlotID(index int) uint16 { return 0 }
 
 // Buffer returns the buffer at the given index.
 func (it *BundleIterator) Buffer(index int) []byte { return nil }
