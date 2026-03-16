@@ -66,8 +66,19 @@ func (c *CQEView) Context() SQEContext {
 }
 
 func (c *CQEView) BufGroup() uint16 {
-	if c.ctx.Mode() == CtxModeDirect {
+	switch c.ctx.Mode() {
+	case CtxModeDirect:
 		return c.ctx.BufGroup()
+	case CtxModeIndirect:
+		sqe := c.ctx.IndirectSQE()
+		if sqe.flags&IOSQE_BUFFER_SELECT != 0 {
+			return sqe.bufIndex
+		}
+	case CtxModeExtended:
+		ext := c.ctx.ExtSQE()
+		if ext.SQE.flags&IOSQE_BUFFER_SELECT != 0 {
+			return ext.SQE.bufIndex
+		}
 	}
 	return 0
 }

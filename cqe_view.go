@@ -9,31 +9,32 @@ package uring
 import "code.hybscloud.com/iofd"
 
 // CQEView provides a view into a completion queue entry.
-// It exposes the completion result and flags as direct fields for
-// zero-overhead access and provides methods to access the submission context.
+// It exposes kernel completion facts directly and lets higher layers decide
+// how to route or interpret them. When available, it also exposes the
+// submission context that produced those facts.
 //
 // # Property Patterns
 //
 // | FullSQE() | Extended() | Mode     | Available Data                                |
 // |-----------|------------|----------|-----------------------------------------------|
 // | false     | false      | Direct   | Op, SQE flags, BufGroup, FD, Res, CQE flags   |
-// | true      | false      | Indirect | + full ioUringSqe                             |
-// | true      | true       | Extended | + UserData typed overlay (Handler, refs, vals) |
+// | true      | false      | Indirect | + full ioUringSqe copy                        |
+// | true      | true       | Extended | + borrowed `ExtSQE` escape hatch              |
 //
 // # Usage
 //
 //	n, err := ring.Wait(cqes)
 //	for i := 0; i < n; i++ {
 //	    cqe := cqes[i]
-//	    if cqe.Extended() {
-//	        ext := cqe.ExtSQE()
-//	        ctx := ViewCtx1[*Conn](ext).Vals1()
-//	        ctx.Fn(ring, cqe)
-//	    } else if cqe.FullSQE() {
-//	        sqe := cqe.SQE()
-//	        // dispatch by sqe fields
-//	    } else {
-//	        // dispatch by Op/FD
+//	    // Observe the kernel facts first.
+//	    op := cqe.Op()
+//	    fd := cqe.FD()
+//	    if cqe.HasMore() {
+//	        // Higher layers decide whether to keep routing this live stream.
+//	    }
+//	    if cqe.FullSQE() {
+//	        // Indirect and Extended modes also expose the submitted SQE.
+//	        _ = cqe.SQE()
 //	    }
 //	}
 type CQEView struct {
@@ -89,16 +90,17 @@ func (c *CQEView) FD() iofd.FD {
 	}
 }
 
-// ExtSQE returns the ExtSQE for Extended mode contexts.
-// Caller must ensure context is in Extended mode.
+// ExtSQE returns the borrowed ExtSQE backing Extended mode contexts.
+// Caller should check Extended() first.
 //
 //go:nosplit
 func (c *CQEView) ExtSQE() *ExtSQE {
 	return c.ctx.ExtSQE()
 }
 
-// SQE returns an SQEView for inspecting the full SQE fields.
-// Caller should check FullSQE() first; returns invalid view for Direct mode.
+// SQE returns a view of the submitted SQE when the context retains one.
+// Caller should check FullSQE() first; Direct mode returns an invalid view
+// because it keeps only compact completion-context facts.
 //
 //go:nosplit
 func (c *CQEView) SQE() SQEView {
@@ -113,22 +115,32 @@ func (c *CQEView) SQE() SQEView {
 }
 
 // Context returns the underlying SQEContext.
-// Use this for advanced operations or mode inspection.
+// Use this for advanced mode-specific inspection beyond the CQEView helpers.
 //
 //go:nosplit
 func (c *CQEView) Context() SQEContext {
 	return c.ctx
 }
 
-// BufGroup returns the buffer group index.
-// Only meaningful for Direct mode or when IOSQE_BUFFER_SELECT was used.
+// BufGroup returns the observed submission buffer group index.
+// It is non-zero only when buffer selection was part of the submission.
 //
 //go:nosplit
 func (c *CQEView) BufGroup() uint16 {
-	if c.ctx.Mode() == CtxModeDirect {
+	switch c.ctx.Mode() {
+	case CtxModeDirect:
 		return c.ctx.BufGroup()
+	case CtxModeIndirect:
+		sqe := c.ctx.IndirectSQE()
+		if sqe.flags&IOSQE_BUFFER_SELECT != 0 {
+			return sqe.bufIndex
+		}
+	case CtxModeExtended:
+		ext := c.ctx.ExtSQE()
+		if ext.SQE.flags&IOSQE_BUFFER_SELECT != 0 {
+			return ext.SQE.bufIndex
+		}
 	}
-	// For Indirect/Extended, extract from SQE flags if buffer select was used
 	return 0
 }
 
