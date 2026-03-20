@@ -58,35 +58,97 @@ func PackDirect(op, flags uint8, bufGroup uint16, fd int32) SQEContext {
 
 func ForFD(fd int32) SQEContext { return PackDirect(0, 0, 0, fd) }
 
-func (c SQEContext) Op() uint8 { return uint8((c & ctxOpMask) >> ctxOpShift) }
+func (c SQEContext) Op() uint8 {
+	if c.IsDirect() {
+		return uint8((c & ctxOpMask) >> ctxOpShift)
+	}
+	if c.IsExtended() {
+		return c.ExtSQE().SQE.opcode
+	}
+	return c.IndirectSQE().opcode
+}
 
-func (c SQEContext) Flags() uint8 { return uint8((c & ctxFlagsMask) >> ctxFlagsShift) }
+func (c SQEContext) Flags() uint8 {
+	if c.IsDirect() {
+		return uint8((c & ctxFlagsMask) >> ctxFlagsShift)
+	}
+	if c.IsExtended() {
+		return c.ExtSQE().SQE.flags
+	}
+	return c.IndirectSQE().flags
+}
 
-func (c SQEContext) BufGroup() uint16 { return uint16((c & ctxBufGrpMask) >> ctxBufGrpShift) }
+func (c SQEContext) BufGroup() uint16 {
+	if c.IsDirect() {
+		return uint16((c & ctxBufGrpMask) >> ctxBufGrpShift)
+	}
+	if c.IsExtended() {
+		return c.ExtSQE().SQE.bufIndex
+	}
+	return c.IndirectSQE().bufIndex
+}
 
 func (c SQEContext) FD() int32 {
-	fdBits := c & ctxFDMask
-	if fdBits&ctxFDSignBit != 0 {
-		fdBits |= ctxFDSignExt
+	if c.IsDirect() {
+		fdBits := c & ctxFDMask
+		if fdBits&ctxFDSignBit != 0 {
+			fdBits |= ctxFDSignExt
+		}
+		return int32(fdBits >> ctxFDShift)
 	}
-	return int32(fdBits >> ctxFDShift)
+	if c.IsExtended() {
+		return c.ExtSQE().SQE.fd
+	}
+	return c.IndirectSQE().fd
 }
 
 func (c SQEContext) WithOp(op uint8) SQEContext {
-	return (c &^ (ctxOpMask | ctxModeMask)) | SQEContext(op) | CtxModeDirect
+	if c.IsDirect() {
+		return (c &^ (ctxOpMask | ctxModeMask)) | SQEContext(op) | CtxModeDirect
+	}
+	if c.IsExtended() {
+		c.ExtSQE().SQE.opcode = op
+		return c
+	}
+	c.IndirectSQE().opcode = op
+	return c
 }
 
 func (c SQEContext) WithFlags(flags uint8) SQEContext {
-	return (c &^ (ctxFlagsMask | ctxModeMask)) | SQEContext(flags)<<ctxFlagsShift | CtxModeDirect
+	if c.IsDirect() {
+		return (c &^ (ctxFlagsMask | ctxModeMask)) | SQEContext(flags)<<ctxFlagsShift | CtxModeDirect
+	}
+	if c.IsExtended() {
+		c.ExtSQE().SQE.flags = flags
+		return c
+	}
+	c.IndirectSQE().flags = flags
+	return c
 }
 
 func (c SQEContext) WithBufGroup(bufGroup uint16) SQEContext {
-	return (c &^ (ctxBufGrpMask | ctxModeMask)) | SQEContext(bufGroup)<<ctxBufGrpShift | CtxModeDirect
+	if c.IsDirect() {
+		return (c &^ (ctxBufGrpMask | ctxModeMask)) | SQEContext(bufGroup)<<ctxBufGrpShift | CtxModeDirect
+	}
+	if c.IsExtended() {
+		c.ExtSQE().SQE.bufIndex = bufGroup
+		return c
+	}
+	c.IndirectSQE().bufIndex = bufGroup
+	return c
 }
 
 func (c SQEContext) WithFD(fd int32) SQEContext {
-	fdBits := SQEContext(uint32(fd)&0x3FFFFFFF) << ctxFDShift
-	return (c &^ (ctxFDMask | ctxModeMask)) | fdBits | CtxModeDirect
+	if c.IsDirect() {
+		fdBits := SQEContext(uint32(fd)&0x3FFFFFFF) << ctxFDShift
+		return (c &^ (ctxFDMask | ctxModeMask)) | fdBits | CtxModeDirect
+	}
+	if c.IsExtended() {
+		c.ExtSQE().SQE.fd = fd
+		return c
+	}
+	c.IndirectSQE().fd = fd
+	return c
 }
 
 func (c SQEContext) HasBufferSelect() bool { return c.Flags()&IOSQE_BUFFER_SELECT != 0 }

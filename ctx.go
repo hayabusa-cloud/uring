@@ -90,59 +90,117 @@ func ForFD(fd int32) SQEContext {
 //
 //go:nosplit
 func (c SQEContext) Op() uint8 {
-	return uint8(c & ctxOpMask)
+	if c.IsDirect() {
+		return uint8(c & ctxOpMask)
+	}
+	if c.IsExtended() {
+		return c.ExtSQE().SQE.opcode
+	}
+	return c.IndirectSQE().opcode
 }
 
 // Flags returns the `IOSQE_*` flags.
 //
 //go:nosplit
 func (c SQEContext) Flags() uint8 {
-	return uint8((c >> ctxFlagsShift) & 0xFF)
+	if c.IsDirect() {
+		return uint8((c >> ctxFlagsShift) & 0xFF)
+	}
+	if c.IsExtended() {
+		return c.ExtSQE().SQE.flags
+	}
+	return c.IndirectSQE().flags
 }
 
 // BufGroup returns the buffer group index.
 //
 //go:nosplit
 func (c SQEContext) BufGroup() uint16 {
-	return uint16((c >> ctxBufGrpShift) & 0xFFFF)
+	if c.IsDirect() {
+		return uint16((c >> ctxBufGrpShift) & 0xFFFF)
+	}
+	if c.IsExtended() {
+		return c.ExtSQE().SQE.bufIndex
+	}
+	return c.IndirectSQE().bufIndex
 }
 
 // FD returns the sign-extended 30-bit file descriptor.
 //
 //go:nosplit
 func (c SQEContext) FD() int32 {
-	// Extract 30-bit FD value
-	raw := (c >> ctxFDShift) & 0x3FFFFFFF
-	// Sign extend if bit 29 is set
-	if raw&0x20000000 != 0 {
-		raw |= 0xC0000000 // Set bits 30-31 for sign extension
+	if c.IsDirect() {
+		raw := (c >> ctxFDShift) & 0x3FFFFFFF
+		if raw&0x20000000 != 0 {
+			raw |= 0xC0000000
+		}
+		return int32(raw)
 	}
-	return int32(raw)
+	if c.IsExtended() {
+		return c.ExtSQE().SQE.fd
+	}
+	return c.IndirectSQE().fd
 }
 
 // WithOp returns a new context with the opcode replaced.
-// Only valid for Direct mode contexts.
+// For Direct mode, modifies the inline bits.
+// For Indirect/Extended modes, writes to the pointed-to SQE struct.
 func (c SQEContext) WithOp(op uint8) SQEContext {
-	return (c &^ ctxOpMask) | SQEContext(op)
+	if c.IsDirect() {
+		return (c &^ ctxOpMask) | SQEContext(op)
+	}
+	if c.IsExtended() {
+		c.ExtSQE().SQE.opcode = op
+		return c
+	}
+	c.IndirectSQE().opcode = op
+	return c
 }
 
 // WithFlags returns a new context with the flags replaced.
-// Only valid for Direct mode contexts.
+// For Direct mode, modifies the inline bits.
+// For Indirect/Extended modes, writes to the pointed-to SQE struct.
 func (c SQEContext) WithFlags(flags uint8) SQEContext {
-	return (c &^ ctxFlagsMask) | SQEContext(flags)<<ctxFlagsShift
+	if c.IsDirect() {
+		return (c &^ ctxFlagsMask) | SQEContext(flags)<<ctxFlagsShift
+	}
+	if c.IsExtended() {
+		c.ExtSQE().SQE.flags = flags
+		return c
+	}
+	c.IndirectSQE().flags = flags
+	return c
 }
 
 // WithBufGroup returns a new context with the buffer group replaced.
-// Only valid for Direct mode contexts.
+// For Direct mode, modifies the inline bits.
+// For Indirect/Extended modes, writes to the pointed-to SQE struct.
 func (c SQEContext) WithBufGroup(bufGroup uint16) SQEContext {
-	return (c &^ ctxBufGrpMask) | SQEContext(bufGroup)<<ctxBufGrpShift
+	if c.IsDirect() {
+		return (c &^ ctxBufGrpMask) | SQEContext(bufGroup)<<ctxBufGrpShift
+	}
+	if c.IsExtended() {
+		c.ExtSQE().SQE.bufIndex = bufGroup
+		return c
+	}
+	c.IndirectSQE().bufIndex = bufGroup
+	return c
 }
 
 // WithFD returns a new context with the file descriptor replaced.
-// Only valid for Direct mode contexts.
+// For Direct mode, modifies the inline bits.
+// For Indirect/Extended modes, writes to the pointed-to SQE struct.
 func (c SQEContext) WithFD(fd int32) SQEContext {
-	fdBits := SQEContext(uint32(fd)&0x3FFFFFFF) << ctxFDShift
-	return (c &^ (ctxFDMask | ctxModeMask)) | fdBits | CtxModeDirect
+	if c.IsDirect() {
+		fdBits := SQEContext(uint32(fd)&0x3FFFFFFF) << ctxFDShift
+		return (c &^ (ctxFDMask | ctxModeMask)) | fdBits | CtxModeDirect
+	}
+	if c.IsExtended() {
+		c.ExtSQE().SQE.fd = fd
+		return c
+	}
+	c.IndirectSQE().fd = fd
+	return c
 }
 
 // HasBufferSelect reports whether the IOSQE_BUFFER_SELECT flag is set.
