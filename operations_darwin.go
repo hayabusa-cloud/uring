@@ -70,13 +70,13 @@ const (
 	IORING_OP_FTRUNCATE
 	IORING_OP_BIND
 	IORING_OP_LISTEN
-	IORING_OP_RECV_ZC      // Zero-copy receive (6.10+)
-	IORING_OP_EPOLL_WAIT   // Epoll wait (6.11+)
-	IORING_OP_READV_FIXED  // Vectored read with fixed buffer (6.12+)
-	IORING_OP_WRITEV_FIXED // Vectored write with fixed buffer (6.12+)
-	IORING_OP_PIPE         // Create pipe (6.13+)
-	IORING_OP_NOP128       // 128-byte NOP (6.13+)
-	IORING_OP_URING_CMD128 // 128-byte uring command (6.13+)
+	IORING_OP_RECV_ZC      // Zero-copy receive
+	IORING_OP_EPOLL_WAIT   // Epoll wait
+	IORING_OP_READV_FIXED  // Vectored read with fixed buffer
+	IORING_OP_WRITEV_FIXED // Vectored write with fixed buffer
+	IORING_OP_PIPE         // Create pipe
+	IORING_OP_NOP128       // 128-byte NOP
+	IORING_OP_URING_CMD128 // 128-byte uring command
 	IORING_OP_LAST
 )
 
@@ -92,8 +92,8 @@ const (
 	IORING_RECV_MULTISHOT_FLAG  = 1 << 1 // Alias for compatibility
 	IORING_RECVSEND_FIXED_BUF   = 1 << 2
 	IORING_SEND_ZC_REPORT_USAGE = 1 << 3
-	IORING_RECVSEND_BUNDLE      = 1 << 4 // Bundle send/recv (6.13+)
-	IORING_SEND_VECTORIZED      = 1 << 5 // Vectorized send (6.14+)
+	IORING_RECVSEND_BUNDLE      = 1 << 4 // Bundle send/recv
+	IORING_SEND_VECTORIZED      = 1 << 5 // Vectorized send
 )
 
 // Internal flags

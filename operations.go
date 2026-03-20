@@ -84,13 +84,13 @@ const (
 	IORING_OP_FTRUNCATE
 	IORING_OP_BIND
 	IORING_OP_LISTEN
-	IORING_OP_RECV_ZC      // Zero-copy receive (6.10+)
-	IORING_OP_EPOLL_WAIT   // Epoll wait (6.11+)
-	IORING_OP_READV_FIXED  // Vectored read with fixed buffers (6.12+)
-	IORING_OP_WRITEV_FIXED // Vectored write with fixed buffers (6.12+)
-	IORING_OP_PIPE         // Create pipe (6.13+)
-	IORING_OP_NOP128       // 128-byte NOP for mixed SQE mode (6.13+)
-	IORING_OP_URING_CMD128 // 128-byte uring command for mixed SQE mode (6.13+)
+	IORING_OP_RECV_ZC      // Zero-copy receive
+	IORING_OP_EPOLL_WAIT   // Epoll wait
+	IORING_OP_READV_FIXED  // Vectored read with fixed buffers
+	IORING_OP_WRITEV_FIXED // Vectored write with fixed buffers
+	IORING_OP_PIPE         // Create pipe
+	IORING_OP_NOP128       // 128-byte NOP opcode
+	IORING_OP_URING_CMD128 // 128-byte uring command opcode
 )
 
 // Timeout operation flags.
@@ -120,7 +120,7 @@ const (
 	IORING_RECVSEND_FIXED_BUF               // Use registered buffer
 	IORING_SEND_ZC_REPORT_USAGE             // Report zero-copy usage
 	IORING_RECVSEND_BUNDLE                  // Bundle mode
-	IORING_SEND_VECTORIZED                  // Vectorized send (6.14+)
+	IORING_SEND_VECTORIZED                  // Vectorized send
 )
 
 // Notification CQE usage flags for zero-copy operations.
@@ -413,7 +413,6 @@ func (ur *ioUring) receiveWithBufferSelect(sqeCtx SQEContext, ioprio uint16, n i
 // receiveBundle submits a bundle receive with IORING_RECVSEND_BUNDLE flag.
 // Grabs multiple contiguous buffers from buffer group in a single operation.
 // The CQE result contains the number of buffers consumed.
-// Requires kernel 6.10+ with IORING_FEAT_RECVSEND_BUNDLE support.
 func (ur *ioUring) receiveBundle(sqeCtx SQEContext, ioprio uint16, n int, group uint16) error {
 	ctx := sqeCtx.WithOp(IORING_OP_RECV).
 		WithFlags(sqeCtx.Flags() | IOSQE_BUFFER_SELECT).
@@ -538,7 +537,9 @@ func (ur *ioUring) linkAt(sqeCtx SQEContext, oldDirfd int, oldPath string, newPa
 		return err
 	}
 	newAddr := uint64(uintptr(unsafe.Pointer(ptr)))
-	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_LINKAT), 0, newAddr, oldAddr, int(sqeCtx.FD()), uint32(uflags))
+	newDirfd := sqeCtx.FD()
+	ctx := sqeCtx.WithOp(IORING_OP_LINKAT).WithFD(int32(oldDirfd))
+	return ur.submitPacked6(ctx, 0, newAddr, oldAddr, int(newDirfd), uint32(uflags))
 }
 
 // msgRing sends a message to another ring.
@@ -650,13 +651,15 @@ func (ur *ioUring) sendmsgZeroCopy(sqeCtx SQEContext, ioprio uint16, buffers [][
 		msg.Control = &oob[0]
 		msg.Controllen = uint64(len(oob))
 	}
-	_ = msg
-	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_SENDMSG_ZC), ioprio, 0, uint64(uintptr(iovPtr)), 1, uint32(uflags))
+	msgAddr := uint64(uintptr(unsafe.Pointer(&msg)))
+	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_SENDMSG_ZC), ioprio, 0, msgAddr, 1, uint32(uflags))
 }
 
 // readMultiShot submits a multi-shot read operation.
 func (ur *ioUring) readMultiShot(sqeCtx SQEContext, offset uint64, n int, group uint16) error {
-	ctx := sqeCtx.WithOp(IORING_OP_READ_MULTISHOT).WithBufGroup(group)
+	ctx := sqeCtx.WithOp(IORING_OP_READ_MULTISHOT).
+		WithFlags(sqeCtx.Flags() | IOSQE_BUFFER_SELECT).
+		WithBufGroup(group)
 	return ur.submitPacked9(ctx, 0, offset, 0, n, 0, 0, 0)
 }
 
@@ -681,7 +684,7 @@ func (ur *ioUring) listen(sqeCtx SQEContext, backlog int) error {
 
 // receiveZeroCopy submits a zero-copy receive operation.
 // This uses IORING_OP_RECV_ZC to avoid copying received data to userspace buffers.
-// Requires kernel 6.13+ with ZCRX (zero-copy receive) support.
+// Requires a registered ZCRX interface queue backed by compatible hardware.
 func (ur *ioUring) receiveZeroCopy(sqeCtx SQEContext, ioprio uint16, n int, zcrxIfqIdx uint32) error {
 	return ur.submitPacked(sqeCtx.WithOp(IORING_OP_RECV_ZC), func(e *ioUringSqe) {
 		e.opcode = IORING_OP_RECV_ZC
@@ -695,7 +698,6 @@ func (ur *ioUring) receiveZeroCopy(sqeCtx SQEContext, ioprio uint16, n int, zcrx
 
 // epollWait performs an epoll_wait operation via io_uring.
 // This allows epoll monitoring to be integrated into the io_uring event loop.
-// Requires kernel 6.13+.
 func (ur *ioUring) epollWait(sqeCtx SQEContext, events *EpollEvent, maxEvents int, timeout int32) error {
 	addr := uint64(uintptr(unsafe.Pointer(events)))
 	return ur.submitPacked(sqeCtx.WithOp(IORING_OP_EPOLL_WAIT), func(e *ioUringSqe) {
@@ -710,7 +712,6 @@ func (ur *ioUring) epollWait(sqeCtx SQEContext, events *EpollEvent, maxEvents in
 
 // readvFixed submits a vectored read operation using registered buffers.
 // All iovecs must point to registered buffer memory.
-// Requires kernel 6.13+.
 func (ur *ioUring) readvFixed(sqeCtx SQEContext, offset uint64, bufIndices []int) error {
 	n := len(bufIndices)
 	if n < 1 {
@@ -742,7 +743,6 @@ func (ur *ioUring) readvFixed(sqeCtx SQEContext, offset uint64, bufIndices []int
 
 // writevFixed submits a vectored write operation using registered buffers.
 // All iovecs must point to registered buffer memory.
-// Requires kernel 6.13+.
 func (ur *ioUring) writevFixed(sqeCtx SQEContext, offset uint64, bufIndices []int, lengths []int) error {
 	n := len(bufIndices)
 	if n < 1 || n != len(lengths) {
@@ -776,7 +776,6 @@ func (ur *ioUring) writevFixed(sqeCtx SQEContext, offset uint64, bufIndices []in
 // The fds parameter must point to an int32[2] array where the kernel
 // will write the read end (fds[0]) and write end (fds[1]) file descriptors.
 // The fd field in sqeCtx is not used.
-// Requires kernel 6.14+.
 func (ur *ioUring) pipe(sqeCtx SQEContext, fds *[2]int32, flags uint32) error {
 	return ur.submitPacked(sqeCtx.WithOp(IORING_OP_PIPE), func(e *ioUringSqe) {
 		e.opcode = IORING_OP_PIPE
@@ -851,7 +850,7 @@ func (ur *ioUring) getxattr(sqeCtx SQEContext, path, name string, value []byte) 
 	})
 }
 
-// futexWait submits a futex wait operation. Requires kernel 6.7+.
+// futexWait submits a futex wait operation.
 func (ur *ioUring) futexWait(sqeCtx SQEContext, addr *uint32, val uint64, mask uint64, flags uint32) error {
 	return ur.submitPacked(sqeCtx.WithOp(IORING_OP_FUTEX_WAIT), func(e *ioUringSqe) {
 		e.opcode = IORING_OP_FUTEX_WAIT
@@ -863,7 +862,7 @@ func (ur *ioUring) futexWait(sqeCtx SQEContext, addr *uint32, val uint64, mask u
 	})
 }
 
-// futexWake submits a futex wake operation. Requires kernel 6.7+.
+// futexWake submits a futex wake operation.
 func (ur *ioUring) futexWake(sqeCtx SQEContext, addr *uint32, val uint64, mask uint64, flags uint32) error {
 	return ur.submitPacked(sqeCtx.WithOp(IORING_OP_FUTEX_WAKE), func(e *ioUringSqe) {
 		e.opcode = IORING_OP_FUTEX_WAKE
@@ -875,7 +874,7 @@ func (ur *ioUring) futexWake(sqeCtx SQEContext, addr *uint32, val uint64, mask u
 	})
 }
 
-// futexWaitV submits a vectored futex wait operation. Requires kernel 6.7+.
+// futexWaitV submits a vectored futex wait operation.
 func (ur *ioUring) futexWaitV(sqeCtx SQEContext, waitv unsafe.Pointer, count uint32, flags uint32) error {
 	return ur.submitPacked(sqeCtx.WithOp(IORING_OP_FUTEX_WAITV), func(e *ioUringSqe) {
 		e.opcode = IORING_OP_FUTEX_WAITV
@@ -886,7 +885,7 @@ func (ur *ioUring) futexWaitV(sqeCtx SQEContext, waitv unsafe.Pointer, count uin
 	})
 }
 
-// waitid submits a waitid operation. Requires kernel 6.7+.
+// waitid submits a waitid operation.
 func (ur *ioUring) waitid(sqeCtx SQEContext, idtype int, id int, infop unsafe.Pointer, options int) error {
 	return ur.submitPacked(sqeCtx.WithOp(IORING_OP_WAITID), func(e *ioUringSqe) {
 		e.opcode = IORING_OP_WAITID
@@ -899,7 +898,6 @@ func (ur *ioUring) waitid(sqeCtx SQEContext, idtype int, id int, infop unsafe.Po
 }
 
 // fixedFdInstall installs a fixed descriptor into the normal file table.
-// Requires kernel 6.8+.
 func (ur *ioUring) fixedFdInstall(sqeCtx SQEContext, fixedIndex int, flags uint32) error {
 	return ur.submitPacked(sqeCtx.WithOp(IORING_OP_FIXED_FD_INSTALL), func(e *ioUringSqe) {
 		e.opcode = IORING_OP_FIXED_FD_INSTALL
@@ -924,7 +922,7 @@ func (ur *ioUring) filesUpdate(sqeCtx SQEContext, fds []int32, offset int) error
 	})
 }
 
-// uringCmd submits a generic uring command (passthrough). Requires kernel 5.19+.
+// uringCmd submits a generic uring command (passthrough).
 func (ur *ioUring) uringCmd(sqeCtx SQEContext, cmdOp uint32, cmdData []byte) error {
 	return ur.submitPacked(sqeCtx.WithOp(IORING_OP_URING_CMD), func(e *ioUringSqe) {
 		e.opcode = IORING_OP_URING_CMD
@@ -938,25 +936,12 @@ func (ur *ioUring) uringCmd(sqeCtx SQEContext, cmdOp uint32, cmdData []byte) err
 	})
 }
 
-// nop128 submits a 128-byte NOP for mixed SQE mode testing. Requires kernel 6.13+.
+// nop128 returns ErrNotSupported until the ring can map 128-byte SQE slots.
 func (ur *ioUring) nop128(sqeCtx SQEContext) error {
-	return ur.submitPacked(sqeCtx.WithOp(IORING_OP_NOP128), func(e *ioUringSqe) {
-		e.opcode = IORING_OP_NOP128
-		e.flags = sqeCtx.Flags()
-		e.fd = sqeCtx.FD()
-	})
+	return ErrNotSupported
 }
 
-// uringCmd128 submits a 128-byte uring command. Requires kernel 6.13+.
+// uringCmd128 returns ErrNotSupported until the ring can map 128-byte SQE slots.
 func (ur *ioUring) uringCmd128(sqeCtx SQEContext, cmdOp uint32, cmdData []byte) error {
-	return ur.submitPacked(sqeCtx.WithOp(IORING_OP_URING_CMD128), func(e *ioUringSqe) {
-		e.opcode = IORING_OP_URING_CMD128
-		e.flags = sqeCtx.Flags()
-		e.fd = sqeCtx.FD()
-		e.off = uint64(cmdOp)
-		if len(cmdData) > 0 {
-			e.addr = uint64(uintptr(unsafe.Pointer(&cmdData[0])))
-			e.len = uint32(len(cmdData))
-		}
-	})
+	return ErrNotSupported
 }

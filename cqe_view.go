@@ -184,7 +184,7 @@ func (c *CQEView) IsNotification() bool {
 }
 
 // HasBufferMore reports whether the buffer was partially consumed (incremental mode).
-// Available in kernel 6.12+. When set, the same buffer ID remains valid
+// When set, the same buffer ID remains valid
 // for additional data.
 //
 //go:nosplit

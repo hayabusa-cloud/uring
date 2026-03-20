@@ -4,6 +4,8 @@
 
 //go:build mips || mips64 || ppc || ppc64 || s390x || sparc || sparc64
 
+// Refactored from code.hybscloud.com/sox.
+
 package uring
 
 const isBigEndian = true
