@@ -179,7 +179,7 @@ func newUringProvideBuffers(size, n int) *uringProvideBuffers {
 	if n > (1 << 15) {
 		gn, n = n>>15, 1<<15
 	}
-	mem := iobuf.AlignedMem(int(size)*n, iobuf.PageSize)
+	mem := iobuf.AlignedMem(int(size)*n*gn, iobuf.PageSize)
 	ptr := unsafe.Pointer(unsafe.SliceData(mem))
 	return &uringProvideBuffers{
 		gn:    gn,
