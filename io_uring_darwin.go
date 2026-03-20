@@ -39,35 +39,14 @@ const (
 )
 
 const (
-	IORING_FEAT_SINGLE_MMAP = 1 << iota
-	IORING_FEAT_NODROP
-	IORING_FEAT_SUBMIT_STABLE
-	IORING_FEAT_RW_CUR_POS
-	IORING_FEAT_CUR_PERSONALITY
-	IORING_FEAT_FAST_POLL
-	IORING_FEAT_POLL_32BITS
-	IORING_FEAT_SQPOLL_NONFIXED
-	IORING_FEAT_EXT_ARG
-	IORING_FEAT_NATIVE_WORKERS
-	IORING_FEAT_RSRC_TAGS
-	IORING_FEAT_CQE_SKIP
-	IORING_FEAT_LINKED_FILE
-	IORING_FEAT_REG_REG_RING
-	IORING_FEAT_RECVSEND_BUNDLE // Bundle send/recv (6.13+)
-	IORING_FEAT_MIN_TIMEOUT     // Minimum timeout (6.13+)
-	IORING_FEAT_RW_ATTR         // Read/write with attributes (6.14+)
-	IORING_FEAT_NO_IOWAIT       // No I/O wait mode (6.14+)
-)
-
-const (
 	IORING_ENTER_GETEVENTS       = 1 << 0
 	IORING_ENTER_SQ_WAKEUP       = 1 << 1
 	IORING_ENTER_SQ_WAIT         = 1 << 2
 	IORING_ENTER_EXT_ARG         = 1 << 3
 	IORING_ENTER_REGISTERED_RING = 1 << 4
-	IORING_ENTER_ABS_TIMER       = 1 << 5 // Absolute timer (6.13+)
-	IORING_ENTER_EXT_ARG_REG     = 1 << 6 // Extended arg registered (6.13+)
-	IORING_ENTER_NO_IOWAIT       = 1 << 7 // No I/O wait (6.14+)
+	IORING_ENTER_ABS_TIMER       = 1 << 5 // Absolute timer
+	IORING_ENTER_EXT_ARG_REG     = 1 << 6 // Extended arg registered
+	IORING_ENTER_NO_IOWAIT       = 1 << 7 // No I/O wait
 )
 
 const (
@@ -107,7 +86,7 @@ const (
 	IORING_CQE_F_MORE
 	IORING_CQE_F_SOCK_NONEMPTY
 	IORING_CQE_F_NOTIF
-	IORING_CQE_F_BUF_MORE // Buffer has more data (6.0+)
+	IORING_CQE_F_BUF_MORE // Buffer has more data
 )
 
 const (
@@ -161,21 +140,19 @@ const IORING_REGISTER_USE_REGISTERED_RING uintptr = 1 << 31
 
 // Resource registration flags.
 const (
-	IORING_RSRC_REGISTER_SPARSE = 1 << 0 // Sparse registration (5.19+)
+	IORING_RSRC_REGISTER_SPARSE = 1 << 0 // Sparse registration
 )
 
 // IORING_FILE_INDEX_ALLOC is passed as file_index to have io_uring allocate
 // a free direct descriptor slot. The allocated index is returned in cqe->res.
 // Returns -ENFILE if no free slots available.
-// Available since kernel 5.15.
 const IORING_FILE_INDEX_ALLOC uint32 = 0xFFFFFFFF
 
 // IORING_FIXED_FD_NO_CLOEXEC omits O_CLOEXEC when installing a fixed fd.
 // By default, FixedFdInstall sets O_CLOEXEC on the new regular fd.
-// Available since kernel 6.8.
 const IORING_FIXED_FD_NO_CLOEXEC uint32 = 1 << 0
 
-// Futex2 flags for FutexWait/FutexWake operations (kernel 6.7+).
+// Futex2 flags for FutexWait/FutexWake operations.
 const (
 	FUTEX2_SIZE_U8  uint32 = 0x00
 	FUTEX2_SIZE_U16 uint32 = 0x01
@@ -187,13 +164,13 @@ const (
 
 const FUTEX_BITSET_MATCH_ANY uint64 = 0xFFFFFFFF
 
-// MSG_RING command types for the addr field (kernel 5.18+).
+// MSG_RING command types for the addr field.
 const (
 	IORING_MSG_DATA    uint64 = 0
 	IORING_MSG_SEND_FD uint64 = 1
 )
 
-// MSG_RING flags for MsgRing operations (kernel 5.18+).
+// MSG_RING flags for MsgRing operations.
 const (
 	IORING_MSG_RING_CQE_SKIP   uint32 = 1 << 0
 	IORING_MSG_RING_FLAGS_PASS uint32 = 1 << 1
@@ -281,9 +258,8 @@ type ioCqRingOffsets struct {
 type ioUring struct {
 	_ noCopy
 
-	mu       sync.Mutex
-	params   *ioUringParams
-	features uint32
+	mu     sync.Mutex
+	params *ioUringParams
 
 	// Simulated SQ using a buffered channel
 	sqChan chan *ioUringSqe
@@ -398,14 +374,6 @@ func newIoUring(entries int, opts ...func(params *ioUringParams)) (*ioUring, err
 	*params = *ioUringDefaultParams
 	params.sqEntries = uint32(entries)
 	params.cqEntries = uint32(entries * 2)
-	// Simulate all features being available
-	params.features = IORING_FEAT_SINGLE_MMAP | IORING_FEAT_NODROP |
-		IORING_FEAT_SUBMIT_STABLE | IORING_FEAT_RW_CUR_POS |
-		IORING_FEAT_CUR_PERSONALITY | IORING_FEAT_FAST_POLL |
-		IORING_FEAT_POLL_32BITS | IORING_FEAT_SQPOLL_NONFIXED |
-		IORING_FEAT_EXT_ARG | IORING_FEAT_NATIVE_WORKERS |
-		IORING_FEAT_RSRC_TAGS | IORING_FEAT_CQE_SKIP |
-		IORING_FEAT_LINKED_FILE | IORING_FEAT_REG_REG_RING
 
 	for _, opt := range opts {
 		opt(params)
@@ -413,7 +381,6 @@ func newIoUring(entries int, opts ...func(params *ioUringParams)) (*ioUring, err
 
 	ur := &ioUring{
 		params:   params,
-		features: params.features,
 		sqChan:   make(chan *ioUringSqe, entries),
 		cqChan:   make(chan *ioUringCqe, entries*2),
 		cqMask:   uint32(entries*2 - 1),
@@ -424,7 +391,6 @@ func newIoUring(entries int, opts ...func(params *ioUringParams)) (*ioUring, err
 	return ur, nil
 }
 
-// registerProbe simulates probe registration (all ops supported on Darwin).
 func (ur *ioUring) registerProbe(probe *ioUringProbe) error {
 	// Darwin simulator supports all ops
 	ur.ops = make([]ioUringProbeOp, 0, IORING_OP_LAST)
@@ -435,6 +401,10 @@ func (ur *ioUring) registerProbe(probe *ioUringProbe) error {
 		})
 	}
 	return nil
+}
+
+func (ur *ioUring) feature(feat uint32) bool {
+	return feat == ur.params.features&feat
 }
 
 // registerBuffers registers buffers for fixed I/O.
@@ -534,10 +504,6 @@ func (ur *ioUring) registerPoller(p poller) (int, error) {
 }
 
 // feature checks if a feature is supported.
-func (ur *ioUring) feature(feat uint32) bool {
-	return feat == ur.features&feat
-}
-
 // enable enables the ring and starts worker goroutines.
 func (ur *ioUring) enable() error {
 	if ur.enabled.Load() {

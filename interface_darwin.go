@@ -65,7 +65,7 @@ func NewUring(options ...func(options *UringOptions)) (*Uring, error) {
 		return nil, err
 	}
 	rFlags, wFlags := uint8(0), uint8(0)
-	if r.feature(IORING_FEAT_CQE_SKIP) && !opt.NotifySucceed {
+	if !opt.NotifySucceed {
 		wFlags |= IOSQE_CQE_SKIP_SUCCESS
 	}
 	ret := Uring{
@@ -124,12 +124,12 @@ type Uring struct {
 	writeLikeOpFlags uint8
 }
 
-// Start initializes the io_uring instance with probes, buffers, and enables the ring.
+// Start initializes the io_uring instance, populates simulated capabilities, registers buffers, and enables the ring.
 func (ur *Uring) Start() error {
 	// Initialize context pools
 	ur.ctxPools.Init()
 
-	// register probes (simulated on Darwin)
+	// populate simulated capabilities
 	probe := ioUringProbe{}
 	err := ur.registerProbe(&probe)
 	if err != nil {
@@ -171,6 +171,8 @@ func (ur *Uring) Start() error {
 	return nil
 }
 
+// Wait flushes pending submissions and collects completion events into CQEView slice.
+// Returns the number of events received, or `iox.ErrWouldBlock` if the CQ is empty.
 func (ur *Uring) Wait(cqes []CQEView) (n int, err error) {
 	err = ur.ioUring.enter()
 	if err != nil {
@@ -592,7 +594,8 @@ func (ur *Uring) Nop(sqeCtx SQEContext, options ...OpOptionFunc) error {
 	return ur.nop(sqeCtx.WithFlags(flags))
 }
 
-// Close closes a file descriptor.
+// Close submits `IORING_OP_CLOSE` for the file descriptor carried in sqeCtx.
+// It closes a target fd; it does not tear down the Uring instance.
 func (ur *Uring) Close(sqeCtx SQEContext, options ...OpOptionFunc) error {
 	flags := ur.operationOptions(options)
 	return ur.close(sqeCtx.WithFlags(flags))

@@ -22,58 +22,37 @@ import (
 // `code.hybscloud.com/sox` into this package.
 
 const (
-	IORING_SETUP_IOPOLL             = 1 << 0
-	IORING_SETUP_SQPOLL             = 1 << 1
-	IORING_SETUP_SQ_AFF             = 1 << 2
-	IORING_SETUP_CQSIZE             = 1 << 3
-	IORING_SETUP_CLAMP              = 1 << 4
-	IORING_SETUP_ATTACH_WQ          = 1 << 5
-	IORING_SETUP_R_DISABLED         = 1 << 6
-	IORING_SETUP_SUBMIT_ALL         = 1 << 7
-	IORING_SETUP_COOP_TASKRUN       = 1 << 8
-	IORING_SETUP_TASKRUN_FLAG       = 1 << 9
-	IORING_SETUP_SQE128             = 1 << 10
-	IORING_SETUP_CQE32              = 1 << 11
-	IORING_SETUP_SINGLE_ISSUER      = 1 << 12
-	IORING_SETUP_DEFER_TASKRUN      = 1 << 13
-	IORING_SETUP_NO_MMAP            = 1 << 14
-	IORING_SETUP_REGISTERED_FD_ONLY = 1 << 15
-	IORING_SETUP_NO_SQARRAY         = 1 << 16
-	IORING_SETUP_HYBRID_IOPOLL      = 1 << 17
-	IORING_SETUP_CQE_MIXED          = 1 << 18 // Allow both 16b and 32b CQEs (6.13+)
-	IORING_SETUP_SQE_MIXED          = 1 << 19 // Allow both 64b and 128b SQEs (6.13+)
+	IORING_SETUP_IOPOLL             = zcall.IORING_SETUP_IOPOLL
+	IORING_SETUP_SQPOLL             = zcall.IORING_SETUP_SQPOLL
+	IORING_SETUP_SQ_AFF             = zcall.IORING_SETUP_SQ_AFF
+	IORING_SETUP_CQSIZE             = zcall.IORING_SETUP_CQSIZE
+	IORING_SETUP_CLAMP              = zcall.IORING_SETUP_CLAMP
+	IORING_SETUP_ATTACH_WQ          = zcall.IORING_SETUP_ATTACH_WQ
+	IORING_SETUP_R_DISABLED         = zcall.IORING_SETUP_R_DISABLED
+	IORING_SETUP_SUBMIT_ALL         = zcall.IORING_SETUP_SUBMIT_ALL
+	IORING_SETUP_COOP_TASKRUN       = zcall.IORING_SETUP_COOP_TASKRUN
+	IORING_SETUP_TASKRUN_FLAG       = zcall.IORING_SETUP_TASKRUN_FLAG
+	IORING_SETUP_SQE128             = zcall.IORING_SETUP_SQE128
+	IORING_SETUP_CQE32              = zcall.IORING_SETUP_CQE32
+	IORING_SETUP_SINGLE_ISSUER      = zcall.IORING_SETUP_SINGLE_ISSUER
+	IORING_SETUP_DEFER_TASKRUN      = zcall.IORING_SETUP_DEFER_TASKRUN
+	IORING_SETUP_NO_MMAP            = zcall.IORING_SETUP_NO_MMAP
+	IORING_SETUP_REGISTERED_FD_ONLY = zcall.IORING_SETUP_REGISTERED_FD_ONLY
+	IORING_SETUP_NO_SQARRAY         = zcall.IORING_SETUP_NO_SQARRAY
+	IORING_SETUP_HYBRID_IOPOLL      = zcall.IORING_SETUP_HYBRID_IOPOLL
+	IORING_SETUP_CQE_MIXED          = zcall.IORING_SETUP_CQE_MIXED // Allow both 16b and 32b CQEs
+	IORING_SETUP_SQE_MIXED          = zcall.IORING_SETUP_SQE_MIXED // Allow both 64b and 128b SQEs
 )
 
 const (
-	IORING_FEAT_SINGLE_MMAP = 1 << iota
-	IORING_FEAT_NODROP
-	IORING_FEAT_SUBMIT_STABLE
-	IORING_FEAT_RW_CUR_POS
-	IORING_FEAT_CUR_PERSONALITY
-	IORING_FEAT_FAST_POLL
-	IORING_FEAT_POLL_32BITS
-	IORING_FEAT_SQPOLL_NONFIXED
-	IORING_FEAT_EXT_ARG
-	IORING_FEAT_NATIVE_WORKERS
-	IORING_FEAT_RSRC_TAGS
-	IORING_FEAT_CQE_SKIP
-	IORING_FEAT_LINKED_FILE
-	IORING_FEAT_REG_REG_RING
-	IORING_FEAT_RECVSEND_BUNDLE // Bundle send/recv operations (6.13+)
-	IORING_FEAT_MIN_TIMEOUT     // Minimum timeout support (6.13+)
-	IORING_FEAT_RW_ATTR         // Read/write with attributes (6.14+)
-	IORING_FEAT_NO_IOWAIT       // No I/O wait mode (6.14+)
-)
-
-const (
-	IORING_ENTER_GETEVENTS       = 1 << 0
-	IORING_ENTER_SQ_WAKEUP       = 1 << 1
-	IORING_ENTER_SQ_WAIT         = 1 << 2
-	IORING_ENTER_EXT_ARG         = 1 << 3
-	IORING_ENTER_REGISTERED_RING = 1 << 4
-	IORING_ENTER_ABS_TIMER       = 1 << 5 // Absolute timeout (6.13+)
-	IORING_ENTER_EXT_ARG_REG     = 1 << 6 // Use registered wait region (6.13+)
-	IORING_ENTER_NO_IOWAIT       = 1 << 7 // Skip I/O wait (6.14+)
+	IORING_ENTER_GETEVENTS       = zcall.IORING_ENTER_GETEVENTS
+	IORING_ENTER_SQ_WAKEUP       = zcall.IORING_ENTER_SQ_WAKEUP
+	IORING_ENTER_SQ_WAIT         = zcall.IORING_ENTER_SQ_WAIT
+	IORING_ENTER_EXT_ARG         = zcall.IORING_ENTER_EXT_ARG
+	IORING_ENTER_REGISTERED_RING = zcall.IORING_ENTER_REGISTERED_RING
+	IORING_ENTER_ABS_TIMER       = zcall.IORING_ENTER_ABS_TIMER   // Absolute timeout
+	IORING_ENTER_EXT_ARG_REG     = zcall.IORING_ENTER_EXT_ARG_REG // Use registered wait region
+	IORING_ENTER_NO_IOWAIT       = zcall.IORING_ENTER_NO_IOWAIT   // Skip I/O wait
 )
 
 const (
@@ -92,13 +71,13 @@ const (
 )
 
 const (
-	IOSQE_FIXED_FILE = 1 << iota
-	IOSQE_IO_DRAIN
-	IOSQE_IO_LINK
-	IOSQE_IO_HARDLINK
-	IOSQE_ASYNC
-	IOSQE_BUFFER_SELECT
-	IOSQE_CQE_SKIP_SUCCESS
+	IOSQE_FIXED_FILE       = zcall.IOSQE_FIXED_FILE
+	IOSQE_IO_DRAIN         = zcall.IOSQE_IO_DRAIN
+	IOSQE_IO_LINK          = zcall.IOSQE_IO_LINK
+	IOSQE_IO_HARDLINK      = zcall.IOSQE_IO_HARDLINK
+	IOSQE_ASYNC            = zcall.IOSQE_ASYNC
+	IOSQE_BUFFER_SELECT    = zcall.IOSQE_BUFFER_SELECT
+	IOSQE_CQE_SKIP_SUCCESS = zcall.IOSQE_CQE_SKIP_SUCCESS
 )
 
 const (
@@ -132,55 +111,55 @@ const (
 )
 
 const (
-	IORING_REGISTER_BUFFERS uintptr = iota
-	IORING_UNREGISTER_BUFFERS
-	IORING_REGISTER_FILES
-	IORING_UNREGISTER_FILES
-	IORING_REGISTER_EVENTFD
-	IORING_UNREGISTER_EVENTFD
-	IORING_REGISTER_FILES_UPDATE
-	IORING_REGISTER_EVENTFD_ASYNC
-	IORING_REGISTER_PROBE
-	IORING_REGISTER_PERSONALITY
-	IORING_UNREGISTER_PERSONALITY
-	IORING_REGISTER_RESTRICTIONS
-	IORING_REGISTER_ENABLE_RINGS
-	IORING_REGISTER_FILES2
-	IORING_REGISTER_FILES_UPDATE2
-	IORING_REGISTER_BUFFERS2
-	IORING_REGISTER_BUFFERS_UPDATE
-	IORING_REGISTER_IOWQ_AFF
-	IORING_UNREGISTER_IOWQ_AFF
-	IORING_REGISTER_IOWQ_MAX_WORKERS
-	IORING_REGISTER_RING_FDS
-	IORING_UNREGISTER_RING_FDS
-	IORING_REGISTER_PBUF_RING
-	IORING_UNREGISTER_PBUF_RING
-	IORING_REGISTER_SYNC_CANCEL
-	IORING_REGISTER_FILE_ALLOC_RANGE
-	IORING_REGISTER_PBUF_STATUS
-	IORING_REGISTER_NAPI
-	IORING_UNREGISTER_NAPI
-	IORING_REGISTER_CLOCK         // Register clock source (6.13+)
-	IORING_REGISTER_CLONE_BUFFERS // Clone buffers from another ring (6.13+)
-	IORING_REGISTER_SEND_MSG_RING // Send MSG_RING without ring (6.13+)
-	IORING_REGISTER_ZCRX_IFQ      // Register ZCRX interface queue (6.12+)
-	IORING_REGISTER_RESIZE_RINGS  // Resize CQ ring (6.13+)
-	IORING_REGISTER_MEM_REGION    // Memory region setup (6.19+)
-	IORING_REGISTER_QUERY         // Query ring state (6.19+)
-	IORING_REGISTER_ZCRX_CTRL     // ZCRX control operations (6.19+)
+	IORING_REGISTER_BUFFERS          = zcall.IORING_REGISTER_BUFFERS
+	IORING_UNREGISTER_BUFFERS        = zcall.IORING_UNREGISTER_BUFFERS
+	IORING_REGISTER_FILES            = zcall.IORING_REGISTER_FILES
+	IORING_UNREGISTER_FILES          = zcall.IORING_UNREGISTER_FILES
+	IORING_REGISTER_EVENTFD          = zcall.IORING_REGISTER_EVENTFD
+	IORING_UNREGISTER_EVENTFD        = zcall.IORING_UNREGISTER_EVENTFD
+	IORING_REGISTER_FILES_UPDATE     = zcall.IORING_REGISTER_FILES_UPDATE
+	IORING_REGISTER_EVENTFD_ASYNC    = zcall.IORING_REGISTER_EVENTFD_ASYNC
+	IORING_REGISTER_PROBE            = zcall.IORING_REGISTER_PROBE
+	IORING_REGISTER_PERSONALITY      = zcall.IORING_REGISTER_PERSONALITY
+	IORING_UNREGISTER_PERSONALITY    = zcall.IORING_UNREGISTER_PERSONALITY
+	IORING_REGISTER_RESTRICTIONS     = zcall.IORING_REGISTER_RESTRICTIONS
+	IORING_REGISTER_ENABLE_RINGS     = zcall.IORING_REGISTER_ENABLE_RINGS
+	IORING_REGISTER_FILES2           = zcall.IORING_REGISTER_FILES2
+	IORING_REGISTER_FILES_UPDATE2    = zcall.IORING_REGISTER_FILES_UPDATE2
+	IORING_REGISTER_BUFFERS2         = zcall.IORING_REGISTER_BUFFERS2
+	IORING_REGISTER_BUFFERS_UPDATE   = zcall.IORING_REGISTER_BUFFERS_UPDATE
+	IORING_REGISTER_IOWQ_AFF         = zcall.IORING_REGISTER_IOWQ_AFF
+	IORING_UNREGISTER_IOWQ_AFF       = zcall.IORING_UNREGISTER_IOWQ_AFF
+	IORING_REGISTER_IOWQ_MAX_WORKERS = zcall.IORING_REGISTER_IOWQ_MAX_WORKERS
+	IORING_REGISTER_RING_FDS         = zcall.IORING_REGISTER_RING_FDS
+	IORING_UNREGISTER_RING_FDS       = zcall.IORING_UNREGISTER_RING_FDS
+	IORING_REGISTER_PBUF_RING        = zcall.IORING_REGISTER_PBUF_RING
+	IORING_UNREGISTER_PBUF_RING      = zcall.IORING_UNREGISTER_PBUF_RING
+	IORING_REGISTER_SYNC_CANCEL      = zcall.IORING_REGISTER_SYNC_CANCEL
+	IORING_REGISTER_FILE_ALLOC_RANGE = zcall.IORING_REGISTER_FILE_ALLOC_RANGE
+	IORING_REGISTER_PBUF_STATUS      = zcall.IORING_REGISTER_PBUF_STATUS
+	IORING_REGISTER_NAPI             = zcall.IORING_REGISTER_NAPI
+	IORING_UNREGISTER_NAPI           = zcall.IORING_UNREGISTER_NAPI
+	IORING_REGISTER_CLOCK            = zcall.IORING_REGISTER_CLOCK         // Register clock source
+	IORING_REGISTER_CLONE_BUFFERS    = zcall.IORING_REGISTER_CLONE_BUFFERS // Clone buffers from another ring
+	IORING_REGISTER_SEND_MSG_RING    = zcall.IORING_REGISTER_SEND_MSG_RING // Send MSG_RING without ring
+	IORING_REGISTER_ZCRX_IFQ         = zcall.IORING_REGISTER_ZCRX_IFQ      // Register ZCRX interface queue
+	IORING_REGISTER_RESIZE_RINGS     = zcall.IORING_REGISTER_RESIZE_RINGS  // Resize CQ ring
+	IORING_REGISTER_MEM_REGION       = zcall.IORING_REGISTER_MEM_REGION    // Memory region setup (6.19+)
+	IORING_REGISTER_QUERY            = zcall.IORING_REGISTER_QUERY         // Query ring state (6.19+)
+	IORING_REGISTER_ZCRX_CTRL        = zcall.IORING_REGISTER_ZCRX_CTRL     // ZCRX control operations (6.19+)
 )
 
 // IORING_REGISTER_USE_REGISTERED_RING is a flag that can be OR'd with register
 // opcodes to use a registered ring fd instead of a regular fd.
-const IORING_REGISTER_USE_REGISTERED_RING uintptr = 1 << 31
+const IORING_REGISTER_USE_REGISTERED_RING = zcall.IORING_REGISTER_USE_REGISTERED_RING
 
 const (
 	IO_URING_OP_SUPPORTED = 1 << 0
 )
 
 const (
-	ioUringDefaultEntries = 0x2000
+	ioUringDefaultEntries = UringEntriesMedium
 
 	ioUringDefaultSqThreadCPU  = 0 // CPU 0 is always valid
 	ioUringDefaultSqThreadIdle = 5 * time.Second
@@ -195,13 +174,28 @@ type ioUring struct {
 	sq     ioUringSq
 	cq     ioUringCq
 	ringFd int
-	ops    []ioUringProbeOp
 	bufs   [][]byte
 	files  []int32 // registered file descriptors
+	ops    []ioUringProbeOp
 }
 
 // ioUringFd represents a file descriptor in io_uring context.
 type ioUringFd int32
+
+type ioUringProbe struct {
+	lastOp uint8
+	opsLen uint8
+	resv   uint16
+	resv2  [3]uint32
+	ops    [256]ioUringProbeOp
+}
+
+type ioUringProbeOp struct {
+	op    uint8
+	resv  uint8
+	flags uint16
+	resv2 uint32
+}
 
 func newIoUring(entries int, opts ...func(params *ioUringParams)) (*ioUring, error) {
 	if entries < 1 {
@@ -268,21 +262,6 @@ func newIoUring(entries int, opts ...func(params *ioUringParams)) (*ioUring, err
 	return uring, nil
 }
 
-type ioUringProbe struct {
-	lastOp uint8
-	opsLen uint8
-	resv   uint16
-	resv2  [3]uint32
-	ops    [256]ioUringProbeOp
-}
-
-type ioUringProbeOp struct {
-	op    uint8
-	resv  uint8
-	flags uint16
-	resv2 uint32
-}
-
 func (ur *ioUring) registerProbe(probe *ioUringProbe) error {
 	n := uintptr(len(probe.ops))
 	_, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_REGISTER_PROBE, unsafe.Pointer(probe), n)
@@ -298,6 +277,10 @@ func (ur *ioUring) registerProbe(probe *ioUringProbe) error {
 	}
 
 	return nil
+}
+
+func (ur *ioUring) feature(feat uint32) bool {
+	return feat == ur.params.features&feat
 }
 
 func (ur *ioUring) registerBuffers(addr unsafe.Pointer, n, size int) error {
@@ -545,10 +528,6 @@ func (ur *ioUring) registerPoller(p poller) (int, error) {
 	return int(efd), nil
 }
 
-func (ur *ioUring) feature(feat uint32) bool {
-	return feat == ur.params.features&feat
-}
-
 func (ur *ioUring) enable() error {
 	_, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_REGISTER_ENABLE_RINGS, nil, 0)
 	if errno != 0 {
@@ -566,7 +545,7 @@ func (ur *ioUring) submitPacked(sqeCtx SQEContext, fn func(e *ioUringSqe)) error
 	ur.sl.Lock()
 
 	h, t := atomic.LoadUint32(ur.sq.kHead), atomic.LoadUint32(ur.sq.kTail)
-	if (t+1)&*ur.sq.kRingMask == h {
+	if t-h >= *ur.sq.kRingEntries {
 		ur.sl.Unlock()
 		return iox.ErrWouldBlock
 	}
@@ -643,7 +622,7 @@ func (ur *ioUring) submitExtended(sqeCtx SQEContext) error {
 func (ur *ioUring) sqCount() int {
 	h := atomic.LoadUint32(ur.sq.kHead)
 	t := atomic.LoadUint32(ur.sq.kTail)
-	return int((t - h) & *ur.sq.kRingMask)
+	return int(t - h)
 }
 
 func (ur *ioUring) enter() error {
@@ -660,7 +639,7 @@ func (ur *ioUring) enter() error {
 	sqHead := atomic.LoadUint32(ur.sq.kHead)
 	sqTail := atomic.LoadUint32(ur.sq.kTail)
 	if (ur.params.flags&IORING_SETUP_SQPOLL == 0) && sqHead != sqTail {
-		n := (sqTail - sqHead) & *ur.sq.kRingMask
+		n := sqTail - sqHead
 		_, err := ioUringEnter(ur.ringFd, uintptr(n), 0, IORING_ENTER_GETEVENTS)
 		// EALREADY means concurrent operation in progress - continue to check CQEs
 		if err != nil && err != ErrExists {
@@ -678,7 +657,7 @@ func (ur *ioUring) poll(n int) error {
 	}
 	h := atomic.LoadUint32(ur.sq.kHead)
 	t := atomic.LoadUint32(ur.sq.kTail)
-	submit := (t - h) & *ur.sq.kRingMask
+	submit := t - h
 	for {
 		_, err := ioUringEnter(ur.ringFd, uintptr(submit), uintptr(n), IORING_ENTER_GETEVENTS)
 		if err == ErrInterrupted {
@@ -818,21 +797,19 @@ type ioUringRSrcRegister struct {
 
 // Resource registration flags.
 const (
-	IORING_RSRC_REGISTER_SPARSE = 1 << 0 // Sparse registration (5.19+)
+	IORING_RSRC_REGISTER_SPARSE = 1 << 0 // Sparse registration
 )
 
 // IORING_FILE_INDEX_ALLOC is passed as file_index to have io_uring allocate
 // a free direct descriptor slot. The allocated index is returned in cqe->res.
 // Returns -ENFILE if no free slots available.
-// Available since kernel 5.15.
 const IORING_FILE_INDEX_ALLOC uint32 = 0xFFFFFFFF
 
 // IORING_FIXED_FD_NO_CLOEXEC omits O_CLOEXEC when installing a fixed fd.
 // By default, FixedFdInstall sets O_CLOEXEC on the new regular fd.
-// Available since kernel 6.8.
 const IORING_FIXED_FD_NO_CLOEXEC uint32 = 1 << 0
 
-// Futex2 flags for FutexWait/FutexWake operations (kernel 6.7+).
+// Futex2 flags for FutexWait/FutexWake operations.
 // These follow the futex2(2) interface, not the legacy futex(2) v1 flags.
 const (
 	FUTEX2_SIZE_U8  uint32 = 0x00 // 8-bit futex
@@ -846,7 +823,7 @@ const (
 // FUTEX_BITSET_MATCH_ANY matches any waker when used as mask in FutexWait.
 const FUTEX_BITSET_MATCH_ANY uint64 = 0xFFFFFFFF
 
-// MSG_RING command types for the addr field (kernel 5.18+).
+// MSG_RING command types for the addr field.
 const (
 	// IORING_MSG_DATA sends data (result + userData) to target ring's CQ.
 	IORING_MSG_DATA uint64 = 0
@@ -855,7 +832,7 @@ const (
 	IORING_MSG_SEND_FD uint64 = 1
 )
 
-// MSG_RING flags for MsgRing operations (kernel 5.18+).
+// MSG_RING flags for MsgRing operations.
 const (
 	// IORING_MSG_RING_CQE_SKIP skips posting CQE to target ring.
 	// The source ring still gets a completion.
@@ -867,8 +844,8 @@ const (
 
 // Buffer ring registration flags.
 const (
-	IOU_PBUF_RING_MMAP = 1 // Kernel allocates memory, app uses mmap (6.13+)
-	IOU_PBUF_RING_INC  = 2 // Incremental buffer consumption mode (6.13+)
+	IOU_PBUF_RING_MMAP = 1 // Kernel allocates memory, app uses mmap
+	IOU_PBUF_RING_INC  = 2 // Incremental buffer consumption mode
 )
 
 // ioUringBufReg mirrors struct io_uring_buf_reg
@@ -1036,7 +1013,7 @@ func ioUringEnter(fd int, toSubmit uintptr, minComplete uintptr, flags uintptr) 
 
 // ========================================
 // Zero-Copy Receive (ZCRX) Structures
-// Requires kernel 6.18+ with network device hardware RX queue support
+// Requires the Linux 6.18+ baseline and network device hardware RX queue support
 // ========================================
 
 // ZCRX area shift and mask for encoding area ID into offsets.
@@ -1088,7 +1065,7 @@ type QueryHdr struct {
 type QueryOpcode struct {
 	NrRequestOpcodes  uint32 // Number of supported IORING_OP_* opcodes
 	NrRegisterOpcodes uint32 // Number of supported IORING_REGISTER_* opcodes
-	FeatureFlags      uint64 // Bitmask of IORING_FEAT_* flags
+	FeatureFlags      uint64 // Raw kernel feature bitmask returned by IORING_REGISTER_QUERY
 	RingSetupFlags    uint64 // Bitmask of IORING_SETUP_* flags
 	EnterFlags        uint64 // Bitmask of IORING_ENTER_* flags
 	SqeFlags          uint64 // Bitmask of IOSQE_* flags
@@ -1473,7 +1450,7 @@ func (ur *ioUring) cloneBuffers(clone *CloneBuffers) error {
 }
 
 // ========================================
-// Resize Rings Methods (Linux 6.13+)
+// Resize Rings Methods
 // ========================================
 
 // resizeRings resizes the SQ and CQ rings of an io_uring instance.

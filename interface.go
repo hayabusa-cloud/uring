@@ -89,7 +89,7 @@ func NewUring(options ...func(options *UringOptions)) (*Uring, error) {
 		return nil, err
 	}
 	rFlags, wFlags := uint8(0), uint8(0)
-	if r.feature(IORING_FEAT_CQE_SKIP) && !opt.NotifySucceed {
+	if !opt.NotifySucceed {
 		wFlags |= IOSQE_CQE_SKIP_SUCCESS
 	}
 	ret := Uring{
@@ -121,8 +121,7 @@ func NewUring(options ...func(options *UringOptions)) (*Uring, error) {
 	return &ret, nil
 }
 
-// UringFeatures reports the capabilities of the io_uring instance.
-// Fields are populated during NewUring() and Start().
+// UringFeatures reports per-ring sizing and metadata returned at creation time.
 type UringFeatures struct {
 	// SQEntries is the actual number of SQ entries allocated by the kernel.
 	SQEntries int
@@ -130,21 +129,6 @@ type UringFeatures struct {
 	CQEntries int
 	// UserdataByteOrder is the byte order for userdata field interpretation.
 	UserdataByteOrder binary.ByteOrder
-
-	// Kernel feature flags (populated during Start())
-	HasRecvSendBundle bool // IORING_FEAT_RECVSEND_BUNDLE (6.13+)
-	HasMinTimeout     bool // IORING_FEAT_MIN_TIMEOUT (6.13+)
-	HasRWAttr         bool // IORING_FEAT_RW_ATTR (6.14+)
-	HasNoIOWait       bool // IORING_FEAT_NO_IOWAIT (6.14+)
-
-	// Operation support flags (6.13+)
-	HasRecvZC       bool // IORING_OP_RECV_ZC
-	HasEpollWait    bool // IORING_OP_EPOLL_WAIT
-	HasReadvFixed   bool // IORING_OP_READV_FIXED
-	HasWritevFixed  bool // IORING_OP_WRITEV_FIXED
-	HasPipe         bool // IORING_OP_PIPE (6.14+)
-	HasMixedSQEMode bool // IORING_SETUP_SQE_MIXED (6.13+)
-	HasMixedCQEMode bool // IORING_SETUP_CQE_MIXED (6.13+)
 }
 
 // Uring is the main io_uring interface for submitting and completing I/O operations.
@@ -152,7 +136,7 @@ type UringFeatures struct {
 type Uring struct {
 	*ioUring
 	*UringOptions
-	// Features reports kernel capabilities (populated during Start).
+	// Features reports actual ring sizing and userdata metadata.
 	Features *UringFeatures
 
 	buffers      *uringProvideBuffers
@@ -172,43 +156,25 @@ type Uring struct {
 	writeLikeOpFlags uint8
 }
 
-// Start initializes the io_uring instance with probes, buffers, and enables the ring.
+// Start initializes the io_uring instance with buffers and enables the ring.
+// Context pools are constructed eagerly by NewUring and are intentionally not
+// reset here so any SQEs borrowed before Start remain valid.
 func (ur *Uring) Start() error {
-	// Initialize context pools
-	ur.ctxPools.Init()
+	var err error
 
-	// register probes
+	// Register probes as dormant placeholder infrastructure for future
+	// post-baseline capability branches. Current Linux 6.18+ startup does not
+	// derive public feature state from probe results.
 	probe := ioUringProbe{}
-	err := ur.registerProbe(&probe)
+	err = ur.registerProbe(&probe)
 	if err != nil {
 		return err
 	}
 
-	// Detect kernel features from params.features
-	ur.Features.HasRecvSendBundle = ur.feature(IORING_FEAT_RECVSEND_BUNDLE)
-	ur.Features.HasMinTimeout = ur.feature(IORING_FEAT_MIN_TIMEOUT)
-	ur.Features.HasRWAttr = ur.feature(IORING_FEAT_RW_ATTR)
-	ur.Features.HasNoIOWait = ur.feature(IORING_FEAT_NO_IOWAIT)
-
-	// Check operation support from probes (6.13+ ops)
 	for _, op := range ur.ops {
 		switch op.op {
-		case IORING_OP_RECV_ZC:
-			ur.Features.HasRecvZC = true
-		case IORING_OP_EPOLL_WAIT:
-			ur.Features.HasEpollWait = true
-		case IORING_OP_READV_FIXED:
-			ur.Features.HasReadvFixed = true
-		case IORING_OP_WRITEV_FIXED:
-			ur.Features.HasWritevFixed = true
-		case IORING_OP_PIPE:
-			ur.Features.HasPipe = true
 		}
 	}
-
-	// Check mixed SQE/CQE mode support (from setup flags echo)
-	ur.Features.HasMixedSQEMode = ur.params.flags&IORING_SETUP_SQE_MIXED != 0 || probe.lastOp >= IORING_OP_NOP128
-	ur.Features.HasMixedCQEMode = ur.params.flags&IORING_SETUP_CQE_MIXED != 0 || probe.lastOp >= IORING_OP_NOP128
 
 	// register buffers
 	if ur.LockedBufferMem > (1 << 16) {
@@ -247,7 +213,7 @@ func (ur *Uring) Start() error {
 }
 
 // Wait flushes pending submissions and collects completion events into CQEView slice.
-// Returns the number of events received, or ErrWouldBlock if the CQ is empty.
+// Returns the number of events received, or `iox.ErrWouldBlock` if the CQ is empty.
 //
 // CQEView provides direct field access to Res and Flags, and methods to access
 // the submission context based on mode (Direct, Indirect, Extended).
@@ -586,7 +552,6 @@ func (ur *Uring) ReceiveMultiShot(sqeCtx SQEContext, so PollFd, b []byte, option
 // ReceiveBundle performs a bundle receive operation.
 // Grabs multiple contiguous buffers from the buffer group in a single operation.
 // The CQE result contains bytes received; use BundleBuffers() to get buffer range.
-// Requires kernel 6.10+ with IORING_FEAT_RECVSEND_BUNDLE support.
 // Always uses buffer selection from the kernel-provided buffer ring.
 func (ur *Uring) ReceiveBundle(sqeCtx SQEContext, so PollFd, options ...OpOptionFunc) error {
 	ctx := sqeCtx.WithFD(int32(so.Fd()))
@@ -598,7 +563,6 @@ func (ur *Uring) ReceiveBundle(sqeCtx SQEContext, so PollFd, options ...OpOption
 // ReceiveBundleMultiShot combines multishot with bundle for maximum throughput.
 // Continuous reception with automatic buffer replenishment, grabbing multiple
 // buffers per completion.
-// Requires kernel 6.10+ with IORING_FEAT_RECVSEND_BUNDLE support.
 func (ur *Uring) ReceiveBundleMultiShot(sqeCtx SQEContext, so PollFd, options ...OpOptionFunc) error {
 	ctx := sqeCtx.WithFD(int32(so.Fd()))
 	flags, ioprio, bufSize, bufGroup := ur.receiveWithBufferSelectOptions(so, options)
@@ -812,7 +776,8 @@ func (ur *Uring) Nop(sqeCtx SQEContext, options ...OpOptionFunc) error {
 	return ur.nop(sqeCtx.WithFlags(flags))
 }
 
-// Close closes a file descriptor.
+// Close submits `IORING_OP_CLOSE` for the file descriptor carried in sqeCtx.
+// It closes a target fd; it does not tear down the Uring instance.
 func (ur *Uring) Close(sqeCtx SQEContext, options ...OpOptionFunc) error {
 	flags := ur.operationOptions(options)
 	return ur.close(sqeCtx.WithFlags(flags))
@@ -1075,16 +1040,14 @@ func (ur *Uring) LinkTimeout(sqeCtx SQEContext, d time.Duration, options ...OpOp
 }
 
 // ========================================
-// Kernel 6.13+ Operations
+// Linux 6.18+ baseline operations
 // ========================================
 
 // ReceiveZeroCopy performs a zero-copy receive operation.
-// Requires kernel 6.13+ with ZCRX support and a registered ZCRX interface queue.
-// zcrxIfqIdx is the ZCRX interface queue index from RegisterZCRXIfq.
+// Supported Linux 6.18+ kernels provide the opcode; the operation still requires
+// a registered ZCRX interface queue. zcrxIfqIdx is the queue index returned by
+// RegisterZCRXIfq.
 func (ur *Uring) ReceiveZeroCopy(sqeCtx SQEContext, so PollFd, n int, zcrxIfqIdx uint32, options ...OpOptionFunc) error {
-	if !ur.Features.HasRecvZC {
-		return ErrNotSupported
-	}
 	flags, ioprio, _, _ := ur.receiveOptions(nil, options)
 	ctx := sqeCtx.WithFD(int32(so.Fd())).WithFlags(flags | ur.readLikeOpFlags)
 	return ur.receiveZeroCopy(ctx, ioprio, n, zcrxIfqIdx)
@@ -1092,11 +1055,7 @@ func (ur *Uring) ReceiveZeroCopy(sqeCtx SQEContext, so PollFd, n int, zcrxIfqIdx
 
 // EpollWait performs an epoll_wait operation via io_uring.
 // This integrates epoll monitoring into the io_uring event loop.
-// Requires kernel 6.13+.
 func (ur *Uring) EpollWait(sqeCtx SQEContext, events []EpollEvent, timeout int32, options ...OpOptionFunc) error {
-	if !ur.Features.HasEpollWait {
-		return ErrNotSupported
-	}
 	if len(events) == 0 {
 		return ErrInvalidParam
 	}
@@ -1107,11 +1066,7 @@ func (ur *Uring) EpollWait(sqeCtx SQEContext, events []EpollEvent, timeout int32
 
 // ReadvFixed performs a vectored read using registered buffers.
 // All buffer indices must refer to previously registered buffers.
-// Requires kernel 6.13+.
 func (ur *Uring) ReadvFixed(sqeCtx SQEContext, offset int64, bufIndices []int, options ...OpOptionFunc) error {
-	if !ur.Features.HasReadvFixed {
-		return ErrNotSupported
-	}
 	flags := ur.operationOptions(options)
 	ctx := sqeCtx.WithFlags(flags | ur.readLikeOpFlags)
 	return ur.readvFixed(ctx, uint64(offset), bufIndices)
@@ -1119,11 +1074,7 @@ func (ur *Uring) ReadvFixed(sqeCtx SQEContext, offset int64, bufIndices []int, o
 
 // WritevFixed performs a vectored write using registered buffers.
 // All buffer indices must refer to previously registered buffers.
-// Requires kernel 6.13+.
 func (ur *Uring) WritevFixed(sqeCtx SQEContext, offset int64, bufIndices []int, lengths []int, options ...OpOptionFunc) error {
-	if !ur.Features.HasWritevFixed {
-		return ErrNotSupported
-	}
 	flags := ur.operationOptions(options)
 	ctx := sqeCtx.WithFlags(flags | ur.writeLikeOpFlags)
 	return ur.writevFixed(ctx, uint64(offset), bufIndices, lengths)
@@ -1133,11 +1084,7 @@ func (ur *Uring) WritevFixed(sqeCtx SQEContext, offset int64, bufIndices []int, 
 // The fds parameter must point to an int32[2] array where the kernel
 // will write the read end (fds[0]) and write end (fds[1]) file descriptors.
 // On successful completion, fds[0] will be the read end and fds[1] the write end.
-// Requires kernel 6.14+.
 func (ur *Uring) Pipe(sqeCtx SQEContext, fds *[2]int32, pipeFlags uint32, options ...OpOptionFunc) error {
-	if !ur.Features.HasPipe {
-		return ErrNotSupported
-	}
 	flags := ur.operationOptions(options)
 	ctx := sqeCtx.WithFlags(flags)
 	return ur.pipe(ctx, fds, pipeFlags)
@@ -1149,9 +1096,9 @@ func (ur *Uring) Pipe(sqeCtx SQEContext, fds *[2]int32, pipeFlags uint32, option
 
 // RegisterZCRXIfq registers a zero-copy receive interface queue.
 // This sets up ZCRX for a specific network interface RX queue.
-// Returns the ZCRX instance ID on success.
-// Requires kernel 6.18+ with ZCRX-capable network hardware.
-func (ur *Uring) RegisterZCRXIfq(ifIdx, ifRxq uint32, rqEntries uint32, area *ZCRXAreaReg) (uint32, error) {
+// Returns the ZCRX instance ID and kernel-reported refill ring offsets on success.
+// Requires the Linux 6.18+ baseline and ZCRX-capable network hardware.
+func (ur *Uring) RegisterZCRXIfq(ifIdx, ifRxq uint32, rqEntries uint32, area *ZCRXAreaReg) (uint32, ZCRXOffsets, error) {
 	reg := ZCRXIfqReg{
 		IfIdx:     ifIdx,
 		IfRxq:     ifRxq,
@@ -1160,9 +1107,9 @@ func (ur *Uring) RegisterZCRXIfq(ifIdx, ifRxq uint32, rqEntries uint32, area *ZC
 	}
 	err := ur.registerZCRXIfq(&reg)
 	if err != nil {
-		return 0, err
+		return 0, ZCRXOffsets{}, err
 	}
-	return reg.ZcrxID, nil
+	return reg.ZcrxID, reg.Offsets, nil
 }
 
 // ZCRXFlushRQ flushes the ZCRX refill queue.
@@ -1182,7 +1129,6 @@ func (ur *Uring) ZCRXFlushRQ(zcrxID uint32) error {
 // RegisterBufRingMMAP registers a buffer ring with kernel-allocated memory.
 // The kernel allocates the ring memory and the application uses mmap to access it.
 // Returns the buffer ring for adding buffers.
-// Requires kernel 6.13+.
 func (ur *Uring) RegisterBufRingMMAP(entries int, groupID uint16) (*ioUringBufRing, error) {
 	r, backing, err := ur.registerBufRingWithFlags(entries, groupID, IOU_PBUF_RING_MMAP)
 	if backing != nil {
@@ -1194,7 +1140,6 @@ func (ur *Uring) RegisterBufRingMMAP(entries int, groupID uint16) (*ioUringBufRi
 // RegisterBufRingIncremental registers a buffer ring in incremental consumption mode.
 // In this mode, buffers can be partially consumed across multiple completions.
 // The CQE will have IORING_CQE_F_BUF_MORE set if more data remains.
-// Requires kernel 6.13+.
 func (ur *Uring) RegisterBufRingIncremental(entries int, groupID uint16) (*ioUringBufRing, error) {
 	r, backing, err := ur.registerBufRingWithFlags(entries, groupID, IOU_PBUF_RING_INC)
 	if backing != nil {
@@ -1205,7 +1150,6 @@ func (ur *Uring) RegisterBufRingIncremental(entries int, groupID uint16) (*ioUri
 
 // RegisterBufRingWithFlags registers a buffer ring with specified flags.
 // Flags can be combined: IOU_PBUF_RING_MMAP | IOU_PBUF_RING_INC
-// Requires kernel 6.13+.
 func (ur *Uring) RegisterBufRingWithFlags(entries int, groupID uint16, flags uint16) (*ioUringBufRing, error) {
 	r, backing, err := ur.registerBufRingWithFlags(entries, groupID, flags)
 	if backing != nil {
@@ -1215,7 +1159,7 @@ func (ur *Uring) RegisterBufRingWithFlags(entries int, groupID uint16, flags uin
 }
 
 // ========================================
-// Fixed Files (Linux 5.1+)
+// Fixed Files
 // ========================================
 
 // RegisterFiles registers file descriptors for use with IOSQE_FIXED_FILE flag.
@@ -1236,8 +1180,6 @@ func (ur *Uring) RegisterFiles(fds []int32) error {
 //
 // Sparse registration is useful for applications that manage a dynamic
 // set of file descriptors (e.g., connection pools, file caches).
-//
-// Requires kernel 5.19+.
 func (ur *Uring) RegisterFilesSparse(count uint32) error {
 	return ur.registerFilesSparse(count)
 }
@@ -1407,7 +1349,7 @@ func (ur *Uring) CloneBuffersFromRegistered(srcRegisteredIdx int, srcOff, dstOff
 }
 
 // ========================================
-// Ring Resize (Linux 6.19+)
+// Ring Resize
 // ========================================
 
 // ResizeRings resizes the SQ and CQ rings of this io_uring instance.
@@ -1422,7 +1364,7 @@ func (ur *Uring) CloneBuffersFromRegistered(srcRegisteredIdx int, srcOff, dstOff
 //   - newSQSize: New SQ ring size (0 to keep current)
 //   - newCQSize: New CQ ring size (0 defaults to 2×newSQSize)
 //
-// Requires kernel 6.13+.
+// Supported on Linux 6.18+.
 func (ur *Uring) ResizeRings(newSQSize, newCQSize uint32) error {
 	return ur.resizeRings(newSQSize, newCQSize)
 }
@@ -1526,12 +1468,11 @@ func (ur *Uring) FTruncate(sqeCtx SQEContext, length int64, options ...OpOptionF
 }
 
 // ========================================
-// Futex Operations (Linux 6.7+)
+// Futex Operations
 // ========================================
 
 // FutexWait submits an async futex wait operation.
 // Waits until the value at addr matches val, using the specified mask and flags.
-// Requires kernel 6.7+.
 func (ur *Uring) FutexWait(sqeCtx SQEContext, addr *uint32, val uint64, mask uint64, flags uint32, options ...OpOptionFunc) error {
 	_ = ur.operationOptions(options)
 	return ur.ioUring.futexWait(sqeCtx, addr, val, mask, flags)
@@ -1539,7 +1480,6 @@ func (ur *Uring) FutexWait(sqeCtx SQEContext, addr *uint32, val uint64, mask uin
 
 // FutexWake submits an async futex wake operation.
 // Wakes up to val waiters on the futex at addr, using the specified mask and flags.
-// Requires kernel 6.7+.
 func (ur *Uring) FutexWake(sqeCtx SQEContext, addr *uint32, val uint64, mask uint64, flags uint32, options ...OpOptionFunc) error {
 	_ = ur.operationOptions(options)
 	return ur.ioUring.futexWake(sqeCtx, addr, val, mask, flags)
@@ -1548,33 +1488,30 @@ func (ur *Uring) FutexWake(sqeCtx SQEContext, addr *uint32, val uint64, mask uin
 // FutexWaitV submits a vectored futex wait operation.
 // Waits on multiple futexes simultaneously. The waitv pointer should point to
 // a struct futex_waitv array with count elements.
-// Requires kernel 6.7+.
 func (ur *Uring) FutexWaitV(sqeCtx SQEContext, waitv unsafe.Pointer, count uint32, flags uint32, options ...OpOptionFunc) error {
 	_ = ur.operationOptions(options)
 	return ur.ioUring.futexWaitV(sqeCtx, waitv, count, flags)
 }
 
 // ========================================
-// Process Operations (Linux 6.7+)
+// Process Operations
 // ========================================
 
 // Waitid waits for a process to change state asynchronously.
 // idtype specifies which id to wait for (P_PID, P_PGID, P_ALL).
 // The siginfo_t result is written to infop.
-// Requires kernel 6.7+.
 func (ur *Uring) Waitid(sqeCtx SQEContext, idtype, id int, infop unsafe.Pointer, options int, opts ...OpOptionFunc) error {
 	_ = ur.operationOptions(opts)
 	return ur.ioUring.waitid(sqeCtx, idtype, id, infop, options)
 }
 
 // ========================================
-// Fixed Descriptor Operations (Linux 6.8+)
+// Fixed Descriptor Operations
 // ========================================
 
 // FixedFdInstall installs a fixed (registered) file descriptor into the
 // normal file descriptor table. Returns the new fd in the CQE result.
 // The fixedIndex is the index in the registered files table.
-// Requires kernel 6.8+.
 func (ur *Uring) FixedFdInstall(sqeCtx SQEContext, fixedIndex int, flags uint32, options ...OpOptionFunc) error {
 	_ = ur.operationOptions(options)
 	return ur.ioUring.fixedFdInstall(sqeCtx, fixedIndex, flags)
@@ -1611,7 +1548,7 @@ func (ur *Uring) MsgRing(sqeCtx SQEContext, userData int64, result int32, option
 //   - userData: Value passed to the target ring's CQE
 //   - skipCQE: If true, no CQE is posted to the target ring
 //
-// Requires kernel 5.18+. Both rings must have registered file tables.
+// Both rings must have registered file tables.
 func (ur *Uring) MsgRingFD(sqeCtx SQEContext, srcFD uint32, dstSlot uint32, userData int64, skipCQE bool, options ...OpOptionFunc) error {
 	_ = ur.operationOptions(options)
 	var flags uint32
@@ -1622,19 +1559,19 @@ func (ur *Uring) MsgRingFD(sqeCtx SQEContext, srcFD uint32, dstSlot uint32, user
 }
 
 // ========================================
-// Passthrough Commands (Linux 5.19+/6.13+)
+// Passthrough Commands
 // ========================================
 
 // UringCmd submits a generic passthrough command.
 // The cmdOp specifies the command operation, and cmdData provides optional data.
-// Requires kernel 5.19+.
 func (ur *Uring) UringCmd(sqeCtx SQEContext, cmdOp uint32, cmdData []byte, options ...OpOptionFunc) error {
 	_ = ur.operationOptions(options)
 	return ur.ioUring.uringCmd(sqeCtx, cmdOp, cmdData)
 }
 
-// Nop128 submits a 128-byte NOP operation for testing mixed SQE mode.
-// Requires kernel 6.13+ with IORING_SETUP_SQE_MIXED.
+// Nop128 submits a 128-byte NOP operation.
+// The current ring implementation only maps 64-byte SQEs, so this returns
+// ErrNotSupported until SQE128 or SQE_MIXED ring wiring is added.
 func (ur *Uring) Nop128(sqeCtx SQEContext, options ...OpOptionFunc) error {
 	_ = ur.operationOptions(options)
 	return ur.ioUring.nop128(sqeCtx)
@@ -1642,7 +1579,8 @@ func (ur *Uring) Nop128(sqeCtx SQEContext, options ...OpOptionFunc) error {
 
 // UringCmd128 submits a 128-byte passthrough command.
 // Provides 80 bytes of command data space (vs 48 bytes for standard UringCmd).
-// Requires kernel 6.13+ with IORING_SETUP_SQE_MIXED.
+// The current ring implementation only maps 64-byte SQEs, so this returns
+// ErrNotSupported until SQE128 or SQE_MIXED ring wiring is added.
 func (ur *Uring) UringCmd128(sqeCtx SQEContext, cmdOp uint32, cmdData []byte, options ...OpOptionFunc) error {
 	_ = ur.operationOptions(options)
 	return ur.ioUring.uringCmd128(sqeCtx, cmdOp, cmdData)
