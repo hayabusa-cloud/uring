@@ -1095,15 +1095,18 @@ func (ur *Uring) Pipe(sqeCtx SQEContext, fds *[2]int32, pipeFlags uint32, option
 // ========================================
 
 // RegisterZCRXIfq registers a zero-copy receive interface queue.
-// This sets up ZCRX for a specific network interface RX queue.
+// region must describe the refill-ring memory (IORING_MEM_REGION_TYPE_USER).
+// rxBufLen is the desired receive buffer chunk size; 0 means page size.
 // Returns the ZCRX instance ID and kernel-reported refill ring offsets on success.
 // Requires the Linux 6.18+ baseline and ZCRX-capable network hardware.
-func (ur *Uring) RegisterZCRXIfq(ifIdx, ifRxq uint32, rqEntries uint32, area *ZCRXAreaReg) (uint32, ZCRXOffsets, error) {
+func (ur *Uring) RegisterZCRXIfq(ifIdx, ifRxq uint32, rqEntries uint32, area *ZCRXAreaReg, region *RegionDesc, rxBufLen uint32) (uint32, ZCRXOffsets, error) {
 	reg := ZCRXIfqReg{
 		IfIdx:     ifIdx,
 		IfRxq:     ifRxq,
 		RqEntries: rqEntries,
 		AreaPtr:   uint64(uintptr(unsafe.Pointer(area))),
+		RegionPtr: uint64(uintptr(unsafe.Pointer(region))),
+		RxBufLen:  rxBufLen,
 	}
 	err := ur.registerZCRXIfq(&reg)
 	if err != nil {

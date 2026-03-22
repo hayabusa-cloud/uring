@@ -1305,7 +1305,7 @@ type ZCRXIfqReg struct {
 	RegionPtr uint64      // Pointer to memory region descriptor
 	Offsets   ZCRXOffsets // Offsets within the ring
 	ZcrxID    uint32      // ZCRX instance ID (output)
-	_         uint32      // Reserved
+	RxBufLen  uint32      // Chunk size hint; 0 defaults to page size
 	Resv      [3]uint64   // Reserved
 }
 
