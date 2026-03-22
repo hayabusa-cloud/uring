@@ -37,6 +37,8 @@ type ContextPools struct {
 	extendedQueue *contextPoolQueue
 }
 
+// NewContextPools creates page-aligned pools for IndirectSQE and ExtSQE contexts
+// with the given per-pool capacity. Call Init before use.
 func NewContextPools(capacity int) *ContextPools {
 	n := normalizeContextPoolCapacity(capacity)
 

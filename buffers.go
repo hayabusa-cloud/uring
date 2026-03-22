@@ -40,7 +40,7 @@ const (
 )
 
 // Default configuration constants.
-// Default uses 128 MiB for registered buffers; configure RLIMIT_MEMLOCK accordingly.
+// Default uses 64 MiB for registered buffers; configure RLIMIT_MEMLOCK accordingly.
 const (
 	registerBufferDefaultMem = 1 << 26 // 64 MiB default
 	bufferSizeDefault        = BufferSizeMedium
