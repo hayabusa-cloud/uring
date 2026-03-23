@@ -209,24 +209,43 @@ func (*noCopy) Unlock() {}
 // containing the text of s. If s contains a NUL byte at any location,
 // it returns (nil, EINVAL).
 func bytePtrFromString(s string) (*byte, error) {
+	a, err := bytesFromString0(s)
+	if err != nil {
+		return nil, err
+	}
+	return &a[0], nil
+}
+
+// bytesFromString0 returns a NUL-terminated byte slice for s.
+func bytesFromString0(s string) ([]byte, error) {
 	for i := 0; i < len(s); i++ {
 		if s[i] == 0 {
 			return nil, ErrInvalidParam
 		}
 	}
-	// Allocate a byte slice with room for NUL terminator
 	a := make([]byte, len(s)+1)
 	copy(a, s)
-	return &a[0], nil
+	return a, nil
+}
+
+// bytePtrFromBytes0 returns a pointer to the first byte of a NUL-terminated slice.
+func bytePtrFromBytes0(b []byte) *byte {
+	return (*byte)(unsafe.Pointer(unsafe.SliceData(b)))
+}
+
+// ioVecSliceFromBytesSlice converts a slice of byte slices to an IoVec slice.
+func ioVecSliceFromBytesSlice(iov [][]byte) []IoVec {
+	vec := make([]IoVec, len(iov))
+	for i := range len(iov) {
+		vec[i] = IoVec{Base: unsafe.SliceData(iov[i]), Len: uint64(len(iov[i]))}
+	}
+	return vec
 }
 
 // ioVecFromBytesSlice converts a slice of byte slices to iovec array.
 // Returns unsafe.Pointer directly to avoid uintptr → unsafe.Pointer conversion at call sites.
 func ioVecFromBytesSlice(iov [][]byte) (ptr unsafe.Pointer, n int) {
-	vec := make([]IoVec, len(iov))
-	for i := range len(iov) {
-		vec[i] = IoVec{Base: unsafe.SliceData(iov[i]), Len: uint64(len(iov[i]))}
-	}
+	vec := ioVecSliceFromBytesSlice(iov)
 	return unsafe.Pointer(unsafe.SliceData(vec)), len(vec)
 }
 
