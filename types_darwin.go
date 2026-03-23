@@ -74,7 +74,7 @@ type Socket interface{}
 
 // PollFd represents a pollable file descriptor (Darwin stub).
 type PollFd interface {
-	Fd() int32
+	Fd() int
 }
 
 // PollCloser extends PollFd with close capability (Darwin stub).

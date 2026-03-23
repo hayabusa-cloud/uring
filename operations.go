@@ -452,13 +452,13 @@ func (ur *ioUring) splice(sqeCtx SQEContext, rfd int, rOff *int64, wOff *int64, 
 
 // provideBuffers provides buffers to the kernel.
 func (ur *ioUring) provideBuffers(sqeCtx SQEContext, num int, starting int, addr unsafe.Pointer, size int, group uint16) error {
-	ctx := sqeCtx.WithOp(IORING_OP_PROVIDE_BUFFERS).WithBufGroup(group).WithFD(int32(num))
+	ctx := sqeCtx.WithOp(IORING_OP_PROVIDE_BUFFERS).WithBufGroup(group).withFD(int32(num))
 	return ur.submitPacked9(ctx, 0, uint64(starting), uint64(uintptr(addr)), size, 0, 0, 0)
 }
 
 // removeBuffers removes buffers from the kernel.
 func (ur *ioUring) removeBuffers(sqeCtx SQEContext, num int, group uint16) error {
-	ctx := sqeCtx.WithOp(IORING_OP_REMOVE_BUFFERS).WithBufGroup(group).WithFD(int32(num))
+	ctx := sqeCtx.WithOp(IORING_OP_REMOVE_BUFFERS).WithBufGroup(group).withFD(int32(num))
 	return ur.submitPacked9(ctx, 0, 0, 0, 0, 0, 0, 0)
 }
 
@@ -484,7 +484,7 @@ func (ur *ioUring) renameAt(sqeCtx SQEContext, oldPath, newPath string, uflags i
 		return err
 	}
 	newAddr := uint64(uintptr(unsafe.Pointer(newPtr)))
-	ctx := sqeCtx.WithOp(IORING_OP_RENAMEAT).WithFD(AT_FDCWD)
+	ctx := sqeCtx.WithOp(IORING_OP_RENAMEAT).withFD(AT_FDCWD)
 	return ur.submitPacked6(ctx, 0, newAddr, oldAddr, AT_FDCWD, uint32(uflags))
 }
 
@@ -538,7 +538,7 @@ func (ur *ioUring) linkAt(sqeCtx SQEContext, oldDirfd int, oldPath string, newPa
 	}
 	newAddr := uint64(uintptr(unsafe.Pointer(ptr)))
 	newDirfd := sqeCtx.FD()
-	ctx := sqeCtx.WithOp(IORING_OP_LINKAT).WithFD(int32(oldDirfd))
+	ctx := sqeCtx.WithOp(IORING_OP_LINKAT).withFD(int32(oldDirfd))
 	return ur.submitPacked6(ctx, 0, newAddr, oldAddr, int(newDirfd), uint32(uflags))
 }
 
@@ -569,7 +569,7 @@ func (ur *ioUring) msgRingFD(sqeCtx SQEContext, srcFD uint32, dstSlot uint32, us
 // fileIndex of 0 means regular socket (FD returned in CQE res).
 // Non-zero fileIndex is used for backward compatibility but doesn't encode properly.
 func (ur *ioUring) socket(sqeCtx SQEContext, domain, typ, proto int, fileIndex uint32) error {
-	ctx := sqeCtx.WithOp(IORING_OP_SOCKET).WithFD(int32(domain))
+	ctx := sqeCtx.WithOp(IORING_OP_SOCKET).withFD(int32(domain))
 	return ur.submitPacked9(ctx, 0, uint64(typ), 0, proto, 0, 0, int32(fileIndex))
 }
 
@@ -584,7 +584,7 @@ func (ur *ioUring) socketDirect(sqeCtx SQEContext, domain, typ, proto int, fileI
 	if fileIndex != IORING_FILE_INDEX_ALLOC {
 		kernelIndex = fileIndex + 1
 	}
-	ctx := sqeCtx.WithOp(IORING_OP_SOCKET).WithFD(int32(domain))
+	ctx := sqeCtx.WithOp(IORING_OP_SOCKET).withFD(int32(domain))
 	return ur.submitPacked9(ctx, 0, uint64(typ), 0, proto, 0, 0, int32(kernelIndex))
 }
 

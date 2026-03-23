@@ -6,7 +6,10 @@
 
 package uring
 
-import "unsafe"
+import (
+	"code.hybscloud.com/iofd"
+	"unsafe"
+)
 
 // SQEContext preserves the Linux bit-level context encoding on Darwin so
 // completion paths can round-trip user_data consistently. Darwin remains a
@@ -138,16 +141,21 @@ func (c SQEContext) WithBufGroup(bufGroup uint16) SQEContext {
 	return c
 }
 
-func (c SQEContext) WithFD(fd int32) SQEContext {
+func (c SQEContext) WithFD(fd iofd.FD) SQEContext {
+	return c.withFD(int32(fd))
+}
+
+func (c SQEContext) withFD(fd int32) SQEContext {
+	raw := fd
 	if c.IsDirect() {
-		fdBits := SQEContext(uint32(fd)&0x3FFFFFFF) << ctxFDShift
+		fdBits := SQEContext(uint32(raw)&0x3FFFFFFF) << ctxFDShift
 		return (c &^ (ctxFDMask | ctxModeMask)) | fdBits | CtxModeDirect
 	}
 	if c.IsExtended() {
-		c.ExtSQE().SQE.fd = fd
+		c.ExtSQE().SQE.fd = raw
 		return c
 	}
-	c.IndirectSQE().fd = fd
+	c.IndirectSQE().fd = raw
 	return c
 }
 

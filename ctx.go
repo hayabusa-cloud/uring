@@ -7,6 +7,7 @@
 package uring
 
 import (
+	"code.hybscloud.com/iofd"
 	"unsafe"
 )
 
@@ -190,16 +191,24 @@ func (c SQEContext) WithBufGroup(bufGroup uint16) SQEContext {
 // WithFD returns a new context with the file descriptor replaced.
 // For Direct mode, modifies the inline bits.
 // For Indirect/Extended modes, writes to the pointed-to SQE struct.
-func (c SQEContext) WithFD(fd int32) SQEContext {
+func (c SQEContext) WithFD(fd iofd.FD) SQEContext {
+	return c.withFD(int32(fd))
+}
+
+// withFD returns a new context with the raw file descriptor replaced.
+// It keeps the hot path in raw `int32` form for internal call sites that
+// already operate on kernel-shaped fd values.
+func (c SQEContext) withFD(fd int32) SQEContext {
+	raw := fd
 	if c.IsDirect() {
-		fdBits := SQEContext(uint32(fd)&0x3FFFFFFF) << ctxFDShift
+		fdBits := SQEContext(uint32(raw)&0x3FFFFFFF) << ctxFDShift
 		return (c &^ (ctxFDMask | ctxModeMask)) | fdBits | CtxModeDirect
 	}
 	if c.IsExtended() {
-		c.ExtSQE().SQE.fd = fd
+		c.ExtSQE().SQE.fd = raw
 		return c
 	}
-	c.IndirectSQE().fd = fd
+	c.IndirectSQE().fd = raw
 	return c
 }
 

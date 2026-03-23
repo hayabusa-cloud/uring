@@ -14,6 +14,8 @@ import (
 	"sync/atomic"
 	"time"
 	"unsafe"
+
+	"code.hybscloud.com/iofd"
 )
 
 // Uring entry count constants define the number of SQE slots in the submission queue.
@@ -525,7 +527,7 @@ func (ur *Uring) Connect(sqeCtx SQEContext, remote Addr, options ...OpOptionFunc
 // Receive performs a socket receive operation.
 // If b is nil, uses buffer selection from the kernel-provided buffer ring.
 func (ur *Uring) Receive(sqeCtx SQEContext, so PollFd, b []byte, options ...OpOptionFunc) error {
-	ctx := sqeCtx.WithFD(int32(so.Fd()))
+	ctx := sqeCtx.WithFD(iofd.FD(so.Fd()))
 	if b == nil {
 		flags, ioprio, bufSize, bufGroup := ur.receiveWithBufferSelectOptions(so, options)
 		ctx = ctx.WithFlags(flags | ur.readLikeOpFlags)
@@ -538,7 +540,7 @@ func (ur *Uring) Receive(sqeCtx SQEContext, so PollFd, b []byte, options ...OpOp
 
 // ReceiveMultiShot performs multi-shot receive operation.
 func (ur *Uring) ReceiveMultiShot(sqeCtx SQEContext, so PollFd, b []byte, options ...OpOptionFunc) error {
-	ctx := sqeCtx.WithFD(int32(so.Fd()))
+	ctx := sqeCtx.WithFD(iofd.FD(so.Fd()))
 	if b == nil {
 		flags, ioprio, bufSize, bufGroup := ur.receiveWithBufferSelectOptions(so, options)
 		ctx = ctx.WithFlags(flags | ur.readLikeOpFlags)
@@ -554,7 +556,7 @@ func (ur *Uring) ReceiveMultiShot(sqeCtx SQEContext, so PollFd, b []byte, option
 // The CQE result contains bytes received; use BundleBuffers() to get buffer range.
 // Always uses buffer selection from the kernel-provided buffer ring.
 func (ur *Uring) ReceiveBundle(sqeCtx SQEContext, so PollFd, options ...OpOptionFunc) error {
-	ctx := sqeCtx.WithFD(int32(so.Fd()))
+	ctx := sqeCtx.WithFD(iofd.FD(so.Fd()))
 	flags, ioprio, bufSize, bufGroup := ur.receiveWithBufferSelectOptions(so, options)
 	ctx = ctx.WithFlags(flags | ur.readLikeOpFlags)
 	return ur.receiveBundle(ctx, ioprio, bufSize, bufGroup)
@@ -564,7 +566,7 @@ func (ur *Uring) ReceiveBundle(sqeCtx SQEContext, so PollFd, options ...OpOption
 // Continuous reception with automatic buffer replenishment, grabbing multiple
 // buffers per completion.
 func (ur *Uring) ReceiveBundleMultiShot(sqeCtx SQEContext, so PollFd, options ...OpOptionFunc) error {
-	ctx := sqeCtx.WithFD(int32(so.Fd()))
+	ctx := sqeCtx.WithFD(iofd.FD(so.Fd()))
 	flags, ioprio, bufSize, bufGroup := ur.receiveWithBufferSelectOptions(so, options)
 	ctx = ctx.WithFlags(flags | ur.readLikeOpFlags)
 	return ur.receiveBundle(ctx, ioprio|IORING_RECV_MULTISHOT, bufSize, bufGroup)
@@ -584,7 +586,7 @@ func (ur *Uring) BundleIterator(cqe CQEView, group uint16) *BundleIterator {
 // Send writes data to a socket.
 func (ur *Uring) Send(sqeCtx SQEContext, so PollFd, p []byte, options ...OpOptionFunc) error {
 	flags, ioprio, offset, n := ur.sendOptions(p, options)
-	ctx := sqeCtx.WithFD(int32(so.Fd())).WithFlags(flags | ur.writeLikeOpFlags)
+	ctx := sqeCtx.WithFD(iofd.FD(so.Fd())).WithFlags(flags | ur.writeLikeOpFlags)
 	return ur.send(ctx, ioprio, p, uint64(offset), n)
 }
 
@@ -593,7 +595,7 @@ type SendTargets interface {
 	// Count returns the number of targets.
 	Count() int
 	// FD returns the file descriptor at index i.
-	FD(i int) int
+	FD(i int) iofd.FD
 }
 
 // Multicast sends data to multiple sockets, selecting copy vs zero-copy per message size.
@@ -661,7 +663,7 @@ func (ur *Uring) Multicast(sqeCtx SQEContext, targets SendTargets, bufIndex int,
 	var err error
 	for i := range count {
 		fd := targets.FD(i)
-		targetCtx := ctx.WithFD(int32(fd))
+		targetCtx := ctx.WithFD(fd)
 
 		var sendErr error
 		if useZeroCopy {
@@ -743,7 +745,7 @@ func (ur *Uring) MulticastZeroCopy(sqeCtx SQEContext, targets SendTargets, bufIn
 	var err error
 	for i := range count {
 		fd := targets.FD(i)
-		targetCtx := ctx.WithFD(int32(fd))
+		targetCtx := ctx.WithFD(fd)
 		var sendErr error
 		if useZeroCopy {
 			sendErr = ur.sendZeroCopyFixed(targetCtx, bufIndex, uint64(offset), n, 0)
@@ -862,7 +864,7 @@ func (ur *Uring) FileAdvise(sqeCtx SQEContext, offset int64, length int, advice 
 // SendMsg sends a message with control data.
 func (ur *Uring) SendMsg(sqeCtx SQEContext, so PollFd, buffers [][]byte, oob []byte, to Addr, options ...OpOptionFunc) error {
 	flags, ioprio := ur.sendmsgOptions(buffers, options)
-	ctx := sqeCtx.WithFD(int32(so.Fd())).WithFlags(flags | ur.writeLikeOpFlags)
+	ctx := sqeCtx.WithFD(iofd.FD(so.Fd())).WithFlags(flags | ur.writeLikeOpFlags)
 	var sa Sockaddr
 	if to != nil {
 		sa = AddrToSockaddr(to)
@@ -873,7 +875,7 @@ func (ur *Uring) SendMsg(sqeCtx SQEContext, so PollFd, buffers [][]byte, oob []b
 // RecvMsg receives a message with control data.
 func (ur *Uring) RecvMsg(sqeCtx SQEContext, so PollFd, buffers [][]byte, oob []byte, options ...OpOptionFunc) error {
 	flags, ioprio := ur.recvmsgOptions(buffers, options)
-	ctx := sqeCtx.WithFD(int32(so.Fd())).WithFlags(flags | ur.readLikeOpFlags)
+	ctx := sqeCtx.WithFD(iofd.FD(so.Fd())).WithFlags(flags | ur.readLikeOpFlags)
 	return ur.recvmsg(ctx, ioprio, buffers, oob)
 }
 
@@ -1049,7 +1051,7 @@ func (ur *Uring) LinkTimeout(sqeCtx SQEContext, d time.Duration, options ...OpOp
 // RegisterZCRXIfq.
 func (ur *Uring) ReceiveZeroCopy(sqeCtx SQEContext, so PollFd, n int, zcrxIfqIdx uint32, options ...OpOptionFunc) error {
 	flags, ioprio, _, _ := ur.receiveOptions(nil, options)
-	ctx := sqeCtx.WithFD(int32(so.Fd())).WithFlags(flags | ur.readLikeOpFlags)
+	ctx := sqeCtx.WithFD(iofd.FD(so.Fd())).WithFlags(flags | ur.readLikeOpFlags)
 	return ur.receiveZeroCopy(ctx, ioprio, n, zcrxIfqIdx)
 }
 
