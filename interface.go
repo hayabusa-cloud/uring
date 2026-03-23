@@ -284,10 +284,10 @@ func (ur *Uring) PutIndirectSQE(sqe *IndirectSQE) {
 	ur.ctxPools.PutIndirect(sqe)
 }
 
-// submitExtended submits an SQE using Extended mode context.
+// SubmitExtended submits an SQE using Extended mode context.
 // The ExtSQE.SQE fields must be populated before calling this method.
 // The io_uring.user_data field is set to the SQEContext (pointer + mode bits).
-func (ur *Uring) submitExtended(sqeCtx SQEContext) error {
+func (ur *Uring) SubmitExtended(sqeCtx SQEContext) error {
 	return ur.ioUring.submitExtended(sqeCtx)
 }
 
@@ -354,7 +354,7 @@ func (ur *Uring) RingFD() int {
 // SocketRaw creates a socket using io_uring.
 // The fd field in sqeCtx is ignored (will be set to domain by the kernel).
 func (ur *Uring) SocketRaw(sqeCtx SQEContext, domain, typ, proto int, options ...OpOptionFunc) error {
-	flags, _, fileIndex := ur.socketOptions(options)
+	flags, fileIndex := ur.socketOptions(options)
 	ctx := sqeCtx.WithFlags(flags)
 	return ur.socket(ctx, domain, typ, proto, fileIndex)
 }
@@ -409,7 +409,7 @@ func (ur *Uring) UnixSocket(sqeCtx SQEContext, options ...OpOptionFunc) error {
 // for auto-allocation (the allocated index is returned in CQE res).
 // Requires registered files via RegisterFiles or RegisterFilesSparse.
 func (ur *Uring) SocketDirect(sqeCtx SQEContext, domain, typ, proto int, fileIndex uint32, options ...OpOptionFunc) error {
-	flags, _, _ := ur.socketOptions(options)
+	flags, _ := ur.socketOptions(options)
 	ctx := sqeCtx.WithFlags(flags)
 	return ur.socketDirect(ctx, domain, typ, proto, fileIndex)
 }
@@ -470,7 +470,7 @@ func (ur *Uring) UnixSocketDirect(sqeCtx SQEContext, options ...OpOptionFunc) er
 
 // Bind binds a socket to an address.
 func (ur *Uring) Bind(sqeCtx SQEContext, addr Addr, options ...OpOptionFunc) error {
-	flags, _ := ur.bindOptions(options)
+	flags := ur.bindOptions(options)
 	ctx := sqeCtx.WithFlags(flags)
 	return ur.bind(ctx, AddrToSockaddr(addr))
 }
@@ -519,7 +519,7 @@ func (ur *Uring) AcceptDirectMultiShot(sqeCtx SQEContext, fileIndex uint32, opti
 
 // Connect initiates a socket connection to a remote address.
 func (ur *Uring) Connect(sqeCtx SQEContext, remote Addr, options ...OpOptionFunc) error {
-	flags := ur.operationOptions(options)
+	flags := ur.connectOptions(options)
 	ctx := sqeCtx.WithFlags(flags)
 	return ur.connect(ctx, AddrToSockaddr(remote))
 }
@@ -759,15 +759,15 @@ func (ur *Uring) MulticastZeroCopy(sqeCtx SQEContext, targets SendTargets, bufIn
 
 // Timeout submits a timeout request with the specified duration.
 func (ur *Uring) Timeout(sqeCtx SQEContext, d time.Duration, options ...OpOptionFunc) error {
-	flags, cnt := ur.timeoutOptions(options)
+	flags, cnt, timeoutFlags := ur.timeoutOptions(options)
 	ctx := sqeCtx.WithFlags(flags)
 	nano := d.Nanoseconds()
-	return ur.timeout(ctx, cnt, &Timespec{Sec: nano / int64(time.Second), Nsec: nano % int64(time.Second)}, 0)
+	return ur.timeout(ctx, cnt, &Timespec{Sec: nano / int64(time.Second), Nsec: nano % int64(time.Second)}, int(timeoutFlags))
 }
 
 // Shutdown gracefully closes a socket.
 func (ur *Uring) Shutdown(sqeCtx SQEContext, how int, options ...OpOptionFunc) error {
-	flags := ur.operationOptions(options)
+	flags := ur.shutdownOptions(options)
 	ctx := sqeCtx.WithFlags(flags)
 	return ur.shutdown(ctx, how)
 }
@@ -781,7 +781,7 @@ func (ur *Uring) Nop(sqeCtx SQEContext, options ...OpOptionFunc) error {
 // Close submits `IORING_OP_CLOSE` for the file descriptor carried in sqeCtx.
 // It closes a target fd; it does not tear down the Uring instance.
 func (ur *Uring) Close(sqeCtx SQEContext, options ...OpOptionFunc) error {
-	flags := ur.operationOptions(options)
+	flags := ur.closeOptions(options)
 	return ur.close(sqeCtx.WithFlags(flags))
 }
 
@@ -801,22 +801,22 @@ func (ur *Uring) Write(sqeCtx SQEContext, b []byte, options ...OpOptionFunc) err
 
 // Splice transfers data between file descriptors.
 func (ur *Uring) Splice(sqeCtx SQEContext, fdIn int, n int, options ...OpOptionFunc) error {
-	flags := ur.operationOptions(options)
+	flags, _, spliceFlags := ur.spliceOptions(options)
 	ctx := sqeCtx.WithFlags(flags)
-	return ur.splice(ctx, fdIn, nil, nil, n, 0)
+	return ur.splice(ctx, fdIn, nil, nil, n, int(spliceFlags))
 }
 
 // Tee duplicates data between pipes.
 func (ur *Uring) Tee(sqeCtx SQEContext, fdIn int, length int, options ...OpOptionFunc) error {
-	flags := ur.operationOptions(options)
+	flags, _, spliceFlags := ur.teeOptions(options)
 	ctx := sqeCtx.WithFlags(flags)
-	return ur.tee(ctx, fdIn, length, 0)
+	return ur.tee(ctx, fdIn, length, int(spliceFlags))
 }
 
 // Sync performs a file sync operation.
 func (ur *Uring) Sync(sqeCtx SQEContext, options ...OpOptionFunc) error {
-	flags := ur.operationOptions(options)
-	return ur.fsync(sqeCtx.WithFlags(flags))
+	flags, fsyncFlags := ur.syncOptions(options)
+	return ur.fsync(sqeCtx.WithFlags(flags), fsyncFlags)
 }
 
 // ReadV performs a vectored read operation.
@@ -849,7 +849,7 @@ func (ur *Uring) WriteFixed(sqeCtx SQEContext, bufIndex int, n int, options ...O
 
 // OpenAt opens a file at the given path relative to a directory fd.
 func (ur *Uring) OpenAt(sqeCtx SQEContext, pathname string, openFlags int, mode uint32, options ...OpOptionFunc) error {
-	flags := ur.operationOptions(options)
+	flags := ur.openAtOptions(options)
 	ctx := sqeCtx.WithFlags(flags)
 	return ur.openAt(ctx, pathname, openFlags, mode)
 }
@@ -881,14 +881,14 @@ func (ur *Uring) RecvMsg(sqeCtx SQEContext, so PollFd, buffers [][]byte, oob []b
 
 // PollAdd adds a file descriptor to the poll set.
 func (ur *Uring) PollAdd(sqeCtx SQEContext, events int, options ...OpOptionFunc) error {
-	flags := ur.operationOptions(options)
+	flags := ur.pollAddOptions(options)
 	ctx := sqeCtx.WithFlags(flags)
 	return ur.pollAdd(ctx, 0, events)
 }
 
 // PollRemove removes a file descriptor from the poll set.
 func (ur *Uring) PollRemove(sqeCtx SQEContext, options ...OpOptionFunc) error {
-	flags := ur.operationOptions(options)
+	flags := ur.pollRemoveOptions(options)
 	return ur.pollRemove(sqeCtx.WithFlags(flags))
 }
 
@@ -898,7 +898,7 @@ func (ur *Uring) PollRemove(sqeCtx SQEContext, options ...OpOptionFunc) error {
 // Each CQE has IORING_CQE_F_MORE set while poll continues; the final CQE
 // has !IORING_CQE_F_MORE when poll terminates or is cancelled.
 func (ur *Uring) PollAddMultishot(sqeCtx SQEContext, events int, options ...OpOptionFunc) error {
-	flags := ur.operationOptions(options)
+	flags := ur.pollAddOptions(options)
 	ctx := sqeCtx.WithFlags(flags)
 	return ur.pollAdd(ctx, IORING_POLL_ADD_MULTI, events)
 }
@@ -907,7 +907,7 @@ func (ur *Uring) PollAddMultishot(sqeCtx SQEContext, events int, options ...OpOp
 // Unlike edge-triggered poll which fires once when state changes,
 // level-triggered poll fires continuously while the condition is true.
 func (ur *Uring) PollAddLevel(sqeCtx SQEContext, events int, options ...OpOptionFunc) error {
-	flags := ur.operationOptions(options)
+	flags := ur.pollAddOptions(options)
 	ctx := sqeCtx.WithFlags(flags)
 	return ur.pollAdd(ctx, IORING_POLL_ADD_LEVEL, events)
 }
@@ -915,7 +915,7 @@ func (ur *Uring) PollAddLevel(sqeCtx SQEContext, events int, options ...OpOption
 // PollAddMultishotLevel combines multishot and level-triggered modes.
 // This creates a persistent, level-triggered poll subscription.
 func (ur *Uring) PollAddMultishotLevel(sqeCtx SQEContext, events int, options ...OpOptionFunc) error {
-	flags := ur.operationOptions(options)
+	flags := ur.pollAddOptions(options)
 	ctx := sqeCtx.WithFlags(flags)
 	return ur.pollAdd(ctx, IORING_POLL_ADD_MULTI|IORING_POLL_ADD_LEVEL, events)
 }
@@ -944,7 +944,7 @@ func (ur *Uring) PollUpdate(sqeCtx SQEContext, oldUserData, newUserData uint64, 
 
 // TimeoutRemove removes a timeout request.
 func (ur *Uring) TimeoutRemove(sqeCtx SQEContext, userData uint64, options ...OpOptionFunc) error {
-	flags := ur.operationOptions(options)
+	flags := ur.timeoutRemoveOptions(options)
 	ctx := sqeCtx.WithFlags(flags)
 	return ur.timeoutRemove(ctx, userData, 0)
 }
@@ -958,20 +958,20 @@ func (ur *Uring) TimeoutRemove(sqeCtx SQEContext, userData uint64, options ...Op
 //   - d: New timeout duration
 //   - absolute: If true, d is treated as absolute time; if false, relative from now
 func (ur *Uring) TimeoutUpdate(sqeCtx SQEContext, userData uint64, d time.Duration, absolute bool, options ...OpOptionFunc) error {
-	flags := ur.operationOptions(options)
+	flags, timeoutFlags := ur.timeoutUpdateOptions(options)
 	ctx := sqeCtx.WithFlags(flags)
 	nano := d.Nanoseconds()
 	ts := &Timespec{Sec: nano / int64(time.Second), Nsec: nano % int64(time.Second)}
-	uflags := 0
+	uflags := int(timeoutFlags)
 	if absolute {
-		uflags = IORING_TIMEOUT_ABS
+		uflags |= IORING_TIMEOUT_ABS
 	}
 	return ur.timeoutUpdate(ctx, userData, ts, uflags)
 }
 
 // AsyncCancel cancels a pending async operation.
 func (ur *Uring) AsyncCancel(sqeCtx SQEContext, targetUserData uint64, options ...OpOptionFunc) error {
-	flags := ur.operationOptions(options)
+	flags := ur.asyncCancelOptions(options)
 	ctx := sqeCtx.WithFlags(flags)
 	return ur.asyncCancel(ctx, targetUserData)
 }
@@ -981,7 +981,7 @@ func (ur *Uring) AsyncCancel(sqeCtx SQEContext, targetUserData uint64, options .
 // Otherwise cancels the first matching operation.
 // The FD to cancel is taken from sqeCtx.FD().
 func (ur *Uring) AsyncCancelFD(sqeCtx SQEContext, cancelAll bool, options ...OpOptionFunc) error {
-	flags := ur.operationOptions(options)
+	flags := ur.asyncCancelOptions(options)
 	ctx := sqeCtx.WithFlags(flags)
 	cancelFlags := IORING_ASYNC_CANCEL_FD
 	if cancelAll {
@@ -994,7 +994,7 @@ func (ur *Uring) AsyncCancelFD(sqeCtx SQEContext, cancelAll bool, options ...OpO
 // If cancelAll is true, cancels all matching operations and returns count.
 // Otherwise cancels the first matching operation.
 func (ur *Uring) AsyncCancelOpcode(sqeCtx SQEContext, opcode uint8, cancelAll bool, options ...OpOptionFunc) error {
-	flags := ur.operationOptions(options)
+	flags := ur.asyncCancelOptions(options)
 	ctx := sqeCtx.WithFlags(flags)
 	cancelFlags := IORING_ASYNC_CANCEL_OP
 	if cancelAll {
@@ -1006,7 +1006,7 @@ func (ur *Uring) AsyncCancelOpcode(sqeCtx SQEContext, opcode uint8, cancelAll bo
 // AsyncCancelAny cancels any one pending operation.
 // Returns 0 on success, -ENOENT if no operations pending.
 func (ur *Uring) AsyncCancelAny(sqeCtx SQEContext, options ...OpOptionFunc) error {
-	flags := ur.operationOptions(options)
+	flags := ur.asyncCancelOptions(options)
 	ctx := sqeCtx.WithFlags(flags)
 	return ur.asyncCancelExt(ctx, 0, 0, IORING_ASYNC_CANCEL_ANY)
 }
@@ -1014,7 +1014,7 @@ func (ur *Uring) AsyncCancelAny(sqeCtx SQEContext, options ...OpOptionFunc) erro
 // AsyncCancelAll cancels all pending operations.
 // Returns the count of cancelled operations.
 func (ur *Uring) AsyncCancelAll(sqeCtx SQEContext, options ...OpOptionFunc) error {
-	flags := ur.operationOptions(options)
+	flags := ur.asyncCancelOptions(options)
 	ctx := sqeCtx.WithFlags(flags)
 	return ur.asyncCancelExt(ctx, 0, 0, IORING_ASYNC_CANCEL_ALL|IORING_ASYNC_CANCEL_ANY)
 }
@@ -1035,10 +1035,10 @@ func (ur *Uring) SyncFileRange(sqeCtx SQEContext, offset int64, length int, sync
 
 // LinkTimeout creates a linked timeout operation.
 func (ur *Uring) LinkTimeout(sqeCtx SQEContext, d time.Duration, options ...OpOptionFunc) error {
-	flags := ur.operationOptions(options)
+	flags, timeoutFlags := ur.linkTimeoutOptions(options)
 	ctx := sqeCtx.WithFlags(flags)
 	nano := d.Nanoseconds()
-	return ur.linkTimeout(ctx, &Timespec{Sec: nano / int64(time.Second), Nsec: nano % int64(time.Second)}, 0)
+	return ur.linkTimeout(ctx, &Timespec{Sec: nano / int64(time.Second), Nsec: nano % int64(time.Second)}, int(timeoutFlags))
 }
 
 // ========================================
@@ -1402,28 +1402,28 @@ func (ur *Uring) ZCRXExport(zcrxID uint32) (int, error) {
 
 // FSetXattr sets an extended attribute on a file descriptor.
 func (ur *Uring) FSetXattr(sqeCtx SQEContext, name string, value []byte, flags int, options ...OpOptionFunc) error {
-	_ = ur.operationOptions(options)
-	return ur.ioUring.fsetxattr(sqeCtx, name, value, flags)
+	opFlags := ur.operationOptions(options)
+	return ur.ioUring.fsetxattr(sqeCtx.WithFlags(opFlags), name, value, flags)
 }
 
 // SetXattr sets an extended attribute on a path.
 func (ur *Uring) SetXattr(sqeCtx SQEContext, path, name string, value []byte, flags int, options ...OpOptionFunc) error {
-	_ = ur.operationOptions(options)
-	return ur.ioUring.setxattr(sqeCtx, path, name, value, flags)
+	opFlags := ur.operationOptions(options)
+	return ur.ioUring.setxattr(sqeCtx.WithFlags(opFlags), path, name, value, flags)
 }
 
 // FGetXattr gets an extended attribute from a file descriptor.
 // The result length is returned in the CQE.
 func (ur *Uring) FGetXattr(sqeCtx SQEContext, name string, value []byte, options ...OpOptionFunc) error {
-	_ = ur.operationOptions(options)
-	return ur.ioUring.fgetxattr(sqeCtx, name, value)
+	flags := ur.operationOptions(options)
+	return ur.ioUring.fgetxattr(sqeCtx.WithFlags(flags), name, value)
 }
 
 // GetXattr gets an extended attribute from a path.
 // The result length is returned in the CQE.
 func (ur *Uring) GetXattr(sqeCtx SQEContext, path, name string, value []byte, options ...OpOptionFunc) error {
-	_ = ur.operationOptions(options)
-	return ur.ioUring.getxattr(sqeCtx, path, name, value)
+	flags := ur.operationOptions(options)
+	return ur.ioUring.getxattr(sqeCtx.WithFlags(flags), path, name, value)
 }
 
 // ========================================
@@ -1432,44 +1432,44 @@ func (ur *Uring) GetXattr(sqeCtx SQEContext, path, name string, value []byte, op
 
 // Statx gets file status with extended information.
 func (ur *Uring) Statx(sqeCtx SQEContext, path string, flags, mask int, stat *Statx_t, options ...OpOptionFunc) error {
-	_ = ur.operationOptions(options)
-	return ur.ioUring.statx(sqeCtx, path, flags, mask, stat)
+	opFlags := ur.statxOptions(options)
+	return ur.ioUring.statx(sqeCtx.WithFlags(opFlags), path, flags, mask, stat)
 }
 
 // RenameAt renames a file at a path.
 func (ur *Uring) RenameAt(sqeCtx SQEContext, oldPath, newPath string, flags int, options ...OpOptionFunc) error {
-	_ = ur.operationOptions(options)
-	return ur.ioUring.renameAt(sqeCtx, oldPath, newPath, flags)
+	opFlags := ur.renameAtOptions(options)
+	return ur.ioUring.renameAt(sqeCtx.WithFlags(opFlags), oldPath, newPath, flags)
 }
 
 // UnlinkAt removes a file or directory.
 func (ur *Uring) UnlinkAt(sqeCtx SQEContext, path string, flags int, options ...OpOptionFunc) error {
-	_ = ur.operationOptions(options)
-	return ur.ioUring.unlinkAt(sqeCtx, path, flags)
+	opFlags := ur.unlinkAtOptions(options)
+	return ur.ioUring.unlinkAt(sqeCtx.WithFlags(opFlags), path, flags)
 }
 
 // MkdirAt creates a directory.
 func (ur *Uring) MkdirAt(sqeCtx SQEContext, path string, mode uint32, options ...OpOptionFunc) error {
-	_ = ur.operationOptions(options)
-	return ur.ioUring.mkdirAt(sqeCtx, path, 0, mode)
+	flags := ur.mkdirAtOptions(options)
+	return ur.ioUring.mkdirAt(sqeCtx.WithFlags(flags), path, 0, mode)
 }
 
 // SymlinkAt creates a symbolic link.
 func (ur *Uring) SymlinkAt(sqeCtx SQEContext, target, linkpath string, options ...OpOptionFunc) error {
-	_ = ur.operationOptions(options)
-	return ur.ioUring.symlinkAt(sqeCtx, target, linkpath)
+	flags := ur.symlinkAtOptions(options)
+	return ur.ioUring.symlinkAt(sqeCtx.WithFlags(flags), target, linkpath)
 }
 
 // LinkAt creates a hard link.
 func (ur *Uring) LinkAt(sqeCtx SQEContext, oldDirfd int, oldPath, newPath string, flags int, options ...OpOptionFunc) error {
-	_ = ur.operationOptions(options)
-	return ur.ioUring.linkAt(sqeCtx, oldDirfd, oldPath, newPath, flags)
+	opFlags := ur.linkAtOptions(options)
+	return ur.ioUring.linkAt(sqeCtx.WithFlags(opFlags), oldDirfd, oldPath, newPath, flags)
 }
 
 // FTruncate truncates a file to the specified length.
 func (ur *Uring) FTruncate(sqeCtx SQEContext, length int64, options ...OpOptionFunc) error {
-	_ = ur.operationOptions(options)
-	return ur.ioUring.fTruncate(sqeCtx, length)
+	flags := ur.operationOptions(options)
+	return ur.ioUring.fTruncate(sqeCtx.WithFlags(flags), length)
 }
 
 // ========================================
@@ -1479,23 +1479,23 @@ func (ur *Uring) FTruncate(sqeCtx SQEContext, length int64, options ...OpOptionF
 // FutexWait submits an async futex wait operation.
 // Waits until the value at addr matches val, using the specified mask and flags.
 func (ur *Uring) FutexWait(sqeCtx SQEContext, addr *uint32, val uint64, mask uint64, flags uint32, options ...OpOptionFunc) error {
-	_ = ur.operationOptions(options)
-	return ur.ioUring.futexWait(sqeCtx, addr, val, mask, flags)
+	opFlags := ur.operationOptions(options)
+	return ur.ioUring.futexWait(sqeCtx.WithFlags(opFlags), addr, val, mask, flags)
 }
 
 // FutexWake submits an async futex wake operation.
 // Wakes up to val waiters on the futex at addr, using the specified mask and flags.
 func (ur *Uring) FutexWake(sqeCtx SQEContext, addr *uint32, val uint64, mask uint64, flags uint32, options ...OpOptionFunc) error {
-	_ = ur.operationOptions(options)
-	return ur.ioUring.futexWake(sqeCtx, addr, val, mask, flags)
+	opFlags := ur.operationOptions(options)
+	return ur.ioUring.futexWake(sqeCtx.WithFlags(opFlags), addr, val, mask, flags)
 }
 
 // FutexWaitV submits a vectored futex wait operation.
 // Waits on multiple futexes simultaneously. The waitv pointer should point to
 // a struct futex_waitv array with count elements.
 func (ur *Uring) FutexWaitV(sqeCtx SQEContext, waitv unsafe.Pointer, count uint32, flags uint32, options ...OpOptionFunc) error {
-	_ = ur.operationOptions(options)
-	return ur.ioUring.futexWaitV(sqeCtx, waitv, count, flags)
+	opFlags := ur.operationOptions(options)
+	return ur.ioUring.futexWaitV(sqeCtx.WithFlags(opFlags), waitv, count, flags)
 }
 
 // ========================================
@@ -1506,8 +1506,8 @@ func (ur *Uring) FutexWaitV(sqeCtx SQEContext, waitv unsafe.Pointer, count uint3
 // idtype specifies which id to wait for (P_PID, P_PGID, P_ALL).
 // The siginfo_t result is written to infop.
 func (ur *Uring) Waitid(sqeCtx SQEContext, idtype, id int, infop unsafe.Pointer, options int, opts ...OpOptionFunc) error {
-	_ = ur.operationOptions(opts)
-	return ur.ioUring.waitid(sqeCtx, idtype, id, infop, options)
+	flags := ur.operationOptions(opts)
+	return ur.ioUring.waitid(sqeCtx.WithFlags(flags), idtype, id, infop, options)
 }
 
 // ========================================
@@ -1518,16 +1518,17 @@ func (ur *Uring) Waitid(sqeCtx SQEContext, idtype, id int, infop unsafe.Pointer,
 // normal file descriptor table. Returns the new fd in the CQE result.
 // The fixedIndex is the index in the registered files table.
 func (ur *Uring) FixedFdInstall(sqeCtx SQEContext, fixedIndex int, flags uint32, options ...OpOptionFunc) error {
-	_ = ur.operationOptions(options)
-	return ur.ioUring.fixedFdInstall(sqeCtx, fixedIndex, flags)
+	opFlags := ur.operationOptions(options)
+	ctx := sqeCtx.WithFlags(opFlags | IOSQE_FIXED_FILE)
+	return ur.ioUring.fixedFdInstall(ctx, fixedIndex, flags)
 }
 
 // FilesUpdate updates registered files at the specified offset.
 // The fds slice contains the new file descriptors to register.
 // Use -1 to unregister a slot.
 func (ur *Uring) FilesUpdate(sqeCtx SQEContext, fds []int32, offset int, options ...OpOptionFunc) error {
-	_ = ur.operationOptions(options)
-	return ur.ioUring.filesUpdate(sqeCtx, fds, offset)
+	flags := ur.operationOptions(options)
+	return ur.ioUring.filesUpdate(sqeCtx.WithFlags(flags), fds, offset)
 }
 
 // ========================================
@@ -1538,8 +1539,8 @@ func (ur *Uring) FilesUpdate(sqeCtx SQEContext, fds []int32, offset int, options
 // The sqeCtx.FD() should be the target ring's file descriptor.
 // userData and result are passed to the target ring's CQE.
 func (ur *Uring) MsgRing(sqeCtx SQEContext, userData int64, result int32, options ...OpOptionFunc) error {
-	_ = ur.operationOptions(options)
-	return ur.ioUring.msgRing(sqeCtx, userData, result)
+	flags := ur.operationOptions(options)
+	return ur.ioUring.msgRing(sqeCtx.WithFlags(flags), userData, result)
 }
 
 // MsgRingFD transfers a fixed file descriptor to another io_uring instance.
@@ -1555,12 +1556,12 @@ func (ur *Uring) MsgRing(sqeCtx SQEContext, userData int64, result int32, option
 //
 // Both rings must have registered file tables.
 func (ur *Uring) MsgRingFD(sqeCtx SQEContext, srcFD uint32, dstSlot uint32, userData int64, skipCQE bool, options ...OpOptionFunc) error {
-	_ = ur.operationOptions(options)
+	opFlags := ur.operationOptions(options)
 	var flags uint32
 	if skipCQE {
 		flags = IORING_MSG_RING_CQE_SKIP
 	}
-	return ur.ioUring.msgRingFD(sqeCtx, srcFD, dstSlot, userData, flags)
+	return ur.ioUring.msgRingFD(sqeCtx.WithFlags(opFlags), srcFD, dstSlot, userData, flags)
 }
 
 // ========================================
@@ -1570,16 +1571,16 @@ func (ur *Uring) MsgRingFD(sqeCtx SQEContext, srcFD uint32, dstSlot uint32, user
 // UringCmd submits a generic passthrough command.
 // The cmdOp specifies the command operation, and cmdData provides optional data.
 func (ur *Uring) UringCmd(sqeCtx SQEContext, cmdOp uint32, cmdData []byte, options ...OpOptionFunc) error {
-	_ = ur.operationOptions(options)
-	return ur.ioUring.uringCmd(sqeCtx, cmdOp, cmdData)
+	flags := ur.operationOptions(options)
+	return ur.ioUring.uringCmd(sqeCtx.WithFlags(flags), cmdOp, cmdData)
 }
 
 // Nop128 submits a 128-byte NOP operation.
 // The current ring implementation only maps 64-byte SQEs, so this returns
 // ErrNotSupported until SQE128 or SQE_MIXED ring wiring is added.
 func (ur *Uring) Nop128(sqeCtx SQEContext, options ...OpOptionFunc) error {
-	_ = ur.operationOptions(options)
-	return ur.ioUring.nop128(sqeCtx)
+	flags := ur.operationOptions(options)
+	return ur.ioUring.nop128(sqeCtx.WithFlags(flags))
 }
 
 // UringCmd128 submits a 128-byte passthrough command.
@@ -1587,6 +1588,6 @@ func (ur *Uring) Nop128(sqeCtx SQEContext, options ...OpOptionFunc) error {
 // The current ring implementation only maps 64-byte SQEs, so this returns
 // ErrNotSupported until SQE128 or SQE_MIXED ring wiring is added.
 func (ur *Uring) UringCmd128(sqeCtx SQEContext, cmdOp uint32, cmdData []byte, options ...OpOptionFunc) error {
-	_ = ur.operationOptions(options)
-	return ur.ioUring.uringCmd128(sqeCtx, cmdOp, cmdData)
+	flags := ur.operationOptions(options)
+	return ur.ioUring.uringCmd128(sqeCtx.WithFlags(flags), cmdOp, cmdData)
 }
