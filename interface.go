@@ -18,8 +18,8 @@ import (
 	"code.hybscloud.com/iofd"
 )
 
-// Uring entry count constants define the number of SQE slots in the submission queue.
-// 7 tiers with power-of-4 progression: 8, 32, 128, 512, 2048, 8192, 32768.
+// Uring entry count constants define submission queue sizes.
+// The values scale by powers of four: 8, 32, 128, 512, 2048, 8192, and 32768.
 const (
 	UringEntriesPico   = 1 << 3  // 8 entries
 	UringEntriesNano   = 1 << 5  // 32 entries

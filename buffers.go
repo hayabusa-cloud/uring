@@ -12,6 +12,7 @@ import (
 	"unsafe"
 
 	"code.hybscloud.com/iobuf"
+	"code.hybscloud.com/iofd"
 	"code.hybscloud.com/zcall"
 )
 
@@ -176,11 +177,11 @@ func AlignedMemBlock() []byte {
 }
 
 // newUnixSocketPair creates a pair of connected Unix domain sockets.
-func newUnixSocketPair() ([2]int, error) {
+func newUnixSocketPair() ([2]iofd.FD, error) {
 	var fds [2]int32
 	errno := zcall.Socketpair(zcall.AF_UNIX, zcall.SOCK_STREAM|zcall.SOCK_CLOEXEC, 0, &fds)
 	if errno != 0 {
-		return [2]int{}, errFromErrno(errno)
+		return [2]iofd.FD{}, errFromErrno(errno)
 	}
-	return [2]int{int(fds[0]), int(fds[1])}, nil
+	return [2]iofd.FD{iofd.FD(fds[0]), iofd.FD(fds[1])}, nil
 }
