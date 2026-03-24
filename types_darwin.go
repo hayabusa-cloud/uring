@@ -229,15 +229,15 @@ type noCopy struct{}
 func (*noCopy) Lock()   {}
 func (*noCopy) Unlock() {}
 
-// bytePtrFromString returns a pointer to a NUL-terminated byte array.
+// bytePtrFromString returns a pointer to a new NUL-terminated copy of s.
 func bytePtrFromString(s string) (*byte, error) {
+	a := make([]byte, len(s)+1)
 	for i := 0; i < len(s); i++ {
 		if s[i] == 0 {
 			return nil, ErrInvalidParam
 		}
+		a[i] = s[i]
 	}
-	a := make([]byte, len(s)+1)
-	copy(a, s)
 	return &a[0], nil
 }
 
@@ -281,7 +281,7 @@ type poller interface {
 	wait(events []EpollEvent, timeout int) (int, error)
 }
 
-// sockaddr extracts the raw socket address pointer and length from a Sockaddr.
+// sockaddr returns the borrowed raw address pointer and length.
 func sockaddr(sa Sockaddr) (unsafe.Pointer, int, error) {
 	if sa == nil {
 		return nil, 0, nil
@@ -290,7 +290,8 @@ func sockaddr(sa Sockaddr) (unsafe.Pointer, int, error) {
 	return ptr, int(length), nil
 }
 
-// sockaddrData returns the raw bytes of a socket address.
+// sockaddrData returns a borrowed byte view over a socket address.
+// Callers must retain the Sockaddr root while the returned slice is in use.
 func sockaddrData(sa Sockaddr) ([]byte, error) {
 	if sa == nil {
 		return nil, nil
@@ -299,8 +300,8 @@ func sockaddrData(sa Sockaddr) ([]byte, error) {
 	return unsafe.Slice((*byte)(ptr), length), nil
 }
 
-// AddrToSockaddr converts an Addr to a Sockaddr (Darwin stub).
-// Returns nil as socket operations are not supported on Darwin.
+// AddrToSockaddr converts an Addr to a Sockaddr.
+// Darwin returns nil because socket helpers are unavailable.
 func AddrToSockaddr(addr Addr) Sockaddr {
 	return nil
 }

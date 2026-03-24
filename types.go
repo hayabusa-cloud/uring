@@ -205,32 +205,20 @@ type noCopy struct{}
 func (*noCopy) Lock()   {}
 func (*noCopy) Unlock() {}
 
-// bytePtrFromString returns a pointer to a NUL-terminated byte array
-// containing the text of s. If s contains a NUL byte at any location,
-// it returns (nil, EINVAL).
-func bytePtrFromString(s string) (*byte, error) {
-	a, err := bytesFromString0(s)
-	if err != nil {
-		return nil, err
+// writeCString writes s into dst as a NUL-terminated C string.
+// dst must have capacity at least len(s)+1.
+func writeCString(dst []byte, s string) error {
+	if len(dst) < len(s)+1 {
+		return ErrInvalidParam
 	}
-	return &a[0], nil
-}
-
-// bytesFromString0 returns a NUL-terminated byte slice for s.
-func bytesFromString0(s string) ([]byte, error) {
 	for i := 0; i < len(s); i++ {
 		if s[i] == 0 {
-			return nil, ErrInvalidParam
+			return ErrInvalidParam
 		}
+		dst[i] = s[i]
 	}
-	a := make([]byte, len(s)+1)
-	copy(a, s)
-	return a, nil
-}
-
-// bytePtrFromBytes0 returns a pointer to the first byte of a NUL-terminated slice.
-func bytePtrFromBytes0(b []byte) *byte {
-	return (*byte)(unsafe.Pointer(unsafe.SliceData(b)))
+	dst[len(s)] = 0
+	return nil
 }
 
 // ioVecSliceFromBytesSlice converts a slice of byte slices to an IoVec slice.
@@ -280,7 +268,8 @@ type poller interface {
 	wait(events []EpollEvent, timeout int) (int, error)
 }
 
-// sockaddr extracts the raw socket address pointer and length from a Sockaddr.
+// sockaddr returns the borrowed raw address pointer and length.
+// Async submit paths must keep the Sockaddr root alive until kernel consumption.
 func sockaddr(sa Sockaddr) (unsafe.Pointer, int, error) {
 	if sa == nil {
 		return nil, 0, nil
@@ -289,7 +278,8 @@ func sockaddr(sa Sockaddr) (unsafe.Pointer, int, error) {
 	return ptr, int(length), nil
 }
 
-// sockaddrData returns the raw bytes of a socket address.
+// sockaddrData returns a borrowed byte view over a socket address.
+// Callers must retain the Sockaddr root while the returned slice is in use.
 func sockaddrData(sa Sockaddr) ([]byte, error) {
 	if sa == nil {
 		return nil, nil
@@ -299,6 +289,7 @@ func sockaddrData(sa Sockaddr) ([]byte, error) {
 }
 
 // AddrToSockaddr converts an Addr to a Sockaddr.
+// Submission paths that stage the result keep the returned Sockaddr alive.
 func AddrToSockaddr(addr Addr) Sockaddr {
 	if addr == nil {
 		return nil
