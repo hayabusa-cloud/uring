@@ -8,31 +8,31 @@ package uring
 
 import "code.hybscloud.com/iox"
 
-// ExtendedCQE is a zero-overhead CQE for Extended mode operations.
-type ExtendedCQE struct {
+// ExtCQE is a zero-overhead CQE for Extended mode operations.
+type ExtCQE struct {
 	Res   int32
 	Flags uint32
 	Ext   *ExtSQE
 }
 
-func (c *ExtendedCQE) IsSuccess() bool      { return c.Res >= 0 }
-func (c *ExtendedCQE) HasMore() bool        { return c.Flags&IORING_CQE_F_MORE != 0 }
-func (c *ExtendedCQE) HasBuffer() bool      { return c.Flags&IORING_CQE_F_BUFFER != 0 }
-func (c *ExtendedCQE) BufID() uint16        { return uint16(c.Flags >> IORING_CQE_BUFFER_SHIFT) }
-func (c *ExtendedCQE) IsNotification() bool { return c.Flags&IORING_CQE_F_NOTIF != 0 }
-func (c *ExtendedCQE) HasBufferMore() bool  { return c.Flags&IORING_CQE_F_BUF_MORE != 0 }
-func (c *ExtendedCQE) Op() uint8            { return c.Ext.SQE.opcode }
-func (c *ExtendedCQE) FD() int32            { return c.Ext.SQE.fd }
+func (c *ExtCQE) IsSuccess() bool      { return c.Res >= 0 }
+func (c *ExtCQE) HasMore() bool        { return c.Flags&IORING_CQE_F_MORE != 0 }
+func (c *ExtCQE) HasBuffer() bool      { return c.Flags&IORING_CQE_F_BUFFER != 0 }
+func (c *ExtCQE) BufID() uint16        { return uint16(c.Flags >> IORING_CQE_BUFFER_SHIFT) }
+func (c *ExtCQE) IsNotification() bool { return c.Flags&IORING_CQE_F_NOTIF != 0 }
+func (c *ExtCQE) HasBufferMore() bool  { return c.Flags&IORING_CQE_F_BUF_MORE != 0 }
+func (c *ExtCQE) Op() uint8            { return c.Ext.SQE.opcode }
+func (c *ExtCQE) FD() int32            { return c.Ext.SQE.fd }
 
 // WaitExtended retrieves completion events using Extended mode fast-path (darwin stub).
-func (ur *Uring) WaitExtended(cqes []ExtendedCQE) (int, error) {
+func (ur *Uring) WaitExtended(cqes []ExtCQE) (int, error) {
 	if err := ur.ioUring.enter(); err != nil {
 		return 0, err
 	}
 	return ur.ioUring.waitBatchExtended(cqes)
 }
 
-func (ur *ioUring) waitBatchExtended(cqes []ExtendedCQE) (int, error) {
+func (ur *ioUring) waitBatchExtended(cqes []ExtCQE) (int, error) {
 	if len(cqes) == 0 {
 		return 0, nil
 	}
@@ -47,7 +47,7 @@ func (ur *ioUring) waitBatchExtended(cqes []ExtendedCQE) (int, error) {
 				if ctx.Mode() == CtxModeExtended {
 					ext = ctx.ExtSQE()
 				}
-				cqes[n] = ExtendedCQE{
+				cqes[n] = ExtCQE{
 					Res:   cqe.res,
 					Flags: cqe.flags,
 					Ext:   ext,

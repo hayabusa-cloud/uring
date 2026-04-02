@@ -41,7 +41,7 @@ type ScopedExtSQE struct {
 // Submitted or Release closes the scope.
 func (ur *Uring) NewScopedExtSQE() ScopedExtSQE {
 	return ScopedExtSQE{
-		Ext:  ur.GetExtSQE(),
+		Ext:  ur.ExtSQE(),
 		ring: ur,
 	}
 }
@@ -95,7 +95,7 @@ func (s *ScopedExtSQE) Release() {
 //	    return ring.Read(sqeCtx, fd, buf)
 //	})
 func (ur *Uring) WithExtSQE(fn func(ext *ExtSQE) error) error {
-	ext := ur.GetExtSQE()
+	ext := ur.ExtSQE()
 	if ext == nil {
 		return iox.ErrWouldBlock
 	}
@@ -107,10 +107,10 @@ func (ur *Uring) WithExtSQE(fn func(ext *ExtSQE) error) error {
 	return err
 }
 
-// MustGetExtSQE gets an ExtSQE from the pool, panicking if exhausted.
+// MustExtSQE gets an ExtSQE from the pool, panicking if exhausted.
 // Use only in contexts where pool exhaustion is a programming error.
-func (ur *Uring) MustGetExtSQE() *ExtSQE {
-	ext := ur.GetExtSQE()
+func (ur *Uring) MustExtSQE() *ExtSQE {
+	ext := ur.ExtSQE()
 	if ext == nil {
 		panic("uring: ExtSQE pool exhausted")
 	}

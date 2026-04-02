@@ -8,21 +8,21 @@ package uring
 
 // This file is part of the `uring` package refactored from `code.hybscloud.com/sox`.
 
-var defaultUringOptions = UringOptions{
-	Entries:                 UringEntriesMedium,
+var defaultOptions = Options{
+	Entries:                 EntriesMedium,
 	LockedBufferMem:         registerBufferDefaultMem,
 	ReadBufferSize:          bufferSizeDefault,
-	ReadBufferNum:           UringEntriesMedium * 2,
+	ReadBufferNum:           EntriesMedium * 2,
 	WriteBufferSize:         bufferSizeDefault,
-	WriteBufferNum:          UringEntriesMedium,
+	WriteBufferNum:          EntriesMedium,
 	MultiIssuers:            false,
 	NotifySucceed:           false,
 	IndirectSubmissionQueue: false,
 }
 
-type UringOptionFunc func(opt *UringOptions)
+type OptionFunc func(opt *Options)
 
-func (uo *UringOptions) Apply(opts ...UringOptionFunc) {
+func (uo *Options) Apply(opts ...OptionFunc) {
 	for _, f := range opts {
 		f(uo)
 	}
@@ -31,11 +31,11 @@ func (uo *UringOptions) Apply(opts ...UringOptionFunc) {
 var (
 	// UringLargeLockedBufferMemOptions uses the maximum registered buffer memory (128 MiB).
 	// This equals the default; kept for backward compatibility.
-	UringLargeLockedBufferMemOptions UringOptionFunc = func(opt *UringOptions) {
+	UringLargeLockedBufferMemOptions OptionFunc = func(opt *Options) {
 		opt.LockedBufferMem = registerBufferSize * registerBufferNum
 	}
 	// UringMultiSizeBufferOptions enables multi-size buffer groups.
-	UringMultiSizeBufferOptions UringOptionFunc = func(opt *UringOptions) {
+	UringMultiSizeBufferOptions OptionFunc = func(opt *Options) {
 		opt.MultiSizeBuffer = 1
 	}
 )

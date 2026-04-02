@@ -338,7 +338,7 @@ func (r *ZCRXReceiver) Start(fd iofd.FD, handler ZCRXHandler) error {
 	r.fd = fd
 	r.handler = handler
 
-	ext := r.pool.GetExtended()
+	ext := r.pool.Extended()
 	if ext == nil {
 		r.state.Store(zcrxStateIdle)
 		return iox.ErrWouldBlock
@@ -367,7 +367,7 @@ func (r *ZCRXReceiver) Start(fd iofd.FD, handler ZCRXHandler) error {
 	r.ext = ext
 	r.userData.Store(uint64(sqeCtx))
 
-	if err := r.ring.submitExtended(sqeCtx); err != nil {
+	if err := r.ring.SubmitExtended(sqeCtx); err != nil {
 		r.ext = nil
 		r.userData.Store(0)
 		r.pool.PutExtended(ext)
@@ -424,12 +424,14 @@ func (r *ZCRXReceiver) handleCQE(view CQEView, rawCqe *ioUringCqe) {
 
 // finish retires the receiver, runs OnStopped, returns ext, and then publishes Stopped.
 func (r *ZCRXReceiver) finish(ext *ExtSQE) {
-	state := r.state.Load()
-	if state != zcrxStateActive && state != zcrxStateStopping {
-		return
-	}
-	if !r.state.CompareAndSwap(state, zcrxStateRetiring) {
-		return
+	for {
+		state := r.state.Load()
+		if state != zcrxStateActive && state != zcrxStateStopping {
+			return
+		}
+		if r.state.CompareAndSwap(state, zcrxStateRetiring) {
+			break
+		}
 	}
 	r.ext = nil
 	r.userData.Store(0)

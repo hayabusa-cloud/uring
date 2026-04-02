@@ -9,17 +9,21 @@ package uring
 // This file is part of the `uring` package refactored from `code.hybscloud.com/sox`.
 
 import (
+	"errors"
+	"fmt"
 	"sync/atomic"
 	"unsafe"
 
 	"code.hybscloud.com/dwcas"
 	"code.hybscloud.com/spin"
+	"code.hybscloud.com/zcall"
 )
 
 func newUringBufferRings() *uringBufferRings {
 	ret := uringBufferRings{
 		rings:    make([]*ioUringBufRing, 0),
 		backings: make([][]byte, 0),
+		gids:     make([]uint16, 0),
 		counts:   make([]uintptr, 0),
 		masks:    make([]uintptr, 0),
 		sizes:    make([]int, 0),
@@ -42,6 +46,7 @@ func newUringBufferRings() *uringBufferRings {
 type uringBufferRings struct {
 	rings    []*ioUringBufRing
 	backings [][]byte // keeps backing memory alive to prevent GC
+	gids     []uint16
 	locks    []spin.Lock
 	counts   []uintptr
 	masks    []uintptr
@@ -49,11 +54,12 @@ type uringBufferRings struct {
 	buffers  [][]byte // per-group buffer memory (GC-safe)
 }
 
-func (rings *uringBufferRings) appendGroup(br *ioUringBufRing, n int) {
+func (rings *uringBufferRings) appendGroup(br *ioUringBufRing, gid uint16, n int) {
 	rings.rings = append(rings.rings, br)
 	rings.locks = append(rings.locks, spin.Lock{})
 	rings.counts = append(rings.counts, uintptr(n))
 	rings.masks = append(rings.masks, uintptr(n-1))
+	rings.gids = append(rings.gids, gid)
 }
 
 func (rings *uringBufferRings) registerBuffers(ur *ioUring, b *uringProvideBuffers) error {
@@ -64,7 +70,7 @@ func (rings *uringBufferRings) registerBuffers(ur *ioUring, b *uringProvideBuffe
 		if err != nil {
 			return err
 		}
-		rings.appendGroup(br, b.n)
+		rings.appendGroup(br, gid, b.n)
 	}
 	return nil
 }
@@ -78,7 +84,7 @@ func (rings *uringBufferRings) registerGroups(ur *ioUring, g *uringProvideBuffer
 			if err != nil {
 				return err
 			}
-			rings.appendGroup(br, g.cfg.PicoNum)
+			rings.appendGroup(br, gid, g.cfg.PicoNum)
 		}
 
 		if g.cfg.NanoNum > 0 {
@@ -88,7 +94,7 @@ func (rings *uringBufferRings) registerGroups(ur *ioUring, g *uringProvideBuffer
 			if err != nil {
 				return err
 			}
-			rings.appendGroup(br, g.cfg.NanoNum)
+			rings.appendGroup(br, gid, g.cfg.NanoNum)
 		}
 
 		if g.cfg.MicroNum > 0 {
@@ -98,7 +104,7 @@ func (rings *uringBufferRings) registerGroups(ur *ioUring, g *uringProvideBuffer
 			if err != nil {
 				return err
 			}
-			rings.appendGroup(br, g.cfg.MicroNum)
+			rings.appendGroup(br, gid, g.cfg.MicroNum)
 		}
 
 		if g.cfg.SmallNum > 0 {
@@ -108,7 +114,7 @@ func (rings *uringBufferRings) registerGroups(ur *ioUring, g *uringProvideBuffer
 			if err != nil {
 				return err
 			}
-			rings.appendGroup(br, g.cfg.SmallNum)
+			rings.appendGroup(br, gid, g.cfg.SmallNum)
 		}
 
 		if g.cfg.MediumNum > 0 {
@@ -118,7 +124,7 @@ func (rings *uringBufferRings) registerGroups(ur *ioUring, g *uringProvideBuffer
 			if err != nil {
 				return err
 			}
-			rings.appendGroup(br, g.cfg.MediumNum)
+			rings.appendGroup(br, gid, g.cfg.MediumNum)
 		}
 
 		if g.cfg.BigNum > 0 {
@@ -128,7 +134,7 @@ func (rings *uringBufferRings) registerGroups(ur *ioUring, g *uringProvideBuffer
 			if err != nil {
 				return err
 			}
-			rings.appendGroup(br, g.cfg.BigNum)
+			rings.appendGroup(br, gid, g.cfg.BigNum)
 		}
 
 		if g.cfg.LargeNum > 0 {
@@ -138,7 +144,7 @@ func (rings *uringBufferRings) registerGroups(ur *ioUring, g *uringProvideBuffer
 			if err != nil {
 				return err
 			}
-			rings.appendGroup(br, g.cfg.LargeNum)
+			rings.appendGroup(br, gid, g.cfg.LargeNum)
 		}
 
 		if g.cfg.GreatNum > 0 {
@@ -148,7 +154,7 @@ func (rings *uringBufferRings) registerGroups(ur *ioUring, g *uringProvideBuffer
 			if err != nil {
 				return err
 			}
-			rings.appendGroup(br, g.cfg.GreatNum)
+			rings.appendGroup(br, gid, g.cfg.GreatNum)
 		}
 
 		if g.cfg.HugeNum > 0 {
@@ -158,7 +164,7 @@ func (rings *uringBufferRings) registerGroups(ur *ioUring, g *uringProvideBuffer
 			if err != nil {
 				return err
 			}
-			rings.appendGroup(br, g.cfg.HugeNum)
+			rings.appendGroup(br, gid, g.cfg.HugeNum)
 		}
 
 		if g.cfg.VastNum > 0 {
@@ -168,7 +174,7 @@ func (rings *uringBufferRings) registerGroups(ur *ioUring, g *uringProvideBuffer
 			if err != nil {
 				return err
 			}
-			rings.appendGroup(br, g.cfg.VastNum)
+			rings.appendGroup(br, gid, g.cfg.VastNum)
 		}
 
 		if g.cfg.GiantNum > 0 {
@@ -178,7 +184,7 @@ func (rings *uringBufferRings) registerGroups(ur *ioUring, g *uringProvideBuffer
 			if err != nil {
 				return err
 			}
-			rings.appendGroup(br, g.cfg.GiantNum)
+			rings.appendGroup(br, gid, g.cfg.GiantNum)
 		}
 
 		if g.cfg.TitanNum > 0 {
@@ -188,13 +194,16 @@ func (rings *uringBufferRings) registerGroups(ur *ioUring, g *uringProvideBuffer
 			if err != nil {
 				return err
 			}
-			rings.appendGroup(br, g.cfg.TitanNum)
+			rings.appendGroup(br, gid, g.cfg.TitanNum)
 		}
 	}
 	return nil
 }
 
 func (rings *uringBufferRings) registerGroup(ur *ioUring, entries int, gid uint16, buf []byte, size int) (*ioUringBufRing, error) {
+	if entries <= 0 || entries&(entries-1) != 0 {
+		return nil, ErrInvalidParam
+	}
 	r, backing, err := ur.registerBufRing(entries, gid)
 	if err != nil {
 		return nil, err
@@ -242,23 +251,49 @@ func (rings *uringBufferRings) advance(ur *ioUring) {
 	}
 }
 
+func (rings *uringBufferRings) release(ur *ioUring) error {
+	var err error
+	for i := len(rings.gids) - 1; i >= 0; i-- {
+		if rings.backings[i] == nil && rings.rings[i] != nil {
+			mappingSize := uintptr(rings.masks[i]+1) * ioUringBufSize
+			errno := zcall.Munmap(unsafe.Pointer(rings.rings[i]), mappingSize)
+			if errno != 0 {
+				err = errors.Join(err, fmt.Errorf("munmap buf ring gid %d: %w", rings.gids[i], errFromErrno(errno)))
+			}
+		}
+	}
+	rings.reset()
+	return err
+}
+
+func (rings *uringBufferRings) reset() {
+	rings.rings = nil
+	rings.backings = nil
+	rings.gids = nil
+	rings.locks = nil
+	rings.counts = nil
+	rings.masks = nil
+	rings.sizes = nil
+	rings.buffers = nil
+}
+
 // bundleIterator constructs a BundleIterator from a CQE and the internal index
 // of the buffer ring group. The index is the position in the rings slice
 // (i.e., group - gidOffset). gidOffset and group are captured in the
 // iterator for use by Recycle.
-func (rings *uringBufferRings) bundleIterator(cqe CQEView, index int, gidOffset, group uint16) *BundleIterator {
+func (rings *uringBufferRings) bundleIterator(cqe CQEView, index int, gidOffset, group uint16) (BundleIterator, bool) {
 	if index < 0 || index >= len(rings.rings) {
-		return nil
+		return BundleIterator{}, false
 	}
-	it := newBundleIterator(
+	it, ok := newBundleIterator(
 		cqe,
 		unsafe.Pointer(unsafe.SliceData(rings.buffers[index])),
 		rings.sizes[index],
 		uint16(rings.masks[index]),
 	)
-	if it != nil {
+	if ok {
 		it.gidOffset = gidOffset
 		it.group = group
 	}
-	return it
+	return it, ok
 }

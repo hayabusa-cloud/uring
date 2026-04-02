@@ -16,16 +16,16 @@ import (
 )
 
 const (
-	UringEntriesPico   = 1 << 3  // 8 entries
-	UringEntriesNano   = 1 << 5  // 32 entries
-	UringEntriesMicro  = 1 << 7  // 128 entries
-	UringEntriesSmall  = 1 << 9  // 512 entries
-	UringEntriesMedium = 1 << 11 // 2048 entries
-	UringEntriesLarge  = 1 << 13 // 8192 entries
-	UringEntriesHuge   = 1 << 15 // 32768 entries
+	EntriesPico   = 1 << 3  // 8 entries
+	EntriesNano   = 1 << 5  // 32 entries
+	EntriesMicro  = 1 << 7  // 128 entries
+	EntriesSmall  = 1 << 9  // 512 entries
+	EntriesMedium = 1 << 11 // 2048 entries
+	EntriesLarge  = 1 << 13 // 8192 entries
+	EntriesHuge   = 1 << 15 // 32768 entries
 )
 
-type UringOptions struct {
+type Options struct {
 	Entries                 int
 	LockedBufferMem         int
 	ReadBufferSize          int
@@ -40,8 +40,8 @@ type UringOptions struct {
 	HybridPolling           bool
 }
 
-func NewUring(options ...func(options *UringOptions)) (*Uring, error) {
-	opt := defaultUringOptions
+func New(options ...func(options *Options)) (*Uring, error) {
+	opt := defaultOptions
 	for _, option := range options {
 		option(&opt)
 	}
@@ -72,7 +72,7 @@ func NewUring(options ...func(options *UringOptions)) (*Uring, error) {
 	}
 	ret := Uring{
 		ioUring:          r,
-		UringOptions:     &opt,
+		Options:          &opt,
 		bufferRings:      newUringBufferRings(),
 		ctxPools:         NewContextPools(opt.Entries),
 		readLikeOpFlags:  rFlags,
@@ -86,7 +86,7 @@ func NewUring(options ...func(options *UringOptions)) (*Uring, error) {
 		ret.buffers = newUringProvideBuffers(opt.ReadBufferSize, opt.ReadBufferNum)
 		ret.buffers.setGIDOffset(opt.ReadBufferGidOffset)
 	}
-	feat := UringFeatures{
+	feat := Features{
 		SQEntries:         int(r.params.sqEntries),
 		CQEntries:         int(r.params.cqEntries),
 		UserdataByteOrder: binary.LittleEndian,
@@ -99,7 +99,7 @@ func NewUring(options ...func(options *UringOptions)) (*Uring, error) {
 	return &ret, nil
 }
 
-type UringFeatures struct {
+type Features struct {
 	SQEntries         int
 	CQEntries         int
 	UserdataByteOrder binary.ByteOrder
@@ -107,8 +107,8 @@ type UringFeatures struct {
 
 type Uring struct {
 	*ioUring
-	*UringOptions
-	Features *UringFeatures
+	*Options
+	Features *Features
 
 	buffers      *uringProvideBuffers
 	bufferGroups *uringProvideBufferGroups
@@ -119,21 +119,30 @@ type Uring struct {
 	// ctxPools provides lock-free pools for IndirectSQE and ExtSQE contexts.
 	ctxPools *ContextPools
 
-	// bufRingBackings stores backing memory for buffer rings to prevent GC.
-	bufRingBackings [][]byte
-
 	readLikeOpFlags  uint8
 	writeLikeOpFlags uint8
 }
 
 // Start initializes the io_uring instance, populates simulated capabilities, registers buffers, and enables the ring.
-func (ur *Uring) Start() error {
+func (ur *Uring) Start() (err error) {
+	if ur.closed.Load() {
+		return ErrClosed
+	}
+	if !ur.started.CompareAndSwap(false, true) {
+		return ErrExists
+	}
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, ur.Stop())
+		}
+	}()
+
 	// Initialize context pools
 	ur.ctxPools.Init()
 
 	// populate simulated capabilities
 	probe := ioUringProbe{}
-	err := ur.registerProbe(&probe)
+	err = ur.registerProbe(&probe)
 	if err != nil {
 		return err
 	}
@@ -173,8 +182,26 @@ func (ur *Uring) Start() error {
 	return nil
 }
 
-// Wait flushes pending submissions and collects completion events into CQEView slice.
-// Returns the number of events received, or `iox.ErrWouldBlock` if the CQ is empty.
+// Stop tears down Darwin simulator resources and makes the ring permanently unusable.
+func (ur *Uring) Stop() error {
+	var err error
+	if ur.bufferRings != nil {
+		if stopErr := ur.bufferRings.release(ur.ioUring); stopErr != nil {
+			err = errors.Join(err, stopErr)
+		}
+	}
+	if stopErr := ur.ioUring.stop(); stopErr != nil {
+		err = errors.Join(err, stopErr)
+	}
+	ur.buffersPool = nil
+	ur.buffers = nil
+	ur.bufferGroups = nil
+	return err
+}
+
+// Wait flushes pending submissions and collects completion events into cqes.
+// It returns the number of events received, or `iox.ErrWouldBlock` if the CQ
+// is empty.
 func (ur *Uring) Wait(cqes []CQEView) (n int, err error) {
 	err = ur.ioUring.enter()
 	if err != nil {
@@ -185,14 +212,14 @@ func (ur *Uring) Wait(cqes []CQEView) (n int, err error) {
 	return ur.ioUring.waitBatch(cqes)
 }
 
-// GetExtSQE acquires an ExtSQE from the pool for Extended mode submissions.
+// ExtSQE acquires an ExtSQE from the pool for Extended mode submissions.
 // The returned ExtSQE is borrowed until PutExtSQE after the corresponding CQE
 // is processed. Callers must not retain pointers into SQE or UserData after
 // release.
 //
 //go:nosplit
-func (ur *Uring) GetExtSQE() *ExtSQE {
-	return ur.ctxPools.GetExtended()
+func (ur *Uring) ExtSQE() *ExtSQE {
+	return ur.ctxPools.Extended()
 }
 
 // PutExtSQE returns an ExtSQE to the pool after completion processing.
@@ -204,12 +231,12 @@ func (ur *Uring) PutExtSQE(sqe *ExtSQE) {
 	ur.ctxPools.PutExtended(sqe)
 }
 
-// GetIndirectSQE acquires an IndirectSQE from the pool.
+// IndirectSQE acquires an IndirectSQE from the pool.
 // The returned IndirectSQE is borrowed until PutIndirectSQE.
 //
 //go:nosplit
-func (ur *Uring) GetIndirectSQE() *IndirectSQE {
-	return ur.ctxPools.GetIndirect()
+func (ur *Uring) IndirectSQE() *IndirectSQE {
+	return ur.ctxPools.Indirect()
 }
 
 // PutIndirectSQE returns an IndirectSQE to the pool.
@@ -220,8 +247,8 @@ func (ur *Uring) PutIndirectSQE(sqe *IndirectSQE) {
 	ur.ctxPools.PutIndirect(sqe)
 }
 
-// submitExtended submits an SQE using Extended mode context.
-func (ur *Uring) submitExtended(sqeCtx SQEContext) error {
+// SubmitExtended submits an SQE using Extended mode context.
+func (ur *Uring) SubmitExtended(sqeCtx SQEContext) error {
 	return ur.ioUring.submitExtended(sqeCtx)
 }
 
@@ -318,7 +345,7 @@ func (ur *Uring) MsgRingFD(sqeCtx SQEContext, srcFD uint32, dstSlot uint32, user
 
 // SocketRaw creates a socket using io_uring.
 func (ur *Uring) SocketRaw(sqeCtx SQEContext, domain, typ, proto int, options ...OpOptionFunc) error {
-	flags, _, fileIndex := ur.socketOptions(options)
+	flags, fileIndex := ur.socketOptions(options)
 	ctx := sqeCtx.WithFlags(flags)
 	return ur.socket(ctx, domain, typ, proto, fileIndex)
 }
@@ -431,7 +458,7 @@ func (ur *Uring) UnixSocketDirect(sqeCtx SQEContext, options ...OpOptionFunc) er
 
 // Bind binds a socket to an address.
 func (ur *Uring) Bind(sqeCtx SQEContext, addr Addr, options ...OpOptionFunc) error {
-	flags, _ := ur.bindOptions(options)
+	flags := ur.bindOptions(options)
 	ctx := sqeCtx.WithFlags(flags)
 	return ur.bind(ctx, AddrToSockaddr(addr))
 }
@@ -577,10 +604,10 @@ func (ur *Uring) MulticastZeroCopy(sqeCtx SQEContext, targets SendTargets, bufIn
 
 // Timeout submits a timeout request.
 func (ur *Uring) Timeout(sqeCtx SQEContext, d time.Duration, options ...OpOptionFunc) error {
-	flags, cnt := ur.timeoutOptions(options)
+	flags, cnt, timeoutFlags := ur.timeoutOptions(options)
 	ctx := sqeCtx.WithFlags(flags)
 	nano := d.Nanoseconds()
-	return ur.timeout(ctx, cnt, &Timespec{Sec: nano / int64(time.Second), Nsec: nano % int64(time.Second)}, 0)
+	return ur.timeout(ctx, cnt, &Timespec{Sec: nano / int64(time.Second), Nsec: nano % int64(time.Second)}, int(timeoutFlags))
 }
 
 // Shutdown gracefully closes a socket.
@@ -619,22 +646,22 @@ func (ur *Uring) Write(sqeCtx SQEContext, b []byte, options ...OpOptionFunc) err
 
 // Splice transfers data between file descriptors.
 func (ur *Uring) Splice(sqeCtx SQEContext, fdIn int, n int, options ...OpOptionFunc) error {
-	flags := ur.operationOptions(options)
+	flags, _, spliceFlags := ur.spliceOptions(options)
 	ctx := sqeCtx.WithFlags(flags)
-	return ur.splice(ctx, fdIn, nil, nil, n, 0)
+	return ur.splice(ctx, fdIn, nil, nil, n, int(spliceFlags))
 }
 
 // Tee duplicates data between pipes.
 func (ur *Uring) Tee(sqeCtx SQEContext, fdIn int, length int, options ...OpOptionFunc) error {
-	flags := ur.operationOptions(options)
+	flags, _, spliceFlags := ur.teeOptions(options)
 	ctx := sqeCtx.WithFlags(flags)
-	return ur.tee(ctx, fdIn, length, 0)
+	return ur.tee(ctx, fdIn, length, int(spliceFlags))
 }
 
 // Sync performs a file sync operation.
 func (ur *Uring) Sync(sqeCtx SQEContext, options ...OpOptionFunc) error {
-	flags := ur.operationOptions(options)
-	return ur.fsync(sqeCtx.WithFlags(flags))
+	flags, fsyncFlags := ur.syncOptions(options)
+	return ur.fsync(sqeCtx.WithFlags(flags), fsyncFlags)
 }
 
 // ReadV performs a vectored read operation.

@@ -40,7 +40,7 @@ type ContextPools struct {
 // NewContextPools creates page-aligned pools for IndirectSQE and ExtSQE contexts
 // with the given per-pool capacity. Call Init before use.
 func NewContextPools(capacity int) *ContextPools {
-	n := normalizeContextPoolCapacity(capacity)
+	n := alignPoolCapacity(capacity)
 
 	indirectMem := iobuf.AlignedMem(n*int(unsafe.Sizeof(IndirectSQE{})), iobuf.PageSize)
 	indirect := unsafe.Slice((*IndirectSQE)(unsafe.Pointer(unsafe.SliceData(indirectMem))), n)
@@ -56,22 +56,15 @@ func NewContextPools(capacity int) *ContextPools {
 	}
 }
 
-func normalizeContextPoolCapacity(capacity int) int {
+func alignPoolCapacity(capacity int) int {
 	if capacity < 1 || capacity > math.MaxUint32 {
 		panic("capacity must be between 1 and MaxUint32")
 	}
-	capacity--
-	capacity |= capacity >> 1
-	capacity |= capacity >> 2
-	capacity |= capacity >> 4
-	capacity |= capacity >> 8
-	capacity |= capacity >> 16
-	capacity++
-	return capacity
+	return roundToPowerOf2(capacity)
 }
 
 //go:nosplit
-func (p *ContextPools) GetIndirect() *IndirectSQE {
+func (p *ContextPools) Indirect() *IndirectSQE {
 	entry, ok := p.indirectQueue.get()
 	if !ok {
 		return nil
@@ -85,7 +78,7 @@ func (p *ContextPools) PutIndirect(indirect *IndirectSQE) {
 }
 
 //go:nosplit
-func (p *ContextPools) GetExtended() *ExtSQE {
+func (p *ContextPools) Extended() *ExtSQE {
 	entry, ok := p.extendedQueue.get()
 	if !ok {
 		return nil

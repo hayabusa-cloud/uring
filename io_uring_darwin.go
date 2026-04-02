@@ -258,8 +258,10 @@ type ioCqRingOffsets struct {
 type ioUring struct {
 	_ noCopy
 
-	mu     sync.Mutex
-	params *ioUringParams
+	// lifecycleMu serializes stopChan handoff and close so concurrent Stop calls
+	// cannot both observe the same channel and close it twice.
+	lifecycleMu sync.Mutex
+	params      *ioUringParams
 
 	// Simulated SQ using a buffered channel
 	sqChan chan *ioUringSqe
@@ -282,6 +284,8 @@ type ioUring struct {
 	workerWg sync.WaitGroup
 	stopChan chan struct{}
 	enabled  atomic.Bool
+	started  atomic.Bool
+	closed   atomic.Bool
 
 	ops []ioUringProbeOp
 }
@@ -362,13 +366,7 @@ func newIoUring(entries int, opts ...func(params *ioUringParams)) (*ioUring, err
 		return nil, ErrInvalidParam
 	}
 
-	// Round up to power of 2
-	entries--
-	entries |= entries >> 1
-	entries |= entries >> 2
-	entries |= entries >> 4
-	entries |= entries >> 8
-	entries++
+	entries = roundToPowerOf2(entries)
 
 	params := new(ioUringParams)
 	*params = *ioUringDefaultParams
@@ -501,6 +499,36 @@ func (ur *ioUring) unregisterBufRing(groupID uint16) error {
 // registerPoller is a no-op on Darwin (no kernel event fd).
 func (ur *ioUring) registerPoller(p poller) (int, error) {
 	return 0, ErrNotSupported
+}
+
+func (ur *ioUring) stop() error {
+	if ur.closed.Load() {
+		return nil
+	}
+
+	ur.lifecycleMu.Lock()
+	if ur.closed.Load() {
+		ur.lifecycleMu.Unlock()
+		return nil
+	}
+	ur.closed.Store(true)
+
+	stopChan := ur.stopChan
+	ur.stopChan = nil
+	waitWorkers := ur.enabled.Load()
+	ur.enabled.Store(false)
+	ur.bufs = nil
+	ur.files = nil
+	ur.ops = nil
+	ur.lifecycleMu.Unlock()
+
+	if stopChan != nil {
+		close(stopChan)
+	}
+	if waitWorkers {
+		ur.workerWg.Wait()
+	}
+	return nil
 }
 
 // feature checks if a feature is supported.

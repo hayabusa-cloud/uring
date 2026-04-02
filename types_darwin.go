@@ -189,8 +189,8 @@ const (
 	EPOLLET  = 0x80000000
 )
 
-// Statx_t represents the statx structure.
-type Statx_t struct {
+// Statx represents the statx structure.
+type Statx struct {
 	Mask             uint32
 	Blksize          uint32
 	Attributes       uint64

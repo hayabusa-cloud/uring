@@ -28,13 +28,7 @@ func newUringProvideBuffers(size, n int) *uringProvideBuffers {
 	if size < 1 || n < 1 {
 		panic("size and n must be positive")
 	}
-	// Round up n to power of 2
-	n--
-	n |= n >> 1
-	n |= n >> 2
-	n |= n >> 4
-	n |= n >> 8
-	n++
+	n = roundToPowerOf2(n)
 
 	return &uringProvideBuffers{
 		size:  size,
@@ -96,13 +90,7 @@ func newUringBufferGroups(scale int) *uringProvideBufferGroups {
 	if scale < 1 || scale > (1<<12) {
 		panic("scale must be between 1 and 4096")
 	}
-	mask := scale - 1
-	mask |= mask >> 1
-	mask |= mask >> 2
-	mask |= mask >> 4
-	mask |= mask >> 8
-	mask++
-	mask--
+	mask := roundToPowerOf2(scale) - 1
 
 	return &uringProvideBufferGroups{
 		groups: make([]*uringProvideBuffers, 0),

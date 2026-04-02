@@ -22,7 +22,7 @@ type ScopedExtSQE struct {
 // NewScopedExtSQE gets an ExtSQE from the pool wrapped in a scope.
 func (ur *Uring) NewScopedExtSQE() ScopedExtSQE {
 	return ScopedExtSQE{
-		Ext:  ur.GetExtSQE(),
+		Ext:  ur.ExtSQE(),
 		ring: ur,
 	}
 }
@@ -54,7 +54,7 @@ func (s *ScopedExtSQE) Release() {
 
 // WithExtSQE executes fn with an ExtSQE from the pool.
 func (ur *Uring) WithExtSQE(fn func(ext *ExtSQE) error) error {
-	ext := ur.GetExtSQE()
+	ext := ur.ExtSQE()
 	if ext == nil {
 		return iox.ErrWouldBlock
 	}
@@ -66,9 +66,9 @@ func (ur *Uring) WithExtSQE(fn func(ext *ExtSQE) error) error {
 	return err
 }
 
-// MustGetExtSQE gets an ExtSQE from the pool, panicking if exhausted.
-func (ur *Uring) MustGetExtSQE() *ExtSQE {
-	ext := ur.GetExtSQE()
+// MustExtSQE gets an ExtSQE from the pool, panicking if exhausted.
+func (ur *Uring) MustExtSQE() *ExtSQE {
+	ext := ur.ExtSQE()
 	if ext == nil {
 		panic("uring: ExtSQE pool exhausted")
 	}

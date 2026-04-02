@@ -29,3 +29,8 @@ func (r *uringBufferRings) registerGroups(ur *ioUring, groups *uringProvideBuffe
 func (r *uringBufferRings) advance(ur *ioUring) {
 	// No-op on Darwin simulator
 }
+
+func (r *uringBufferRings) release(ur *ioUring) error {
+	r.rings = nil
+	return nil
+}

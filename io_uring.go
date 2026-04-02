@@ -7,6 +7,9 @@
 package uring
 
 import (
+	"errors"
+	"fmt"
+	"runtime"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -159,7 +162,7 @@ const (
 )
 
 const (
-	ioUringDefaultEntries = UringEntriesMedium
+	ioUringDefaultEntries = EntriesMedium
 
 	ioUringDefaultSqThreadCPU  = 0 // CPU 0 is always valid
 	ioUringDefaultSqThreadIdle = 5 * time.Second
@@ -168,8 +171,11 @@ const (
 type ioUring struct {
 	_ noCopy
 
-	sl     spin.Lock
-	params *ioUringParams
+	submit        submitState
+	lifecycleLock spin.Lock
+	started       atomic.Bool
+	closed        atomic.Bool
+	params        *ioUringParams
 
 	sq     ioUringSq
 	cq     ioUringCq
@@ -177,6 +183,25 @@ type ioUring struct {
 	bufs   [][]byte
 	files  []int32 // registered file descriptors
 	ops    []ioUringProbeOp
+
+	pollerFd int
+}
+
+type submitState struct {
+	lock spin.Lock
+
+	keepAlive        []submitKeepAlive
+	keepAliveHead    uint32
+	keepAliveExtFree *submitKeepAliveExt // protected by submit-state serialization
+
+	shared bool // shared reports whether submissions may arrive from multiple goroutines
+}
+
+type submitSlot struct {
+	index uint32
+	tail  uint32
+	sqe   *ioUringSqe
+	keep  *submitKeepAlive
 }
 
 // ioUringFd represents a file descriptor in io_uring context.
@@ -214,7 +239,11 @@ func newIoUring(entries int, opts ...func(params *ioUringParams)) (*ioUring, err
 	}
 
 	uring := &ioUring{
-		sl:     spin.Lock{},
+		submit: submitState{
+			lock:      spin.Lock{},
+			keepAlive: make([]submitKeepAlive, int(params.sqEntries)),
+			shared:    params.flags&IORING_SETUP_SINGLE_ISSUER == 0,
+		},
 		params: params,
 
 		sq: ioUringSq{
@@ -223,43 +252,53 @@ func newIoUring(entries int, opts ...func(params *ioUringParams)) (*ioUring, err
 		cq: ioUringCq{
 			ringSz: params.cqOff.cqes + uint32(unsafe.Sizeof(uint32(0)))*params.cqEntries,
 		},
-		ringFd: fd,
-		bufs:   [][]byte{},
+		ringFd:   fd,
+		bufs:     [][]byte{},
+		pollerFd: -1,
 	}
 
-	// Map the SQ ring
-	ptr, errno := zcall.Mmap(nil, uintptr(uring.sq.ringSz), PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, uintptr(uring.ringFd), uintptr(IORING_OFF_SQ_RING))
-	if errno != 0 {
+	if err := uring.remapRings(params); err != nil {
 		zcall.Close(uintptr(fd))
-		return nil, errFromErrno(errno)
+		return nil, err
 	}
-	uring.sq.ringPtr = ptr
-	uring.sq.kHead = (*uint32)(unsafe.Add(ptr, params.sqOff.head))
-	uring.sq.kTail = (*uint32)(unsafe.Add(ptr, params.sqOff.tail))
-	uring.sq.kRingMask = (*uint32)(unsafe.Add(ptr, params.sqOff.ringMask))
-	uring.sq.kRingEntries = (*uint32)(unsafe.Add(ptr, params.sqOff.ringEntries))
-	uring.sq.kFlags = (*uint32)(unsafe.Add(ptr, params.sqOff.flags))
-	uring.sq.kDropped = (*uint32)(unsafe.Add(ptr, params.sqOff.dropped))
-	uring.sq.array = unsafe.Slice((*uint32)(unsafe.Add(ptr, params.sqOff.array)), int(params.sqEntries))
-
-	// Map the SQEs
-	sqesPtr, errno := zcall.Mmap(nil, uintptr(params.sqEntries)*unsafe.Sizeof(ioUringSqe{}), PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, uintptr(uring.ringFd), uintptr(IORING_OFF_SQES))
-	if errno != 0 {
-		zcall.Munmap(ptr, uintptr(uring.sq.ringSz))
-		zcall.Close(uintptr(fd))
-		return nil, errFromErrno(errno)
-	}
-	uring.sq.sqesPtr = sqesPtr
-	uring.sq.sqes = unsafe.Slice((*ioUringSqe)(sqesPtr), int(params.sqEntries))
-
-	uring.cq.kHead = (*uint32)(unsafe.Add(ptr, params.cqOff.head))
-	uring.cq.kTail = (*uint32)(unsafe.Add(ptr, params.cqOff.tail))
-	uring.cq.kRingMask = (*uint32)(unsafe.Add(ptr, params.cqOff.ringMask))
-	uring.cq.kRingEntries = (*uint32)(unsafe.Add(ptr, params.cqOff.ringEntries))
-	uring.cq.kOverflow = (*uint32)(unsafe.Add(ptr, params.cqOff.overflow))
-	uring.cq.cqes = unsafe.Slice((*ioUringCqe)(unsafe.Add(ptr, params.cqOff.cqes)), int(params.cqEntries))
 
 	return uring, nil
+}
+
+func (ur *ioUring) remapRings(params *ioUringParams) error {
+	ur.sq.ringSz = params.sqOff.array + uint32(unsafe.Sizeof(uint32(0)))*params.sqEntries
+	ur.cq.ringSz = params.cqOff.cqes + uint32(unsafe.Sizeof(uint32(0)))*params.cqEntries
+
+	ptr, errno := zcall.Mmap(nil, uintptr(ur.sq.ringSz), PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, uintptr(ur.ringFd), uintptr(IORING_OFF_SQ_RING))
+	if errno != 0 {
+		return errFromErrno(errno)
+	}
+
+	sqesPtr, errno := zcall.Mmap(nil, uintptr(params.sqEntries)*unsafe.Sizeof(ioUringSqe{}), PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, uintptr(ur.ringFd), uintptr(IORING_OFF_SQES))
+	if errno != 0 {
+		zcall.Munmap(ptr, uintptr(ur.sq.ringSz))
+		return errFromErrno(errno)
+	}
+
+	ur.sq.ringPtr = ptr
+	ur.sq.sqesPtr = sqesPtr
+	ur.sq.kHead = (*uint32)(unsafe.Add(ptr, params.sqOff.head))
+	ur.sq.kTail = (*uint32)(unsafe.Add(ptr, params.sqOff.tail))
+	ur.sq.kRingMask = (*uint32)(unsafe.Add(ptr, params.sqOff.ringMask))
+	ur.sq.kRingEntries = (*uint32)(unsafe.Add(ptr, params.sqOff.ringEntries))
+	ur.sq.kFlags = (*uint32)(unsafe.Add(ptr, params.sqOff.flags))
+	ur.sq.kDropped = (*uint32)(unsafe.Add(ptr, params.sqOff.dropped))
+	ur.sq.array = unsafe.Slice((*uint32)(unsafe.Add(ptr, params.sqOff.array)), int(params.sqEntries))
+	ur.sq.sqes = unsafe.Slice((*ioUringSqe)(sqesPtr), int(params.sqEntries))
+
+	ur.cq.kHead = (*uint32)(unsafe.Add(ptr, params.cqOff.head))
+	ur.cq.kTail = (*uint32)(unsafe.Add(ptr, params.cqOff.tail))
+	ur.cq.kRingMask = (*uint32)(unsafe.Add(ptr, params.cqOff.ringMask))
+	ur.cq.kRingEntries = (*uint32)(unsafe.Add(ptr, params.cqOff.ringEntries))
+	ur.cq.kOverflow = (*uint32)(unsafe.Add(ptr, params.cqOff.overflow))
+	ur.cq.cqes = unsafe.Slice((*ioUringCqe)(unsafe.Add(ptr, params.cqOff.cqes)), int(params.cqEntries))
+
+	return nil
 }
 
 func (ur *ioUring) registerProbe(probe *ioUringProbe) error {
@@ -301,6 +340,7 @@ func (ur *ioUring) registerBuffers(addr unsafe.Pointer, n, size int) error {
 	reg := ioUringRSrcRegister{nr: uint32(n), data: uint64(data)}
 	regSize := uintptr(unsafe.Sizeof(reg))
 	_, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_REGISTER_BUFFERS2, unsafe.Pointer(&reg), regSize)
+	runtime.KeepAlive(vectors)
 	if errno != 0 {
 		return errFromErrno(errno)
 	}
@@ -429,7 +469,8 @@ func (ur *ioUring) unregisterFiles() error {
 }
 
 func (ur *ioUring) registerBufRing(entries int, groupID uint16) (*ioUringBufRing, []byte, error) {
-	return ur.registerBufRingWithFlags(entries, groupID, 0)
+	r, backing, _, err := ur.registerBufRingWithFlags(entries, groupID, 0)
+	return r, backing, err
 }
 
 // registerBufRingWithFlags registers a buffer ring with specified flags.
@@ -439,16 +480,11 @@ func (ur *ioUring) registerBufRing(entries int, groupID uint16) (*ioUringBufRing
 //
 // Returns the buffer ring pointer and the backing slice (nil for mmap mode).
 // The caller must keep the backing slice alive to prevent GC.
-func (ur *ioUring) registerBufRingWithFlags(entries int, groupID uint16, flags uint16) (*ioUringBufRing, []byte, error) {
+func (ur *ioUring) registerBufRingWithFlags(entries int, groupID uint16, flags uint16) (*ioUringBufRing, []byte, uintptr, error) {
 	if entries < 1 || entries > (1<<15) {
 		panic("entries must be between 1 and 32768")
 	}
-	entries--
-	entries |= entries >> 1
-	entries |= entries >> 2
-	entries |= entries >> 4
-	entries |= entries >> 8
-	entries++
+	entries = roundToPowerOf2(entries)
 
 	var r *ioUringBufRing
 	var backing []byte
@@ -463,7 +499,7 @@ func (ur *ioUring) registerBufRingWithFlags(entries int, groupID uint16, flags u
 		}
 		_, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_REGISTER_PBUF_RING, unsafe.Pointer(&reg), 1)
 		if errno != 0 {
-			return nil, nil, errFromErrno(errno)
+			return nil, nil, 0, errFromErrno(errno)
 		}
 
 		// Calculate mmap offset for this buffer ring
@@ -475,10 +511,11 @@ func (ur *ioUring) registerBufRingWithFlags(entries int, groupID uint16, flags u
 		if errno != 0 {
 			// Unregister on mmap failure
 			_ = ur.unregisterBufRing(groupID)
-			return nil, nil, errFromErrno(errno)
+			return nil, nil, 0, errFromErrno(errno)
 		}
 		r = (*ioUringBufRing)(ptr)
 		// backing is nil for mmap mode - kernel manages the memory
+		return r, nil, size, nil
 	} else {
 		// User allocates memory - keep the slice alive to prevent GC
 		backing = iobuf.AlignedMem(entries*int(unsafe.Sizeof(ioUringBuf{})), iobuf.PageSize)
@@ -494,10 +531,10 @@ func (ur *ioUring) registerBufRingWithFlags(entries int, groupID uint16, flags u
 		}
 		_, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_REGISTER_PBUF_RING, unsafe.Pointer(&reg), 1)
 		if errno != 0 {
-			return nil, nil, errFromErrno(errno)
+			return nil, nil, 0, errFromErrno(errno)
 		}
 	}
-	return r, backing, nil
+	return r, backing, 0, nil
 }
 
 func (ur *ioUring) unregisterBufRing(groupID uint16) error {
@@ -510,6 +547,12 @@ func (ur *ioUring) unregisterBufRing(groupID uint16) error {
 }
 
 func (ur *ioUring) registerPoller(p poller) (int, error) {
+	if ur.closed.Load() {
+		return 0, ErrClosed
+	}
+	if ur.pollerFd >= 0 {
+		return 0, ErrExists
+	}
 	efd, errno := zcall.Eventfd2(0, zcall.EFD_NONBLOCK|zcall.EFD_CLOEXEC)
 	if errno != 0 {
 		return 0, errFromErrno(errno)
@@ -517,15 +560,85 @@ func (ur *ioUring) registerPoller(p poller) (int, error) {
 
 	_, errno = zcall.IoUringRegister(uintptr(ur.ringFd), IORING_REGISTER_EVENTFD_ASYNC, unsafe.Pointer(&efd), 1)
 	if errno != 0 {
+		zcall.Close(uintptr(efd))
 		return 0, errFromErrno(errno)
 	}
 
 	err := p.add(int(efd), EPOLLIN|EPOLLET)
 	if err != nil {
+		_, _ = zcall.IoUringRegister(uintptr(ur.ringFd), IORING_UNREGISTER_EVENTFD, nil, 0)
+		zcall.Close(uintptr(efd))
 		return 0, err
 	}
 
+	ur.pollerFd = int(efd)
 	return int(efd), nil
+}
+
+func (ur *ioUring) stop() error {
+	if ur.closed.Load() {
+		return nil
+	}
+
+	ur.lifecycleLock.Lock()
+	defer ur.lifecycleLock.Unlock()
+	if ur.closed.Load() {
+		return nil
+	}
+	ur.closed.Store(true)
+
+	ur.lockSubmitState()
+	defer ur.unlockSubmitState()
+	ur.clearAllKeepAlive()
+	return ur.cleanupCoreRingResources()
+}
+
+func (ur *ioUring) closeAfterFatalResize(remapErr error) error {
+	ur.clearAllKeepAlive()
+	err := ur.cleanupCoreRingResources()
+	ur.closed.Store(true)
+	return errors.Join(remapErr, err)
+}
+
+func (ur *ioUring) cleanupCoreRingResources() error {
+	var err error
+	if ur.pollerFd >= 0 {
+		errno := zcall.Close(uintptr(ur.pollerFd))
+		if errno != 0 {
+			err = errors.Join(err, fmt.Errorf("close eventfd %d: %w", ur.pollerFd, errFromErrno(errno)))
+		}
+		ur.pollerFd = -1
+	}
+
+	ur.bufs = nil
+	ur.files = nil
+	ur.ops = nil
+
+	ur.unmapRings()
+	if ur.ringFd >= 0 {
+		errno := zcall.Close(uintptr(ur.ringFd))
+		if errno != 0 {
+			err = errors.Join(err, fmt.Errorf("close ring fd %d: %w", ur.ringFd, errFromErrno(errno)))
+		}
+		ur.ringFd = -1
+	}
+
+	return err
+}
+
+func (ur *ioUring) clearRingViews() {
+	ur.sq = ioUringSq{}
+	ur.cq = ioUringCq{}
+}
+
+func (ur *ioUring) unmapRings() {
+	if ur.sq.sqesPtr != nil {
+		zcall.Munmap(ur.sq.sqesPtr, uintptr(len(ur.sq.sqes))*unsafe.Sizeof(ioUringSqe{}))
+	}
+	if ur.sq.ringPtr != nil {
+		zcall.Munmap(ur.sq.ringPtr, uintptr(ur.sq.ringSz))
+	}
+	ur.clearRingViews()
 }
 
 func (ur *ioUring) enable() error {
@@ -536,87 +649,97 @@ func (ur *ioUring) enable() error {
 	return nil
 }
 
-// Zero-allocation submission methods using packed SQEContext.
-// These methods avoid heap allocation by packing all context into the 64-bit user_data field.
-
-// submitPacked submits an SQE with packed context (zero-allocation).
-// The sqeCtx is stored directly in SQE.userData without any pointer indirection.
-func (ur *ioUring) submitPacked(sqeCtx SQEContext, fn func(e *ioUringSqe)) error {
-	ur.sl.Lock()
-
-	h, t := atomic.LoadUint32(ur.sq.kHead), atomic.LoadUint32(ur.sq.kTail)
-	if t-h >= *ur.sq.kRingEntries {
-		ur.sl.Unlock()
-		return iox.ErrWouldBlock
-	}
-
-	e := &ur.sq.sqes[t&*ur.sq.kRingMask]
-	fn(e)
-	e.userData = sqeCtx.Raw()
-
-	if ur.params.flags&IORING_SETUP_NO_SQARRAY == 0 {
-		ur.sq.array[t&*ur.sq.kRingMask] = t & *ur.sq.kRingMask
-	}
-
-	// Release barrier ensures SQE writes are visible to kernel before tail update
-	dwcas.BarrierRelease()
-	atomic.StoreUint32(ur.sq.kTail, t+1)
-
-	ur.sl.Unlock()
-	return nil
-}
-
 // submitPacked3 submits a 3-argument operation with packed context.
 func (ur *ioUring) submitPacked3(sqeCtx SQEContext, ioprio uint16, addr uint64, n int) error {
-	return ur.submitPacked(sqeCtx, func(e *ioUringSqe) {
-		e.opcode = sqeCtx.Op()
-		e.flags = sqeCtx.Flags()
-		e.ioprio = ioprio
-		e.fd = sqeCtx.FD()
-		e.addr = addr
-		e.len = uint32(n)
-	})
+	slot, err := ur.reserveSubmitSlot()
+	if err != nil {
+		return err
+	}
+	slot.fill3(sqeCtx, ioprio, addr, n)
+	ur.publishSubmitSlot(slot, sqeCtx)
+	return nil
 }
 
 // submitPacked6 submits a 6-argument operation with packed context.
 func (ur *ioUring) submitPacked6(sqeCtx SQEContext, ioprio uint16, off uint64, addr uint64, n int, uflags uint32) error {
-	return ur.submitPacked(sqeCtx, func(e *ioUringSqe) {
-		e.opcode = sqeCtx.Op()
-		e.flags = sqeCtx.Flags()
-		e.ioprio = ioprio
-		e.fd = sqeCtx.FD()
-		e.off = off
-		e.addr = addr
-		e.len = uint32(n)
-		e.uflags = uflags
-	})
+	slot, err := ur.reserveSubmitSlot()
+	if err != nil {
+		return err
+	}
+	slot.fill6(sqeCtx, ioprio, off, addr, n, uflags)
+	ur.publishSubmitSlot(slot, sqeCtx)
+	return nil
 }
 
 // submitPacked9 submits a 9-argument operation with packed context.
 func (ur *ioUring) submitPacked9(sqeCtx SQEContext, ioprio uint16, off uint64, addr uint64, n int, uflags uint32, personality uint16, spliceFdIn int32) error {
-	return ur.submitPacked(sqeCtx, func(e *ioUringSqe) {
-		e.opcode = sqeCtx.Op()
-		e.flags = sqeCtx.Flags()
-		e.ioprio = ioprio
-		e.fd = sqeCtx.FD()
-		e.off = off
-		e.addr = addr
-		e.len = uint32(n)
-		e.uflags = uflags
-		e.bufIndex = sqeCtx.BufGroup()
-		e.personality = personality
-		e.spliceFdIn = spliceFdIn
-	})
+	slot, err := ur.reserveSubmitSlot()
+	if err != nil {
+		return err
+	}
+	slot.fill9(sqeCtx, ioprio, off, addr, n, uflags, personality, spliceFdIn)
+	ur.publishSubmitSlot(slot, sqeCtx)
+	return nil
 }
 
-// submitExtended submits an SQE using Extended mode context.
-// Copies all fields from ExtSQE.SQE to the kernel SQE.
+func (slot submitSlot) fill3(sqeCtx SQEContext, ioprio uint16, addr uint64, n int) {
+	e := slot.sqe
+	e.opcode = sqeCtx.Op()
+	e.flags = sqeCtx.Flags()
+	e.ioprio = ioprio
+	e.fd = sqeCtx.FD()
+	e.off = 0
+	e.addr = addr
+	e.len = uint32(n)
+	e.uflags = 0
+	e.bufIndex = 0
+	e.personality = 0
+	e.spliceFdIn = 0
+	e.pad = [2]uint64{}
+}
+
+func (slot submitSlot) fill6(sqeCtx SQEContext, ioprio uint16, off uint64, addr uint64, n int, uflags uint32) {
+	e := slot.sqe
+	e.opcode = sqeCtx.Op()
+	e.flags = sqeCtx.Flags()
+	e.ioprio = ioprio
+	e.fd = sqeCtx.FD()
+	e.off = off
+	e.addr = addr
+	e.len = uint32(n)
+	e.uflags = uflags
+	e.bufIndex = 0
+	e.personality = 0
+	e.spliceFdIn = 0
+	e.pad = [2]uint64{}
+}
+
+func (slot submitSlot) fill9(sqeCtx SQEContext, ioprio uint16, off uint64, addr uint64, n int, uflags uint32, personality uint16, spliceFdIn int32) {
+	e := slot.sqe
+	e.opcode = sqeCtx.Op()
+	e.flags = sqeCtx.Flags()
+	e.ioprio = ioprio
+	e.fd = sqeCtx.FD()
+	e.off = off
+	e.addr = addr
+	e.len = uint32(n)
+	e.uflags = uflags
+	e.bufIndex = sqeCtx.BufGroup()
+	e.personality = personality
+	e.spliceFdIn = spliceFdIn
+	e.pad = [2]uint64{}
+}
+
+// submitExtended copies ExtSQE.SQE into the reserved kernel SQE.
 func (ur *ioUring) submitExtended(sqeCtx SQEContext) error {
 	ext := sqeCtx.ExtSQE()
-	return ur.submitPacked(sqeCtx, func(e *ioUringSqe) {
-		// Copy all SQE fields from the ExtSQE
-		*e = ext.SQE
-	})
+	slot, err := ur.reserveSubmitSlot()
+	if err != nil {
+		return err
+	}
+	*slot.sqe = ext.SQE
+	ur.publishSubmitSlot(slot, sqeCtx)
+	return nil
 }
 
 func (ur *ioUring) sqCount() int {
@@ -629,25 +752,37 @@ func (ur *ioUring) enter() error {
 	flags := atomic.LoadUint32(ur.sq.kFlags)
 	if flags&IORING_SQ_NEED_WAKEUP == IORING_SQ_NEED_WAKEUP {
 		_, err := ioUringEnter(ur.ringFd, uintptr(ur.params.sqEntries), 0, IORING_ENTER_SQ_WAKEUP)
-		// EALREADY means concurrent operation in progress - continue to check CQEs
+		// ErrExists means another enter is already in progress.
 		if err != nil && err != ErrExists {
 			return err
 		}
 	}
-	ur.sl.Lock()
-	// Use atomic loads to ensure visibility of submitPacked's atomic stores
+
+	ur.lockSubmitState()
+	err := ur.enterPending()
+	ur.unlockSubmitState()
+	return err
+}
+
+func (ur *ioUring) enterPending() error {
+	// Atomic loads pair with publishSubmitSlot's stores.
 	sqHead := atomic.LoadUint32(ur.sq.kHead)
 	sqTail := atomic.LoadUint32(ur.sq.kTail)
-	if (ur.params.flags&IORING_SETUP_SQPOLL == 0) && sqHead != sqTail {
+	if ur.params.flags&IORING_SETUP_SQPOLL == 0 {
 		n := sqTail - sqHead
-		_, err := ioUringEnter(ur.ringFd, uintptr(n), 0, IORING_ENTER_GETEVENTS)
-		// EALREADY means concurrent operation in progress - continue to check CQEs
-		if err != nil && err != ErrExists {
-			ur.sl.Unlock()
-			return err
+		// DEFER_TASKRUN and COOP_TASKRUN may still need a zero-submit enter after
+		// the kernel has already consumed the SQEs.
+		needTaskrunKick := n == 0 && ur.params.flags&(IORING_SETUP_DEFER_TASKRUN|IORING_SETUP_COOP_TASKRUN) != 0
+		if n != 0 || needTaskrunKick {
+			_, err := ioUringEnter(ur.ringFd, uintptr(n), 0, IORING_ENTER_GETEVENTS)
+			// ErrExists means another enter is already in progress.
+			if err != nil && err != ErrExists {
+				ur.releaseConsumedKeepAlive()
+				return err
+			}
 		}
 	}
-	ur.sl.Unlock()
+	ur.releaseConsumedKeepAlive()
 	return nil
 }
 
@@ -676,7 +811,7 @@ func (ur *ioUring) wait() (*ioUringCqe, error) {
 			break
 		}
 
-		// Acquire barrier ensures CQE data is visible after reading head/tail
+		// Acquire barrier makes CQE contents visible after reading head and tail.
 		dwcas.BarrierAcquire()
 
 		e := &ur.cq.cqes[h&*ur.cq.kRingMask]
@@ -690,9 +825,7 @@ func (ur *ioUring) wait() (*ioUringCqe, error) {
 	return nil, iox.ErrWouldBlock
 }
 
-// waitBatch retrieves multiple CQEs with a single atomic operation.
-// Returns the number of CQEs copied into the slice.
-// Uses batch-advance: claim range with CAS, then copy all, reducing atomic ops.
+// waitBatch claims and copies multiple CQEs with one CAS.
 func (ur *ioUring) waitBatch(cqes []CQEView) (int, error) {
 	if len(cqes) == 0 {
 		return 0, nil
@@ -1453,30 +1586,77 @@ func (ur *ioUring) cloneBuffers(clone *CloneBuffers) error {
 // Resize Rings Methods
 // ========================================
 
-// resizeRings resizes the SQ and CQ rings of an io_uring instance.
-// This allows dynamic adjustment of ring sizes without recreating the ring.
+// resizeRings asks the kernel to resize the SQ and CQ rings of an io_uring
+// instance without recreating it.
 //
 // Requirements:
-//   - The ring must be created with IORING_SETUP_DEFER_TASKRUN flag
+//   - The ring must not use SQPOLL mode
 //   - The ring must not be in CQ overflow condition
 //   - newSQSize and newCQSize must be power-of-two values
 //
-// The kernel will copy pending SQ and CQ entries during resize.
-// If newSQSize is 0, only the CQ ring is resized (CQ size defaults to 2×SQ).
+// The kernel copies pending SQ and CQ entries during resize. The request may
+// still fail with EINVAL on hosts that do not accept the requested resize.
+// If newSQSize is 0, the current SQ size is reused in the kernel request so
+// callers can resize only the CQ ring (and newCQSize still defaults to 2×SQ
+// when left at 0).
 // If newCQSize is 0, it defaults to 2×newSQSize.
+// A post-register remap failure is terminal: the ring is closed because the
+// kernel has already committed the resize and userspace can no longer trust the
+// stale mappings safely.
 func (ur *ioUring) resizeRings(newSQSize, newCQSize uint32) error {
+	ur.lockSubmitState()
+	defer ur.unlockSubmitState()
+	ur.releaseConsumedKeepAlive()
+
+	if newSQSize == 0 {
+		newSQSize = ur.params.sqEntries
+	}
 	params := ioUringParams{
 		sqEntries: newSQSize,
 		cqEntries: newCQSize,
-		flags:     IORING_SETUP_CLAMP, // Clamp to max allowable if too large
+		flags:     IORING_SETUP_CLAMP,
 	}
 	// If explicit CQ size provided, set the flag
 	if newCQSize > 0 {
 		params.flags |= IORING_SETUP_CQSIZE
 	}
+
+	oldTail := atomic.LoadUint32(ur.sq.kTail)
+	oldMask := uint32(0)
+	if ur.sq.kRingMask != nil {
+		oldMask = *ur.sq.kRingMask
+	}
+	oldKeepAliveHead := ur.submit.keepAliveHead
+	oldKeepAlive := ur.submit.keepAlive
+	oldRingPtr := ur.sq.ringPtr
+	oldSqRingSz := ur.sq.ringSz
+	oldSqesPtr := ur.sq.sqesPtr
+	oldSqeMapSz := uintptr(len(ur.sq.sqes)) * unsafe.Sizeof(ioUringSqe{})
+
 	_, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_REGISTER_RESIZE_RINGS, unsafe.Pointer(&params), 1)
 	if errno != 0 {
 		return errFromErrno(errno)
 	}
+
+	zcall.Munmap(oldSqesPtr, oldSqeMapSz)
+	zcall.Munmap(oldRingPtr, uintptr(oldSqRingSz))
+	ur.clearRingViews()
+	if err := ur.remapRings(&params); err != nil {
+		return ur.closeAfterFatalResize(fmt.Errorf("remap resized rings: %w", err))
+	}
+
+	if len(oldKeepAlive) != int(params.sqEntries) {
+		newKeepAlive := make([]submitKeepAlive, int(params.sqEntries))
+		newMask := params.sqEntries - 1
+		for idx := oldKeepAliveHead; idx != oldTail; idx++ {
+			newKeepAlive[idx&newMask] = oldKeepAlive[idx&oldMask]
+		}
+		ur.submit.keepAlive = newKeepAlive
+	}
+
+	ur.params.sqEntries = params.sqEntries
+	ur.params.cqEntries = params.cqEntries
+	ur.params.sqOff = params.sqOff
+	ur.params.cqOff = params.cqOff
 	return nil
 }

@@ -200,7 +200,7 @@ func (ur *Uring) newMultishotSubscription(
 	handler MultishotHandler,
 	init func(ext *ExtSQE),
 ) (*MultishotSubscription, error) {
-	ext := ur.ctxPools.GetExtended()
+	ext := ur.ctxPools.Extended()
 	if ext == nil {
 		return nil, iox.ErrWouldBlock
 	}
@@ -221,7 +221,7 @@ func (ur *Uring) newMultishotSubscription(
 
 	extCtx := PackExtended(ext)
 	sub.userData = extCtx.Raw()
-	if err := ur.submitExtended(extCtx); err != nil {
+	if err := ur.SubmitExtended(extCtx); err != nil {
 		sub.ext.Store(nil)
 		sub.markStopped()
 		ur.ctxPools.PutExtended(ext)

@@ -11,7 +11,7 @@ const (
 	GiB = 1 << 30
 )
 
-// Common machine memory sizes for UringOptionsForSystem.
+// Common machine memory sizes for OptionsForSystem.
 const (
 	MachineMemory512MB = 512 * MiB
 	MachineMemory1GB   = 1 * GiB
@@ -38,7 +38,7 @@ const (
 	systemMemoryRatio = 25 // 25% of system memory for io_uring
 )
 
-// UringOptionsForSystem returns UringOptions configured for a machine with the given total memory.
+// OptionsForSystem returns Options configured for a machine with the given total memory.
 //
 // This is the recommended entry point for configuring io_uring based on available system resources.
 // It automatically calculates a generous budget (25% of system memory) for high-performance I/O.
@@ -46,21 +46,21 @@ const (
 // Use the MachineMemory* constants for common configurations:
 //
 //	// 1GB machine (e.g., Linode Nanode, small CI runner)
-//	opts := UringOptionsForSystem(MachineMemory1GB)
-//	ring, err := NewUring(func(o *UringOptions) { *o = opts })
+//	opts := OptionsForSystem(MachineMemory1GB)
+//	ring, err := New(func(o *Options) { *o = opts })
 //
 //	// 4GB machine (e.g., medium VM)
-//	opts := UringOptionsForSystem(MachineMemory4GB)
+//	opts := OptionsForSystem(MachineMemory4GB)
 //
 // Or pass the actual system memory:
 //
-//	opts := UringOptionsForSystem(3840 * MiB)  // 3.75 GiB
-func UringOptionsForSystem(systemMemory int) UringOptions {
+//	opts := OptionsForSystem(3840 * MiB)  // 3.75 GiB
+func OptionsForSystem(systemMemory int) Options {
 	budget := systemMemory * systemMemoryRatio / 100
-	return UringOptionsForBudget(budget)
+	return OptionsForBudget(budget)
 }
 
-// UringOptionsForBudget returns UringOptions configured for the given memory budget.
+// OptionsForBudget returns Options configured for the given memory budget.
 //
 // Budget specifies the total memory in bytes to allocate for the io_uring instance.
 // Supports budgets from 16 MiB to 128 GiB (values outside this range are clamped).
@@ -73,12 +73,12 @@ func UringOptionsForSystem(systemMemory int) UringOptions {
 // Example:
 //
 //	// 256 MiB budget for a medium server
-//	opts := UringOptionsForBudget(256 * MiB)
-//	ring, err := NewUring(func(o *UringOptions) { *o = opts })
+//	opts := OptionsForBudget(256 * MiB)
+//	ring, err := New(func(o *Options) { *o = opts })
 //
 //	// 64 MiB budget for memory-constrained environment
-//	opts := UringOptionsForBudget(64 * MiB)
-func UringOptionsForBudget(budget int) UringOptions {
+//	opts := OptionsForBudget(64 * MiB)
+func OptionsForBudget(budget int) Options {
 	budget = clampBudget(budget)
 
 	entries := entriesForBudget(budget)
@@ -91,7 +91,7 @@ func UringOptionsForBudget(budget int) UringOptions {
 	cfg := bufferConfigForMem(bufferGroupMem)
 	scale := scaleForMem(bufferGroupMem, cfg)
 
-	return UringOptions{
+	return Options{
 		Entries:         entries,
 		LockedBufferMem: lockedMem,
 		MultiSizeBuffer: scale,
@@ -103,15 +103,15 @@ func UringOptionsForBudget(budget int) UringOptions {
 }
 
 // BufferConfigForBudget returns a BufferGroupsConfig and scale for the given memory budget.
-// Use this when you want fine-grained control over UringOptions while using
+// Use this when you want fine-grained control over Options while using
 // budget-based buffer configuration.
 //
-// Budget handling matches UringOptionsForBudget:
+// Budget handling matches OptionsForBudget:
 //   - registered buffers use 25% of the budget (minimum 8 MiB)
 //   - ring overhead is reserved from the same budget
 //   - buffer groups use the remaining memory
 //
-// The returned scale should be passed to UringOptions.MultiSizeBuffer.
+// The returned scale should be passed to Options.MultiSizeBuffer.
 //
 // Example:
 //
@@ -145,13 +145,13 @@ func entriesForBudget(budget int) int {
 	// Be generous with entries to maximize concurrent operations.
 	switch {
 	case budget < 32*MiB:
-		return UringEntriesSmall // 512 (~48 KB overhead)
+		return EntriesSmall // 512 (~48 KB overhead)
 	case budget < 256*MiB:
-		return UringEntriesMedium // 2048 (~192 KB overhead)
+		return EntriesMedium // 2048 (~192 KB overhead)
 	case budget < 1*GiB:
-		return UringEntriesLarge // 8192 (~768 KB overhead)
+		return EntriesLarge // 8192 (~768 KB overhead)
 	default:
-		return UringEntriesHuge // 32768 (~3 MB overhead)
+		return EntriesHuge // 32768 (~3 MB overhead)
 	}
 }
 

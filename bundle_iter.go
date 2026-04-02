@@ -24,8 +24,8 @@ const maxInt = int(^uint(0) >> 1)
 type BundleIterator struct {
 	bufBacking unsafe.Pointer // Base address of buffer backing memory
 	bufSize    int            // Size of each buffer
-	startID    uint16         // Starting buffer ID from CQE
 	count      int            // Number of buffers consumed
+	startID    uint16         // Starting buffer ID from CQE
 	gidOffset  uint16         // Group ID offset for Recycle
 	group      uint16         // Buffer group index for Recycle
 	ringMask   uint16         // Buffer ring mask (entries - 1) for wrap-around
@@ -36,7 +36,7 @@ type BundleIterator struct {
 // Handles ring wrap-around and partial last buffer.
 //
 //go:nosplit
-func (it *BundleIterator) bufAt(pos int) []byte {
+func (it BundleIterator) bufAt(pos int) []byte {
 	id := (it.startID + uint16(pos)) & it.ringMask
 	bufPtr := unsafe.Add(it.bufBacking, int(id)*it.bufSize)
 	size := it.bufSize
@@ -57,41 +57,41 @@ func (it *BundleIterator) bufAt(pos int) []byte {
 // bufBacking must remain alive for the iterator's lifetime and must cover at
 // least bufSize*ringEntries bytes.
 //
-// Returns nil if the CQE indicates no data was received or if the constructor
-// arguments are invalid.
-func NewBundleIterator(cqe CQEView, bufBacking []byte, bufSize int, ringEntries int) *BundleIterator {
+// Returns a zero BundleIterator and false if the CQE indicates no data was
+// received or if the constructor arguments are invalid.
+func NewBundleIterator(cqe CQEView, bufBacking []byte, bufSize int, ringEntries int) (BundleIterator, bool) {
 	if cqe.Res <= 0 || bufSize <= 0 || ringEntries <= 0 || ringEntries&(ringEntries-1) != 0 {
-		return nil
+		return BundleIterator{}, false
 	}
 	if ringEntries > maxInt/bufSize || len(bufBacking) < ringEntries*bufSize {
-		return nil
+		return BundleIterator{}, false
 	}
 	return newBundleIterator(cqe, unsafe.Pointer(unsafe.SliceData(bufBacking)), bufSize, uint16(ringEntries-1))
 }
 
-func newBundleIterator(cqe CQEView, bufBacking unsafe.Pointer, bufSize int, ringMask uint16) *BundleIterator {
+func newBundleIterator(cqe CQEView, bufBacking unsafe.Pointer, bufSize int, ringMask uint16) (BundleIterator, bool) {
 	startID, count := cqe.BundleBuffers(bufSize)
 	if count == 0 {
-		return nil
+		return BundleIterator{}, false
 	}
 
-	return &BundleIterator{
+	return BundleIterator{
 		bufBacking: bufBacking,
 		bufSize:    bufSize,
 		startID:    startID,
 		count:      count,
 		ringMask:   ringMask,
 		totalBytes: cqe.Res,
-	}
+	}, true
 }
 
 // Count returns the number of buffers consumed in this bundle.
-func (it *BundleIterator) Count() int {
+func (it BundleIterator) Count() int {
 	return it.count
 }
 
 // TotalBytes returns the total bytes received in this bundle.
-func (it *BundleIterator) TotalBytes() int {
+func (it BundleIterator) TotalBytes() int {
 	return int(it.totalBytes)
 }
 
@@ -103,7 +103,7 @@ func (it *BundleIterator) TotalBytes() int {
 //	for buf := range iter.All() {
 //	    process(buf)
 //	}
-func (it *BundleIterator) All() iter.Seq[[]byte] {
+func (it BundleIterator) All() iter.Seq[[]byte] {
 	return func(yield func([]byte) bool) {
 		for pos := range it.count {
 			if !yield(it.bufAt(pos)) {
@@ -122,7 +122,7 @@ func (it *BundleIterator) All() iter.Seq[[]byte] {
 //	for id, buf := range iter.AllWithSlotID() {
 //	    fmt.Printf("Slot ID %d: %d bytes\n", id, len(buf))
 //	}
-func (it *BundleIterator) AllWithSlotID() iter.Seq2[uint16, []byte] {
+func (it BundleIterator) AllWithSlotID() iter.Seq2[uint16, []byte] {
 	return func(yield func(uint16, []byte) bool) {
 		for pos := range it.count {
 			if !yield(it.SlotID(pos), it.bufAt(pos)) {
@@ -137,14 +137,14 @@ func (it *BundleIterator) AllWithSlotID() iter.Seq2[uint16, []byte] {
 // Index must be in range [0, Count()).
 //
 //go:nosplit
-func (it *BundleIterator) SlotID(index int) uint16 {
+func (it BundleIterator) SlotID(index int) uint16 {
 	return (it.startID + uint16(index)) & it.ringMask
 }
 
 // Buffer returns the buffer at the given index without advancing the iterator.
 // Index must be in range [0, Count()).
 // The last buffer may be partial.
-func (it *BundleIterator) Buffer(index int) []byte {
+func (it BundleIterator) Buffer(index int) []byte {
 	if index < 0 || index >= it.count {
 		return nil
 	}
@@ -153,7 +153,7 @@ func (it *BundleIterator) Buffer(index int) []byte {
 
 // Collect returns all buffers as a slice.
 // This allocates a new slice; for zero-allocation iteration, use All().
-func (it *BundleIterator) Collect() [][]byte {
+func (it BundleIterator) Collect() [][]byte {
 	result := make([][]byte, 0, it.count)
 	for buf := range it.All() {
 		result = append(result, buf)
@@ -163,7 +163,7 @@ func (it *BundleIterator) Collect() [][]byte {
 
 // CopyTo copies all bundle data to the destination slice.
 // Returns the number of bytes copied.
-func (it *BundleIterator) CopyTo(dst []byte) int {
+func (it BundleIterator) CopyTo(dst []byte) int {
 	copied := 0
 	for buf := range it.All() {
 		n := copy(dst[copied:], buf)
@@ -184,7 +184,7 @@ func (it *BundleIterator) CopyTo(dst []byte) int {
 // ring provide/advance.
 //
 // The group info (gidOffset, group) is captured at construction time.
-func (it *BundleIterator) Recycle(ur *Uring) {
+func (it BundleIterator) Recycle(ur *Uring) {
 	for pos := range it.count {
 		id := it.SlotID(pos)
 		bufPtr := unsafe.Add(it.bufBacking, int(id)*it.bufSize)

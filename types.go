@@ -161,9 +161,9 @@ const (
 	EPOLLET  = 0x80000000
 )
 
-// Statx_t represents the statx structure.
+// Statx represents the statx structure.
 // Layout matches struct statx in Linux.
-type Statx_t struct {
+type Statx struct {
 	Mask             uint32
 	Blksize          uint32
 	Attributes       uint64

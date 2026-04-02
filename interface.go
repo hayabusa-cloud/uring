@@ -11,29 +11,31 @@ package uring
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"time"
 	"unsafe"
 
 	"code.hybscloud.com/iofd"
+	"code.hybscloud.com/zcall"
 )
 
 // Uring entry count constants define submission queue sizes.
 // The values scale by powers of four: 8, 32, 128, 512, 2048, 8192, and 32768.
 const (
-	UringEntriesPico   = 1 << 3  // 8 entries
-	UringEntriesNano   = 1 << 5  // 32 entries
-	UringEntriesMicro  = 1 << 7  // 128 entries
-	UringEntriesSmall  = 1 << 9  // 512 entries
-	UringEntriesMedium = 1 << 11 // 2048 entries
-	UringEntriesLarge  = 1 << 13 // 8192 entries
-	UringEntriesHuge   = 1 << 15 // 32768 entries
+	EntriesPico   = 1 << 3  // 8 entries
+	EntriesNano   = 1 << 5  // 32 entries
+	EntriesMicro  = 1 << 7  // 128 entries
+	EntriesSmall  = 1 << 9  // 512 entries
+	EntriesMedium = 1 << 11 // 2048 entries
+	EntriesLarge  = 1 << 13 // 8192 entries
+	EntriesHuge   = 1 << 15 // 32768 entries
 )
 
-// UringOptions configures the io_uring instance behavior.
+// Options configures the io_uring instance behavior.
 // All fields have sensible defaults if not specified.
-type UringOptions struct {
-	// Entries specifies the number of SQE slots (use UringEntries* constants).
+type Options struct {
+	// Entries specifies the number of SQE slots (use Entries* constants).
 	Entries int
 	// LockedBufferMem is the total memory for registered buffers (bytes).
 	LockedBufferMem int
@@ -49,11 +51,16 @@ type UringOptions struct {
 	WriteBufferNum int
 	// MultiSizeBuffer enables multiple buffer size groups when > 0.
 	MultiSizeBuffer int
-	// MultiIssuers enables COOP_TASKRUN mode for concurrent submission.
+	// MultiIssuers enables the shared-submit configuration for rings that accept
+	// submissions from multiple goroutines. When false, New requests
+	// SINGLE_ISSUER + DEFER_TASKRUN and callers must serialize submit-state
+	// operations such as submit, Wait/enter, Stop, and ring resize. When true,
+	// it requests COOP_TASKRUN and keeps the shared-submit synchronization path.
 	MultiIssuers bool
 	// NotifySucceed ensures CQEs are generated for all successful operations.
 	NotifySucceed bool
-	// IndirectSubmissionQueue enables the SQ array (for legacy compatibility).
+	// IndirectSubmissionQueue enables the SQ array. When false, New requests
+	// IORING_SETUP_NO_SQARRAY to reduce ring memory in the direct-index submit path.
 	IndirectSubmissionQueue bool
 	// HybridPolling enables hybrid I/O polling mode (IORING_SETUP_HYBRID_IOPOLL).
 	// This delays polling to reduce CPU usage while maintaining low latency.
@@ -62,10 +69,10 @@ type UringOptions struct {
 	HybridPolling bool
 }
 
-// NewUring creates a new io_uring instance with the specified options.
+// New creates a new io_uring instance with the specified options.
 // Returns an unstarted ring; call Start() to initialize buffers and enable.
-func NewUring(options ...func(options *UringOptions)) (*Uring, error) {
-	opt := defaultUringOptions
+func New(options ...func(options *Options)) (*Uring, error) {
+	opt := defaultOptions
 	for _, option := range options {
 		option(&opt)
 	}
@@ -96,7 +103,7 @@ func NewUring(options ...func(options *UringOptions)) (*Uring, error) {
 	}
 	ret := Uring{
 		ioUring:          r,
-		UringOptions:     &opt,
+		Options:          &opt,
 		bufferRings:      newUringBufferRings(),
 		ctxPools:         NewContextPools(opt.Entries),
 		readLikeOpFlags:  rFlags,
@@ -110,7 +117,7 @@ func NewUring(options ...func(options *UringOptions)) (*Uring, error) {
 		ret.buffers = newUringProvideBuffers(opt.ReadBufferSize, opt.ReadBufferNum)
 		ret.buffers.setGIDOffset(opt.ReadBufferGidOffset)
 	}
-	feat := UringFeatures{
+	feat := Features{
 		SQEntries:         int(r.params.sqEntries),
 		CQEntries:         int(r.params.cqEntries),
 		UserdataByteOrder: binary.LittleEndian,
@@ -123,8 +130,8 @@ func NewUring(options ...func(options *UringOptions)) (*Uring, error) {
 	return &ret, nil
 }
 
-// UringFeatures reports per-ring sizing and metadata returned at creation time.
-type UringFeatures struct {
+// Features reports per-ring sizing and metadata returned at creation time.
+type Features struct {
 	// SQEntries is the actual number of SQ entries allocated by the kernel.
 	SQEntries int
 	// CQEntries is the actual number of CQ entries allocated by the kernel.
@@ -137,13 +144,16 @@ type UringFeatures struct {
 // It wraps the kernel io_uring instance with buffer management and typed operations.
 type Uring struct {
 	*ioUring
-	*UringOptions
+	*Options
 	// Features reports actual ring sizing and userdata metadata.
-	Features *UringFeatures
+	Features *Features
 
 	buffers      *uringProvideBuffers
 	bufferGroups *uringProvideBufferGroups
 	bufferRings  *uringBufferRings
+	// registeredBufRings keeps explicit RegisterBufRing* registrations reachable
+	// so Stop can unregister them and release any extra mappings.
+	registeredBufRings []registeredBufRing
 
 	buffersPool *RegisterBufferPool
 
@@ -151,18 +161,32 @@ type Uring struct {
 	// Capacity matches SQ entries for natural backpressure.
 	ctxPools *ContextPools
 
-	// bufRingBackings stores backing memory for buffer rings to prevent GC.
-	bufRingBackings [][]byte
-
 	readLikeOpFlags  uint8
 	writeLikeOpFlags uint8
 }
 
+type registeredBufRing struct {
+	groupID  uint16
+	backing  []byte
+	mmapPtr  unsafe.Pointer
+	mmapSize uintptr
+}
+
 // Start initializes the io_uring instance with buffers and enables the ring.
-// Context pools are constructed eagerly by NewUring and are intentionally not
+// Context pools are constructed eagerly by New and are intentionally not
 // reset here so any SQEs borrowed before Start remain valid.
-func (ur *Uring) Start() error {
-	var err error
+func (ur *Uring) Start() (err error) {
+	if ur.closed.Load() {
+		return ErrClosed
+	}
+	if !ur.started.CompareAndSwap(false, true) {
+		return ErrExists
+	}
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, ur.Stop())
+		}
+	}()
 
 	// Register probes as dormant placeholder infrastructure for future
 	// post-baseline capability branches. Current Linux 6.18+ startup does not
@@ -214,8 +238,55 @@ func (ur *Uring) Start() error {
 	return nil
 }
 
-// Wait flushes pending submissions and collects completion events into CQEView slice.
-// Returns the number of events received, or `iox.ErrWouldBlock` if the CQ is empty.
+// Stop tears down ring-owned resources and makes the ring permanently unusable.
+// It is idempotent, but callers must not race Stop against active submit/reap work.
+func (ur *Uring) Stop() error {
+	var err error
+	if stopErr := ur.ioUring.stop(); stopErr != nil {
+		err = errors.Join(err, fmt.Errorf("release ring core: %w", stopErr))
+	}
+	if stopErr := ur.releaseRegisteredBufRings(); stopErr != nil {
+		err = errors.Join(err, fmt.Errorf("release manual buf rings: %w", stopErr))
+	}
+	if ur.bufferRings != nil {
+		if stopErr := ur.bufferRings.release(ur.ioUring); stopErr != nil {
+			err = errors.Join(err, fmt.Errorf("release provided buf rings: %w", stopErr))
+		}
+	}
+
+	ur.buffersPool = nil
+	ur.buffers = nil
+	ur.bufferGroups = nil
+	return err
+}
+
+func (ur *Uring) trackRegisteredBufRing(groupID uint16, backing []byte, mmapPtr unsafe.Pointer, mmapSize uintptr) {
+	ur.registeredBufRings = append(ur.registeredBufRings, registeredBufRing{
+		groupID:  groupID,
+		backing:  backing,
+		mmapPtr:  mmapPtr,
+		mmapSize: mmapSize,
+	})
+}
+
+func (ur *Uring) releaseRegisteredBufRings() error {
+	var err error
+	for i := len(ur.registeredBufRings) - 1; i >= 0; i-- {
+		reg := ur.registeredBufRings[i]
+		if reg.mmapPtr != nil && reg.mmapSize != 0 {
+			errno := zcall.Munmap(reg.mmapPtr, reg.mmapSize)
+			if errno != 0 {
+				err = errors.Join(err, fmt.Errorf("munmap manual buf ring gid %d: %w", reg.groupID, errFromErrno(errno)))
+			}
+		}
+	}
+	ur.registeredBufRings = nil
+	return err
+}
+
+// Wait flushes pending submissions, drives deferred task work when needed, and
+// collects completion events into cqes. It returns the number of events
+// received, or `iox.ErrWouldBlock` if the CQ is empty.
 //
 // CQEView provides direct field access to Res and Flags, and methods to access
 // the submission context based on mode (Direct, Indirect, Extended).
@@ -246,19 +317,19 @@ func (ur *Uring) Wait(cqes []CQEView) (n int, err error) {
 // Context Pool Accessors
 // ========================================
 
-// GetExtSQE acquires an ExtSQE from the pool for Extended mode submissions.
+// ExtSQE acquires an ExtSQE from the pool for Extended mode submissions.
 // Returns nil if the pool is exhausted (ring is full - natural backpressure).
 // The returned ExtSQE is borrowed until PutExtSQE after the corresponding CQE
 // is processed. Callers must not retain pointers into SQE or UserData after
 // release.
 //
 //go:nosplit
-func (ur *Uring) GetExtSQE() *ExtSQE {
-	return ur.ctxPools.GetExtended()
+func (ur *Uring) ExtSQE() *ExtSQE {
+	return ur.ctxPools.Extended()
 }
 
 // PutExtSQE returns an ExtSQE to the pool after completion processing.
-// Must be called exactly once per GetExtSQE to maintain pool balance.
+// Must be called exactly once per ExtSQE to maintain pool balance.
 // After this call the ExtSQE, typed context views, and raw CastUserData
 // overlays derived from it are invalid.
 //
@@ -267,13 +338,13 @@ func (ur *Uring) PutExtSQE(sqe *ExtSQE) {
 	ur.ctxPools.PutExtended(sqe)
 }
 
-// GetIndirectSQE acquires an IndirectSQE from the pool for Indirect mode submissions.
+// IndirectSQE acquires an IndirectSQE from the pool for Indirect mode submissions.
 // Returns nil if the pool is exhausted.
 // The returned IndirectSQE is borrowed until PutIndirectSQE.
 //
 //go:nosplit
-func (ur *Uring) GetIndirectSQE() *IndirectSQE {
-	return ur.ctxPools.GetIndirect()
+func (ur *Uring) IndirectSQE() *IndirectSQE {
+	return ur.ctxPools.Indirect()
 }
 
 // PutIndirectSQE returns an IndirectSQE to the pool.
@@ -524,8 +595,10 @@ func (ur *Uring) Connect(sqeCtx SQEContext, remote Addr, options ...OpOptionFunc
 	return ur.connect(ctx, AddrToSockaddr(remote))
 }
 
-// Receive performs a socket receive operation.
-// If b is nil, uses buffer selection from the kernel-provided buffer ring.
+// Receive performs a socket receive operation with MSG_WAITALL semantics.
+// If b is nil, it uses buffer selection from the kernel-provided buffer ring.
+// If b is non-nil, the buffer must remain valid and unmodified until the
+// corresponding CQE is observed.
 func (ur *Uring) Receive(sqeCtx SQEContext, so PollFd, b []byte, options ...OpOptionFunc) error {
 	ctx := sqeCtx.WithFD(iofd.FD(so.Fd()))
 	if b == nil {
@@ -574,12 +647,12 @@ func (ur *Uring) ReceiveBundleMultiShot(sqeCtx SQEContext, so PollFd, options ..
 
 // BundleIterator constructs a BundleIterator for the given CQE and buffer group.
 // The group parameter is the group ID as used during buffer ring registration.
-// Returns nil if the group is not registered or the CQE has no data.
+// Returns a zero BundleIterator and false if the group is not registered or the CQE has no data.
 //
 // The returned iterator borrows ring-owned backing memory. Process the buffers
 // before calling Recycle, and call Recycle from a single goroutine without
 // racing other buffer-ring recycle/advance activity on the same Uring.
-func (ur *Uring) BundleIterator(cqe CQEView, group uint16) *BundleIterator {
+func (ur *Uring) BundleIterator(cqe CQEView, group uint16) (BundleIterator, bool) {
 	return ur.bufferRings.bundleIterator(cqe, int(group)-ur.ReadBufferGidOffset, uint16(ur.ReadBufferGidOffset), group)
 }
 
@@ -1056,7 +1129,8 @@ func (ur *Uring) ReceiveZeroCopy(sqeCtx SQEContext, so PollFd, n int, zcrxIfqIdx
 }
 
 // EpollWait performs an epoll_wait operation via io_uring.
-// This integrates epoll monitoring into the io_uring event loop.
+// The opcode does not accept an inline timeout; timeout must be 0 and callers
+// should use LinkTimeout when they need a deadline.
 func (ur *Uring) EpollWait(sqeCtx SQEContext, events []EpollEvent, timeout int32, options ...OpOptionFunc) error {
 	if len(events) == 0 {
 		return ErrInvalidParam
@@ -1135,32 +1209,39 @@ func (ur *Uring) ZCRXFlushRQ(zcrxID uint32) error {
 // The kernel allocates the ring memory and the application uses mmap to access it.
 // Returns the buffer ring for adding buffers.
 func (ur *Uring) RegisterBufRingMMAP(entries int, groupID uint16) (*ioUringBufRing, error) {
-	r, backing, err := ur.registerBufRingWithFlags(entries, groupID, IOU_PBUF_RING_MMAP)
-	if backing != nil {
-		ur.bufRingBackings = append(ur.bufRingBackings, backing)
+	r, backing, mmapSize, err := ur.registerBufRingWithFlags(entries, groupID, IOU_PBUF_RING_MMAP)
+	if err != nil {
+		return nil, err
 	}
-	return r, err
+	ur.trackRegisteredBufRing(groupID, backing, unsafe.Pointer(r), mmapSize)
+	return r, nil
 }
 
 // RegisterBufRingIncremental registers a buffer ring in incremental consumption mode.
 // In this mode, buffers can be partially consumed across multiple completions.
 // The CQE will have IORING_CQE_F_BUF_MORE set if more data remains.
 func (ur *Uring) RegisterBufRingIncremental(entries int, groupID uint16) (*ioUringBufRing, error) {
-	r, backing, err := ur.registerBufRingWithFlags(entries, groupID, IOU_PBUF_RING_INC)
-	if backing != nil {
-		ur.bufRingBackings = append(ur.bufRingBackings, backing)
+	r, backing, mmapSize, err := ur.registerBufRingWithFlags(entries, groupID, IOU_PBUF_RING_INC)
+	if err != nil {
+		return nil, err
 	}
-	return r, err
+	ur.trackRegisteredBufRing(groupID, backing, nil, mmapSize)
+	return r, nil
 }
 
 // RegisterBufRingWithFlags registers a buffer ring with specified flags.
 // Flags can be combined: IOU_PBUF_RING_MMAP | IOU_PBUF_RING_INC
 func (ur *Uring) RegisterBufRingWithFlags(entries int, groupID uint16, flags uint16) (*ioUringBufRing, error) {
-	r, backing, err := ur.registerBufRingWithFlags(entries, groupID, flags)
-	if backing != nil {
-		ur.bufRingBackings = append(ur.bufRingBackings, backing)
+	r, backing, mmapSize, err := ur.registerBufRingWithFlags(entries, groupID, flags)
+	if err != nil {
+		return nil, err
 	}
-	return r, err
+	var mmapPtr unsafe.Pointer
+	if mmapSize != 0 {
+		mmapPtr = unsafe.Pointer(r)
+	}
+	ur.trackRegisteredBufRing(groupID, backing, mmapPtr, mmapSize)
+	return r, nil
 }
 
 // ========================================
@@ -1366,12 +1447,17 @@ func (ur *Uring) CloneBuffersFromRegistered(srcRegisteredIdx int, srcOff, dstOff
 //   - Sizes must be power-of-two values
 //
 // Parameters:
-//   - newSQSize: New SQ ring size (0 to keep current)
+//   - newSQSize: New SQ ring size (0 keeps the current SQ size)
 //   - newCQSize: New CQ ring size (0 defaults to 2×newSQSize)
 //
 // Supported on Linux 6.18+.
 func (ur *Uring) ResizeRings(newSQSize, newCQSize uint32) error {
-	return ur.resizeRings(newSQSize, newCQSize)
+	if err := ur.resizeRings(newSQSize, newCQSize); err != nil {
+		return err
+	}
+	ur.Features.SQEntries = int(ur.params.sqEntries)
+	ur.Features.CQEntries = int(ur.params.cqEntries)
+	return nil
 }
 
 // ========================================
@@ -1431,7 +1517,7 @@ func (ur *Uring) GetXattr(sqeCtx SQEContext, path, name string, value []byte, op
 // ========================================
 
 // Statx gets file status with extended information.
-func (ur *Uring) Statx(sqeCtx SQEContext, path string, flags, mask int, stat *Statx_t, options ...OpOptionFunc) error {
+func (ur *Uring) Statx(sqeCtx SQEContext, path string, flags, mask int, stat *Statx, options ...OpOptionFunc) error {
 	opFlags := ur.statxOptions(options)
 	return ur.ioUring.statx(sqeCtx.WithFlags(opFlags), path, flags, mask, stat)
 }
