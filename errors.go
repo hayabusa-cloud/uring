@@ -45,8 +45,14 @@ var (
 	// ErrBusy indicates the resource is busy.
 	ErrBusy = errors.New("uring: resource busy")
 
+	// ErrClosed indicates the ring has already been stopped.
+	ErrClosed = errors.New("uring: ring closed")
+
 	// ErrExists indicates the resource already exists.
 	ErrExists = errors.New("uring: already exists")
+
+	// ErrNameTooLong indicates a pathname exceeds the kernel limit.
+	ErrNameTooLong = errors.New("uring: name too long")
 
 	// ErrNotFound indicates the resource was not found.
 	ErrNotFound = errors.New("uring: not found")
@@ -96,6 +102,7 @@ const (
 	EFAULT          = uintptr(zcall.EFAULT)
 	EBUSY           = uintptr(zcall.EBUSY)
 	EEXIST          = uintptr(zcall.EEXIST)
+	ENAMETOOLONG    = uintptr(zcall.ENAMETOOLONG)
 	ENODEV          = uintptr(zcall.ENODEV)
 	EINVAL          = uintptr(zcall.EINVAL)
 	EPIPE           = uintptr(zcall.EPIPE)
@@ -164,6 +171,8 @@ func errFromErrno(errno uintptr) error {
 		return ErrBusy
 	case EEXIST, EALREADY:
 		return ErrExists
+	case ENAMETOOLONG:
+		return ErrNameTooLong
 	case ECANCELED:
 		return ErrCanceled
 	case ETIMEDOUT:

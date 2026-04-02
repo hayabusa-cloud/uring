@@ -160,20 +160,9 @@ func newUringProvideBuffers(size, n int) *uringProvideBuffers {
 	if n < 2 || n > (1<<28) {
 		panic("n must be between 2 and 268435456")
 	}
-	size--
-	size |= size >> 1
-	size |= size >> 2
-	size |= size >> 4
-	size |= size >> 8
-	size |= size >> 16
-	size++
+	size = roundToPowerOf2(size)
+	n = roundToPowerOf2(n)
 	mask := n - 1
-	mask |= mask >> 1
-	mask |= mask >> 2
-	mask |= mask >> 4
-	mask |= mask >> 8
-	mask |= mask >> 16
-	n = mask + 1
 	mask |= math.MaxInt16
 	gn := 1
 	if n > (1 << 15) {
@@ -255,12 +244,45 @@ func newUringBufferGroupsWithConfig(scale int, cfg BufferGroupsConfig) *uringPro
 	if scale < 1 || scale > (1<<12) {
 		panic("scale must be between 1 and 4096")
 	}
+	scale = roundToPowerOf2(scale)
 	mask := scale - 1
-	mask |= mask >> 1
-	mask |= mask >> 2
-	mask |= mask >> 4
-	mask |= mask >> 8
-	scale = mask + 1
+
+	if cfg.PicoNum > 0 {
+		cfg.PicoNum = roundToPowerOf2(cfg.PicoNum)
+	}
+	if cfg.NanoNum > 0 {
+		cfg.NanoNum = roundToPowerOf2(cfg.NanoNum)
+	}
+	if cfg.MicroNum > 0 {
+		cfg.MicroNum = roundToPowerOf2(cfg.MicroNum)
+	}
+	if cfg.SmallNum > 0 {
+		cfg.SmallNum = roundToPowerOf2(cfg.SmallNum)
+	}
+	if cfg.MediumNum > 0 {
+		cfg.MediumNum = roundToPowerOf2(cfg.MediumNum)
+	}
+	if cfg.BigNum > 0 {
+		cfg.BigNum = roundToPowerOf2(cfg.BigNum)
+	}
+	if cfg.LargeNum > 0 {
+		cfg.LargeNum = roundToPowerOf2(cfg.LargeNum)
+	}
+	if cfg.GreatNum > 0 {
+		cfg.GreatNum = roundToPowerOf2(cfg.GreatNum)
+	}
+	if cfg.HugeNum > 0 {
+		cfg.HugeNum = roundToPowerOf2(cfg.HugeNum)
+	}
+	if cfg.VastNum > 0 {
+		cfg.VastNum = roundToPowerOf2(cfg.VastNum)
+	}
+	if cfg.GiantNum > 0 {
+		cfg.GiantNum = roundToPowerOf2(cfg.GiantNum)
+	}
+	if cfg.TitanNum > 0 {
+		cfg.TitanNum = roundToPowerOf2(cfg.TitanNum)
+	}
 
 	g := &uringProvideBufferGroups{
 		scale:     scale,

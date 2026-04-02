@@ -30,7 +30,9 @@ var (
 	ErrNoDevice           = errors.New("uring: no such device")
 	ErrNotSupported       = errors.New("uring: operation not supported")
 	ErrBusy               = errors.New("uring: resource busy")
+	ErrClosed             = errors.New("uring: ring closed")
 	ErrExists             = errors.New("uring: already exists")
+	ErrNameTooLong        = errors.New("uring: name too long")
 	ErrNotFound           = errors.New("uring: not found")
 	ErrCanceled           = errors.New("uring: operation canceled")
 	ErrTimedOut           = errors.New("uring: operation timed out")
@@ -83,6 +85,7 @@ const (
 	EFAULT          = 14
 	EBUSY           = 16
 	EEXIST          = 17
+	ENAMETOOLONG    = 63
 	EMFILE          = 24
 	ENFILE          = 23
 	ENOSYS          = 78
@@ -122,6 +125,8 @@ func errFromErrno(errno uintptr) error {
 		return ErrBusy
 	case EEXIST, EALREADY:
 		return ErrExists
+	case ENAMETOOLONG:
+		return ErrNameTooLong
 	case ECANCELED:
 		return ErrCanceled
 	case ETIMEDOUT:
