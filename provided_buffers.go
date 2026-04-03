@@ -13,146 +13,6 @@ import (
 	"code.hybscloud.com/iobuf"
 )
 
-// bufferGroupIndex identifies a tier in the 12-tier buffer system.
-type bufferGroupIndex uint16
-
-// Buffer group tier indices.
-//
-// The 12-tier buffer system uses a power-of-4 size progression:
-//
-//	Tier    Name    Size        Use Case
-//	0       Pico    32 B        Tiny metadata, headers
-//	1       Nano    128 B       Small protocol frames
-//	2       Micro   512 B       Standard protocol messages
-//	3       Small   2 KiB       Typical HTTP requests
-//	4       Medium  8 KiB       Page-sized operations
-//	5       Big     32 KiB      Large messages
-//	6       Large   128 KiB     Bulk transfers
-//	7       Great   512 KiB     Large file chunks
-//	8       Huge    2 MiB       Very large buffers
-//	9       Vast    8 MiB       Streaming media
-//	10      Giant   32 MiB      Maximum standard
-//	11      Titan   128 MiB     Extreme cases
-const (
-	bufferGroupIndexPico = iota
-	bufferGroupIndexNano
-	bufferGroupIndexMicro
-	bufferGroupIndexSmall
-	bufferGroupIndexMedium
-	bufferGroupIndexBig
-	bufferGroupIndexLarge
-	bufferGroupIndexGreat
-	bufferGroupIndexHuge
-	bufferGroupIndexVast
-	bufferGroupIndexGiant
-	bufferGroupIndexTitan
-	bufferGroupIndexEnd
-)
-
-// Default buffer counts per tier.
-// Smaller buffers have more instances to handle high-frequency small I/O.
-// Larger buffers have fewer instances due to memory constraints.
-const (
-	DefaultBufferNumPico   = 1 << 15 // 32768 × 32 B = 1 MiB
-	DefaultBufferNumNano   = 1 << 14 // 16384 × 128 B = 2 MiB
-	DefaultBufferNumMicro  = 1 << 13 // 8192 × 512 B = 4 MiB
-	DefaultBufferNumSmall  = 1 << 12 // 4096 × 2 KiB = 8 MiB
-	DefaultBufferNumMedium = 1 << 11 // 2048 × 8 KiB = 16 MiB
-	DefaultBufferNumBig    = 1 << 10 // 1024 × 32 KiB = 32 MiB
-	DefaultBufferNumLarge  = 1 << 9  // 512 × 128 KiB = 64 MiB
-	DefaultBufferNumGreat  = 1 << 8  // 256 × 512 KiB = 128 MiB
-	DefaultBufferNumHuge   = 1 << 7  // 128 × 2 MiB = 256 MiB
-	DefaultBufferNumVast   = 1 << 6  // 64 × 8 MiB = 512 MiB
-	DefaultBufferNumGiant  = 1 << 5  // 32 × 32 MiB = 1 GiB
-	DefaultBufferNumTitan  = 1 << 4  // 16 × 128 MiB = 2 GiB
-)
-
-// BufferGroupsConfig configures buffer counts for each tier.
-//
-// Each field specifies the number of buffers to allocate for that tier.
-// A zero count disables the tier (no memory allocated).
-//
-// Memory usage calculation:
-//
-//	Total = Sum(TierSize × TierCount × Scale)
-//
-// Example with default config (Scale=1):
-//
-//	Pico:   32768 × 32 B   = 1 MiB
-//	Nano:   16384 × 128 B  = 2 MiB
-//	Micro:  8192 × 512 B   = 4 MiB
-//	Small:  4096 × 2 KiB   = 8 MiB
-//	Medium: 2048 × 8 KiB   = 16 MiB
-//	Big:    1024 × 32 KiB  = 32 MiB
-//	Large:  512 × 128 KiB  = 64 MiB
-//	                Total  ≈ 127 MiB per scale
-type BufferGroupsConfig struct {
-	PicoNum   int // 32 B buffers
-	NanoNum   int // 128 B buffers
-	MicroNum  int // 512 B buffers
-	SmallNum  int // 2 KiB buffers
-	MediumNum int // 8 KiB buffers
-	BigNum    int // 32 KiB buffers
-	LargeNum  int // 128 KiB buffers
-	GreatNum  int // 512 KiB buffers
-	HugeNum   int // 2 MiB buffers
-	VastNum   int // 8 MiB buffers
-	GiantNum  int // 32 MiB buffers
-	TitanNum  int // 128 MiB buffers
-}
-
-// DefaultBufferGroupsConfig returns the default configuration.
-// Enables first 8 tiers (Pico through Great), totaling ~256 MiB per scale.
-// Suitable for servers with 512MB+ memory.
-func DefaultBufferGroupsConfig() BufferGroupsConfig {
-	return BufferGroupsConfig{
-		PicoNum:   DefaultBufferNumPico,
-		NanoNum:   DefaultBufferNumNano,
-		MicroNum:  DefaultBufferNumMicro,
-		SmallNum:  DefaultBufferNumSmall,
-		MediumNum: DefaultBufferNumMedium,
-		BigNum:    DefaultBufferNumBig,
-		LargeNum:  DefaultBufferNumLarge,
-		GreatNum:  0, // Disabled by default
-		HugeNum:   0, // Disabled by default
-		VastNum:   0, // Disabled by default
-		GiantNum:  0, // Disabled by default
-		TitanNum:  0, // Disabled by default
-	}
-}
-
-// FullBufferGroupsConfig returns configuration with all 12 tiers enabled.
-// Requires ~4 GiB per scale. Use for high-memory servers.
-func FullBufferGroupsConfig() BufferGroupsConfig {
-	return BufferGroupsConfig{
-		PicoNum:   DefaultBufferNumPico,
-		NanoNum:   DefaultBufferNumNano,
-		MicroNum:  DefaultBufferNumMicro,
-		SmallNum:  DefaultBufferNumSmall,
-		MediumNum: DefaultBufferNumMedium,
-		BigNum:    DefaultBufferNumBig,
-		LargeNum:  DefaultBufferNumLarge,
-		GreatNum:  DefaultBufferNumGreat,
-		HugeNum:   DefaultBufferNumHuge,
-		VastNum:   DefaultBufferNumVast,
-		GiantNum:  DefaultBufferNumGiant,
-		TitanNum:  DefaultBufferNumTitan,
-	}
-}
-
-// MinimalBufferGroupsConfig returns a reduced configuration (~32 MiB per scale).
-// Enables first 6 tiers (Pico through Big), totaling ~32 MiB per scale.
-// Suitable for memory-constrained environments.
-func MinimalBufferGroupsConfig() BufferGroupsConfig {
-	return BufferGroupsConfig{
-		PicoNum:   DefaultBufferNumPico,
-		NanoNum:   DefaultBufferNumNano,
-		MicroNum:  DefaultBufferNumMicro,
-		SmallNum:  DefaultBufferNumSmall,
-		MediumNum: DefaultBufferNumMedium,
-	}
-}
-
 func newUringProvideBuffers(size, n int) *uringProvideBuffers {
 	if size < 2 || size > (1<<28) {
 		panic("size must be between 2 and 268435456")
@@ -246,7 +106,6 @@ func newUringBufferGroupsWithConfig(scale int, cfg BufferGroupsConfig) *uringPro
 	}
 	scale = roundToPowerOf2(scale)
 	mask := scale - 1
-
 	if cfg.PicoNum > 0 {
 		cfg.PicoNum = roundToPowerOf2(cfg.PicoNum)
 	}
@@ -579,14 +438,12 @@ func (g *uringProvideBufferGroups) bufGroupBySize(f PollFd, size int) uint16 {
 		return bufferGroupIndexEnd*offset + bufferGroupIndexGiant + g.gidOffset
 	case size <= BufferSizeTitan && g.cfg.TitanNum > 0:
 		return bufferGroupIndexEnd*offset + bufferGroupIndexTitan + g.gidOffset
-	default:
-		// Return the highest enabled tier
-		maxTier := g.maxEnabledTierIndex()
-		if maxTier >= 0 {
-			return bufferGroupIndexEnd*offset + uint16(maxTier) + g.gidOffset
-		}
-		return bufferGroupIndexEnd*(offset+1) + g.gidOffset
 	}
+	maxTier := g.maxEnabledTierIndex()
+	if maxTier >= 0 {
+		return bufferGroupIndexEnd*offset + uint16(maxTier) + g.gidOffset
+	}
+	return bufferGroupIndexEnd*(offset+1) + g.gidOffset
 }
 
 func (g *uringProvideBufferGroups) bufGroupByData(f PollFd, b []byte) uint16 {
