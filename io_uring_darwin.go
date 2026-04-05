@@ -638,6 +638,7 @@ func (ur *ioUring) submitPacked3(sqeCtx SQEContext, ioprio uint16, addr uint64, 
 		e.fd = sqeCtx.FD()
 		e.addr = addr
 		e.len = uint32(n)
+		mirrorExtendedSQE(sqeCtx, e)
 	})
 }
 
@@ -652,6 +653,7 @@ func (ur *ioUring) submitPacked6(sqeCtx SQEContext, ioprio uint16, off uint64, a
 		e.addr = addr
 		e.len = uint32(n)
 		e.uflags = uflags
+		mirrorExtendedSQE(sqeCtx, e)
 	})
 }
 
@@ -669,6 +671,7 @@ func (ur *ioUring) submitPacked9(sqeCtx SQEContext, ioprio uint16, off uint64, a
 		e.bufIndex = sqeCtx.BufGroup()
 		e.personality = personality
 		e.spliceFdIn = spliceFdIn
+		mirrorExtendedSQE(sqeCtx, e)
 	})
 }
 

@@ -250,7 +250,7 @@ func newIoUring(entries int, opts ...func(params *ioUringParams)) (*ioUring, err
 			ringSz: params.sqOff.array + uint32(unsafe.Sizeof(uint32(0)))*params.sqEntries,
 		},
 		cq: ioUringCq{
-			ringSz: params.cqOff.cqes + uint32(unsafe.Sizeof(uint32(0)))*params.cqEntries,
+			ringSz: params.cqOff.cqes + uint32(unsafe.Sizeof(ioUringCqe{}))*params.cqEntries,
 		},
 		ringFd:   fd,
 		bufs:     [][]byte{},
@@ -267,7 +267,7 @@ func newIoUring(entries int, opts ...func(params *ioUringParams)) (*ioUring, err
 
 func (ur *ioUring) remapRings(params *ioUringParams) error {
 	ur.sq.ringSz = params.sqOff.array + uint32(unsafe.Sizeof(uint32(0)))*params.sqEntries
-	ur.cq.ringSz = params.cqOff.cqes + uint32(unsafe.Sizeof(uint32(0)))*params.cqEntries
+	ur.cq.ringSz = params.cqOff.cqes + uint32(unsafe.Sizeof(ioUringCqe{}))*params.cqEntries
 
 	ptr, errno := zcall.Mmap(nil, uintptr(ur.sq.ringSz), PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, uintptr(ur.ringFd), uintptr(IORING_OFF_SQ_RING))
 	if errno != 0 {
@@ -482,7 +482,7 @@ func (ur *ioUring) registerBufRing(entries int, groupID uint16) (*ioUringBufRing
 // The caller must keep the backing slice alive to prevent GC.
 func (ur *ioUring) registerBufRingWithFlags(entries int, groupID uint16, flags uint16) (*ioUringBufRing, []byte, uintptr, error) {
 	if entries < 1 || entries > (1<<15) {
-		panic("entries must be between 1 and 32768")
+		return nil, nil, 0, ErrInvalidParam
 	}
 	entries = roundToPowerOf2(entries)
 
@@ -656,6 +656,7 @@ func (ur *ioUring) submitPacked3(sqeCtx SQEContext, ioprio uint16, addr uint64, 
 		return err
 	}
 	slot.fill3(sqeCtx, ioprio, addr, n)
+	mirrorExtendedSQE(sqeCtx, slot.sqe)
 	ur.publishSubmitSlot(slot, sqeCtx)
 	return nil
 }
@@ -667,6 +668,7 @@ func (ur *ioUring) submitPacked6(sqeCtx SQEContext, ioprio uint16, off uint64, a
 		return err
 	}
 	slot.fill6(sqeCtx, ioprio, off, addr, n, uflags)
+	mirrorExtendedSQE(sqeCtx, slot.sqe)
 	ur.publishSubmitSlot(slot, sqeCtx)
 	return nil
 }
@@ -678,8 +680,19 @@ func (ur *ioUring) submitPacked9(sqeCtx SQEContext, ioprio uint16, off uint64, a
 		return err
 	}
 	slot.fill9(sqeCtx, ioprio, off, addr, n, uflags, personality, spliceFdIn)
+	mirrorExtendedSQE(sqeCtx, slot.sqe)
 	ur.publishSubmitSlot(slot, sqeCtx)
 	return nil
+}
+
+// mirrorExtendedSQE copies the filled kernel SQE back into the ExtSQE so that
+// ExtCQE.Op() and ExtCQE.FD() can read the submitted fields at completion time.
+//
+//go:nosplit
+func mirrorExtendedSQE(sqeCtx SQEContext, e *ioUringSqe) {
+	if sqeCtx.IsExtended() {
+		sqeCtx.ExtSQE().SQE = *e
+	}
 }
 
 func (slot submitSlot) fill3(sqeCtx SQEContext, ioprio uint16, addr uint64, n int) {
@@ -752,8 +765,8 @@ func (ur *ioUring) enter() error {
 	flags := atomic.LoadUint32(ur.sq.kFlags)
 	if flags&IORING_SQ_NEED_WAKEUP == IORING_SQ_NEED_WAKEUP {
 		_, err := ioUringEnter(ur.ringFd, uintptr(ur.params.sqEntries), 0, IORING_ENTER_SQ_WAKEUP)
-		// ErrExists means another enter is already in progress.
-		if err != nil && err != ErrExists {
+		// ErrExists/ErrInProgress means another enter is already in progress.
+		if err != nil && err != ErrExists && err != ErrInProgress {
 			return err
 		}
 	}
@@ -775,8 +788,8 @@ func (ur *ioUring) enterPending() error {
 		needTaskrunKick := n == 0 && ur.params.flags&(IORING_SETUP_DEFER_TASKRUN|IORING_SETUP_COOP_TASKRUN) != 0
 		if n != 0 || needTaskrunKick {
 			_, err := ioUringEnter(ur.ringFd, uintptr(n), 0, IORING_ENTER_GETEVENTS)
-			// ErrExists means another enter is already in progress.
-			if err != nil && err != ErrExists {
+			// ErrExists/ErrInProgress means another enter is already in progress.
+			if err != nil && err != ErrExists && err != ErrInProgress {
 				ur.releaseConsumedKeepAlive()
 				return err
 			}

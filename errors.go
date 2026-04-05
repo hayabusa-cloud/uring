@@ -149,7 +149,7 @@ func errFromErrno(errno uintptr) error {
 		return ErrInterrupted
 	case EAGAIN:
 		return iox.ErrWouldBlock
-	case EINPROGRESS:
+	case EINPROGRESS, EALREADY:
 		return ErrInProgress
 	case EFAULT:
 		return ErrFaultParams
@@ -169,7 +169,7 @@ func errFromErrno(errno uintptr) error {
 		return ErrNotSupported
 	case EBUSY:
 		return ErrBusy
-	case EEXIST, EALREADY:
+	case EEXIST:
 		return ErrExists
 	case ENAMETOOLONG:
 		return ErrNameTooLong
