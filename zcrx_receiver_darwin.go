@@ -10,6 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"unsafe"
+
+	"code.hybscloud.com/iofd"
 )
 
 var zcrxBufPool sync.Pool
@@ -76,7 +78,7 @@ type ZCRXReceiver struct {
 	zcrxID   uint32
 	area     zcrxArea
 	handler  ZCRXHandler
-	fd       int32
+	fd       iofd.FD
 	closed   atomic.Bool
 	state    atomic.Uint32
 	ext      *ExtSQE
@@ -89,7 +91,7 @@ func NewZCRXReceiver(ring *Uring, pool *ContextPools, cfg ZCRXConfig) (*ZCRXRece
 }
 
 // Start returns ErrNotSupported on Darwin.
-func (r *ZCRXReceiver) Start(fd int32, handler ZCRXHandler) error { return ErrNotSupported }
+func (r *ZCRXReceiver) Start(fd iofd.FD, handler ZCRXHandler) error { return ErrNotSupported }
 
 // Stop is a no-op stub on Darwin.
 func (r *ZCRXReceiver) Stop() error { return nil }

@@ -192,9 +192,9 @@ type submitState struct {
 
 	keepAlive        []submitKeepAlive
 	keepAliveHead    uint32
-	keepAliveExtFree *submitKeepAliveExt // protected by submit-state serialization
+	keepAliveExtFree *submitKeepAliveExt // protected by the shared-submit lock or the single-issuer caller contract
 
-	shared bool // shared reports whether submissions may arrive from multiple goroutines
+	shared bool // shared reports whether submit-state operations may arrive from multiple goroutines and need internal locking
 }
 
 type submitSlot struct {
@@ -479,7 +479,7 @@ func (ur *ioUring) registerBufRing(entries int, groupID uint16) (*ioUringBufRing
 //   - IOU_PBUF_RING_INC: incremental buffer consumption mode
 //
 // Returns the buffer ring pointer and the backing slice (nil for mmap mode).
-// The caller must keep the backing slice alive to prevent GC.
+// Caller must keep the backing slice reachable while the registration is live.
 func (ur *ioUring) registerBufRingWithFlags(entries int, groupID uint16, flags uint16) (*ioUringBufRing, []byte, uintptr, error) {
 	if entries < 1 || entries > (1<<15) {
 		return nil, nil, 0, ErrInvalidParam
@@ -751,6 +751,7 @@ func (ur *ioUring) submitExtended(sqeCtx SQEContext) error {
 		return err
 	}
 	*slot.sqe = ext.SQE
+	listenerTrackSubmit(ext)
 	ur.publishSubmitSlot(slot, sqeCtx)
 	return nil
 }
@@ -761,6 +762,9 @@ func (ur *ioUring) sqCount() int {
 	return int(t - h)
 }
 
+// enter flushes published SQEs and drives deferred task work when needed.
+// Single-issuer rings rely on caller serialization here so the fast path can
+// avoid shared-submit locking.
 func (ur *ioUring) enter() error {
 	flags := atomic.LoadUint32(ur.sq.kFlags)
 	if flags&IORING_SQ_NEED_WAKEUP == IORING_SQ_NEED_WAKEUP {

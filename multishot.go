@@ -31,7 +31,7 @@ const (
 // MultishotStep describes one observed multishot CQE.
 //
 // `CQE` is borrowed and valid only during `OnMultishotStep`.
-// Negative `res` values are decoded into `Err`. `Cancelled` reports that the
+// Negative `CQE.Res` values are decoded into `Err`. `Cancelled` reports that the
 // kernel step was `-ECANCELED`.
 type MultishotStep struct {
 	CQE       CQEView
@@ -117,7 +117,7 @@ const (
 // It delivers zero or more step callbacks until cancelled or exhausted.
 //
 // Lifecycle:
-//  1. Create it with `Uring.AcceptMultishot` or `Uring.RecvMultishot`
+//  1. Create it with `Uring.AcceptMultishot` or `Uring.ReceiveMultishot`
 //  2. Observe `OnMultishotStep` for each CQE
 //  3. End it with `Cancel`, `Unsubscribe`, or a terminal kernel completion
 //  4. If callbacks stay enabled, one `OnMultishotStop` runs at most once
@@ -200,6 +200,10 @@ func (ur *Uring) newMultishotSubscription(
 	handler MultishotHandler,
 	init func(ext *ExtSQE),
 ) (*MultishotSubscription, error) {
+	if handler == nil {
+		handler = NoopMultishotHandler{}
+	}
+
 	ext := ur.ctxPools.Extended()
 	if ext == nil {
 		return nil, iox.ErrWouldBlock
@@ -210,7 +214,8 @@ func (ur *Uring) newMultishotSubscription(
 		handler: handler,
 	}
 	ctx := CastUserData[multishotCtx](ext)
-	ctx.Fn = sub.makeHandler()
+	ctx.Fn = multishotCQEHandler
+	extAnchors(ext).owner = sub
 	sub.ext.Store(ext)
 	sub.state.Store(uint32(SubscriptionActive))
 
@@ -247,10 +252,10 @@ func (ur *Uring) AcceptMultishot(sqeCtx SQEContext, handler MultishotHandler) (*
 	})
 }
 
-// RecvMultishot starts a multishot receive subscription with buffer selection.
+// ReceiveMultishot starts a multishot receive subscription with buffer selection.
 // The handler receives one `MultishotStep` per CQE and one terminal stop.
 // Use `step.CQE.BufID()` for the buffer ID and `step.CQE.Res` for the byte count.
-func (ur *Uring) RecvMultishot(sqeCtx SQEContext, handler MultishotHandler) (*MultishotSubscription, error) {
+func (ur *Uring) ReceiveMultishot(sqeCtx SQEContext, handler MultishotHandler) (*MultishotSubscription, error) {
 	fd := sqeCtx.FD()
 	bufGroup := sqeCtx.BufGroup()
 	return ur.newMultishotSubscription(handler, func(ext *ExtSQE) {
@@ -264,14 +269,28 @@ func (ur *Uring) RecvMultishot(sqeCtx SQEContext, handler MultishotHandler) (*Mu
 	})
 }
 
+// RecvMultishot calls [Uring.ReceiveMultishot].
+//
+// Deprecated: use [Uring.ReceiveMultishot].
+func (ur *Uring) RecvMultishot(sqeCtx SQEContext, handler MultishotHandler) (*MultishotSubscription, error) {
+	return ur.ReceiveMultishot(sqeCtx, handler)
+}
+
 // ========================================
 // CQE Handling
 // ========================================
 
-func (s *MultishotSubscription) makeHandler() Handler {
-	return func(_ *Uring, _ *ioUringSqe, cqe *ioUringCqe) {
-		s.handleCQE(cqe)
+func multishotCQEHandler(ring *Uring, _ *ioUringSqe, cqe *ioUringCqe) {
+	ctx := SQEContext(cqe.userData)
+	if !ctx.IsExtended() {
+		return
 	}
+	ext := ctx.ExtSQE()
+	sub, _ := extAnchors(ext).owner.(*MultishotSubscription)
+	if sub == nil {
+		return
+	}
+	sub.handleCQE(cqe)
 }
 
 func (s *MultishotSubscription) decodeStep(cqe *ioUringCqe) MultishotStep {

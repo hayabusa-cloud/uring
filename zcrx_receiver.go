@@ -345,8 +345,8 @@ func (r *ZCRXReceiver) Start(fd iofd.FD, handler ZCRXHandler) error {
 	}
 
 	ctx := CastUserData[zcrxCtx](ext)
-	ctx.Fn = r.makeHandler()
-	ctx.receiver = r
+	ctx.Fn = zcrxCQEHandler
+	extAnchors(ext).owner = r
 	if err := r.ring.ZCRXFlushRQ(r.zcrxID); err != nil {
 		r.state.Store(zcrxStateIdle)
 		r.ext = nil
@@ -380,38 +380,44 @@ func (r *ZCRXReceiver) Start(fd iofd.FD, handler ZCRXHandler) error {
 
 // zcrxCtx is the 64-byte extended user-data payload for ZCRX CQEs.
 type zcrxCtx struct {
-	Fn       Handler
-	receiver *ZCRXReceiver
-	_        [48]byte // pad to 64 bytes
+	Fn Handler
+	_  [56]byte // pad to 64 bytes
 }
 
 var _ [64 - unsafe.Sizeof(zcrxCtx{})]byte
 var _ [unsafe.Sizeof(zcrxCtx{}) - 64]byte
 
-// makeHandler returns the CQE dispatch handler.
-func (r *ZCRXReceiver) makeHandler() Handler {
-	return func(ring *Uring, sqe *ioUringSqe, cqe *ioUringCqe) {
-		view := CQEView{
-			Res:   cqe.res,
-			Flags: cqe.flags,
-			ctx:   SQEContext(cqe.userData),
-		}
-		r.handleCQE(view, cqe)
+// zcrxCQEHandler is the static CQE dispatcher for ZCRX multishot receives.
+func zcrxCQEHandler(_ *Uring, _ *ioUringSqe, cqe *ioUringCqe) {
+	view := CQEView{
+		Res:   cqe.res,
+		Flags: cqe.flags,
+		ctx:   SQEContext(cqe.userData),
 	}
+	if !view.Extended() {
+		return
+	}
+	ext := view.ExtSQE()
+	receiver, _ := extAnchors(ext).owner.(*ZCRXReceiver)
+	if receiver == nil {
+		return
+	}
+	receiver.handleCQE(view, cqe)
 }
 
 // handleCQE dispatches a single ZCRX CQE.
 func (r *ZCRXReceiver) handleCQE(view CQEView, rawCqe *ioUringCqe) {
 	if view.Res < 0 {
+		continueOnError := true
 		if r.handler != nil {
-			if !r.handler.OnError(errFromResult(view.Res)) {
-				_ = r.Stop()
-			}
+			continueOnError = r.handler.OnError(errFromResult(view.Res))
 		}
 		if view.Flags&IORING_CQE_F_MORE != 0 {
+			if r.handler != nil && !continueOnError {
+				_ = r.Stop()
+			}
 			return
 		}
-		_ = r.Stop()
 		r.finish(view.ctx.ExtSQE())
 		return
 	}
@@ -460,31 +466,31 @@ func (r *ZCRXReceiver) Stop() error {
 	return nil
 }
 
-// Stopped reports whether terminal retirement is complete and Close can run safely.
+// Stopped reports whether terminal retirement is complete.
+// Close still requires the owning ring to have been stopped.
 func (r *ZCRXReceiver) Stopped() bool {
 	state := r.state.Load()
 	return state == zcrxStateIdle || state == zcrxStateStopped
 }
 
-// Close releases ZCRX resources.
-// Call only after Stopped reports true. Returns iox.ErrWouldBlock while retirement is still in flight.
+// Close releases ZCRX resources after the receiver has retired and the owning
+// ring has been stopped. Returns iox.ErrWouldBlock while retirement is still
+// in flight or while the ring still owns the ZCRX IFQ registration.
 // Safe to call more than once; subsequent calls return nil.
 func (r *ZCRXReceiver) Close() error {
 	if !r.Stopped() {
+		return iox.ErrWouldBlock
+	}
+	if r.ring != nil && !r.ring.closed.Load() {
 		return iox.ErrWouldBlock
 	}
 	if !r.closed.CompareAndSwap(false, true) {
 		return nil
 	}
 
-	var flushErr error
-	if err := r.ring.ZCRXFlushRQ(r.zcrxID); err != nil {
-		flushErr = err
-	}
-
 	r.area.unmap()
 
-	return flushErr
+	return nil
 }
 
 // Active reports whether the receiver is receiving.
@@ -498,9 +504,6 @@ func (r *ZCRXReceiver) deliverData(view CQEView, rawCqe *ioUringCqe) {
 	dataOffset := zcrxCqe.Off & ((1 << IORING_ZCRX_AREA_SHIFT) - 1)
 
 	dataLen := int(view.Res)
-	if dataLen < 0 {
-		return
-	}
 	if dataLen == 0 {
 		buf := r.acquireBuffer()
 		buf.reset(nil, 0, 0, 0, nil)

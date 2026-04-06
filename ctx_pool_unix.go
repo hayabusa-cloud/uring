@@ -2,7 +2,7 @@
 // Use of this source code is governed by a MIT-style
 // license that can be found in the LICENSE file.
 
-//go:build linux
+//go:build unix
 
 package uring
 
@@ -11,7 +11,6 @@ import (
 	"sync/atomic"
 	"unsafe"
 
-	"code.hybscloud.com/iobuf"
 	"code.hybscloud.com/spin"
 )
 
@@ -28,30 +27,25 @@ type contextPoolQueue struct {
 	mask     uint32
 }
 
-// ContextPools holds aligned pools for IndirectSQE and ExtSQE.
+// ContextPools holds pooled IndirectSQE and ExtSQE contexts.
+// IndirectSQE slots use explicit aligned backing; extended slots pair each
+// ExtSQE with adjacent GC-visible sidecar anchors.
 type ContextPools struct {
 	indirect      []IndirectSQE
 	indirectQueue *contextPoolQueue
 
-	extended      []ExtSQE
+	extended      []pooledExtSQE
 	extendedQueue *contextPoolQueue
 }
 
-// NewContextPools creates page-aligned pools for IndirectSQE and ExtSQE contexts
-// with the given per-pool capacity. Call Init before use.
+// NewContextPools creates pooled IndirectSQE and ExtSQE contexts with the given
+// per-pool capacity. New pools are ready for immediate use.
 func NewContextPools(capacity int) *ContextPools {
 	n := alignPoolCapacity(capacity)
-
-	indirectMem := iobuf.AlignedMem(n*int(unsafe.Sizeof(IndirectSQE{})), iobuf.PageSize)
-	indirect := unsafe.Slice((*IndirectSQE)(unsafe.Pointer(unsafe.SliceData(indirectMem))), n)
-
-	extendedMem := iobuf.AlignedMem(n*int(unsafe.Sizeof(ExtSQE{})), iobuf.PageSize)
-	extended := unsafe.Slice((*ExtSQE)(unsafe.Pointer(unsafe.SliceData(extendedMem))), n)
-
 	return &ContextPools{
-		indirect:      indirect,
+		indirect:      newIndirectSQEPool(n),
 		indirectQueue: newContextPoolQueue(n),
-		extended:      extended,
+		extended:      make([]pooledExtSQE, n),
 		extendedQueue: newContextPoolQueue(n),
 	}
 }
@@ -63,6 +57,8 @@ func alignPoolCapacity(capacity int) int {
 	return roundToPowerOf2(capacity)
 }
 
+// Indirect borrows an IndirectSQE from the pool. Returns nil if exhausted.
+//
 //go:nosplit
 func (p *ContextPools) Indirect() *IndirectSQE {
 	entry, ok := p.indirectQueue.get()
@@ -72,42 +68,88 @@ func (p *ContextPools) Indirect() *IndirectSQE {
 	return &p.indirect[entry]
 }
 
+// GetIndirect calls [ContextPools.Indirect].
+//
+// Deprecated: use [ContextPools.Indirect].
+//
+//go:nosplit
+func (p *ContextPools) GetIndirect() *IndirectSQE {
+	return p.Indirect()
+}
+
+// PutIndirect returns an IndirectSQE to the pool.
+//
 //go:nosplit
 func (p *ContextPools) PutIndirect(indirect *IndirectSQE) {
 	p.indirectQueue.put(p.indirectIndex(indirect))
 }
 
+// Extended borrows an ExtSQE from the pool. Returns nil if exhausted.
+//
 //go:nosplit
 func (p *ContextPools) Extended() *ExtSQE {
 	entry, ok := p.extendedQueue.get()
 	if !ok {
 		return nil
 	}
-	return &p.extended[entry]
+	return &p.extended[entry].ext
 }
 
+// GetExtended calls [ContextPools.Extended].
+//
+// Deprecated: use [ContextPools.Extended].
+//
+//go:nosplit
+func (p *ContextPools) GetExtended() *ExtSQE {
+	return p.Extended()
+}
+
+// PutExtended returns an ExtSQE to the pool and clears its sidecar anchors.
+//
 //go:nosplit
 func (p *ContextPools) PutExtended(ext *ExtSQE) {
-	p.extendedQueue.put(p.extendedIndex(ext))
+	i := p.extendedIndex(ext)
+	slot := &p.extended[i]
+	slot.ext.SQE = ioUringSqe{}
+	slot.ext.UserData = [64]byte{}
+	slot.anchors.clear()
+	p.extendedQueue.put(i)
 }
 
+// IndirectAvailable returns the number of IndirectSQE slots available.
 func (p *ContextPools) IndirectAvailable() int {
 	return p.indirectQueue.available()
 }
 
+// ExtendedAvailable returns the number of ExtSQE slots available.
 func (p *ContextPools) ExtendedAvailable() int {
 	return p.extendedQueue.available()
 }
 
+// Capacity returns the per-pool slot count.
 func (p *ContextPools) Capacity() int {
 	return int(p.indirectQueue.capacity)
 }
 
+// Reset scrubs pooled slot state and reinitializes both pool queues, making all
+// slots available again.
 func (p *ContextPools) Reset() {
+	for i := range p.indirect {
+		p.indirect[i] = IndirectSQE{}
+	}
+	for i := range p.extended {
+		p.extended[i].ext.SQE = ioUringSqe{}
+		p.extended[i].ext.UserData = [64]byte{}
+		p.extended[i].anchors.clear()
+	}
 	p.indirectQueue.reset()
 	p.extendedQueue.reset()
 }
 
+// Init resets a previously used pool set.
+//
+// Deprecated: NewContextPools returns ready-to-use pools. Call Reset only when
+// reusing an existing pool set.
 func (p *ContextPools) Init() {
 	p.Reset()
 }
@@ -171,6 +213,10 @@ func (q *contextPoolQueue) put(entry uint32) {
 			sw.Once()
 			continue
 		}
+		if h != q.head.Load() {
+			sw.Once()
+			continue
+		}
 		if t == h+q.capacity {
 			panic("context pool overflow")
 		}
@@ -201,5 +247,5 @@ func (p *ContextPools) indirectIndex(indirect *IndirectSQE) uint32 {
 
 func (p *ContextPools) extendedIndex(ext *ExtSQE) uint32 {
 	base := unsafe.Pointer(unsafe.SliceData(p.extended))
-	return uint32((uintptr(unsafe.Pointer(ext)) - uintptr(base)) / unsafe.Sizeof(ExtSQE{}))
+	return uint32((uintptr(unsafe.Pointer(ext)) - uintptr(base)) / unsafe.Sizeof(pooledExtSQE{}))
 }

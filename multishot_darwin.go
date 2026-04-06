@@ -79,9 +79,16 @@ func (ur *Uring) AcceptMultishot(sqeCtx SQEContext, handler MultishotHandler) (*
 	return nil, ErrNotSupported
 }
 
-// RecvMultishot creates a multishot receive subscription (stub on Darwin).
-func (ur *Uring) RecvMultishot(sqeCtx SQEContext, handler MultishotHandler) (*MultishotSubscription, error) {
+// ReceiveMultishot creates a multishot receive subscription (stub on Darwin).
+func (ur *Uring) ReceiveMultishot(sqeCtx SQEContext, handler MultishotHandler) (*MultishotSubscription, error) {
 	return nil, ErrNotSupported
+}
+
+// RecvMultishot calls [Uring.ReceiveMultishot].
+//
+// Deprecated: use [Uring.ReceiveMultishot].
+func (ur *Uring) RecvMultishot(sqeCtx SQEContext, handler MultishotHandler) (*MultishotSubscription, error) {
+	return ur.ReceiveMultishot(sqeCtx, handler)
 }
 
 // asyncCancelByUserData submits an async cancel request using userData.

@@ -2,7 +2,7 @@
 // Use of this source code is governed by a MIT-style
 // license that can be found in the LICENSE file.
 
-//go:build darwin
+//go:build linux
 
 package uring
 
@@ -13,6 +13,6 @@ import (
 )
 
 func newIndirectSQEPool(capacity int) []IndirectSQE {
-	indirectMem := iobuf.AlignedMem(capacity*int(unsafe.Sizeof(IndirectSQE{})), 64)
+	indirectMem := iobuf.AlignedMem(capacity*int(unsafe.Sizeof(IndirectSQE{})), iobuf.PageSize)
 	return unsafe.Slice((*IndirectSQE)(unsafe.Pointer(unsafe.SliceData(indirectMem))), capacity)
 }
