@@ -7,11 +7,12 @@
 package uring
 
 import (
-	"code.hybscloud.com/iobuf"
-	"code.hybscloud.com/iox"
 	"errors"
 	"testing"
 	"unsafe"
+
+	"code.hybscloud.com/iobuf"
+	"code.hybscloud.com/iox"
 )
 
 type zcrxCQE32 struct {
