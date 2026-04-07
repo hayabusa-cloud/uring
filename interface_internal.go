@@ -40,7 +40,6 @@ var (
 	MultiSizeBufferOptions OptionFunc = func(opt *Options) {
 		opt.MultiSizeBuffer = 1
 	}
-
 )
 
 func (ur *Uring) operationOptions(opts []OpOptionFunc) (flags uint8) {

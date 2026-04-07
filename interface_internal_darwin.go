@@ -38,7 +38,6 @@ var (
 	MultiSizeBufferOptions OptionFunc = func(opt *Options) {
 		opt.MultiSizeBuffer = 1
 	}
-
 )
 
 func (ur *Uring) operationOptions(opts []OpOptionFunc) (flags uint8) {
@@ -93,20 +92,6 @@ func (ur *Uring) pollRemoveOptions(opts []OpOptionFunc) (flags uint8) {
 	opt := defaultUringOpOption
 	opt.Apply(opts...)
 	return opt.Flags
-}
-
-func (ur *Uring) syncFileRangeOptions(opts []OpOptionFunc) (flags uint8, offset int64, n int) {
-	if len(opts) < 1 {
-		return uringOpFlagsNone, 0, bufferSizeDefault
-	}
-	opt := defaultUringOpOption
-	opt.Apply(opts...)
-
-	size := bufferSizeDefault
-	if opt.N != nil {
-		size = *opt.N
-	}
-	return opt.Flags, opt.Offset, size
 }
 
 func (ur *Uring) msgOptions(opts []OpOptionFunc) (flags uint8, ioprio uint16) {
@@ -222,54 +207,12 @@ func (ur *Uring) writeOptions(b []byte, opts []OpOptionFunc) (flags uint8, iopri
 	return ur.streamOptions(b, opts)
 }
 
-func (ur *Uring) fadviseOptions(b []byte, opts []OpOptionFunc) (flags uint8, offset int64, n int, advice int) {
-	if len(opts) < 1 {
-		return uringOpFlagsNone, 0, len(b), 0
-	}
-	opt := defaultUringOpOption
-	opt.Apply(opts...)
-
-	size := len(b)
-	if opt.N != nil && *opt.N < len(b) {
-		size = *opt.N
-	}
-
-	return opt.Flags, opt.Offset, size, opt.Fadvise
-}
-
-func (ur *Uring) madviseOptions(b []byte, opts []OpOptionFunc) (flags uint8, advice int) {
-	if len(opts) < 1 {
-		return uringOpFlagsNone, 0
-	}
-	opt := defaultUringOpOption
-	opt.Apply(opts...)
-	return opt.Flags, opt.Fadvise
-}
-
 func (ur *Uring) sendOptions(b []byte, opts []OpOptionFunc) (flags uint8, ioprio uint16, offset int64, n int) {
 	return ur.streamOptions(b, opts)
 }
 
 func (ur *Uring) receiveOptions(b []byte, opts []OpOptionFunc) (flags uint8, ioprio uint16, offset int64, n int) {
 	return ur.streamOptions(b, opts)
-}
-
-func (ur *Uring) openAt2Options(opts []OpOptionFunc) (flags uint8) {
-	if len(opts) < 1 {
-		return uringOpFlagsNone
-	}
-	opt := defaultUringOpOption
-	opt.Apply(opts...)
-	return opt.Flags
-}
-
-func (ur *Uring) epollCtlOptions(opts []OpOptionFunc) (flags uint8) {
-	if len(opts) < 1 {
-		return uringOpFlagsNone
-	}
-	opt := defaultUringOpOption
-	opt.Apply(opts...)
-	return opt.Flags
 }
 
 func (ur *Uring) spliceOptions(opts []OpOptionFunc) (flags uint8, n int, spliceFlags uint32) {
