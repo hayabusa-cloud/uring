@@ -90,6 +90,7 @@ const (
 	ENFILE          = 23
 	ENOSYS          = 78
 	ENOTSUP         = 45
+	EPIPE           = 32
 	ECANCELED       = 89
 )
 
@@ -145,6 +146,10 @@ func errFromErrno(errno uintptr) error {
 		return ErrNetworkUnreachable
 	case EHOSTUNREACH, EHOSTDOWN:
 		return ErrHostUnreachable
+	case EPIPE:
+		return ErrBrokenPipe
+	case ENOBUFS:
+		return ErrNoBufferSpace
 	default:
 		return syscall.Errno(errno)
 	}
