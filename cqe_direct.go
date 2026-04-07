@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 
 	"code.hybscloud.com/dwcas"
+	"code.hybscloud.com/iofd"
 	"code.hybscloud.com/iox"
 	"code.hybscloud.com/spin"
 )
@@ -29,28 +30,28 @@ type DirectCQE struct {
 	Op       uint8  // IORING_OP_* opcode
 	SQEFlags uint8  // SQE flags (IOSQE_*)
 	BufGroup uint16 // Buffer group index
-	FD       int32  // File descriptor
+	FD       iofd.FD
 }
 
 // IsSuccess reports whether the operation completed successfully.
 //
 //go:nosplit
 func (c *DirectCQE) IsSuccess() bool {
-	return c.Res >= 0
+	return cqeIsSuccess(c.Res)
 }
 
 // HasMore reports whether more completions are coming (multishot).
 //
 //go:nosplit
 func (c *DirectCQE) HasMore() bool {
-	return c.Flags&IORING_CQE_F_MORE != 0
+	return cqeHasMore(c.Flags)
 }
 
 // HasBuffer reports whether a buffer ID is available.
 //
 //go:nosplit
 func (c *DirectCQE) HasBuffer() bool {
-	return c.Flags&IORING_CQE_F_BUFFER != 0
+	return cqeHasBuffer(c.Flags)
 }
 
 // BufID returns the buffer ID from CQE flags.
@@ -58,14 +59,14 @@ func (c *DirectCQE) HasBuffer() bool {
 //
 //go:nosplit
 func (c *DirectCQE) BufID() uint16 {
-	return uint16(c.Flags >> IORING_CQE_BUFFER_SHIFT)
+	return cqeBufID(c.Flags)
 }
 
 // IsNotification reports whether this is a zero-copy notification CQE.
 //
 //go:nosplit
 func (c *DirectCQE) IsNotification() bool {
-	return c.Flags&IORING_CQE_F_NOTIF != 0
+	return cqeIsNotification(c.Flags)
 }
 
 // WaitDirect retrieves completion events using Direct mode fast-path.
@@ -118,7 +119,7 @@ func (ur *ioUring) waitBatchDirect(cqes []DirectCQE) (int, error) {
 		n := int(available)
 		for i := range n {
 			e := &ur.cq.cqes[(h+uint32(i))&mask]
-			ctx := SQEContext(e.userData)
+			ctx := SQEContextFromRaw(e.userData)
 
 			cqes[i] = DirectCQE{
 				Res:      e.res,
@@ -126,7 +127,7 @@ func (ur *ioUring) waitBatchDirect(cqes []DirectCQE) (int, error) {
 				Op:       ctx.Op(),
 				SQEFlags: ctx.Flags(),
 				BufGroup: ctx.BufGroup(),
-				FD:       ctx.FD(),
+				FD:       iofd.FD(ctx.FD()),
 			}
 		}
 		return n, nil

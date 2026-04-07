@@ -6,7 +6,10 @@
 
 package uring
 
-import "code.hybscloud.com/iox"
+import (
+	"code.hybscloud.com/iofd"
+	"code.hybscloud.com/iox"
+)
 
 // DirectCQE is a zero-overhead CQE for Direct mode operations.
 type DirectCQE struct {
@@ -15,14 +18,14 @@ type DirectCQE struct {
 	Op       uint8
 	SQEFlags uint8
 	BufGroup uint16
-	FD       int32
+	FD       iofd.FD
 }
 
-func (c *DirectCQE) IsSuccess() bool      { return c.Res >= 0 }
-func (c *DirectCQE) HasMore() bool        { return c.Flags&IORING_CQE_F_MORE != 0 }
-func (c *DirectCQE) HasBuffer() bool      { return c.Flags&IORING_CQE_F_BUFFER != 0 }
-func (c *DirectCQE) BufID() uint16        { return uint16(c.Flags >> IORING_CQE_BUFFER_SHIFT) }
-func (c *DirectCQE) IsNotification() bool { return c.Flags&IORING_CQE_F_NOTIF != 0 }
+func (c *DirectCQE) IsSuccess() bool      { return cqeIsSuccess(c.Res) }
+func (c *DirectCQE) HasMore() bool        { return cqeHasMore(c.Flags) }
+func (c *DirectCQE) HasBuffer() bool      { return cqeHasBuffer(c.Flags) }
+func (c *DirectCQE) BufID() uint16        { return cqeBufID(c.Flags) }
+func (c *DirectCQE) IsNotification() bool { return cqeIsNotification(c.Flags) }
 
 // WaitDirect retrieves completion events using Direct mode fast-path (darwin stub).
 func (ur *Uring) WaitDirect(cqes []DirectCQE) (int, error) {
@@ -42,14 +45,14 @@ func (ur *ioUring) waitBatchDirect(cqes []DirectCQE) (int, error) {
 		select {
 		case cqe := <-ur.cqChan:
 			if cqe != nil {
-				ctx := SQEContext(cqe.userData)
+				ctx := SQEContextFromRaw(cqe.userData)
 				cqes[n] = DirectCQE{
 					Res:      cqe.res,
 					Flags:    cqe.flags,
 					Op:       ctx.Op(),
 					SQEFlags: ctx.Flags(),
 					BufGroup: ctx.BufGroup(),
-					FD:       ctx.FD(),
+					FD:       iofd.FD(ctx.FD()),
 				}
 				n++
 			}

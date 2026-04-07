@@ -17,14 +17,15 @@ import "unsafe"
 
 // Each returned CtxRefs* view aliases sqe.UserData directly. The typed layout
 // pointers returned by Vals* remain valid only while the owning ExtSQE remains
-// borrowed and must not outlive PutExtended/PutExtSQE.
+// borrowed and must not outlive PutExtended/PutExtSQE. Raw `UserData` bytes do
+// not root overlaid Go references for the GC, so caller code must keep them
+// live elsewhere when using pointer-bearing views.
 
 // ViewCtx creates a CtxRefs0 for accessing the UserData with 0 refs.
 //
 // Example:
 //
 //	c := uring.ViewCtx(sqe).Vals3()  // 0 refs, 3 vals
-//	c.Fn = handler
 //	c.Val1 = timestamp
 //	c.Val2 = flags
 //	c.Val3 = seqNum
@@ -37,8 +38,6 @@ func ViewCtx(sqe *ExtSQE) CtxRefs0 {
 // Example:
 //
 //	c := uring.ViewCtx1[Connection](sqe).Vals1()  // 1 ref, 1 val
-//	c.Fn = handleRecv
-//	c.Ref1 = conn
 //	c.Val1 = time.Now().UnixNano()
 func ViewCtx1[T1 any](sqe *ExtSQE) CtxRefs1[T1] {
 	return CtxRefs1[T1]{sqe: sqe}
@@ -49,9 +48,6 @@ func ViewCtx1[T1 any](sqe *ExtSQE) CtxRefs1[T1] {
 // Example:
 //
 //	c := uring.ViewCtx2[Connection, Buffer](sqe).Vals2()  // 2 refs, 2 vals
-//	c.Fn = handleIO
-//	c.Ref1 = conn
-//	c.Ref2 = buf
 //	c.Val1 = offset
 //	c.Val2 = length
 func ViewCtx2[T1, T2 any](sqe *ExtSQE) CtxRefs2[T1, T2] {

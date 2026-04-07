@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 
 	"code.hybscloud.com/dwcas"
+	"code.hybscloud.com/iofd"
 	"code.hybscloud.com/iox"
 	"code.hybscloud.com/spin"
 )
@@ -32,21 +33,21 @@ type ExtCQE struct {
 //
 //go:nosplit
 func (c *ExtCQE) IsSuccess() bool {
-	return c.Res >= 0
+	return cqeIsSuccess(c.Res)
 }
 
 // HasMore reports whether more completions are coming (multishot).
 //
 //go:nosplit
 func (c *ExtCQE) HasMore() bool {
-	return c.Flags&IORING_CQE_F_MORE != 0
+	return cqeHasMore(c.Flags)
 }
 
 // HasBuffer reports whether a buffer ID is available.
 //
 //go:nosplit
 func (c *ExtCQE) HasBuffer() bool {
-	return c.Flags&IORING_CQE_F_BUFFER != 0
+	return cqeHasBuffer(c.Flags)
 }
 
 // BufID returns the buffer ID from CQE flags.
@@ -54,21 +55,21 @@ func (c *ExtCQE) HasBuffer() bool {
 //
 //go:nosplit
 func (c *ExtCQE) BufID() uint16 {
-	return uint16(c.Flags >> IORING_CQE_BUFFER_SHIFT)
+	return cqeBufID(c.Flags)
 }
 
 // IsNotification reports whether this is a zero-copy notification CQE.
 //
 //go:nosplit
 func (c *ExtCQE) IsNotification() bool {
-	return c.Flags&IORING_CQE_F_NOTIF != 0
+	return cqeIsNotification(c.Flags)
 }
 
 // HasBufferMore reports whether the buffer was partially consumed.
 //
 //go:nosplit
 func (c *ExtCQE) HasBufferMore() bool {
-	return c.Flags&IORING_CQE_F_BUF_MORE != 0
+	return cqeHasBufferMore(c.Flags)
 }
 
 // Op returns the IORING_OP_* opcode from the stored SQE.
@@ -81,8 +82,8 @@ func (c *ExtCQE) Op() uint8 {
 // FD returns the file descriptor from the stored SQE.
 //
 //go:nosplit
-func (c *ExtCQE) FD() int32 {
-	return c.Ext.SQE.fd
+func (c *ExtCQE) FD() iofd.FD {
+	return iofd.FD(c.Ext.SQE.fd)
 }
 
 // WaitExtended retrieves completion events using Extended mode fast-path.
@@ -135,7 +136,7 @@ func (ur *ioUring) waitBatchExtended(cqes []ExtCQE) (int, error) {
 		n := int(available)
 		for i := range n {
 			e := &ur.cq.cqes[(h+uint32(i))&mask]
-			ctx := SQEContext(e.userData)
+			ctx := SQEContextFromRaw(e.userData)
 
 			var ext *ExtSQE
 			if ctx.Mode() == CtxModeExtended {

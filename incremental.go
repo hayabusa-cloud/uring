@@ -156,7 +156,7 @@ var incrementalCQEHandler Handler = func(_ *Uring, _ *ioUringSqe, cqe *ioUringCq
 	view := CQEView{
 		Res:   cqe.res,
 		Flags: cqe.flags,
-		ctx:   SQEContext(cqe.userData),
+		ctx:   SQEContextFromRaw(cqe.userData),
 	}
 	if !view.Extended() {
 		return

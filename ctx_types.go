@@ -11,8 +11,9 @@ import "unsafe"
 // Handler is the callback function signature for completion handling.
 // It receives the Uring instance, the original SQE, and the completion result.
 //
-// The handler pointer is stored in the first 8 bytes of the UserData area
-// within ExtSQE.
+// When embedded in raw `ExtSQE.UserData`, only static non-capturing functions
+// are safe to store directly. Capturing closures and other live Go roots must
+// stay outside raw user-data bytes.
 //
 // Example:
 //

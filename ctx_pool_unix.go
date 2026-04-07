@@ -68,15 +68,6 @@ func (p *ContextPools) Indirect() *IndirectSQE {
 	return &p.indirect[entry]
 }
 
-// GetIndirect calls [ContextPools.Indirect].
-//
-// Deprecated: use [ContextPools.Indirect].
-//
-//go:nosplit
-func (p *ContextPools) GetIndirect() *IndirectSQE {
-	return p.Indirect()
-}
-
 // PutIndirect returns an IndirectSQE to the pool.
 //
 //go:nosplit
@@ -93,15 +84,6 @@ func (p *ContextPools) Extended() *ExtSQE {
 		return nil
 	}
 	return &p.extended[entry].ext
-}
-
-// GetExtended calls [ContextPools.Extended].
-//
-// Deprecated: use [ContextPools.Extended].
-//
-//go:nosplit
-func (p *ContextPools) GetExtended() *ExtSQE {
-	return p.Extended()
 }
 
 // PutExtended returns an ExtSQE to the pool and clears its sidecar anchors.
@@ -144,14 +126,6 @@ func (p *ContextPools) Reset() {
 	}
 	p.indirectQueue.reset()
 	p.extendedQueue.reset()
-}
-
-// Init resets a previously used pool set.
-//
-// Deprecated: NewContextPools returns ready-to-use pools. Call Reset only when
-// reusing an existing pool set.
-func (p *ContextPools) Init() {
-	p.Reset()
 }
 
 func newContextPoolQueue(capacity int) *contextPoolQueue {

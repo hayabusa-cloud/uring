@@ -13,17 +13,15 @@ import (
 )
 
 func TestViewCtxBasic(t *testing.T) {
-	ring, err := uring.NewUring(testMinimalBufferOptions, func(opt *uring.UringOptions) {
-		opt.Entries = uring.UringEntriesSmall
+	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
 	})
 	if err != nil {
-		t.Fatalf("NewUring: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	if err := ring.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+	mustStartRing(t, ring)
 
-	ext := ring.GetExtSQE()
+	ext := ring.ExtSQE()
 	if ext == nil {
 		t.Fatal("pool exhausted")
 	}
@@ -58,17 +56,15 @@ type testRef struct {
 }
 
 func TestViewCtx1(t *testing.T) {
-	ring, err := uring.NewUring(testMinimalBufferOptions, func(opt *uring.UringOptions) {
-		opt.Entries = uring.UringEntriesSmall
+	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
 	})
 	if err != nil {
-		t.Fatalf("NewUring: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	if err := ring.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+	mustStartRing(t, ring)
 
-	ext := ring.GetExtSQE()
+	ext := ring.ExtSQE()
 	if ext == nil {
 		t.Fatal("pool exhausted")
 	}
@@ -96,17 +92,15 @@ func TestViewCtx1(t *testing.T) {
 }
 
 func TestViewCtx2(t *testing.T) {
-	ring, err := uring.NewUring(testMinimalBufferOptions, func(opt *uring.UringOptions) {
-		opt.Entries = uring.UringEntriesSmall
+	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
 	})
 	if err != nil {
-		t.Fatalf("NewUring: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	if err := ring.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+	mustStartRing(t, ring)
 
-	ext := ring.GetExtSQE()
+	ext := ring.ExtSQE()
 	if ext == nil {
 		t.Fatal("pool exhausted")
 	}
@@ -133,19 +127,17 @@ func TestViewCtx2(t *testing.T) {
 }
 
 func TestViewCtx3Through7(t *testing.T) {
-	ring, err := uring.NewUring(testMinimalBufferOptions, func(opt *uring.UringOptions) {
-		opt.Entries = uring.UringEntriesSmall
+	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
 	})
 	if err != nil {
-		t.Fatalf("NewUring: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	if err := ring.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+	mustStartRing(t, ring)
 
 	// Test ViewCtx3-7 creation (just verify they don't panic)
 	t.Run("ViewCtx3", func(t *testing.T) {
-		ext := ring.GetExtSQE()
+		ext := ring.ExtSQE()
 		if ext == nil {
 			t.Skip("pool exhausted")
 		}
@@ -158,7 +150,7 @@ func TestViewCtx3Through7(t *testing.T) {
 	})
 
 	t.Run("ViewCtx4", func(t *testing.T) {
-		ext := ring.GetExtSQE()
+		ext := ring.ExtSQE()
 		if ext == nil {
 			t.Skip("pool exhausted")
 		}
@@ -171,7 +163,7 @@ func TestViewCtx3Through7(t *testing.T) {
 	})
 
 	t.Run("ViewCtx5", func(t *testing.T) {
-		ext := ring.GetExtSQE()
+		ext := ring.ExtSQE()
 		if ext == nil {
 			t.Skip("pool exhausted")
 		}
@@ -184,7 +176,7 @@ func TestViewCtx3Through7(t *testing.T) {
 	})
 
 	t.Run("ViewCtx6", func(t *testing.T) {
-		ext := ring.GetExtSQE()
+		ext := ring.ExtSQE()
 		if ext == nil {
 			t.Skip("pool exhausted")
 		}
@@ -197,7 +189,7 @@ func TestViewCtx3Through7(t *testing.T) {
 	})
 
 	t.Run("ViewCtx7", func(t *testing.T) {
-		ext := ring.GetExtSQE()
+		ext := ring.ExtSQE()
 		if ext == nil {
 			t.Skip("pool exhausted")
 		}
@@ -211,17 +203,15 @@ func TestViewCtx3Through7(t *testing.T) {
 }
 
 func TestCtxRefs0ValMethods(t *testing.T) {
-	ring, err := uring.NewUring(testMinimalBufferOptions, func(opt *uring.UringOptions) {
-		opt.Entries = uring.UringEntriesSmall
+	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
 	})
 	if err != nil {
-		t.Fatalf("NewUring: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	if err := ring.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+	mustStartRing(t, ring)
 
-	ext := ring.GetExtSQE()
+	ext := ring.ExtSQE()
 	if ext == nil {
 		t.Fatal("pool exhausted")
 	}
@@ -254,17 +244,15 @@ func TestCtxRefs0ValMethods(t *testing.T) {
 }
 
 func TestCtxRefs1ValMethods(t *testing.T) {
-	ring, err := uring.NewUring(testMinimalBufferOptions, func(opt *uring.UringOptions) {
-		opt.Entries = uring.UringEntriesSmall
+	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
 	})
 	if err != nil {
-		t.Fatalf("NewUring: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	if err := ring.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+	mustStartRing(t, ring)
 
-	ext := ring.GetExtSQE()
+	ext := ring.ExtSQE()
 	if ext == nil {
 		t.Fatal("pool exhausted")
 	}
@@ -294,17 +282,15 @@ func TestCtxRefs1ValMethods(t *testing.T) {
 }
 
 func TestCtxRefs2ValMethods(t *testing.T) {
-	ring, err := uring.NewUring(testMinimalBufferOptions, func(opt *uring.UringOptions) {
-		opt.Entries = uring.UringEntriesSmall
+	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
 	})
 	if err != nil {
-		t.Fatalf("NewUring: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	if err := ring.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+	mustStartRing(t, ring)
 
-	ext := ring.GetExtSQE()
+	ext := ring.ExtSQE()
 	if ext == nil {
 		t.Fatal("pool exhausted")
 	}
@@ -331,17 +317,15 @@ func TestCtxRefs2ValMethods(t *testing.T) {
 }
 
 func TestCtxRefs3ValMethods(t *testing.T) {
-	ring, err := uring.NewUring(testMinimalBufferOptions, func(opt *uring.UringOptions) {
-		opt.Entries = uring.UringEntriesSmall
+	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
 	})
 	if err != nil {
-		t.Fatalf("NewUring: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	if err := ring.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+	mustStartRing(t, ring)
 
-	ext := ring.GetExtSQE()
+	ext := ring.ExtSQE()
 	if ext == nil {
 		t.Fatal("pool exhausted")
 	}
@@ -365,17 +349,15 @@ func TestCtxRefs3ValMethods(t *testing.T) {
 }
 
 func TestCtxRefs4ValMethods(t *testing.T) {
-	ring, err := uring.NewUring(testMinimalBufferOptions, func(opt *uring.UringOptions) {
-		opt.Entries = uring.UringEntriesSmall
+	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
 	})
 	if err != nil {
-		t.Fatalf("NewUring: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	if err := ring.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+	mustStartRing(t, ring)
 
-	ext := ring.GetExtSQE()
+	ext := ring.ExtSQE()
 	if ext == nil {
 		t.Fatal("pool exhausted")
 	}
@@ -396,17 +378,15 @@ func TestCtxRefs4ValMethods(t *testing.T) {
 }
 
 func TestCtxRefs5ValMethods(t *testing.T) {
-	ring, err := uring.NewUring(testMinimalBufferOptions, func(opt *uring.UringOptions) {
-		opt.Entries = uring.UringEntriesSmall
+	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
 	})
 	if err != nil {
-		t.Fatalf("NewUring: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	if err := ring.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+	mustStartRing(t, ring)
 
-	ext := ring.GetExtSQE()
+	ext := ring.ExtSQE()
 	if ext == nil {
 		t.Fatal("pool exhausted")
 	}
@@ -424,17 +404,15 @@ func TestCtxRefs5ValMethods(t *testing.T) {
 }
 
 func TestCtxRefs6ValMethods(t *testing.T) {
-	ring, err := uring.NewUring(testMinimalBufferOptions, func(opt *uring.UringOptions) {
-		opt.Entries = uring.UringEntriesSmall
+	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
 	})
 	if err != nil {
-		t.Fatalf("NewUring: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	if err := ring.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+	mustStartRing(t, ring)
 
-	ext := ring.GetExtSQE()
+	ext := ring.ExtSQE()
 	if ext == nil {
 		t.Fatal("pool exhausted")
 	}
@@ -446,159 +424,4 @@ func TestCtxRefs6ValMethods(t *testing.T) {
 	if ctx6.Vals1() == nil {
 		t.Error("V1() returned nil")
 	}
-}
-
-func TestCtxOfShorthands(t *testing.T) {
-	ring, err := uring.NewUring(testMinimalBufferOptions, func(opt *uring.UringOptions) {
-		opt.Entries = uring.UringEntriesSmall
-	})
-	if err != nil {
-		t.Fatalf("NewUring: %v", err)
-	}
-	if err := ring.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-
-	t.Run("CtxOf", func(t *testing.T) {
-		ext := ring.GetExtSQE()
-		if ext == nil {
-			t.Skip("pool exhausted")
-		}
-		defer ring.PutExtSQE(ext)
-
-		ctx := uring.CtxOf(ext)
-		if ctx == nil {
-			t.Error("CtxOf returned nil")
-		}
-	})
-
-	t.Run("CtxV1Of", func(t *testing.T) {
-		ext := ring.GetExtSQE()
-		if ext == nil {
-			t.Skip("pool exhausted")
-		}
-		defer ring.PutExtSQE(ext)
-
-		ctx := uring.CtxV1Of(ext)
-		if ctx == nil {
-			t.Error("CtxV1Of returned nil")
-		}
-	})
-
-	t.Run("CtxV2Of", func(t *testing.T) {
-		ext := ring.GetExtSQE()
-		if ext == nil {
-			t.Skip("pool exhausted")
-		}
-		defer ring.PutExtSQE(ext)
-
-		ctx := uring.CtxV2Of(ext)
-		if ctx == nil {
-			t.Error("CtxV2Of returned nil")
-		}
-	})
-
-	t.Run("Ctx1Of", func(t *testing.T) {
-		ext := ring.GetExtSQE()
-		if ext == nil {
-			t.Skip("pool exhausted")
-		}
-		defer ring.PutExtSQE(ext)
-
-		ctx := uring.Ctx1Of[int](ext)
-		if ctx == nil {
-			t.Error("Ctx1Of returned nil")
-		}
-	})
-
-	t.Run("Ctx1V1Of", func(t *testing.T) {
-		ext := ring.GetExtSQE()
-		if ext == nil {
-			t.Skip("pool exhausted")
-		}
-		defer ring.PutExtSQE(ext)
-
-		ctx := uring.Ctx1V1Of[int](ext)
-		if ctx == nil {
-			t.Error("Ctx1V1Of returned nil")
-		}
-	})
-
-	t.Run("Ctx1V2Of", func(t *testing.T) {
-		ext := ring.GetExtSQE()
-		if ext == nil {
-			t.Skip("pool exhausted")
-		}
-		defer ring.PutExtSQE(ext)
-
-		ctx := uring.Ctx1V2Of[int](ext)
-		if ctx == nil {
-			t.Error("Ctx1V2Of returned nil")
-		}
-	})
-
-	t.Run("Ctx2Of", func(t *testing.T) {
-		ext := ring.GetExtSQE()
-		if ext == nil {
-			t.Skip("pool exhausted")
-		}
-		defer ring.PutExtSQE(ext)
-
-		ctx := uring.Ctx2Of[int, int](ext)
-		if ctx == nil {
-			t.Error("Ctx2Of returned nil")
-		}
-	})
-
-	t.Run("Ctx2V1Of", func(t *testing.T) {
-		ext := ring.GetExtSQE()
-		if ext == nil {
-			t.Skip("pool exhausted")
-		}
-		defer ring.PutExtSQE(ext)
-
-		ctx := uring.Ctx2V1Of[int, int](ext)
-		if ctx == nil {
-			t.Error("Ctx2V1Of returned nil")
-		}
-	})
-
-	t.Run("Ctx2V2Of", func(t *testing.T) {
-		ext := ring.GetExtSQE()
-		if ext == nil {
-			t.Skip("pool exhausted")
-		}
-		defer ring.PutExtSQE(ext)
-
-		ctx := uring.Ctx2V2Of[int, int](ext)
-		if ctx == nil {
-			t.Error("Ctx2V2Of returned nil")
-		}
-	})
-
-	t.Run("Ctx3Of", func(t *testing.T) {
-		ext := ring.GetExtSQE()
-		if ext == nil {
-			t.Skip("pool exhausted")
-		}
-		defer ring.PutExtSQE(ext)
-
-		ctx := uring.Ctx3Of[int, int, int](ext)
-		if ctx == nil {
-			t.Error("Ctx3Of returned nil")
-		}
-	})
-
-	t.Run("Ctx3V1Of", func(t *testing.T) {
-		ext := ring.GetExtSQE()
-		if ext == nil {
-			t.Skip("pool exhausted")
-		}
-		defer ring.PutExtSQE(ext)
-
-		ctx := uring.Ctx3V1Of[int, int, int](ext)
-		if ctx == nil {
-			t.Error("Ctx3V1Of returned nil")
-		}
-	})
 }

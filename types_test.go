@@ -258,14 +258,14 @@ func BenchmarkIoVecFromBytesSlice(b *testing.B) {
 	}
 }
 
-func BenchmarkContextUserdata(b *testing.B) {
+func BenchmarkContextUserData(b *testing.B) {
 	ctx := context.Background()
-	ctx = ContextWithUserdata(ctx, 42)
+	ctx = ContextWithUserData(ctx, 42)
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		_ = ContextUserdata[int](ctx)
+		_ = ContextUserData[int](ctx)
 	}
 }
 

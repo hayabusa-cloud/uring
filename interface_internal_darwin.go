@@ -18,8 +18,10 @@ var defaultOptions = Options{
 	IndirectSubmissionQueue: false,
 }
 
-type OptionFunc func(opt *Options)
+// OptionFunc mutates [Options] during [New] construction.
+type OptionFunc = func(opt *Options)
 
+// Apply applies option helpers in order.
 func (uo *Options) Apply(opts ...OptionFunc) {
 	for _, f := range opts {
 		f(uo)
@@ -27,15 +29,16 @@ func (uo *Options) Apply(opts ...OptionFunc) {
 }
 
 var (
-	// UringLargeLockedBufferMemOptions uses the maximum registered buffer memory (128 MiB).
-	// This equals the default; kept for backward compatibility.
-	UringLargeLockedBufferMemOptions OptionFunc = func(opt *Options) {
+	// LargeLockedBufferMemOptions uses the maximum registered buffer memory (128 MiB).
+	// This equals the default and keeps the helper-based option style available.
+	LargeLockedBufferMemOptions OptionFunc = func(opt *Options) {
 		opt.LockedBufferMem = registerBufferSize * registerBufferNum
 	}
-	// UringMultiSizeBufferOptions enables multi-size buffer groups.
-	UringMultiSizeBufferOptions OptionFunc = func(opt *Options) {
+	// MultiSizeBufferOptions enables multi-size buffer groups.
+	MultiSizeBufferOptions OptionFunc = func(opt *Options) {
 		opt.MultiSizeBuffer = 1
 	}
+
 )
 
 func (ur *Uring) operationOptions(opts []OpOptionFunc) (flags uint8) {
@@ -106,7 +109,7 @@ func (ur *Uring) syncFileRangeOptions(opts []OpOptionFunc) (flags uint8, offset 
 	return opt.Flags, opt.Offset, size
 }
 
-func (ur *Uring) sendmsgOptions(iovs [][]byte, opts []OpOptionFunc) (flags uint8, ioprio uint16) {
+func (ur *Uring) msgOptions(opts []OpOptionFunc) (flags uint8, ioprio uint16) {
 	if len(opts) < 1 {
 		return uringOpFlagsNone, uringOpIOPrioNone
 	}
@@ -115,13 +118,12 @@ func (ur *Uring) sendmsgOptions(iovs [][]byte, opts []OpOptionFunc) (flags uint8
 	return opt.Flags, opt.IOPrio
 }
 
-func (ur *Uring) recvmsgOptions(iovs [][]byte, opts []OpOptionFunc) (flags uint8, ioprio uint16) {
-	if len(opts) < 1 {
-		return uringOpFlagsNone, uringOpIOPrioNone
-	}
-	opt := defaultUringOpOption
-	opt.Apply(opts...)
-	return opt.Flags, opt.IOPrio
+func (ur *Uring) sendmsgOptions(opts []OpOptionFunc) (flags uint8, ioprio uint16) {
+	return ur.msgOptions(opts)
+}
+
+func (ur *Uring) recvmsgOptions(opts []OpOptionFunc) (flags uint8, ioprio uint16) {
+	return ur.msgOptions(opts)
 }
 
 func (ur *Uring) timeoutOptions(opts []OpOptionFunc) (flags uint8, cnt int, timeoutFlags uint32) {
@@ -196,34 +198,28 @@ func (ur *Uring) statxOptions(opts []OpOptionFunc) (flags uint8) {
 	return opt.Flags
 }
 
-func (ur *Uring) readOptions(b []byte, opts []OpOptionFunc) (flags uint8, ioprio uint16, offset int64, n int) {
+func (ur *Uring) streamOptions(b []byte, opts []OpOptionFunc) (flags uint8, ioprio uint16, offset int64, n int) {
 	if len(opts) < 1 {
 		return uringOpFlagsNone, uringOpIOPrioNone, 0, len(b)
 	}
 	opt := defaultUringOpOption
 	opt.Apply(opts...)
 
-	readSize := len(b)
 	if opt.N != nil && *opt.N < len(b) {
-		readSize = *opt.N
+		n = *opt.N
+	} else {
+		n = len(b)
 	}
 
-	return opt.Flags, opt.IOPrio, opt.Offset, readSize
+	return opt.Flags, opt.IOPrio, opt.Offset, n
+}
+
+func (ur *Uring) readOptions(b []byte, opts []OpOptionFunc) (flags uint8, ioprio uint16, offset int64, n int) {
+	return ur.streamOptions(b, opts)
 }
 
 func (ur *Uring) writeOptions(b []byte, opts []OpOptionFunc) (flags uint8, ioprio uint16, offset int64, n int) {
-	if len(opts) < 1 {
-		return uringOpFlagsNone, uringOpIOPrioNone, 0, len(b)
-	}
-	opt := defaultUringOpOption
-	opt.Apply(opts...)
-
-	writeSize := len(b)
-	if opt.N != nil && *opt.N < len(b) {
-		writeSize = *opt.N
-	}
-
-	return opt.Flags, opt.IOPrio, opt.Offset, writeSize
+	return ur.streamOptions(b, opts)
 }
 
 func (ur *Uring) fadviseOptions(b []byte, opts []OpOptionFunc) (flags uint8, offset int64, n int, advice int) {
@@ -251,33 +247,11 @@ func (ur *Uring) madviseOptions(b []byte, opts []OpOptionFunc) (flags uint8, adv
 }
 
 func (ur *Uring) sendOptions(b []byte, opts []OpOptionFunc) (flags uint8, ioprio uint16, offset int64, n int) {
-	if len(opts) < 1 {
-		return uringOpFlagsNone, uringOpIOPrioNone, 0, len(b)
-	}
-	opt := defaultUringOpOption
-	opt.Apply(opts...)
-
-	n = len(b)
-	if opt.N != nil && *opt.N < len(b) {
-		n = *opt.N
-	}
-
-	return opt.Flags, opt.IOPrio, opt.Offset, n
+	return ur.streamOptions(b, opts)
 }
 
 func (ur *Uring) receiveOptions(b []byte, opts []OpOptionFunc) (flags uint8, ioprio uint16, offset int64, n int) {
-	if len(opts) < 1 {
-		return uringOpFlagsNone, uringOpIOPrioNone, 0, len(b)
-	}
-	opt := defaultUringOpOption
-	opt.Apply(opts...)
-
-	n = len(b)
-	if opt.N != nil && *opt.N < len(b) {
-		n = *opt.N
-	}
-
-	return opt.Flags, opt.IOPrio, opt.Offset, n
+	return ur.streamOptions(b, opts)
 }
 
 func (ur *Uring) openAt2Options(opts []OpOptionFunc) (flags uint8) {

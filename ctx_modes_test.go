@@ -16,15 +16,13 @@ import (
 )
 
 func TestScopedExtSQEBasic(t *testing.T) {
-	ring, err := uring.NewUring(testMinimalBufferOptions, func(opt *uring.UringOptions) {
-		opt.Entries = uring.UringEntriesSmall
+	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
 	})
 	if err != nil {
-		t.Fatalf("NewUring: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	if err := ring.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+	mustStartRing(t, ring)
 
 	// Test basic scope creation
 	scope := ring.NewScopedExtSQE()
@@ -46,15 +44,13 @@ func TestScopedExtSQEBasic(t *testing.T) {
 }
 
 func TestScopedExtSQESubmitted(t *testing.T) {
-	ring, err := uring.NewUring(testMinimalBufferOptions, func(opt *uring.UringOptions) {
-		opt.Entries = uring.UringEntriesSmall
+	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
 	})
 	if err != nil {
-		t.Fatalf("NewUring: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	if err := ring.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+	mustStartRing(t, ring)
 
 	// Get a scope
 	scope := ring.NewScopedExtSQE()
@@ -80,15 +76,13 @@ func TestScopedExtSQESubmitted(t *testing.T) {
 }
 
 func TestWithExtSQE(t *testing.T) {
-	ring, err := uring.NewUring(testMinimalBufferOptions, func(opt *uring.UringOptions) {
-		opt.Entries = uring.UringEntriesSmall
+	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
 	})
 	if err != nil {
-		t.Fatalf("NewUring: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	if err := ring.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+	mustStartRing(t, ring)
 
 	t.Run("success", func(t *testing.T) {
 		var gotExt *uring.ExtSQE
@@ -120,40 +114,36 @@ func TestWithExtSQE(t *testing.T) {
 	})
 }
 
-func TestMustGetExtSQE(t *testing.T) {
-	ring, err := uring.NewUring(testMinimalBufferOptions, func(opt *uring.UringOptions) {
-		opt.Entries = uring.UringEntriesSmall
+func TestMustExtSQE(t *testing.T) {
+	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
 	})
 	if err != nil {
-		t.Fatalf("NewUring: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	if err := ring.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+	mustStartRing(t, ring)
 
 	// Should not panic when pool has items
-	ext := ring.MustGetExtSQE()
+	ext := ring.MustExtSQE()
 	if ext == nil {
-		t.Error("MustGetExtSQE returned nil")
+		t.Error("MustExtSQE returned nil")
 	}
 	ring.PutExtSQE(ext)
 }
 
 func TestWithExtSQEPoolExhaustion(t *testing.T) {
-	ring, err := uring.NewUring(testMinimalBufferOptions, func(opt *uring.UringOptions) {
-		opt.Entries = uring.UringEntriesSmall
+	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
 	})
 	if err != nil {
-		t.Fatalf("NewUring: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	if err := ring.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+	mustStartRing(t, ring)
 
 	// Exhaust the pool
 	var exts []*uring.ExtSQE
 	for {
-		ext := ring.GetExtSQE()
+		ext := ring.ExtSQE()
 		if ext == nil {
 			break
 		}
@@ -177,7 +167,6 @@ func TestWithExtSQEPoolExhaustion(t *testing.T) {
 
 func TestContextPoolsAvailability(t *testing.T) {
 	pool := uring.NewContextPools(16)
-	pool.Init()
 
 	// Test Capacity
 	capacity := pool.Capacity()
@@ -197,18 +186,18 @@ func TestContextPoolsAvailability(t *testing.T) {
 	}
 
 	// Get some items and check availability decreases
-	ind1 := pool.GetIndirect()
+	ind1 := pool.Indirect()
 	if ind1 == nil {
-		t.Fatal("GetIndirect failed")
+		t.Fatal("Indirect failed")
 	}
 
 	if pool.IndirectAvailable() != capacity-1 {
 		t.Errorf("IndirectAvailable after Get: got %d, want %d", pool.IndirectAvailable(), capacity-1)
 	}
 
-	ext1 := pool.GetExtended()
+	ext1 := pool.Extended()
 	if ext1 == nil {
-		t.Fatal("GetExtended failed")
+		t.Fatal("Extended failed")
 	}
 
 	if pool.ExtendedAvailable() != capacity-1 {
@@ -232,20 +221,18 @@ func TestContextPoolsAvailability(t *testing.T) {
 // =============================================================================
 
 func TestContextPools(t *testing.T) {
-	ring, err := uring.NewUring(testMinimalBufferOptions, func(opt *uring.UringOptions) {
-		opt.Entries = uring.UringEntriesSmall
+	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
 	})
 	if err != nil {
-		t.Fatalf("NewUring: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	if err := ring.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+	mustStartRing(t, ring)
 
 	t.Run("ExtSQE pool", func(t *testing.T) {
-		ext := ring.GetExtSQE()
+		ext := ring.ExtSQE()
 		if ext == nil {
-			t.Fatal("GetExtSQE returned nil")
+			t.Fatal("ExtSQE returned nil")
 		}
 
 		// Write some data to verify it's usable
@@ -255,69 +242,67 @@ func TestContextPools(t *testing.T) {
 		ring.PutExtSQE(ext)
 
 		// Get again (may be same or different)
-		ext2 := ring.GetExtSQE()
+		ext2 := ring.ExtSQE()
 		if ext2 == nil {
-			t.Fatal("GetExtSQE returned nil on second get")
+			t.Fatal("ExtSQE returned nil on second get")
 		}
 		ring.PutExtSQE(ext2)
 	})
 
 	t.Run("IndirectSQE pool", func(t *testing.T) {
-		ind := ring.GetIndirectSQE()
+		ind := ring.IndirectSQE()
 		if ind == nil {
-			t.Fatal("GetIndirectSQE returned nil")
+			t.Fatal("IndirectSQE returned nil")
 		}
 
 		// Return to pool
 		ring.PutIndirectSQE(ind)
 
 		// Get again
-		ind2 := ring.GetIndirectSQE()
+		ind2 := ring.IndirectSQE()
 		if ind2 == nil {
-			t.Fatal("GetIndirectSQE returned nil on second get")
+			t.Fatal("IndirectSQE returned nil on second get")
 		}
 		ring.PutIndirectSQE(ind2)
 	})
 }
 
 func TestStartPreservesBorrowedContextPoolEntries(t *testing.T) {
-	ring, err := uring.NewUring(testMinimalBufferOptions, func(opt *uring.UringOptions) {
+	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
 		opt.Entries = 1
 	})
 	if err != nil {
-		t.Fatalf("NewUring: %v", err)
+		t.Fatalf("New: %v", err)
 	}
 
-	ext := ring.GetExtSQE()
+	ext := ring.ExtSQE()
 	if ext == nil {
-		t.Fatal("GetExtSQE before Start returned nil")
+		t.Fatal("ExtSQE before Start returned nil")
 	}
-	ind := ring.GetIndirectSQE()
+	ind := ring.IndirectSQE()
 	if ind == nil {
-		t.Fatal("GetIndirectSQE before Start returned nil")
+		t.Fatal("IndirectSQE before Start returned nil")
 	}
 
-	if err := ring.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+	mustStartRing(t, ring)
 
-	if got := ring.GetExtSQE(); got != nil {
-		t.Fatalf("GetExtSQE after Start = %p, want nil while borrowed entry is outstanding", got)
+	if got := ring.ExtSQE(); got != nil {
+		t.Fatalf("ExtSQE after Start = %p, want nil while borrowed entry is outstanding", got)
 	}
-	if got := ring.GetIndirectSQE(); got != nil {
-		t.Fatalf("GetIndirectSQE after Start = %p, want nil while borrowed entry is outstanding", got)
+	if got := ring.IndirectSQE(); got != nil {
+		t.Fatalf("IndirectSQE after Start = %p, want nil while borrowed entry is outstanding", got)
 	}
 
 	ring.PutExtSQE(ext)
 	ring.PutIndirectSQE(ind)
 
-	if got := ring.GetExtSQE(); got != ext {
-		t.Fatalf("GetExtSQE after PutExtSQE = %p, want %p", got, ext)
+	if got := ring.ExtSQE(); got != ext {
+		t.Fatalf("ExtSQE after PutExtSQE = %p, want %p", got, ext)
 	} else {
 		ring.PutExtSQE(got)
 	}
-	if got := ring.GetIndirectSQE(); got != ind {
-		t.Fatalf("GetIndirectSQE after PutIndirectSQE = %p, want %p", got, ind)
+	if got := ring.IndirectSQE(); got != ind {
+		t.Fatalf("IndirectSQE after PutIndirectSQE = %p, want %p", got, ind)
 	} else {
 		ring.PutIndirectSQE(got)
 	}
@@ -328,21 +313,19 @@ func TestExtendedModeSubmission(t *testing.T) {
 		t.Skip("skipping Extended mode test in short mode (requires reliable io_uring)")
 	}
 
-	ring, err := uring.NewUring(testMinimalBufferOptions, func(opt *uring.UringOptions) {
-		opt.Entries = uring.UringEntriesSmall
+	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
 		opt.NotifySucceed = true
 	})
 	if err != nil {
-		t.Fatalf("NewUring: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	if err := ring.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+	mustStartRing(t, ring)
 
 	// Get ExtSQE and submit NOP with Extended mode
-	ext := ring.GetExtSQE()
+	ext := ring.ExtSQE()
 	if ext == nil {
-		t.Fatal("GetExtSQE returned nil")
+		t.Fatal("ExtSQE returned nil")
 	}
 
 	// Store identifying data
@@ -405,20 +388,18 @@ func TestExtendedModeSubmission(t *testing.T) {
 }
 
 func TestIndirectModeContext(t *testing.T) {
-	ring, err := uring.NewUring(testMinimalBufferOptions, func(opt *uring.UringOptions) {
-		opt.Entries = uring.UringEntriesSmall
+	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
 	})
 	if err != nil {
-		t.Fatalf("NewUring: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	if err := ring.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+	mustStartRing(t, ring)
 
 	// Get IndirectSQE and verify context packing
-	ind := ring.GetIndirectSQE()
+	ind := ring.IndirectSQE()
 	if ind == nil {
-		t.Fatal("GetIndirectSQE returned nil")
+		t.Fatal("IndirectSQE returned nil")
 	}
 
 	ctx := uring.PackIndirect(ind)
@@ -448,9 +429,8 @@ func TestIndirectModeContext(t *testing.T) {
 
 func TestCastUserData(t *testing.T) {
 	pool := uring.NewContextPools(16)
-	pool.Init()
 
-	ext := pool.GetExtended()
+	ext := pool.Extended()
 	if ext == nil {
 		t.Fatal("pool exhausted")
 	}
@@ -483,9 +463,8 @@ func TestCastUserData(t *testing.T) {
 
 func TestCastUserDataTooLargePanics(t *testing.T) {
 	pool := uring.NewContextPools(16)
-	pool.Init()
 
-	ext := pool.GetExtended()
+	ext := pool.Extended()
 	if ext == nil {
 		t.Fatal("pool exhausted")
 	}

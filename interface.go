@@ -54,8 +54,9 @@ type Options struct {
 	// MultiIssuers enables the shared-submit configuration for rings that accept
 	// submissions from multiple goroutines. When false, New requests
 	// SINGLE_ISSUER + DEFER_TASKRUN and callers must serialize submit-state
-	// operations such as submit, Wait/enter, Stop, and ring resize. When true,
-	// it requests COOP_TASKRUN and keeps the shared-submit synchronization path.
+	// operations such as submit, Wait/enter, Stop, and ring resize so the
+	// default fast path can skip shared synchronization. When true, it requests
+	// COOP_TASKRUN and keeps the shared-submit synchronization path.
 	MultiIssuers bool
 	// NotifySucceed ensures CQEs are generated for all successful operations.
 	NotifySucceed bool
@@ -71,11 +72,9 @@ type Options struct {
 
 // New creates a new io_uring instance with the specified options.
 // Returns an unstarted ring; call Start() to initialize buffers and enable.
-func New(options ...func(options *Options)) (*Uring, error) {
+func New(options ...OptionFunc) (*Uring, error) {
 	opt := defaultOptions
-	for _, option := range options {
-		option(&opt)
-	}
+	opt.Apply(options...)
 	setupOpts := []func(params *ioUringParams){ioUringDisabledOptions}
 	if opt.MultiIssuers {
 		setupOpts = append(setupOpts, func(params *ioUringParams) {
@@ -120,10 +119,10 @@ func New(options ...func(options *Options)) (*Uring, error) {
 	feat := Features{
 		SQEntries:         int(r.params.sqEntries),
 		CQEntries:         int(r.params.cqEntries),
-		UserdataByteOrder: binary.LittleEndian,
+		UserDataByteOrder: binary.LittleEndian,
 	}
 	if isBigEndian {
-		feat.UserdataByteOrder = binary.BigEndian
+		feat.UserDataByteOrder = binary.BigEndian
 	}
 	ret.Features = &feat
 
@@ -136,12 +135,16 @@ type Features struct {
 	SQEntries int
 	// CQEntries is the actual number of CQ entries allocated by the kernel.
 	CQEntries int
-	// UserdataByteOrder is the byte order for userdata field interpretation.
-	UserdataByteOrder binary.ByteOrder
+	// UserDataByteOrder is the byte order for user_data field interpretation.
+	UserDataByteOrder binary.ByteOrder
 }
 
 // Uring is the main io_uring interface for submitting and completing I/O operations.
 // It wraps the kernel io_uring instance with buffer management and typed operations.
+// Default rings use the single-issuer fast path, so submit-state operations
+// are not safe for concurrent use by multiple goroutines; caller must
+// serialize submit, Wait/enter, Stop, and ResizeRings unless MultiIssuers is
+// enabled.
 type Uring struct {
 	*ioUring
 	*Options
@@ -239,7 +242,9 @@ func (ur *Uring) Start() (err error) {
 }
 
 // Stop tears down ring-owned resources and makes the ring permanently unusable.
-// It is idempotent, but callers must not race Stop against active submit/reap work.
+// It is idempotent. On single-issuer rings it is not safe for concurrent use
+// with submit, Wait/enter, or ResizeRings; caller must serialize those
+// operations.
 func (ur *Uring) Stop() error {
 	var err error
 	if stopErr := ur.ioUring.stop(); stopErr != nil {
@@ -285,8 +290,10 @@ func (ur *Uring) releaseRegisteredBufRings() error {
 }
 
 // Wait flushes pending submissions, drives deferred task work when needed, and
-// collects completion events into cqes. It returns the number of events
-// received, or `iox.ErrWouldBlock` if the CQ is empty.
+// collects completion events into cqes. On single-issuer rings it is not safe
+// for concurrent use with submit, Stop, or ResizeRings; caller must serialize
+// those operations. It returns the number of events received, or
+// `iox.ErrWouldBlock` if the CQ is empty.
 //
 // CQEView provides direct field access to Res and Flags, and methods to access
 // the submission context based on mode (Direct, Indirect, Extended).
@@ -299,8 +306,9 @@ func (ur *Uring) releaseRegisteredBufRings() error {
 //	    cqe := &cqes[i]
 //	    if cqe.Extended() {
 //	        ext := cqe.ExtSQE()
-//	        ctx := ViewCtx1[*Conn](ext).Vals1()
-//	        ctx.Fn(ring, cqe)
+//	        ctx := ViewCtx(ext).Vals1()
+//	        seq := ctx.Val1
+//	        handleCompletion(cqe.Res, seq)
 //	    }
 //	}
 func (ur *Uring) Wait(cqes []CQEView) (n int, err error) {
@@ -561,8 +569,9 @@ func (ur *Uring) Accept(sqeCtx SQEContext, options ...OpOptionFunc) error {
 	return ur.accept(ctx, ioprio)
 }
 
-// AcceptMultiShot performs multi-shot accept operation.
-func (ur *Uring) AcceptMultiShot(sqeCtx SQEContext, options ...OpOptionFunc) error {
+// SubmitAcceptMultishot submits the raw kernel multishot accept opcode.
+// For the managed subscription helper, use [Uring.AcceptMultishot].
+func (ur *Uring) SubmitAcceptMultishot(sqeCtx SQEContext, options ...OpOptionFunc) error {
 	flags, ioprio := ur.acceptOptions(options)
 	ctx := sqeCtx.WithFlags(flags)
 	return ur.accept(ctx, ioprio|IORING_ACCEPT_MULTISHOT)
@@ -571,7 +580,7 @@ func (ur *Uring) AcceptMultiShot(sqeCtx SQEContext, options ...OpOptionFunc) err
 // AcceptDirect accepts a connection directly into a registered file table slot.
 // The fileIndex specifies which slot to use (0-based), or use IORING_FILE_INDEX_ALLOC
 // for auto-allocation (the allocated index is returned in CQE res).
-// Note: SOCK_CLOEXEC is not supported with direct accept.
+// SOCK_CLOEXEC is not supported with direct accept.
 // Requires registered files via RegisterFiles or RegisterFilesSparse.
 func (ur *Uring) AcceptDirect(sqeCtx SQEContext, fileIndex uint32, options ...OpOptionFunc) error {
 	flags, ioprio := ur.acceptOptions(options)
@@ -579,10 +588,10 @@ func (ur *Uring) AcceptDirect(sqeCtx SQEContext, fileIndex uint32, options ...Op
 	return ur.acceptDirect(ctx, ioprio, fileIndex)
 }
 
-// AcceptDirectMultiShot performs multi-shot accept into registered file table slots.
+// SubmitAcceptDirectMultishot submits the raw kernel multishot accept-direct opcode.
 // Each accepted connection uses the next available slot from auto-allocation.
 // Requires IORING_FILE_INDEX_ALLOC as fileIndex for auto-allocation.
-func (ur *Uring) AcceptDirectMultiShot(sqeCtx SQEContext, fileIndex uint32, options ...OpOptionFunc) error {
+func (ur *Uring) SubmitAcceptDirectMultishot(sqeCtx SQEContext, fileIndex uint32, options ...OpOptionFunc) error {
 	flags, ioprio := ur.acceptOptions(options)
 	ctx := sqeCtx.WithFlags(flags)
 	return ur.acceptDirect(ctx, ioprio|IORING_ACCEPT_MULTISHOT, fileIndex)
@@ -597,12 +606,11 @@ func (ur *Uring) Connect(sqeCtx SQEContext, remote Addr, options ...OpOptionFunc
 
 // Receive performs a socket receive operation with MSG_WAITALL semantics.
 // If b is nil, it uses buffer selection from the kernel-provided buffer ring.
-// If b is non-nil, the buffer must remain valid and unmodified until the
-// corresponding CQE is observed.
-func (ur *Uring) Receive(sqeCtx SQEContext, so PollFd, b []byte, options ...OpOptionFunc) error {
-	ctx := sqeCtx.WithFD(iofd.FD(so.Fd()))
+// If b is non-nil, caller must keep b valid until the operation completes.
+func (ur *Uring) Receive(sqeCtx SQEContext, pollFD PollFd, b []byte, options ...OpOptionFunc) error {
+	ctx := sqeCtx.WithFD(iofd.FD(pollFD.Fd()))
 	if b == nil {
-		flags, ioprio, bufSize, bufGroup := ur.receiveWithBufferSelectOptions(so, options)
+		flags, ioprio, bufSize, bufGroup := ur.receiveWithBufferSelectOptions(pollFD, options)
 		ctx = ctx.WithFlags(flags | ur.readLikeOpFlags)
 		return ur.receiveWithBufferSelect(ctx, ioprio, bufSize, bufGroup)
 	}
@@ -611,11 +619,12 @@ func (ur *Uring) Receive(sqeCtx SQEContext, so PollFd, b []byte, options ...OpOp
 	return ur.receive(ctx, ioprio, b, uint64(offset), n)
 }
 
-// ReceiveMultiShot performs multi-shot receive operation.
-func (ur *Uring) ReceiveMultiShot(sqeCtx SQEContext, so PollFd, b []byte, options ...OpOptionFunc) error {
-	ctx := sqeCtx.WithFD(iofd.FD(so.Fd()))
+// SubmitReceiveMultishot submits the raw kernel multishot receive opcode.
+// For the managed subscription helper, use [Uring.ReceiveMultishot].
+func (ur *Uring) SubmitReceiveMultishot(sqeCtx SQEContext, pollFD PollFd, b []byte, options ...OpOptionFunc) error {
+	ctx := sqeCtx.WithFD(iofd.FD(pollFD.Fd()))
 	if b == nil {
-		flags, ioprio, bufSize, bufGroup := ur.receiveWithBufferSelectOptions(so, options)
+		flags, ioprio, bufSize, bufGroup := ur.receiveWithBufferSelectOptions(pollFD, options)
 		ctx = ctx.WithFlags(flags | ur.readLikeOpFlags)
 		return ur.receiveWithBufferSelect(ctx, ioprio|IORING_RECV_MULTISHOT, bufSize, bufGroup)
 	}
@@ -628,19 +637,18 @@ func (ur *Uring) ReceiveMultiShot(sqeCtx SQEContext, so PollFd, b []byte, option
 // Grabs multiple contiguous buffers from the buffer group in a single operation.
 // The CQE result contains bytes received; use BundleBuffers() to get buffer range.
 // Always uses buffer selection from the kernel-provided buffer ring.
-func (ur *Uring) ReceiveBundle(sqeCtx SQEContext, so PollFd, options ...OpOptionFunc) error {
-	ctx := sqeCtx.WithFD(iofd.FD(so.Fd()))
-	flags, ioprio, bufSize, bufGroup := ur.receiveWithBufferSelectOptions(so, options)
+func (ur *Uring) ReceiveBundle(sqeCtx SQEContext, pollFD PollFd, options ...OpOptionFunc) error {
+	ctx := sqeCtx.WithFD(iofd.FD(pollFD.Fd()))
+	flags, ioprio, bufSize, bufGroup := ur.receiveWithBufferSelectOptions(pollFD, options)
 	ctx = ctx.WithFlags(flags | ur.readLikeOpFlags)
 	return ur.receiveBundle(ctx, ioprio, bufSize, bufGroup)
 }
 
-// ReceiveBundleMultiShot combines multishot with bundle for maximum throughput.
-// Continuous reception with automatic buffer replenishment, grabbing multiple
-// buffers per completion.
-func (ur *Uring) ReceiveBundleMultiShot(sqeCtx SQEContext, so PollFd, options ...OpOptionFunc) error {
-	ctx := sqeCtx.WithFD(iofd.FD(so.Fd()))
-	flags, ioprio, bufSize, bufGroup := ur.receiveWithBufferSelectOptions(so, options)
+// SubmitReceiveBundleMultishot submits the raw kernel multishot bundle receive opcode.
+// It combines multishot with bundle reception for high-throughput raw CQE flows.
+func (ur *Uring) SubmitReceiveBundleMultishot(sqeCtx SQEContext, pollFD PollFd, options ...OpOptionFunc) error {
+	ctx := sqeCtx.WithFD(iofd.FD(pollFD.Fd()))
+	flags, ioprio, bufSize, bufGroup := ur.receiveWithBufferSelectOptions(pollFD, options)
 	ctx = ctx.WithFlags(flags | ur.readLikeOpFlags)
 	return ur.receiveBundle(ctx, ioprio|IORING_RECV_MULTISHOT, bufSize, bufGroup)
 }
@@ -657,9 +665,10 @@ func (ur *Uring) BundleIterator(cqe CQEView, group uint16) (BundleIterator, bool
 }
 
 // Send writes data to a socket.
-func (ur *Uring) Send(sqeCtx SQEContext, so PollFd, p []byte, options ...OpOptionFunc) error {
+// Caller must keep p valid until the operation completes.
+func (ur *Uring) Send(sqeCtx SQEContext, pollFD PollFd, p []byte, options ...OpOptionFunc) error {
 	flags, ioprio, offset, n := ur.sendOptions(p, options)
-	ctx := sqeCtx.WithFD(iofd.FD(so.Fd())).WithFlags(flags | ur.writeLikeOpFlags)
+	ctx := sqeCtx.WithFD(iofd.FD(pollFD.Fd())).WithFlags(flags | ur.writeLikeOpFlags)
 	return ur.send(ctx, ioprio, p, uint64(offset), n)
 }
 
@@ -859,6 +868,7 @@ func (ur *Uring) Close(sqeCtx SQEContext, options ...OpOptionFunc) error {
 }
 
 // Read performs a read operation.
+// Caller must keep b valid until the operation completes.
 func (ur *Uring) Read(sqeCtx SQEContext, b []byte, options ...OpOptionFunc) error {
 	flags, ioprio, offset, n := ur.readOptions(b, options)
 	ctx := sqeCtx.WithFlags(flags | ur.readLikeOpFlags)
@@ -866,6 +876,7 @@ func (ur *Uring) Read(sqeCtx SQEContext, b []byte, options ...OpOptionFunc) erro
 }
 
 // Write performs a write operation.
+// Caller must keep b valid until the operation completes.
 func (ur *Uring) Write(sqeCtx SQEContext, b []byte, options ...OpOptionFunc) error {
 	flags, ioprio, offset, n := ur.writeOptions(b, options)
 	ctx := sqeCtx.WithFlags(flags | ur.writeLikeOpFlags)
@@ -893,6 +904,7 @@ func (ur *Uring) Sync(sqeCtx SQEContext, options ...OpOptionFunc) error {
 }
 
 // ReadV performs a vectored read operation.
+// Caller must keep iovs and their backing buffers valid until the operation completes.
 func (ur *Uring) ReadV(sqeCtx SQEContext, iovs [][]byte, options ...OpOptionFunc) error {
 	flags := ur.operationOptions(options)
 	ctx := sqeCtx.WithFlags(flags | ur.readLikeOpFlags)
@@ -900,6 +912,7 @@ func (ur *Uring) ReadV(sqeCtx SQEContext, iovs [][]byte, options ...OpOptionFunc
 }
 
 // WriteV performs a vectored write operation.
+// Caller must keep iovs and their backing buffers valid until the operation completes.
 func (ur *Uring) WriteV(sqeCtx SQEContext, iovs [][]byte, options ...OpOptionFunc) error {
 	flags := ur.operationOptions(options)
 	ctx := sqeCtx.WithFlags(flags | ur.writeLikeOpFlags)
@@ -935,9 +948,10 @@ func (ur *Uring) FileAdvise(sqeCtx SQEContext, offset int64, length int, advice 
 }
 
 // SendMsg sends a message with control data.
-func (ur *Uring) SendMsg(sqeCtx SQEContext, so PollFd, buffers [][]byte, oob []byte, to Addr, options ...OpOptionFunc) error {
-	flags, ioprio := ur.sendmsgOptions(buffers, options)
-	ctx := sqeCtx.WithFD(iofd.FD(so.Fd())).WithFlags(flags | ur.writeLikeOpFlags)
+// Caller must keep buffers and oob valid until the operation completes.
+func (ur *Uring) SendMsg(sqeCtx SQEContext, pollFD PollFd, buffers [][]byte, oob []byte, to Addr, options ...OpOptionFunc) error {
+	flags, ioprio := ur.sendmsgOptions(options)
+	ctx := sqeCtx.WithFD(iofd.FD(pollFD.Fd())).WithFlags(flags | ur.writeLikeOpFlags)
 	var sa Sockaddr
 	if to != nil {
 		sa = AddrToSockaddr(to)
@@ -946,9 +960,10 @@ func (ur *Uring) SendMsg(sqeCtx SQEContext, so PollFd, buffers [][]byte, oob []b
 }
 
 // RecvMsg receives a message with control data.
-func (ur *Uring) RecvMsg(sqeCtx SQEContext, so PollFd, buffers [][]byte, oob []byte, options ...OpOptionFunc) error {
-	flags, ioprio := ur.recvmsgOptions(buffers, options)
-	ctx := sqeCtx.WithFD(iofd.FD(so.Fd())).WithFlags(flags | ur.readLikeOpFlags)
+// Caller must keep buffers and oob valid until the operation completes.
+func (ur *Uring) RecvMsg(sqeCtx SQEContext, pollFD PollFd, buffers [][]byte, oob []byte, options ...OpOptionFunc) error {
+	flags, ioprio := ur.recvmsgOptions(options)
+	ctx := sqeCtx.WithFD(iofd.FD(pollFD.Fd())).WithFlags(flags | ur.readLikeOpFlags)
 	return ur.recvmsg(ctx, ioprio, buffers, oob)
 }
 
@@ -1122,15 +1137,16 @@ func (ur *Uring) LinkTimeout(sqeCtx SQEContext, d time.Duration, options ...OpOp
 // Supported Linux 6.18+ kernels provide the opcode; the operation still requires
 // a registered ZCRX interface queue. zcrxIfqIdx is the queue index returned by
 // RegisterZCRXIfq.
-func (ur *Uring) ReceiveZeroCopy(sqeCtx SQEContext, so PollFd, n int, zcrxIfqIdx uint32, options ...OpOptionFunc) error {
+func (ur *Uring) ReceiveZeroCopy(sqeCtx SQEContext, pollFD PollFd, n int, zcrxIfqIdx uint32, options ...OpOptionFunc) error {
 	flags, ioprio, _, _ := ur.receiveOptions(nil, options)
-	ctx := sqeCtx.WithFD(iofd.FD(so.Fd())).WithFlags(flags | ur.readLikeOpFlags)
+	ctx := sqeCtx.WithFD(iofd.FD(pollFD.Fd())).WithFlags(flags | ur.readLikeOpFlags)
 	return ur.receiveZeroCopy(ctx, ioprio, n, zcrxIfqIdx)
 }
 
 // EpollWait performs an epoll_wait operation via io_uring.
 // The opcode does not accept an inline timeout; timeout must be 0 and callers
 // should use LinkTimeout when they need a deadline.
+// Caller must keep events valid until the operation completes.
 func (ur *Uring) EpollWait(sqeCtx SQEContext, events []EpollEvent, timeout int32, options ...OpOptionFunc) error {
 	if len(events) == 0 {
 		return ErrInvalidParam
@@ -1160,6 +1176,7 @@ func (ur *Uring) WritevFixed(sqeCtx SQEContext, offset int64, bufIndices []int, 
 // The fds parameter must point to an int32[2] array where the kernel
 // will write the read end (fds[0]) and write end (fds[1]) file descriptors.
 // On successful completion, fds[0] will be the read end and fds[1] the write end.
+// Caller must keep fds valid until the operation completes.
 func (ur *Uring) Pipe(sqeCtx SQEContext, fds *[2]int32, pipeFlags uint32, options ...OpOptionFunc) error {
 	flags := ur.operationOptions(options)
 	ctx := sqeCtx.WithFlags(flags)
@@ -1207,6 +1224,7 @@ func (ur *Uring) ZCRXFlushRQ(zcrxID uint32) error {
 
 // RegisterBufRingMMAP registers a buffer ring with kernel-allocated memory.
 // The kernel allocates the ring memory and the application uses mmap to access it.
+// entries must be between 1 and 32768; non-power-of-two values round up.
 // Returns the buffer ring for adding buffers.
 func (ur *Uring) RegisterBufRingMMAP(entries int, groupID uint16) (*ioUringBufRing, error) {
 	r, backing, mmapSize, err := ur.registerBufRingWithFlags(entries, groupID, IOU_PBUF_RING_MMAP)
@@ -1220,6 +1238,7 @@ func (ur *Uring) RegisterBufRingMMAP(entries int, groupID uint16) (*ioUringBufRi
 // RegisterBufRingIncremental registers a buffer ring in incremental consumption mode.
 // In this mode, buffers can be partially consumed across multiple completions.
 // The CQE will have IORING_CQE_F_BUF_MORE set if more data remains.
+// entries follows the same range and rounding contract as RegisterBufRingMMAP.
 func (ur *Uring) RegisterBufRingIncremental(entries int, groupID uint16) (*ioUringBufRing, error) {
 	r, backing, mmapSize, err := ur.registerBufRingWithFlags(entries, groupID, IOU_PBUF_RING_INC)
 	if err != nil {
@@ -1231,6 +1250,7 @@ func (ur *Uring) RegisterBufRingIncremental(entries int, groupID uint16) (*ioUri
 
 // RegisterBufRingWithFlags registers a buffer ring with specified flags.
 // Flags can be combined: IOU_PBUF_RING_MMAP | IOU_PBUF_RING_INC
+// entries must be between 1 and 32768; non-power-of-two values round up.
 func (ur *Uring) RegisterBufRingWithFlags(entries int, groupID uint16, flags uint16) (*ioUringBufRing, error) {
 	r, backing, mmapSize, err := ur.registerBufRingWithFlags(entries, groupID, flags)
 	if err != nil {
@@ -1439,6 +1459,8 @@ func (ur *Uring) CloneBuffersFromRegistered(srcRegisteredIdx int, srcOff, dstOff
 // ========================================
 
 // ResizeRings resizes the SQ and CQ rings of this io_uring instance.
+// On single-issuer rings it is not safe for concurrent use with submit,
+// Wait/enter, or Stop; caller must serialize those operations.
 // This allows dynamic adjustment of ring sizes without recreating the ring.
 //
 // Requirements:
@@ -1564,6 +1586,7 @@ func (ur *Uring) FTruncate(sqeCtx SQEContext, length int64, options ...OpOptionF
 
 // FutexWait submits an async futex wait operation.
 // Waits until the value at addr matches val, using the specified mask and flags.
+// Caller must keep addr valid until the operation completes.
 func (ur *Uring) FutexWait(sqeCtx SQEContext, addr *uint32, val uint64, mask uint64, flags uint32, options ...OpOptionFunc) error {
 	opFlags := ur.operationOptions(options)
 	return ur.ioUring.futexWait(sqeCtx.WithFlags(opFlags), addr, val, mask, flags)
@@ -1571,6 +1594,7 @@ func (ur *Uring) FutexWait(sqeCtx SQEContext, addr *uint32, val uint64, mask uin
 
 // FutexWake submits an async futex wake operation.
 // Wakes up to val waiters on the futex at addr, using the specified mask and flags.
+// Caller must keep addr valid until the operation completes.
 func (ur *Uring) FutexWake(sqeCtx SQEContext, addr *uint32, val uint64, mask uint64, flags uint32, options ...OpOptionFunc) error {
 	opFlags := ur.operationOptions(options)
 	return ur.ioUring.futexWake(sqeCtx.WithFlags(opFlags), addr, val, mask, flags)
@@ -1579,6 +1603,7 @@ func (ur *Uring) FutexWake(sqeCtx SQEContext, addr *uint32, val uint64, mask uin
 // FutexWaitV submits a vectored futex wait operation.
 // Waits on multiple futexes simultaneously. The waitv pointer should point to
 // a struct futex_waitv array with count elements.
+// Caller must keep waitv valid until the operation completes.
 func (ur *Uring) FutexWaitV(sqeCtx SQEContext, waitv unsafe.Pointer, count uint32, flags uint32, options ...OpOptionFunc) error {
 	opFlags := ur.operationOptions(options)
 	return ur.ioUring.futexWaitV(sqeCtx.WithFlags(opFlags), waitv, count, flags)
@@ -1591,6 +1616,7 @@ func (ur *Uring) FutexWaitV(sqeCtx SQEContext, waitv unsafe.Pointer, count uint3
 // Waitid waits for a process to change state asynchronously.
 // idtype specifies which id to wait for (P_PID, P_PGID, P_ALL).
 // The siginfo_t result is written to infop.
+// Caller must keep infop valid until the operation completes.
 func (ur *Uring) Waitid(sqeCtx SQEContext, idtype, id int, infop unsafe.Pointer, options int, opts ...OpOptionFunc) error {
 	flags := ur.operationOptions(opts)
 	return ur.ioUring.waitid(sqeCtx.WithFlags(flags), idtype, id, infop, options)
@@ -1656,6 +1682,9 @@ func (ur *Uring) MsgRingFD(sqeCtx SQEContext, srcFD uint32, dstSlot uint32, user
 
 // UringCmd submits a generic passthrough command.
 // The cmdOp specifies the command operation, and cmdData provides optional data.
+// The framework retains cmdData until the kernel consumes the SQE. Because the
+// kernel driver may hold cmdData asynchronously until the CQE is posted, caller
+// must keep cmdData valid until the completion is reaped.
 func (ur *Uring) UringCmd(sqeCtx SQEContext, cmdOp uint32, cmdData []byte, options ...OpOptionFunc) error {
 	flags := ur.operationOptions(options)
 	return ur.ioUring.uringCmd(sqeCtx.WithFlags(flags), cmdOp, cmdData)

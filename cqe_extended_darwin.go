@@ -6,7 +6,10 @@
 
 package uring
 
-import "code.hybscloud.com/iox"
+import (
+	"code.hybscloud.com/iofd"
+	"code.hybscloud.com/iox"
+)
 
 // ExtCQE is a zero-overhead CQE for Extended mode operations.
 type ExtCQE struct {
@@ -15,14 +18,14 @@ type ExtCQE struct {
 	Ext   *ExtSQE
 }
 
-func (c *ExtCQE) IsSuccess() bool      { return c.Res >= 0 }
-func (c *ExtCQE) HasMore() bool        { return c.Flags&IORING_CQE_F_MORE != 0 }
-func (c *ExtCQE) HasBuffer() bool      { return c.Flags&IORING_CQE_F_BUFFER != 0 }
-func (c *ExtCQE) BufID() uint16        { return uint16(c.Flags >> IORING_CQE_BUFFER_SHIFT) }
-func (c *ExtCQE) IsNotification() bool { return c.Flags&IORING_CQE_F_NOTIF != 0 }
-func (c *ExtCQE) HasBufferMore() bool  { return c.Flags&IORING_CQE_F_BUF_MORE != 0 }
+func (c *ExtCQE) IsSuccess() bool      { return cqeIsSuccess(c.Res) }
+func (c *ExtCQE) HasMore() bool        { return cqeHasMore(c.Flags) }
+func (c *ExtCQE) HasBuffer() bool      { return cqeHasBuffer(c.Flags) }
+func (c *ExtCQE) BufID() uint16        { return cqeBufID(c.Flags) }
+func (c *ExtCQE) IsNotification() bool { return cqeIsNotification(c.Flags) }
+func (c *ExtCQE) HasBufferMore() bool  { return cqeHasBufferMore(c.Flags) }
 func (c *ExtCQE) Op() uint8            { return c.Ext.SQE.opcode }
-func (c *ExtCQE) FD() int32            { return c.Ext.SQE.fd }
+func (c *ExtCQE) FD() iofd.FD          { return iofd.FD(c.Ext.SQE.fd) }
 
 // WaitExtended retrieves completion events using Extended mode fast-path (darwin stub).
 func (ur *Uring) WaitExtended(cqes []ExtCQE) (int, error) {
@@ -42,7 +45,7 @@ func (ur *ioUring) waitBatchExtended(cqes []ExtCQE) (int, error) {
 		select {
 		case cqe := <-ur.cqChan:
 			if cqe != nil {
-				ctx := SQEContext(cqe.userData)
+				ctx := SQEContextFromRaw(cqe.userData)
 				var ext *ExtSQE
 				if ctx.Mode() == CtxModeExtended {
 					ext = ctx.ExtSQE()

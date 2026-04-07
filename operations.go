@@ -1171,6 +1171,10 @@ func (ur *ioUring) filesUpdate(sqeCtx SQEContext, fds []int32, offset int) error
 	if err != nil {
 		return err
 	}
+	// Retain the fds backing array as []byte so the GC keeps it live
+	// until the kernel consumes the SQE.
+	fdsBytes := unsafe.Slice((*byte)(unsafe.Pointer(&fds[0])), len(fds)*4)
+	slot.keep.retainBytes(fdsBytes)
 	e := slot.sqe
 	*e = ioUringSqe{
 		opcode: IORING_OP_FILES_UPDATE,
@@ -1199,7 +1203,8 @@ func (ur *ioUring) uringCmd(sqeCtx SQEContext, cmdOp uint32, cmdData []byte) err
 		off:    uint64(cmdOp),
 	}
 	if len(cmdData) > 0 {
-		e.addr = uint64(uintptr(unsafe.Pointer(&cmdData[0])))
+		slot.keep.retainBytes(cmdData)
+		e.addr = uint64(uintptr(unsafe.Pointer(unsafe.SliceData(cmdData))))
 		e.len = uint32(len(cmdData))
 	}
 	ur.publishSubmitSlot(slot, ctx)

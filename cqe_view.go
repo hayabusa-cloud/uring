@@ -149,21 +149,21 @@ func (c *CQEView) BufGroup() uint16 {
 //
 //go:nosplit
 func (c *CQEView) BufID() uint16 {
-	return uint16(c.Flags >> IORING_CQE_BUFFER_SHIFT)
+	return cqeBufID(c.Flags)
 }
 
 // HasMore reports whether more completions are coming (multishot).
 //
 //go:nosplit
 func (c *CQEView) HasMore() bool {
-	return c.Flags&IORING_CQE_F_MORE != 0
+	return cqeHasMore(c.Flags)
 }
 
 // HasBuffer reports whether a buffer ID is available in the flags.
 //
 //go:nosplit
 func (c *CQEView) HasBuffer() bool {
-	return c.Flags&IORING_CQE_F_BUFFER != 0
+	return cqeHasBuffer(c.Flags)
 }
 
 // SocketNonEmpty reports whether the socket has more data available.
@@ -180,7 +180,7 @@ func (c *CQEView) SocketNonEmpty() bool {
 //
 //go:nosplit
 func (c *CQEView) IsNotification() bool {
-	return c.Flags&IORING_CQE_F_NOTIF != 0
+	return cqeIsNotification(c.Flags)
 }
 
 // HasBufferMore reports whether the buffer was partially consumed (incremental mode).
@@ -189,7 +189,7 @@ func (c *CQEView) IsNotification() bool {
 //
 //go:nosplit
 func (c *CQEView) HasBufferMore() bool {
-	return c.Flags&IORING_CQE_F_BUF_MORE != 0
+	return cqeHasBufferMore(c.Flags)
 }
 
 // BundleStartID returns the starting buffer ID for a bundle operation.

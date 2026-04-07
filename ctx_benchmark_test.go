@@ -9,6 +9,7 @@ package uring_test
 import (
 	"testing"
 
+	"code.hybscloud.com/iofd"
 	"code.hybscloud.com/uring"
 )
 
@@ -91,7 +92,7 @@ func BenchmarkSQEContext_WithFD(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = ctx.WithFD(5)
+		_ = ctx.WithFD(iofd.FD(5))
 	}
 }
 
@@ -110,7 +111,7 @@ func BenchmarkSQEContext_ChainedWith(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = ctx.WithOp(uring.IORING_OP_RECV).WithFlags(uring.IOSQE_FIXED_FILE).WithFD(5)
+		_ = ctx.WithOp(uring.IORING_OP_RECV).WithFlags(uring.IOSQE_FIXED_FILE).WithFD(iofd.FD(5))
 	}
 }
 

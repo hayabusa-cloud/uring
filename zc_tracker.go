@@ -242,7 +242,7 @@ func zcTrackerCQEHandler(_ *Uring, _ *ioUringSqe, cqe *ioUringCqe) {
 	view := CQEView{
 		Res:   cqe.res,
 		Flags: cqe.flags,
-		ctx:   SQEContext(cqe.userData),
+		ctx:   SQEContextFromRaw(cqe.userData),
 	}
 	if !view.Extended() {
 		return

@@ -246,9 +246,9 @@ func ioVecAddrLen(vec []IoVec) (ptr unsafe.Pointer, n int) {
 // contextKey is a type for context keys to avoid collisions.
 type contextKey[T any] struct{}
 
-// ContextUserdata extracts a typed value from context.
+// ContextUserData extracts a typed value from context.
 // Returns the zero value of T if not found.
-func ContextUserdata[T any](ctx context.Context) T {
+func ContextUserData[T any](ctx context.Context) T {
 	if v := ctx.Value(contextKey[T]{}); v != nil {
 		return v.(T)
 	}
@@ -256,8 +256,8 @@ func ContextUserdata[T any](ctx context.Context) T {
 	return zero
 }
 
-// ContextWithUserdata returns a new context with the typed value stored.
-func ContextWithUserdata[T any](ctx context.Context, val T) context.Context {
+// ContextWithUserData returns a new context with the typed value stored.
+func ContextWithUserData[T any](ctx context.Context, val T) context.Context {
 	return context.WithValue(ctx, contextKey[T]{}, val)
 }
 

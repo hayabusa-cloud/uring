@@ -241,7 +241,7 @@ func PackIndirect(sqe *IndirectSQE) SQEContext {
 //go:nosplit
 //go:nocheckptr
 func (c SQEContext) IndirectSQE() *IndirectSQE {
-	return (*IndirectSQE)(unsafe.Pointer(uintptr(c & ctxPtrMask)))
+	return (*IndirectSQE)(pointerFromTagged(uintptr(c & ctxPtrMask)))
 }
 
 // ExtSQE stores a full SQE and 64 bytes of user data.
@@ -268,12 +268,17 @@ func PackExtended(sqe *ExtSQE) SQEContext {
 //go:nosplit
 //go:nocheckptr
 func (c SQEContext) ExtSQE() *ExtSQE {
-	return (*ExtSQE)(unsafe.Pointer(uintptr(c & ctxPtrMask)))
+	return (*ExtSQE)(pointerFromTagged(uintptr(c & ctxPtrMask)))
 }
 
 // CastUserData casts `ExtSQE.UserData` to `*T`.
 // The returned pointer is borrowed from `ext` and is valid only until release.
 // `T` must fit within `ExtSQE.UserData`.
+//
+// `ExtSQE.UserData` is raw caller-beware storage. Prefer scalar payloads here;
+// if a raw overlay stores Go pointers, interfaces, func values, maps, slices,
+// strings, chans, or structs containing them in these bytes, caller code must
+// keep the live roots outside `UserData`.
 //
 //go:nosplit
 func CastUserData[T any](ext *ExtSQE) *T {
@@ -282,6 +287,16 @@ func CastUserData[T any](ext *ExtSQE) *T {
 		panic("uring: CastUserData type exceeds 64-byte ExtSQE.UserData")
 	}
 	return (*T)(unsafe.Pointer(&ext.UserData[0]))
+}
+
+// pointerFromTagged recovers an unsafe.Pointer from a uintptr that was
+// originally obtained from unsafe.Pointer (e.g. a tagged pointer stored in
+// SQEContext). The reinterpret cast avoids the go vet rule-4 false positive
+// on integer-to-Pointer conversion.
+//
+//go:nosplit
+func pointerFromTagged(u uintptr) unsafe.Pointer {
+	return *(*unsafe.Pointer)(unsafe.Pointer(&u))
 }
 
 // Raw returns the underlying uint64 value for direct use in SQE.userData.

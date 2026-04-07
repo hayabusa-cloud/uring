@@ -207,7 +207,7 @@ func (c SQEContext) IndirectSQE() *IndirectSQE {
 	if !c.IsIndirect() {
 		panic("uring: SQEContext is not in Indirect mode")
 	}
-	return (*IndirectSQE)(unsafe.Pointer(uintptr(c & ctxPtrMask)))
+	return (*IndirectSQE)(pointerFromTagged(uintptr(c & ctxPtrMask)))
 }
 
 //go:nosplit
@@ -216,19 +216,30 @@ func (c SQEContext) ExtSQE() *ExtSQE {
 	if !c.IsExtended() {
 		panic("uring: SQEContext is not in Extended mode")
 	}
-	return (*ExtSQE)(unsafe.Pointer(uintptr(c & ctxPtrMask)))
+	return (*ExtSQE)(pointerFromTagged(uintptr(c & ctxPtrMask)))
+}
+
+//go:nosplit
+func pointerFromTagged(u uintptr) unsafe.Pointer {
+	return *(*unsafe.Pointer)(unsafe.Pointer(&u))
 }
 
 // CastUserData casts ExtSQE.UserData to a user-defined type on Darwin too.
 //
-// Prefer the typed user-data view helpers (ViewCtx, ViewCtx1, ..., ViewCtx7) for
-// new code. They make the intended layout explicit and are the primary surface
-// for higher-level integrations.
+// Prefer the pointer-free typed view helpers when a fixed `UserData` layout is
+// enough. Raw `UserData` remains scalar caller-beware storage; pointer-bearing
+// overlays and `ViewCtx1`...`ViewCtx7` ref layouts still require live roots to
+// stay outside those raw bytes.
 //
 // CastUserData is the low-level escape hatch for code that needs a custom raw
 // struct overlay. Any pointer returned by CastUserData is borrowed from ext and
 // is valid only until the matching PutExtSQE. Callers must not retain the
 // returned pointer, or pointers reachable from it, after release.
+//
+// `ExtSQE.UserData` is raw caller-beware storage. Prefer scalar payloads here;
+// if a raw overlay stores Go pointers, interfaces, func values, maps, slices,
+// strings, chans, or structs containing them in these bytes, caller code must
+// keep the live roots outside `UserData`.
 func CastUserData[T any](ext *ExtSQE) *T {
 	var zero T
 	if unsafe.Sizeof(zero) > uintptr(len(ext.UserData)) {

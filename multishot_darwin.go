@@ -84,13 +84,6 @@ func (ur *Uring) ReceiveMultishot(sqeCtx SQEContext, handler MultishotHandler) (
 	return nil, ErrNotSupported
 }
 
-// RecvMultishot calls [Uring.ReceiveMultishot].
-//
-// Deprecated: use [Uring.ReceiveMultishot].
-func (ur *Uring) RecvMultishot(sqeCtx SQEContext, handler MultishotHandler) (*MultishotSubscription, error) {
-	return ur.ReceiveMultishot(sqeCtx, handler)
-}
-
 // asyncCancelByUserData submits an async cancel request using userData.
 func (ur *Uring) asyncCancelByUserData(userData uint64) error {
 	ctx := PackDirect(IORING_OP_ASYNC_CANCEL, 0, 0, 0)

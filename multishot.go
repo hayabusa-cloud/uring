@@ -269,19 +269,12 @@ func (ur *Uring) ReceiveMultishot(sqeCtx SQEContext, handler MultishotHandler) (
 	})
 }
 
-// RecvMultishot calls [Uring.ReceiveMultishot].
-//
-// Deprecated: use [Uring.ReceiveMultishot].
-func (ur *Uring) RecvMultishot(sqeCtx SQEContext, handler MultishotHandler) (*MultishotSubscription, error) {
-	return ur.ReceiveMultishot(sqeCtx, handler)
-}
-
 // ========================================
 // CQE Handling
 // ========================================
 
 func multishotCQEHandler(ring *Uring, _ *ioUringSqe, cqe *ioUringCqe) {
-	ctx := SQEContext(cqe.userData)
+	ctx := SQEContextFromRaw(cqe.userData)
 	if !ctx.IsExtended() {
 		return
 	}
