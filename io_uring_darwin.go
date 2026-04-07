@@ -847,6 +847,14 @@ func (ur *ioUring) doBind(sqe *ioUringSqe) int32 {
 	return -int32(syscall.ENOSYS)
 }
 
+// mirrorExtendedSQE copies the filled kernel SQE back into the ExtSQE so that
+// ExtCQE.Op() and ExtCQE.FD() can read the submitted fields at completion time.
+func mirrorExtendedSQE(sqeCtx SQEContext, e *ioUringSqe) {
+	if sqeCtx.IsExtended() {
+		sqeCtx.ExtSQE().SQE = *e
+	}
+}
+
 func (ur *ioUring) doListen(sqe *ioUringSqe) int32 {
 	err := syscall.Listen(int(sqe.fd), int(sqe.len))
 	if err != nil {
