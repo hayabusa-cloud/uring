@@ -7,8 +7,9 @@
 package uring
 
 import (
-	"code.hybscloud.com/iofd"
 	"unsafe"
+
+	"code.hybscloud.com/iofd"
 )
 
 // SQEContext encodes `io_uring.user_data`.

@@ -389,6 +389,21 @@ func (v CtxRefs7[T1, T2, T3, T4, T5, T6, T7]) Vals0() *Ctx7[T1, T2, T3, T4, T5, 
 
 // --- 0 refs ---
 
+// CtxOf is a shorthand for ViewCtx(sqe).Vals0().
+func CtxOf(sqe *ExtSQE) *Ctx0 {
+	return Ctx0Of(sqe)
+}
+
+// CtxV1Of is a shorthand for ViewCtx(sqe).Vals1().
+func CtxV1Of(sqe *ExtSQE) *Ctx0V1 {
+	return Ctx0V1Of(sqe)
+}
+
+// CtxV2Of is a shorthand for ViewCtx(sqe).Vals2().
+func CtxV2Of(sqe *ExtSQE) *Ctx0V2 {
+	return Ctx0V2Of(sqe)
+}
+
 // Ctx0Of is a shorthand for ViewCtx(sqe).Vals0().
 // Use when you need just a handler with max data space (56B).
 func Ctx0Of(sqe *ExtSQE) *Ctx0 {
@@ -407,19 +422,59 @@ func Ctx0V2Of(sqe *ExtSQE) *Ctx0V2 {
 	return ViewCtx(sqe).Vals2()
 }
 
-// CtxOf is a shorthand for ViewCtx(sqe).Vals0().
-func CtxOf(sqe *ExtSQE) *Ctx0 {
-	return Ctx0Of(sqe)
+// CtxV3Of is a shorthand for ViewCtx(sqe).Vals3().
+func CtxV3Of(sqe *ExtSQE) *Ctx0V3 {
+	return Ctx0V3Of(sqe)
 }
 
-// CtxV1Of is a shorthand for ViewCtx(sqe).Vals1().
-func CtxV1Of(sqe *ExtSQE) *Ctx0V1 {
-	return Ctx0V1Of(sqe)
+// Ctx0V3Of is a shorthand for ViewCtx(sqe).Vals3().
+// Use when you need 0 refs and 3 vals.
+func Ctx0V3Of(sqe *ExtSQE) *Ctx0V3 {
+	return ViewCtx(sqe).Vals3()
 }
 
-// CtxV2Of is a shorthand for ViewCtx(sqe).Vals2().
-func CtxV2Of(sqe *ExtSQE) *Ctx0V2 {
-	return Ctx0V2Of(sqe)
+// CtxV4Of is a shorthand for ViewCtx(sqe).Vals4().
+func CtxV4Of(sqe *ExtSQE) *Ctx0V4 {
+	return Ctx0V4Of(sqe)
+}
+
+// Ctx0V4Of is a shorthand for ViewCtx(sqe).Vals4().
+// Use when you need 0 refs and 4 vals.
+func Ctx0V4Of(sqe *ExtSQE) *Ctx0V4 {
+	return ViewCtx(sqe).Vals4()
+}
+
+// CtxV5Of is a shorthand for ViewCtx(sqe).Vals5().
+func CtxV5Of(sqe *ExtSQE) *Ctx0V5 {
+	return Ctx0V5Of(sqe)
+}
+
+// Ctx0V5Of is a shorthand for ViewCtx(sqe).Vals5().
+// Use when you need 0 refs and 5 vals.
+func Ctx0V5Of(sqe *ExtSQE) *Ctx0V5 {
+	return ViewCtx(sqe).Vals5()
+}
+
+// CtxV6Of is a shorthand for ViewCtx(sqe).Vals6().
+func CtxV6Of(sqe *ExtSQE) *Ctx0V6 {
+	return Ctx0V6Of(sqe)
+}
+
+// Ctx0V6Of is a shorthand for ViewCtx(sqe).Vals6().
+// Use when you need 0 refs and 6 vals.
+func Ctx0V6Of(sqe *ExtSQE) *Ctx0V6 {
+	return ViewCtx(sqe).Vals6()
+}
+
+// CtxV7Of is a shorthand for ViewCtx(sqe).Vals7().
+func CtxV7Of(sqe *ExtSQE) *Ctx0V7 {
+	return Ctx0V7Of(sqe)
+}
+
+// Ctx0V7Of is a shorthand for ViewCtx(sqe).Vals7().
+// Use when you need 0 refs and 7 vals.
+func Ctx0V7Of(sqe *ExtSQE) *Ctx0V7 {
+	return ViewCtx(sqe).Vals7()
 }
 
 // --- 1 ref ---
@@ -442,6 +497,30 @@ func Ctx1V2Of[T any](sqe *ExtSQE) *Ctx1V2[T] {
 	return ViewCtx1[T](sqe).Vals2()
 }
 
+// Ctx1V3Of is a shorthand for ViewCtx1[T](sqe).Vals3().
+// Use when you need 1 ref and 3 vals.
+func Ctx1V3Of[T any](sqe *ExtSQE) *Ctx1V3[T] {
+	return ViewCtx1[T](sqe).Vals3()
+}
+
+// Ctx1V4Of is a shorthand for ViewCtx1[T](sqe).Vals4().
+// Use when you need 1 ref and 4 vals.
+func Ctx1V4Of[T any](sqe *ExtSQE) *Ctx1V4[T] {
+	return ViewCtx1[T](sqe).Vals4()
+}
+
+// Ctx1V5Of is a shorthand for ViewCtx1[T](sqe).Vals5().
+// Use when you need 1 ref and 5 vals.
+func Ctx1V5Of[T any](sqe *ExtSQE) *Ctx1V5[T] {
+	return ViewCtx1[T](sqe).Vals5()
+}
+
+// Ctx1V6Of is a shorthand for ViewCtx1[T](sqe).Vals6().
+// Use when you need 1 ref and 6 vals.
+func Ctx1V6Of[T any](sqe *ExtSQE) *Ctx1V6[T] {
+	return ViewCtx1[T](sqe).Vals6()
+}
+
 // --- 2 refs ---
 
 // Ctx2Of is a shorthand for ViewCtx2[T1,T2](sqe).Vals0().
@@ -462,6 +541,24 @@ func Ctx2V2Of[T1, T2 any](sqe *ExtSQE) *Ctx2V2[T1, T2] {
 	return ViewCtx2[T1, T2](sqe).Vals2()
 }
 
+// Ctx2V3Of is a shorthand for ViewCtx2[T1,T2](sqe).Vals3().
+// Use when you need 2 refs and 3 vals.
+func Ctx2V3Of[T1, T2 any](sqe *ExtSQE) *Ctx2V3[T1, T2] {
+	return ViewCtx2[T1, T2](sqe).Vals3()
+}
+
+// Ctx2V4Of is a shorthand for ViewCtx2[T1,T2](sqe).Vals4().
+// Use when you need 2 refs and 4 vals.
+func Ctx2V4Of[T1, T2 any](sqe *ExtSQE) *Ctx2V4[T1, T2] {
+	return ViewCtx2[T1, T2](sqe).Vals4()
+}
+
+// Ctx2V5Of is a shorthand for ViewCtx2[T1,T2](sqe).Vals5().
+// Use when you need 2 refs and 5 vals.
+func Ctx2V5Of[T1, T2 any](sqe *ExtSQE) *Ctx2V5[T1, T2] {
+	return ViewCtx2[T1, T2](sqe).Vals5()
+}
+
 // --- 3 refs ---
 
 // Ctx3Of is a shorthand for ViewCtx3[T1,T2,T3](sqe).Vals0().
@@ -474,4 +571,90 @@ func Ctx3Of[T1, T2, T3 any](sqe *ExtSQE) *Ctx3[T1, T2, T3] {
 // Use when you need 3 refs and 1 val.
 func Ctx3V1Of[T1, T2, T3 any](sqe *ExtSQE) *Ctx3V1[T1, T2, T3] {
 	return ViewCtx3[T1, T2, T3](sqe).Vals1()
+}
+
+// Ctx3V2Of is a shorthand for ViewCtx3[T1,T2,T3](sqe).Vals2().
+// Use when you need 3 refs and 2 vals.
+func Ctx3V2Of[T1, T2, T3 any](sqe *ExtSQE) *Ctx3V2[T1, T2, T3] {
+	return ViewCtx3[T1, T2, T3](sqe).Vals2()
+}
+
+// Ctx3V3Of is a shorthand for ViewCtx3[T1,T2,T3](sqe).Vals3().
+// Use when you need 3 refs and 3 vals.
+func Ctx3V3Of[T1, T2, T3 any](sqe *ExtSQE) *Ctx3V3[T1, T2, T3] {
+	return ViewCtx3[T1, T2, T3](sqe).Vals3()
+}
+
+// Ctx3V4Of is a shorthand for ViewCtx3[T1,T2,T3](sqe).Vals4().
+// Use when you need 3 refs and 4 vals.
+func Ctx3V4Of[T1, T2, T3 any](sqe *ExtSQE) *Ctx3V4[T1, T2, T3] {
+	return ViewCtx3[T1, T2, T3](sqe).Vals4()
+}
+
+// --- 4 refs ---
+
+// Ctx4Of is a shorthand for ViewCtx4[T1,T2,T3,T4](sqe).Vals0().
+// Use when you need 4 refs and 0 vals.
+func Ctx4Of[T1, T2, T3, T4 any](sqe *ExtSQE) *Ctx4[T1, T2, T3, T4] {
+	return ViewCtx4[T1, T2, T3, T4](sqe).Vals0()
+}
+
+// Ctx4V1Of is a shorthand for ViewCtx4[T1,T2,T3,T4](sqe).Vals1().
+// Use when you need 4 refs and 1 val.
+func Ctx4V1Of[T1, T2, T3, T4 any](sqe *ExtSQE) *Ctx4V1[T1, T2, T3, T4] {
+	return ViewCtx4[T1, T2, T3, T4](sqe).Vals1()
+}
+
+// Ctx4V2Of is a shorthand for ViewCtx4[T1,T2,T3,T4](sqe).Vals2().
+// Use when you need 4 refs and 2 vals.
+func Ctx4V2Of[T1, T2, T3, T4 any](sqe *ExtSQE) *Ctx4V2[T1, T2, T3, T4] {
+	return ViewCtx4[T1, T2, T3, T4](sqe).Vals2()
+}
+
+// Ctx4V3Of is a shorthand for ViewCtx4[T1,T2,T3,T4](sqe).Vals3().
+// Use when you need 4 refs and 3 vals.
+func Ctx4V3Of[T1, T2, T3, T4 any](sqe *ExtSQE) *Ctx4V3[T1, T2, T3, T4] {
+	return ViewCtx4[T1, T2, T3, T4](sqe).Vals3()
+}
+
+// --- 5 refs ---
+
+// Ctx5Of is a shorthand for ViewCtx5[T1,T2,T3,T4,T5](sqe).Vals0().
+// Use when you need 5 refs and 0 vals.
+func Ctx5Of[T1, T2, T3, T4, T5 any](sqe *ExtSQE) *Ctx5[T1, T2, T3, T4, T5] {
+	return ViewCtx5[T1, T2, T3, T4, T5](sqe).Vals0()
+}
+
+// Ctx5V1Of is a shorthand for ViewCtx5[T1,T2,T3,T4,T5](sqe).Vals1().
+// Use when you need 5 refs and 1 val.
+func Ctx5V1Of[T1, T2, T3, T4, T5 any](sqe *ExtSQE) *Ctx5V1[T1, T2, T3, T4, T5] {
+	return ViewCtx5[T1, T2, T3, T4, T5](sqe).Vals1()
+}
+
+// Ctx5V2Of is a shorthand for ViewCtx5[T1,T2,T3,T4,T5](sqe).Vals2().
+// Use when you need 5 refs and 2 vals.
+func Ctx5V2Of[T1, T2, T3, T4, T5 any](sqe *ExtSQE) *Ctx5V2[T1, T2, T3, T4, T5] {
+	return ViewCtx5[T1, T2, T3, T4, T5](sqe).Vals2()
+}
+
+// --- 6 refs ---
+
+// Ctx6Of is a shorthand for ViewCtx6[T1,T2,T3,T4,T5,T6](sqe).Vals0().
+// Use when you need 6 refs and 0 vals.
+func Ctx6Of[T1, T2, T3, T4, T5, T6 any](sqe *ExtSQE) *Ctx6[T1, T2, T3, T4, T5, T6] {
+	return ViewCtx6[T1, T2, T3, T4, T5, T6](sqe).Vals0()
+}
+
+// Ctx6V1Of is a shorthand for ViewCtx6[T1,T2,T3,T4,T5,T6](sqe).Vals1().
+// Use when you need 6 refs and 1 val.
+func Ctx6V1Of[T1, T2, T3, T4, T5, T6 any](sqe *ExtSQE) *Ctx6V1[T1, T2, T3, T4, T5, T6] {
+	return ViewCtx6[T1, T2, T3, T4, T5, T6](sqe).Vals1()
+}
+
+// --- 7 refs ---
+
+// Ctx7Of is a shorthand for ViewCtx7[T1,T2,T3,T4,T5,T6,T7](sqe).Vals0().
+// Use when you need 7 refs and 0 vals.
+func Ctx7Of[T1, T2, T3, T4, T5, T6, T7 any](sqe *ExtSQE) *Ctx7[T1, T2, T3, T4, T5, T6, T7] {
+	return ViewCtx7[T1, T2, T3, T4, T5, T6, T7](sqe).Vals0()
 }

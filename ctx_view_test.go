@@ -425,3 +425,160 @@ func TestCtxRefs6ValMethods(t *testing.T) {
 		t.Error("V1() returned nil")
 	}
 }
+
+func TestCtxShorthandHelpers(t *testing.T) {
+	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	mustStartRing(t, ring)
+
+	ext := ring.ExtSQE()
+	if ext == nil {
+		t.Fatal("pool exhausted")
+	}
+	defer ring.PutExtSQE(ext)
+
+	if uring.CtxOf(ext) == nil {
+		t.Error("CtxOf() returned nil")
+	}
+	if uring.CtxV1Of(ext) == nil {
+		t.Error("CtxV1Of() returned nil")
+	}
+	if uring.CtxV2Of(ext) == nil {
+		t.Error("CtxV2Of() returned nil")
+	}
+	if uring.CtxV3Of(ext) == nil {
+		t.Error("CtxV3Of() returned nil")
+	}
+	if uring.CtxV4Of(ext) == nil {
+		t.Error("CtxV4Of() returned nil")
+	}
+	if uring.CtxV5Of(ext) == nil {
+		t.Error("CtxV5Of() returned nil")
+	}
+	if uring.CtxV6Of(ext) == nil {
+		t.Error("CtxV6Of() returned nil")
+	}
+	if uring.CtxV7Of(ext) == nil {
+		t.Error("CtxV7Of() returned nil")
+	}
+
+	if uring.Ctx0Of(ext) == nil {
+		t.Error("Ctx0Of() returned nil")
+	}
+	if uring.Ctx0V1Of(ext) == nil {
+		t.Error("Ctx0V1Of() returned nil")
+	}
+	if uring.Ctx0V2Of(ext) == nil {
+		t.Error("Ctx0V2Of() returned nil")
+	}
+	if uring.Ctx0V3Of(ext) == nil {
+		t.Error("Ctx0V3Of() returned nil")
+	}
+	if uring.Ctx0V4Of(ext) == nil {
+		t.Error("Ctx0V4Of() returned nil")
+	}
+	if uring.Ctx0V5Of(ext) == nil {
+		t.Error("Ctx0V5Of() returned nil")
+	}
+	if uring.Ctx0V6Of(ext) == nil {
+		t.Error("Ctx0V6Of() returned nil")
+	}
+	if uring.Ctx0V7Of(ext) == nil {
+		t.Error("Ctx0V7Of() returned nil")
+	}
+
+	if uring.Ctx1Of[int](ext) == nil {
+		t.Error("Ctx1Of() returned nil")
+	}
+	if uring.Ctx1V1Of[int](ext) == nil {
+		t.Error("Ctx1V1Of() returned nil")
+	}
+	if uring.Ctx1V2Of[int](ext) == nil {
+		t.Error("Ctx1V2Of() returned nil")
+	}
+	if uring.Ctx1V3Of[int](ext) == nil {
+		t.Error("Ctx1V3Of() returned nil")
+	}
+	if uring.Ctx1V4Of[int](ext) == nil {
+		t.Error("Ctx1V4Of() returned nil")
+	}
+	if uring.Ctx1V5Of[int](ext) == nil {
+		t.Error("Ctx1V5Of() returned nil")
+	}
+	if uring.Ctx1V6Of[int](ext) == nil {
+		t.Error("Ctx1V6Of() returned nil")
+	}
+
+	if uring.Ctx2Of[int, int](ext) == nil {
+		t.Error("Ctx2Of() returned nil")
+	}
+	if uring.Ctx2V1Of[int, int](ext) == nil {
+		t.Error("Ctx2V1Of() returned nil")
+	}
+	if uring.Ctx2V2Of[int, int](ext) == nil {
+		t.Error("Ctx2V2Of() returned nil")
+	}
+	if uring.Ctx2V3Of[int, int](ext) == nil {
+		t.Error("Ctx2V3Of() returned nil")
+	}
+	if uring.Ctx2V4Of[int, int](ext) == nil {
+		t.Error("Ctx2V4Of() returned nil")
+	}
+	if uring.Ctx2V5Of[int, int](ext) == nil {
+		t.Error("Ctx2V5Of() returned nil")
+	}
+
+	if uring.Ctx3Of[int, int, int](ext) == nil {
+		t.Error("Ctx3Of() returned nil")
+	}
+	if uring.Ctx3V1Of[int, int, int](ext) == nil {
+		t.Error("Ctx3V1Of() returned nil")
+	}
+	if uring.Ctx3V2Of[int, int, int](ext) == nil {
+		t.Error("Ctx3V2Of() returned nil")
+	}
+	if uring.Ctx3V3Of[int, int, int](ext) == nil {
+		t.Error("Ctx3V3Of() returned nil")
+	}
+	if uring.Ctx3V4Of[int, int, int](ext) == nil {
+		t.Error("Ctx3V4Of() returned nil")
+	}
+
+	if uring.Ctx4Of[int, int, int, int](ext) == nil {
+		t.Error("Ctx4Of() returned nil")
+	}
+	if uring.Ctx4V1Of[int, int, int, int](ext) == nil {
+		t.Error("Ctx4V1Of() returned nil")
+	}
+	if uring.Ctx4V2Of[int, int, int, int](ext) == nil {
+		t.Error("Ctx4V2Of() returned nil")
+	}
+	if uring.Ctx4V3Of[int, int, int, int](ext) == nil {
+		t.Error("Ctx4V3Of() returned nil")
+	}
+
+	if uring.Ctx5Of[int, int, int, int, int](ext) == nil {
+		t.Error("Ctx5Of() returned nil")
+	}
+	if uring.Ctx5V1Of[int, int, int, int, int](ext) == nil {
+		t.Error("Ctx5V1Of() returned nil")
+	}
+	if uring.Ctx5V2Of[int, int, int, int, int](ext) == nil {
+		t.Error("Ctx5V2Of() returned nil")
+	}
+
+	if uring.Ctx6Of[int, int, int, int, int, int](ext) == nil {
+		t.Error("Ctx6Of() returned nil")
+	}
+	if uring.Ctx6V1Of[int, int, int, int, int, int](ext) == nil {
+		t.Error("Ctx6V1Of() returned nil")
+	}
+
+	if uring.Ctx7Of[int, int, int, int, int, int, int](ext) == nil {
+		t.Error("Ctx7Of() returned nil")
+	}
+}

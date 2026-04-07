@@ -7,8 +7,9 @@
 package uring
 
 import (
-	"code.hybscloud.com/iofd"
 	"unsafe"
+
+	"code.hybscloud.com/iofd"
 )
 
 // SQEContext preserves the Linux bit-level context encoding on Darwin so
