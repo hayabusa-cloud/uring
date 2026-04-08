@@ -203,7 +203,10 @@
 //   - [Uring.QueryOpcodes]
 //
 // Zero-copy receive (ZCRX):
-//   - [Uring.RegisterZCRXIfq]
+//   - [Uring.QueryZCRX], [Uring.RegisterZCRXIfq]
+//   - [NewZCRXReceiver] requires a ring created with 32-byte CQEs. The
+//     current [Options] surface does not expose `IORING_SETUP_CQE32`, so the
+//     standard [New] path returns [ErrNotSupported] for this constructor.
 //
 // # Performance
 //
