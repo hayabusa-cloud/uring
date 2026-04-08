@@ -39,18 +39,27 @@ const (
 	ctxFDSignExt   SQEContext = 0xC0000000 << ctxFDShift
 )
 
+// Mode returns the context mode (Direct, Indirect, Extended, or Reserved).
+//
 //go:nosplit
 func (c SQEContext) Mode() SQEContext { return c & ctxModeMask }
 
+// IsDirect reports whether this is a Direct mode context (inline data).
+//
 //go:nosplit
 func (c SQEContext) IsDirect() bool { return c.Mode() == CtxModeDirect }
 
+// IsIndirect reports whether this is an Indirect mode context (pointer to 64B).
+//
 //go:nosplit
 func (c SQEContext) IsIndirect() bool { return c.Mode() == CtxModeIndirect }
 
+// IsExtended reports whether this is an Extended mode context (pointer to 128B).
+//
 //go:nosplit
 func (c SQEContext) IsExtended() bool { return c.Mode() == CtxModeExtended }
 
+// PackDirect packs direct-mode submission context.
 func PackDirect(op, flags uint8, bufGroup uint16, fd int32) SQEContext {
 	fdBits := SQEContext(uint32(fd)&0x3FFFFFFF) << ctxFDShift
 	return SQEContext(op) |
@@ -60,8 +69,10 @@ func PackDirect(op, flags uint8, bufGroup uint16, fd int32) SQEContext {
 		CtxModeDirect
 }
 
+// ForFD returns a direct-mode context with only the fd set.
 func ForFD(fd int32) SQEContext { return PackDirect(0, 0, 0, fd) }
 
+// Op returns the `IORING_OP_*` opcode.
 func (c SQEContext) Op() uint8 {
 	if c.IsDirect() {
 		return uint8((c & ctxOpMask) >> ctxOpShift)
@@ -72,6 +83,7 @@ func (c SQEContext) Op() uint8 {
 	return c.IndirectSQE().opcode
 }
 
+// Flags returns the `IOSQE_*` flags.
 func (c SQEContext) Flags() uint8 {
 	if c.IsDirect() {
 		return uint8((c & ctxFlagsMask) >> ctxFlagsShift)
@@ -82,6 +94,7 @@ func (c SQEContext) Flags() uint8 {
 	return c.IndirectSQE().flags
 }
 
+// BufGroup returns the buffer group index.
 func (c SQEContext) BufGroup() uint16 {
 	if c.IsDirect() {
 		return uint16((c & ctxBufGrpMask) >> ctxBufGrpShift)
@@ -92,6 +105,7 @@ func (c SQEContext) BufGroup() uint16 {
 	return c.IndirectSQE().bufIndex
 }
 
+// FD returns the sign-extended 30-bit file descriptor.
 func (c SQEContext) FD() int32 {
 	if c.IsDirect() {
 		fdBits := c & ctxFDMask
@@ -106,6 +120,9 @@ func (c SQEContext) FD() int32 {
 	return c.IndirectSQE().fd
 }
 
+// WithOp returns a new context with the opcode replaced.
+// For Direct mode, modifies the inline bits.
+// For Indirect/Extended modes, writes to the pointed-to SQE struct.
 func (c SQEContext) WithOp(op uint8) SQEContext {
 	if c.IsDirect() {
 		return (c &^ (ctxOpMask | ctxModeMask)) | SQEContext(op) | CtxModeDirect
@@ -118,6 +135,9 @@ func (c SQEContext) WithOp(op uint8) SQEContext {
 	return c
 }
 
+// WithFlags returns a new context with the flags replaced.
+// For Direct mode, modifies the inline bits.
+// For Indirect/Extended modes, writes to the pointed-to SQE struct.
 func (c SQEContext) WithFlags(flags uint8) SQEContext {
 	if c.IsDirect() {
 		return (c &^ (ctxFlagsMask | ctxModeMask)) | SQEContext(flags)<<ctxFlagsShift | CtxModeDirect
@@ -130,6 +150,9 @@ func (c SQEContext) WithFlags(flags uint8) SQEContext {
 	return c
 }
 
+// WithBufGroup returns a new context with the buffer group replaced.
+// For Direct mode, modifies the inline bits.
+// For Indirect/Extended modes, writes to the pointed-to SQE struct.
 func (c SQEContext) WithBufGroup(bufGroup uint16) SQEContext {
 	if c.IsDirect() {
 		return (c &^ (ctxBufGrpMask | ctxModeMask)) | SQEContext(bufGroup)<<ctxBufGrpShift | CtxModeDirect
@@ -142,6 +165,9 @@ func (c SQEContext) WithBufGroup(bufGroup uint16) SQEContext {
 	return c
 }
 
+// WithFD returns a new context with the file descriptor replaced.
+// For Direct mode, modifies the inline bits.
+// For Indirect/Extended modes, writes to the pointed-to SQE struct.
 func (c SQEContext) WithFD(fd iofd.FD) SQEContext {
 	return c.withFD(int32(fd))
 }
@@ -160,11 +186,18 @@ func (c SQEContext) withFD(fd int32) SQEContext {
 	return c
 }
 
+// HasBufferSelect reports whether the IOSQE_BUFFER_SELECT flag is set.
+// Only valid for Direct mode contexts.
 func (c SQEContext) HasBufferSelect() bool { return c.Flags()&IOSQE_BUFFER_SELECT != 0 }
 
+// Raw returns the underlying uint64 value for direct use in SQE.userData.
+//
 //go:nosplit
 func (c SQEContext) Raw() uint64 { return uint64(c) }
 
+// SQEContextFromRaw creates an SQEContext from a raw uint64 value.
+// Used when decoding CQE.userData.
+//
 //go:nosplit
 func SQEContextFromRaw(v uint64) SQEContext { return SQEContext(v) }
 
@@ -186,6 +219,7 @@ type ExtSQE struct {
 // Compile-time size assertions to match Linux layout.
 var _ [128 - unsafe.Sizeof(ExtSQE{})]struct{}
 
+// PackIndirect packs an indirect-mode pointer.
 func PackIndirect(sqe *IndirectSQE) SQEContext {
 	ptr := uintptr(unsafe.Pointer(sqe))
 	if ptr&uintptr(ctxModeMask) != 0 {
@@ -194,6 +228,7 @@ func PackIndirect(sqe *IndirectSQE) SQEContext {
 	return SQEContext(ptr) | CtxModeIndirect
 }
 
+// PackExtended packs an extended-mode pointer.
 func PackExtended(sqe *ExtSQE) SQEContext {
 	ptr := uintptr(unsafe.Pointer(sqe))
 	if ptr&uintptr(ctxModeMask) != 0 {
@@ -202,6 +237,8 @@ func PackExtended(sqe *ExtSQE) SQEContext {
 	return SQEContext(ptr) | CtxModeExtended
 }
 
+// IndirectSQE returns the indirect pointer stored in `c`.
+//
 //go:nosplit
 //go:nocheckptr
 func (c SQEContext) IndirectSQE() *IndirectSQE {
@@ -211,6 +248,8 @@ func (c SQEContext) IndirectSQE() *IndirectSQE {
 	return (*IndirectSQE)(pointerFromTagged(uintptr(c & ctxPtrMask)))
 }
 
+// ExtSQE returns the extended pointer stored in `c`.
+//
 //go:nosplit
 //go:nocheckptr
 func (c SQEContext) ExtSQE() *ExtSQE {
