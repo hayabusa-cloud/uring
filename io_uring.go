@@ -820,6 +820,10 @@ func (ur *ioUring) poll(n int) error {
 	}
 }
 
+// wait spins for one CQE and returns a pointer directly into the CQ ring.
+// The returned *ioUringCqe is borrowed: it remains valid only until the next
+// CAS-advance of kHead (i.e., the next wait call). Callers must read all
+// needed fields before any subsequent completion-queue operation.
 func (ur *ioUring) wait() (*ioUringCqe, error) {
 	sw := spin.Wait{}
 	for {
@@ -913,18 +917,20 @@ func (ur *ioUring) bufRingAdvance(br *ioUringBufRing, count int) {
 func (ur *ioUring) bufRingAvailable(br *ioUringBufRing, bgid uint16) int {
 	head, ret := uint16(0), 0
 	ret = ur.bufRingHead(bgid, &head)
-	if ret > 0 {
+	if ret < 0 {
 		return ret
 	}
 	return int(br.tail - head)
 }
 
+// bufRingHead queries the kernel for the current buffer-ring head.
+// Returns 0 on success or a negative errno on failure.
 func (ur *ioUring) bufRingHead(groupID uint16, head *uint16) int {
 	status := ioUringBufStatus{bufGroup: uint32(groupID)}
 
 	ret, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_REGISTER_PBUF_STATUS, unsafe.Pointer(&status), 1)
 	if ret != 0 {
-		return int(errno)
+		return -int(errno)
 	}
 	*head = uint16(status.head)
 	return 0
@@ -1553,7 +1559,7 @@ func (ur *ioUring) querySCQ() (*QuerySCQ, error) {
 // ========================================
 
 // registerMemRegion registers a memory region with the io_uring ring.
-// This allows sharing memory regions between user space and kernel for efficient data transfer.
+// This enables shared memory regions between user space and kernel for data transfer.
 func (ur *ioUring) registerMemRegion(reg *MemRegionReg) error {
 	_, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_REGISTER_MEM_REGION, unsafe.Pointer(reg), 1)
 	if errno != 0 {
@@ -1567,7 +1573,7 @@ func (ur *ioUring) registerMemRegion(reg *MemRegionReg) error {
 // ========================================
 
 // registerNAPI registers NAPI busy polling with the io_uring ring.
-// NAPI (New API) allows for more efficient network packet processing.
+// NAPI (New API) enables kernel-side batched network packet processing.
 func (ur *ioUring) registerNAPI(napi *NapiReg) error {
 	_, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_REGISTER_NAPI, unsafe.Pointer(napi), 1)
 	if errno != 0 {
