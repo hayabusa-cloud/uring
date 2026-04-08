@@ -82,6 +82,7 @@ var defaultUringOpOption = OpOption{
 // OpOptionFunc is a type that defines a functional option for configuring a OpOption.
 type OpOptionFunc func(opt *OpOption)
 
+// Apply applies the given option functions to the OpOption.
 func (uo *OpOption) Apply(opts ...OpOptionFunc) {
 	for _, f := range opts {
 		f(uo)

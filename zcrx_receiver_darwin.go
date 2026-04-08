@@ -61,8 +61,14 @@ type zcrxArea struct {
 
 func (a *zcrxArea) unmap() {}
 
-func (b *ZCRXBuffer) Bytes() []byte  { return nil }
-func (b *ZCRXBuffer) Len() int       { return 0 }
+// Bytes returns the received data. Valid until Release.
+func (b *ZCRXBuffer) Bytes() []byte { return nil }
+
+// Len returns the received data length.
+func (b *ZCRXBuffer) Len() int { return 0 }
+
+// Release returns the buffer to the kernel via the refill queue.
+// Call on the CQE path. Returns iox.ErrWouldBlock when the refill ring is full.
 func (b *ZCRXBuffer) Release() error { return nil }
 
 type zcrxRefillQ struct{}
@@ -110,10 +116,15 @@ func (r *ZCRXReceiver) Active() bool { return false }
 // Embed to override selectively.
 type NoopZCRXHandler struct{}
 
+// OnData releases the buffer and continues.
 func (NoopZCRXHandler) OnData(buf *ZCRXBuffer) bool {
 	return buf.Release() == nil
 }
+
+// OnError stops on any error.
 func (NoopZCRXHandler) OnError(error) bool { return false }
-func (NoopZCRXHandler) OnStopped()         {}
+
+// OnStopped is a no-op.
+func (NoopZCRXHandler) OnStopped() {}
 
 var _ ZCRXHandler = NoopZCRXHandler{}

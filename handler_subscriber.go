@@ -105,10 +105,17 @@ type listenerSubscriberAdapter struct {
 	*ListenerSubscriber
 }
 
+// OnSocketCreated forwards to the subscriber callback.
 func (a *listenerSubscriberAdapter) OnSocketCreated(fd iofd.FD) bool { return a.onSocketCreated(fd) }
-func (a *listenerSubscriberAdapter) OnBound() bool                   { return a.onBound() }
-func (a *listenerSubscriberAdapter) OnListening()                    { a.onListening() }
-func (a *listenerSubscriberAdapter) OnError(op uint8, err error)     { a.onError(op, err) }
+
+// OnBound forwards to the subscriber callback.
+func (a *listenerSubscriberAdapter) OnBound() bool { return a.onBound() }
+
+// OnListening forwards to the subscriber callback.
+func (a *listenerSubscriberAdapter) OnListening() { a.onListening() }
+
+// OnError forwards to the subscriber callback.
+func (a *listenerSubscriberAdapter) OnError(op uint8, err error) { a.onError(op, err) }
 
 // Handler returns `s` as a `ListenerHandler`.
 func (s *ListenerSubscriber) Handler() ListenerHandler {
@@ -156,9 +163,14 @@ type incrementalSubscriberAdapter struct {
 	*IncrementalSubscriber
 }
 
+// OnData forwards to the subscriber callback.
 func (a *incrementalSubscriberAdapter) OnData(buf []byte, hasMore bool) { a.onData(buf, hasMore) }
-func (a *incrementalSubscriberAdapter) OnComplete()                     { a.onComplete() }
-func (a *incrementalSubscriberAdapter) OnError(err error)               { a.onError(err) }
+
+// OnComplete forwards to the subscriber callback.
+func (a *incrementalSubscriberAdapter) OnComplete() { a.onComplete() }
+
+// OnError forwards to the subscriber callback.
+func (a *incrementalSubscriberAdapter) OnError(err error) { a.onError(err) }
 
 // Handler returns `s` as an `IncrementalHandler`.
 func (s *IncrementalSubscriber) Handler() IncrementalHandler {
@@ -198,7 +210,10 @@ type zcSubscriberAdapter struct {
 	*ZCSubscriber
 }
 
-func (a *zcSubscriberAdapter) OnCompleted(result int32)    { a.onCompleted(result) }
+// OnCompleted forwards to the subscriber callback.
+func (a *zcSubscriberAdapter) OnCompleted(result int32) { a.onCompleted(result) }
+
+// OnNotification forwards to the subscriber callback.
 func (a *zcSubscriberAdapter) OnNotification(result int32) { a.onNotification(result) }
 
 // Handler returns `s` as a `ZCHandler`.
