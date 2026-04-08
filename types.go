@@ -18,27 +18,27 @@ import (
 	"code.hybscloud.com/zcall"
 )
 
-// Re-export types from sock for API compatibility.
+// Network address and socket type aliases.
 type (
-	// Sockaddr is the socket address interface from sock.
+	// Sockaddr is the socket address interface used by socket operations.
 	Sockaddr = sock.Sockaddr
 
-	// Addr is the network address interface from sock.
+	// Addr is the network address interface used by connect and bind helpers.
 	Addr = sock.Addr
 
-	// RawSockaddrAny is a raw socket address from sock.
+	// RawSockaddrAny is the widest raw socket address storage type.
 	RawSockaddrAny = sock.RawSockaddrAny
 
-	// RawSockaddr is the base socket address structure from sock.
+	// RawSockaddr is the base raw socket address structure.
 	RawSockaddr = sock.RawSockaddr
 
-	// RawSockaddrInet4 is the raw IPv4 socket address from sock.
+	// RawSockaddrInet4 is the raw IPv4 socket address structure.
 	RawSockaddrInet4 = sock.RawSockaddrInet4
 
-	// RawSockaddrInet6 is the raw IPv6 socket address from sock.
+	// RawSockaddrInet6 is the raw IPv6 socket address structure.
 	RawSockaddrInet6 = sock.RawSockaddrInet6
 
-	// RawSockaddrUnix is the raw Unix domain socket address from sock.
+	// RawSockaddrUnix is the raw Unix domain socket address structure.
 	RawSockaddrUnix = sock.RawSockaddrUnix
 
 	// NetworkType represents the network address family.
@@ -51,23 +51,23 @@ type (
 	Socket = sock.Socket
 )
 
-// Re-export iofd interfaces for API compatibility.
+// Pollable file-descriptor aliases.
 type (
-	// PollFd represents a pollable file descriptor from iofd.
+	// PollFd represents a file descriptor that can be polled by uring helpers.
 	PollFd = iofd.PollFd
 
-	// PollCloser extends PollFd with close capability from iofd.
+	// PollCloser extends PollFd with close capability.
 	PollCloser = iofd.PollCloser
 )
 
-// Re-export constants from sock.
+// Network family aliases.
 const (
 	NetworkUnix = sock.NetworkUnix
 	NetworkIPv4 = sock.NetworkIPv4
 	NetworkIPv6 = sock.NetworkIPv6
 )
 
-// Re-export sockaddr size constants from sock.
+// Raw socket address size constants.
 const (
 	SizeofSockaddrAny   = sock.SizeofSockaddrAny
 	SizeofSockaddrInet4 = sock.SizeofSockaddrInet4
@@ -75,7 +75,7 @@ const (
 	SizeofSockaddrUnix  = sock.SizeofSockaddrUnix
 )
 
-// Re-export constants from zcall for API compatibility.
+// Socket, protocol, message, shutdown, and memory-mapping aliases.
 const (
 	AF_UNIX  = sock.AF_UNIX
 	AF_LOCAL = sock.AF_LOCAL
@@ -113,7 +113,7 @@ const (
 // IPPROTO_UDPLITE is UDP-Lite protocol number.
 const IPPROTO_UDPLITE = sock.IPPROTO_UDPLITE
 
-// IoVec is the scatter/gather I/O vector from zcall.
+// IoVec is the scatter/gather I/O vector type.
 type IoVec = zcall.Iovec
 
 // Timespec represents a time value with nanosecond precision.

@@ -302,8 +302,12 @@ func (ur *Uring) releaseRegisteredBufRings() error {
 //
 //	cqes := make([]CQEView, 64)
 //	n, err := ring.Wait(cqes)
-//	for i := 0; i < n; i++ {
+//	for i := range n {
 //	    cqe := &cqes[i]
+//	    if cqe.Res < 0 {
+//	        handleCompletionError(cqe.Op(), cqe.Res)
+//	        continue
+//	    }
 //	    if cqe.Extended() {
 //	        ext := cqe.ExtSQE()
 //	        ctx := ViewCtx(ext).Vals1()
@@ -1341,7 +1345,7 @@ func (ur *Uring) QuerySCQ() (*QuerySCQ, error) {
 // ========================================
 
 // RegisterMemRegion registers a memory region with the io_uring ring.
-// Memory regions allow efficient sharing between user space and kernel.
+// Memory regions enable shared access between user space and kernel.
 // Requires kernel 6.19+.
 func (ur *Uring) RegisterMemRegion(region *RegionDesc, flags uint64) error {
 	reg := MemRegionReg{
@@ -1356,8 +1360,7 @@ func (ur *Uring) RegisterMemRegion(region *RegionDesc, flags uint64) error {
 // ========================================
 
 // RegisterNAPI enables NAPI busy polling for network operations.
-// NAPI (New API) provides more efficient network packet processing
-// by allowing the kernel to batch packet handling.
+// NAPI (New API) enables kernel-side batched network packet processing.
 //
 // Parameters:
 //   - busyPollTimeout: timeout in microseconds for busy polling
@@ -1411,7 +1414,7 @@ func (ur *Uring) UnregisterNAPI() error {
 // ========================================
 
 // CloneBuffers clones registered buffers from another io_uring ring.
-// This allows efficient buffer sharing between multiple rings.
+// This enables buffer sharing between multiple rings.
 //
 // Parameters:
 //   - srcFD: source ring file descriptor

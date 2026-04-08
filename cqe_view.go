@@ -24,17 +24,19 @@ import "code.hybscloud.com/iofd"
 // # Usage
 //
 //	n, err := ring.Wait(cqes)
-//	for i := 0; i < n; i++ {
+//	for i := range n {
 //	    cqe := cqes[i]
 //	    // Observe the kernel facts first.
-//	    op := cqe.Op()
-//	    fd := cqe.FD()
+//	    if cqe.Res < 0 {
+//	        return fmt.Errorf("completion failed: op=%d fd=%d res=%d", cqe.Op(), cqe.FD(), cqe.Res)
+//	    }
+//	    fmt.Printf("completed op=%d on fd=%d with res=%d\n", cqe.Op(), cqe.FD(), cqe.Res)
 //	    if cqe.HasMore() {
 //	        // Higher layers decide whether to keep routing this live stream.
 //	    }
 //	    if cqe.FullSQE() {
 //	        // Indirect and Extended modes also expose the submitted SQE.
-//	        _ = cqe.SQE()
+//	        fmt.Printf("submitted opcode=%d\n", cqe.SQE().Opcode())
 //	    }
 //	}
 type CQEView struct {

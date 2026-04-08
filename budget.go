@@ -39,9 +39,7 @@ const (
 )
 
 // OptionsForSystem returns Options configured for a machine with the given total memory.
-//
-// This is the recommended entry point for configuring io_uring based on available system resources.
-// It automatically calculates a generous budget (25% of system memory) for high-performance I/O.
+// It derives a memory budget (25% of system memory) and delegates to [OptionsForBudget].
 //
 // Use the MachineMemory* constants for common configurations:
 //
