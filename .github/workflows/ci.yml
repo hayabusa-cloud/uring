@@ -66,23 +66,21 @@ jobs:
       #     token: ${{ secrets.CODECOV_TOKEN }}
 
   cross-build:
-    name: Cross-Build (linux/${{ matrix.goarch }})
+    name: Cross-Build (Go ${{ matrix.go-version }}, linux/${{ matrix.goarch }})
     runs-on: ubuntu-latest
     timeout-minutes: 5
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { goarch: arm64 }
-          - { goarch: riscv64 }
-          - { goarch: loong64 }
+        go-version: [ '1.26.x', 'stable' ]
+        goarch: [ arm64, riscv64, loong64 ]
     steps:
       - uses: actions/checkout@v6
 
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: '1.26.x'
+          go-version: ${{ matrix.go-version }}
 
       - name: Build
         env:
