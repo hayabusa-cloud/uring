@@ -167,8 +167,13 @@ type OpenHow struct {
 	Resolve uint64
 }
 
+// SizeofOpenHow is the size of OpenHow structure.
 const SizeofOpenHow = 24
+
+// O_LARGEFILE flag for openat (zero on Darwin).
 const O_LARGEFILE = 0
+
+// AT_FDCWD is the special value for current working directory.
 const AT_FDCWD = -2
 
 // EpollEvent represents an epoll event (Darwin uses kqueue but we keep for API compatibility).
@@ -217,6 +222,7 @@ type Statx struct {
 	_                [12]uint64
 }
 
+// StatxTimestamp represents a timestamp in statx.
 type StatxTimestamp struct {
 	Sec  int64
 	Nsec uint32
@@ -226,7 +232,10 @@ type StatxTimestamp struct {
 // noCopy may be added to structs which must not be copied.
 type noCopy struct{}
 
-func (*noCopy) Lock()   {}
+// Lock is a no-op used by go vet's -copylocks checker.
+func (*noCopy) Lock() {}
+
+// Unlock is a no-op used by go vet's -copylocks checker.
 func (*noCopy) Unlock() {}
 
 // bytePtrFromString returns a pointer to a new NUL-terminated copy of s.

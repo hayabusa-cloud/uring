@@ -162,6 +162,7 @@ const (
 	FUTEX2_PRIVATE  uint32 = 128
 )
 
+// FUTEX_BITSET_MATCH_ANY matches any waker when used as mask in FutexWait.
 const FUTEX_BITSET_MATCH_ANY uint64 = 0xFFFFFFFF
 
 // MSG_RING command types for the addr field.

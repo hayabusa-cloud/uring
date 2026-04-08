@@ -202,7 +202,9 @@ type StatxTimestamp struct {
 type noCopy struct{}
 
 // Lock is a no-op used by -copylocks checker from `go vet`.
-func (*noCopy) Lock()   {}
+func (*noCopy) Lock() {}
+
+// Unlock is a no-op used by -copylocks checker from `go vet`.
 func (*noCopy) Unlock() {}
 
 // writeCString writes s into dst as a NUL-terminated C string.

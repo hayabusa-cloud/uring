@@ -25,6 +25,8 @@ const (
 	EntriesHuge   = 1 << 15 // 32768 entries
 )
 
+// Options configures the io_uring instance behavior.
+// All fields have sensible defaults if not specified.
 type Options struct {
 	Entries                 int
 	LockedBufferMem         int
@@ -40,6 +42,8 @@ type Options struct {
 	HybridPolling           bool
 }
 
+// New creates a new io_uring instance with the specified options.
+// Returns an unstarted ring; call Start() to initialize buffers and enable.
 func New(options ...OptionFunc) (*Uring, error) {
 	opt := defaultOptions
 	opt.Apply(options...)
@@ -97,12 +101,19 @@ func New(options ...OptionFunc) (*Uring, error) {
 	return &ret, nil
 }
 
+// Features reports per-ring sizing and metadata returned at creation time.
 type Features struct {
 	SQEntries         int
 	CQEntries         int
 	UserDataByteOrder binary.ByteOrder
 }
 
+// Uring is the main io_uring interface for submitting and completing I/O operations.
+// It wraps the kernel io_uring instance with buffer management and typed operations.
+// Default rings use the single-issuer fast path, so submit-state operations
+// are not safe for concurrent use by multiple goroutines; caller must
+// serialize submit, Wait/enter, Stop, and ResizeRings unless MultiIssuers is
+// enabled.
 type Uring struct {
 	*ioUring
 	*Options
