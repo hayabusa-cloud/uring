@@ -11,7 +11,6 @@ import (
 
 	"code.hybscloud.com/dwcas"
 	"code.hybscloud.com/iofd"
-	"code.hybscloud.com/iox"
 	"code.hybscloud.com/spin"
 )
 
@@ -93,7 +92,11 @@ func (c *ExtCQE) FD() iofd.FD {
 // For applications using only Extended mode, this skips the mode dispatch
 // that Wait([]CQEView) performs per CQE.
 //
-// Returns the number of CQEs retrieved, or iox.ErrWouldBlock if none available.
+// On single-issuer rings it is not safe for concurrent use with submit, Stop,
+// or ResizeRings; caller must serialize those operations.
+// Returns the number of CQEs retrieved, ErrCQOverflow when the ring enters CQ
+// overflow and no CQEs are immediately claimable, or iox.ErrWouldBlock if none
+// are available.
 func (ur *Uring) WaitExtended(cqes []ExtCQE) (int, error) {
 	if err := ur.ioUring.enter(); err != nil {
 		return 0, err
@@ -107,12 +110,18 @@ func (ur *ioUring) waitBatchExtended(cqes []ExtCQE) (int, error) {
 		return 0, nil
 	}
 
+	ur.lockSubmitState()
+	defer ur.unlockSubmitState()
+	if ur.closed.Load() || ur.cq.kHead == nil || ur.cq.kTail == nil || ur.cq.kRingMask == nil || len(ur.cq.cqes) == 0 {
+		return 0, ErrClosed
+	}
+
 	sw := spin.Wait{}
 	for {
 		h := atomic.LoadUint32(ur.cq.kHead)
 		t := atomic.LoadUint32(ur.cq.kTail)
 		if h == t {
-			return 0, iox.ErrWouldBlock
+			return 0, ur.cqEmptyErr()
 		}
 
 		// Calculate batch size

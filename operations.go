@@ -13,6 +13,8 @@ import (
 
 // Refactored from code.hybscloud.com/sox.
 
+const uringCmd128DataMax = 80
+
 // IORING_OP_* values encode io_uring operation types in SQEs and SQEContext.
 const (
 	IORING_OP_NOP uint8 = iota
@@ -459,6 +461,20 @@ func (ur *ioUring) send(sqeCtx SQEContext, ioprio uint16, p []byte, offset uint6
 	}
 	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(p))))
 	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_SEND), ioprio, offset, addr, n, 0)
+}
+
+// sendFixed submits SEND with a registered buffer.
+func (ur *ioUring) sendFixed(sqeCtx SQEContext, bufIndex int, offset uint64, n int, msgFlags uint32) error {
+	if bufIndex < 0 || bufIndex >= len(ur.bufs) {
+		return ErrInvalidParam
+	}
+	buf := ur.bufs[bufIndex]
+	if n < 0 || offset > uint64(len(buf)) || uint64(n) > uint64(len(buf))-offset {
+		return ErrInvalidParam
+	}
+	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(buf)))) + offset
+	ctx := sqeCtx.WithOp(IORING_OP_SEND).WithBufGroup(uint16(bufIndex))
+	return ur.submitPacked9(ctx, IORING_RECVSEND_FIXED_BUF, 0, addr, n, msgFlags, 0, 0)
 }
 
 // receive submits a receive operation with MSG_WAITALL semantics.
@@ -1211,12 +1227,53 @@ func (ur *ioUring) uringCmd(sqeCtx SQEContext, cmdOp uint32, cmdData []byte) err
 	return nil
 }
 
-// nop128 returns ErrNotSupported until the ring can map 128-byte SQE slots.
+// nop128 submits a NOP through a 128-byte SQE slot.
 func (ur *ioUring) nop128(sqeCtx SQEContext) error {
-	return ErrNotSupported
+	if ur.params.flags&IORING_SETUP_SQE128 == 0 || !ur.supportsOpcode(IORING_OP_NOP128) {
+		return ErrNotSupported
+	}
+	ctx := sqeCtx.WithOp(IORING_OP_NOP128)
+	slot, err := ur.reserveSubmitSlot()
+	if err != nil {
+		return err
+	}
+	*slot.sqe = ioUringSqe{
+		opcode: IORING_OP_NOP128,
+		flags:  sqeCtx.Flags(),
+		fd:     sqeCtx.FD(),
+	}
+	mirrorExtendedSQE(ctx, slot.sqe)
+	ur.publishSubmitSlot(slot, ctx)
+	return nil
 }
 
-// uringCmd128 returns ErrNotSupported until the ring can map 128-byte SQE slots.
+// uringCmd128 submits a uring command with inline wide command data.
 func (ur *ioUring) uringCmd128(sqeCtx SQEContext, cmdOp uint32, cmdData []byte) error {
-	return ErrNotSupported
+	if ur.params.flags&IORING_SETUP_SQE128 == 0 || !ur.supportsOpcode(IORING_OP_URING_CMD128) {
+		return ErrNotSupported
+	}
+	if len(cmdData) > uringCmd128DataMax {
+		return ErrInvalidParam
+	}
+	ctx := sqeCtx.WithOp(IORING_OP_URING_CMD128)
+	slot, err := ur.reserveSubmitSlot()
+	if err != nil {
+		return err
+	}
+	if slot.sqe128 == nil {
+		ur.abortSubmitSlot(slot)
+		return ErrNotSupported
+	}
+	*slot.sqe = ioUringSqe{
+		opcode: IORING_OP_URING_CMD128,
+		flags:  sqeCtx.Flags(),
+		fd:     sqeCtx.FD(),
+		off:    uint64(cmdOp),
+	}
+	if len(cmdData) > 0 {
+		copy(slot.inlineCmdData128(), cmdData)
+	}
+	mirrorExtendedSQE(ctx, slot.sqe)
+	ur.publishSubmitSlot(slot, ctx)
+	return nil
 }

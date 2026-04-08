@@ -31,6 +31,7 @@ var (
 	ErrNotSupported       = errors.New("uring: operation not supported")
 	ErrBusy               = errors.New("uring: resource busy")
 	ErrClosed             = errors.New("uring: ring closed")
+	ErrCQOverflow         = errors.New("uring: completion queue overflow")
 	ErrExists             = errors.New("uring: already exists")
 	ErrNameTooLong        = errors.New("uring: name too long")
 	ErrNotFound           = errors.New("uring: not found")

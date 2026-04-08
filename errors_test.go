@@ -84,6 +84,7 @@ func TestErrorMessages(t *testing.T) {
 		ErrBusy,
 		ErrExists,
 		ErrNotFound,
+		ErrCQOverflow,
 		ErrCanceled,
 		ErrTimedOut,
 		ErrConnectionRefused,

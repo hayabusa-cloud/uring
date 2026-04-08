@@ -225,7 +225,7 @@ func TestSubmitKeepAliveRetainsBindAndXattrRoots(t *testing.T) {
 
 		tail := atomic.LoadUint32(ring.ioUring.sq.kTail)
 		idx := (tail - 1) & *ring.ioUring.sq.kRingMask
-		sqe := ring.ioUring.sq.sqes[idx]
+		sqe := ring.ioUring.sq.sqeAt(idx)
 		if got, want := sqe.addr, uint64(uintptr(unsafe.Pointer(unsafe.SliceData(cmdData)))); got != want {
 			t.Fatalf("uringCmd sqe.addr = %#x, want %#x", got, want)
 		}
@@ -240,6 +240,51 @@ func TestSubmitKeepAliveRetainsBindAndXattrRoots(t *testing.T) {
 		}
 		if unsafe.SliceData(kept) != unsafe.SliceData(cmdData) {
 			t.Fatal("uringCmd keepAlive did not retain the original caller buffer")
+		}
+	})
+
+	t.Run("uringCmd128 stages inline command bytes", func(t *testing.T) {
+		ring, err := New(testMinimalBufferOptions, func(opt *Options) {
+			opt.Entries = EntriesNano
+			opt.MultiIssuers = true
+			opt.NotifySucceed = true
+			opt.SQE128 = true
+		})
+		if errors.Is(err, ErrNotSupported) {
+			t.Skip("SQE128 ring setup not supported on this kernel")
+		}
+		if err != nil {
+			t.Fatalf("New SQE128 ring: %v", err)
+		}
+		mustStartRing(t, ring)
+
+		cmdData := []byte("wide-inline-command")
+		cmdCtx := PackDirect(0, IOSQE_IO_LINK, 0, 17)
+		if err := ring.ioUring.uringCmd128(cmdCtx, 123, cmdData); errors.Is(err, ErrNotSupported) {
+			t.Skip("URING_CMD128 opcode not supported on this kernel")
+		} else if err != nil {
+			t.Fatalf("uringCmd128 submit: %v", err)
+		}
+
+		tail := atomic.LoadUint32(ring.ioUring.sq.kTail)
+		idx := (tail - 1) & *ring.ioUring.sq.kRingMask
+		sqe := ring.ioUring.sq.sqeAt(idx)
+		sqe128 := ring.ioUring.sq.sqe128At(idx)
+		if sqe128 == nil {
+			t.Fatal("wide ring did not expose 128-byte SQE view")
+		}
+		if sqe.opcode != IORING_OP_URING_CMD128 {
+			t.Fatalf("uringCmd128 opcode = %d, want %d", sqe.opcode, IORING_OP_URING_CMD128)
+		}
+		if sqe.off != 123 {
+			t.Fatalf("uringCmd128 off = %d, want %d", sqe.off, 123)
+		}
+		inline := unsafe.Slice((*byte)(unsafe.Pointer(&sqe128.pad[0])), len(cmdData))
+		if got := string(inline); got != string(cmdData) {
+			t.Fatalf("uringCmd128 inline data = %q, want %q", got, string(cmdData))
+		}
+		if keep := &ring.ioUring.submit.keepAlive[idx]; keep.active {
+			t.Fatal("uringCmd128 should not retain external command data")
 		}
 	})
 }
@@ -330,7 +375,7 @@ func TestEpollWaitRejectsTimeoutAndStagesZeroOff(t *testing.T) {
 
 	tail := atomic.LoadUint32(ring.ioUring.sq.kTail)
 	idx := (tail - 1) & *ring.ioUring.sq.kRingMask
-	sqe := ring.ioUring.sq.sqes[idx]
+	sqe := ring.ioUring.sq.sqeAt(idx)
 	if sqe.off != 0 {
 		t.Fatalf("epollWait sqe.off = %d, want 0", sqe.off)
 	}
@@ -354,7 +399,8 @@ func TestCloseAfterFatalResizeClosesRingState(t *testing.T) {
 		files:    []int32{1},
 		ops:      []ioUringProbeOp{{op: IORING_OP_NOP}},
 		sq: ioUringSq{
-			sqes: make([]ioUringSqe, 1),
+			sqeStride: unsafe.Sizeof(ioUringSqe{}),
+			sqeMapSz:  unsafe.Sizeof(ioUringSqe{}),
 		},
 	}
 
@@ -371,20 +417,24 @@ func TestCloseAfterFatalResizeClosesRingState(t *testing.T) {
 	if ur.bufs != nil || ur.files != nil || ur.ops != nil {
 		t.Fatal("closeAfterFatalResize did not clear userspace state")
 	}
-	if ur.sq.sqes != nil || ur.sq.kHead != nil || ur.cq.cqes != nil {
+	if ur.sq.sqesPtr != nil || ur.sq.sqeStride != 0 || ur.sq.sqeMapSz != 0 || ur.sq.kHead != nil || ur.cq.cqes != nil {
 		t.Fatal("closeAfterFatalResize did not unmap ring views")
+	}
+	if err := ur.enter(); !errors.Is(err, ErrClosed) {
+		t.Fatalf("enter after fatal resize = %v, want %v", err, ErrClosed)
 	}
 }
 
 func TestClearRingViewsClearsStaleMappings(t *testing.T) {
 	ur := &ioUring{
 		sq: ioUringSq{
-			ringPtr: unsafe.Pointer(new(byte)),
-			sqesPtr: unsafe.Pointer(new(ioUringSqe)),
-			ringSz:  128,
-			sqes:    make([]ioUringSqe, 2),
-			kHead:   new(uint32),
-			kTail:   new(uint32),
+			ringPtr:   unsafe.Pointer(new(byte)),
+			sqesPtr:   unsafe.Pointer(new(ioUringSqe)),
+			ringSz:    128,
+			sqeStride: unsafe.Sizeof(ioUringSqe{}),
+			sqeMapSz:  2 * unsafe.Sizeof(ioUringSqe{}),
+			kHead:     new(uint32),
+			kTail:     new(uint32),
 		},
 		cq: ioUringCq{
 			kHead: new(uint32),
@@ -394,11 +444,34 @@ func TestClearRingViewsClearsStaleMappings(t *testing.T) {
 
 	ur.clearRingViews()
 
-	if ur.sq.ringPtr != nil || ur.sq.sqesPtr != nil || ur.sq.ringSz != 0 || ur.sq.sqes != nil || ur.sq.kHead != nil || ur.sq.kTail != nil {
+	if ur.sq.ringPtr != nil || ur.sq.sqesPtr != nil || ur.sq.ringSz != 0 || ur.sq.sqeStride != 0 || ur.sq.sqeMapSz != 0 || ur.sq.kHead != nil || ur.sq.kTail != nil {
 		t.Fatal("clearRingViews did not clear sq state")
 	}
 	if ur.cq.kHead != nil || ur.cq.kTail != nil || ur.cq.cqes != nil || ur.cq.ringSz != 0 {
 		t.Fatal("clearRingViews did not clear cq state")
+	}
+
+	ring := &Uring{ioUring: ur}
+	if got := ring.SQAvailable(); got != 0 {
+		t.Fatalf("SQAvailable after clearRingViews = %d, want 0", got)
+	}
+	if got := ring.CQPending(); got != 0 {
+		t.Fatalf("CQPending after clearRingViews = %d, want 0", got)
+	}
+	if err := ur.enter(); !errors.Is(err, ErrClosed) {
+		t.Fatalf("enter after clearRingViews = %v, want %v", err, ErrClosed)
+	}
+	if _, err := ur.wait(); !errors.Is(err, ErrClosed) {
+		t.Fatalf("wait after clearRingViews = %v, want %v", err, ErrClosed)
+	}
+	if _, err := ur.waitBatch(make([]CQEView, 1)); !errors.Is(err, ErrClosed) {
+		t.Fatalf("waitBatch after clearRingViews = %v, want %v", err, ErrClosed)
+	}
+	if _, err := ur.waitBatchDirect(make([]DirectCQE, 1)); !errors.Is(err, ErrClosed) {
+		t.Fatalf("waitBatchDirect after clearRingViews = %v, want %v", err, ErrClosed)
+	}
+	if _, err := ur.waitBatchExtended(make([]ExtCQE, 1)); !errors.Is(err, ErrClosed) {
+		t.Fatalf("waitBatchExtended after clearRingViews = %v, want %v", err, ErrClosed)
 	}
 }
 
@@ -567,7 +640,7 @@ func TestSendZeroCopyFixedStagesBufIndexAndOffset(t *testing.T) {
 
 	tail := atomic.LoadUint32(ring.ioUring.sq.kTail)
 	idx := (tail - 1) & *ring.ioUring.sq.kRingMask
-	sqe := ring.ioUring.sq.sqes[idx]
+	sqe := ring.ioUring.sq.sqeAt(idx)
 
 	if sqe.opcode != IORING_OP_SEND_ZC {
 		t.Fatalf("opcode = %d, want %d", sqe.opcode, IORING_OP_SEND_ZC)

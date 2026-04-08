@@ -25,11 +25,12 @@ import (
 
 func logRingDiagnostics(t *testing.T, label string, ring *uring.Uring) {
 	t.Helper()
-	t.Logf("%s: ringFD=%d sqEntries=%d cqEntries=%d sqAvailable=%d cqPending=%d notifySucceed=%t multiIssuers=%t",
+	t.Logf("%s: ringFD=%d sqEntries=%d cqEntries=%d sqeBytes=%d sqAvailable=%d cqPending=%d notifySucceed=%t multiIssuers=%t",
 		label,
 		ring.RingFD(),
 		ring.Features.SQEntries,
 		ring.Features.CQEntries,
+		ring.Features.SQEBytes,
 		ring.SQAvailable(),
 		ring.CQPending(),
 		ring.NotifySucceed,
@@ -1743,14 +1744,17 @@ func TestLinkedOperations(t *testing.T) {
 	t.Log("Linked operations test passed")
 }
 
-// TestMixedSQEMode verifies that 128-byte SQE helpers fail explicitly until
-// SQE128 or SQE_MIXED ring wiring is implemented in userspace.
-func TestMixedSQEMode(t *testing.T) {
+// TestSQE128HelpersRequireWideRing verifies that the 128-byte helpers fail
+// explicitly on default 64-byte rings.
+func TestSQE128HelpersRequireWideRing(t *testing.T) {
 	ring, err := uring.New(testMinimalBufferOptions)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	mustStartRing(t, ring)
+	if got := ring.Features.SQEBytes; got != 64 {
+		t.Fatalf("default ring SQEBytes = %d, want 64", got)
+	}
 
 	nopCtx := uring.PackDirect(uring.IORING_OP_NOP128, 0, 1, 0)
 	err = ring.Nop128(nopCtx)
@@ -1763,7 +1767,39 @@ func TestMixedSQEMode(t *testing.T) {
 	if !errors.Is(err, uring.ErrNotSupported) {
 		t.Fatalf("UringCmd128: got %v, want ErrNotSupported", err)
 	}
-	t.Log("128-byte SQE helpers correctly report unsupported ring wiring")
+	t.Log("128-byte SQE helpers correctly reject non-SQE128 rings")
+}
+
+func TestSQE128NopCycle(t *testing.T) {
+	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
+		opt.SQE128 = true
+	})
+	if errors.Is(err, uring.ErrNotSupported) {
+		t.Skip("SQE128 ring setup not supported on this kernel")
+	}
+	if err != nil {
+		t.Fatalf("New SQE128 ring: %v", err)
+	}
+	mustStartRing(t, ring)
+	if got := ring.Features.SQEBytes; got != 128 {
+		t.Fatalf("SQE128 ring SQEBytes = %d, want 128", got)
+	}
+
+	ctx := uring.PackDirect(uring.IORING_OP_NOP128, 0, 0, 0)
+	if err := ring.Nop128(ctx); errors.Is(err, uring.ErrNotSupported) {
+		t.Skip("NOP128 opcode not supported on this kernel")
+	} else if err != nil {
+		t.Fatalf("Nop128: %v", err)
+	}
+
+	ev, ok := waitForOp(t, ring, uring.IORING_OP_NOP128, time.Second)
+	if !ok {
+		t.Fatal("NOP128 operation did not complete")
+	}
+	if ev.Res < 0 {
+		t.Errorf("NOP128 failed with result: %d", ev.Res)
+	}
 }
 
 // =============================================================================

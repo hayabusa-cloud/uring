@@ -350,6 +350,9 @@ var (
 	ioUringNoSQArrayOptions = func(params *ioUringParams) {
 		params.flags |= IORING_SETUP_NO_SQARRAY
 	}
+	ioUringSQE128Options = func(params *ioUringParams) {
+		params.flags |= IORING_SETUP_SQE128
+	}
 	ioUringIoPollOptions = func(params *ioUringParams) {
 		params.flags |= IORING_SETUP_IOPOLL
 	}
@@ -360,6 +363,13 @@ var (
 		params.flags |= IORING_SETUP_SQPOLL | IORING_SETUP_SQ_AFF
 	}
 )
+
+func sqeBytesFromFlags(flags uint32) int {
+	if flags&IORING_SETUP_SQE128 != 0 {
+		return 128
+	}
+	return 64
+}
 
 // newIoUring creates a new Darwin io_uring simulator.
 func newIoUring(entries int, opts ...func(params *ioUringParams)) (*ioUring, error) {

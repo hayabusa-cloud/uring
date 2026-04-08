@@ -63,6 +63,10 @@ type Options struct {
 	// IndirectSubmissionQueue enables the SQ array. When false, New requests
 	// IORING_SETUP_NO_SQARRAY to reduce ring memory in the direct-index submit path.
 	IndirectSubmissionQueue bool
+	// SQE128 requests 128-byte SQE slots for the ring. This is required for
+	// Nop128 and UringCmd128. When false, the ring keeps the default 64-byte SQE
+	// layout.
+	SQE128 bool
 	// HybridPolling enables hybrid I/O polling mode (IORING_SETUP_HYBRID_IOPOLL).
 	// This delays polling to reduce CPU usage while maintaining low latency.
 	// Requires: O_DIRECT files on polling-capable storage devices (e.g., NVMe).
@@ -75,25 +79,17 @@ type Options struct {
 func New(options ...OptionFunc) (*Uring, error) {
 	opt := defaultOptions
 	opt.Apply(options...)
-	setupOpts := []func(params *ioUringParams){ioUringDisabledOptions}
-	if opt.MultiIssuers {
-		setupOpts = append(setupOpts, func(params *ioUringParams) {
-			params.flags |= IORING_SETUP_COOP_TASKRUN
-		})
-	} else {
-		setupOpts = append(setupOpts, func(params *ioUringParams) {
-			params.flags |= IORING_SETUP_SINGLE_ISSUER
-			params.flags |= IORING_SETUP_DEFER_TASKRUN
-		})
-	}
-	if !opt.IndirectSubmissionQueue {
-		setupOpts = append(setupOpts, ioUringNoSQArrayOptions)
-	}
-	if opt.HybridPolling {
-		setupOpts = append(setupOpts, ioUringHybridIoPollOptions)
-	}
+	baseSetupOpts := newSetupOptions(opt, false)
+	setupOpts := newSetupOptions(opt, opt.SQE128)
 	r, err := newIoUring(opt.Entries, setupOpts...)
 	if err != nil {
+		if opt.SQE128 && errors.Is(err, ErrInvalidParam) {
+			fallback, fallbackErr := newIoUring(opt.Entries, baseSetupOpts...)
+			if fallbackErr == nil {
+				_ = fallback.stop()
+				return nil, ErrNotSupported
+			}
+		}
 		return nil, err
 	}
 	rFlags, wFlags := uint8(0), uint8(0)
@@ -119,6 +115,7 @@ func New(options ...OptionFunc) (*Uring, error) {
 	feat := Features{
 		SQEntries:         int(r.params.sqEntries),
 		CQEntries:         int(r.params.cqEntries),
+		SQEBytes:          sqeBytesFromFlags(r.params.flags),
 		UserDataByteOrder: binary.LittleEndian,
 	}
 	if isBigEndian {
@@ -135,8 +132,34 @@ type Features struct {
 	SQEntries int
 	// CQEntries is the actual number of CQ entries allocated by the kernel.
 	CQEntries int
+	// SQEBytes is the width of each mapped SQE slot in bytes.
+	SQEBytes int
 	// UserDataByteOrder is the byte order for user_data field interpretation.
 	UserDataByteOrder binary.ByteOrder
+}
+
+func newSetupOptions(opt Options, sqe128 bool) []func(params *ioUringParams) {
+	setupOpts := []func(params *ioUringParams){ioUringDisabledOptions}
+	if opt.MultiIssuers {
+		setupOpts = append(setupOpts, func(params *ioUringParams) {
+			params.flags |= IORING_SETUP_COOP_TASKRUN
+		})
+	} else {
+		setupOpts = append(setupOpts, func(params *ioUringParams) {
+			params.flags |= IORING_SETUP_SINGLE_ISSUER
+			params.flags |= IORING_SETUP_DEFER_TASKRUN
+		})
+	}
+	if !opt.IndirectSubmissionQueue {
+		setupOpts = append(setupOpts, ioUringNoSQArrayOptions)
+	}
+	if sqe128 {
+		setupOpts = append(setupOpts, ioUringSQE128Options)
+	}
+	if opt.HybridPolling {
+		setupOpts = append(setupOpts, ioUringHybridIoPollOptions)
+	}
+	return setupOpts
 }
 
 // Uring is the main io_uring interface for submitting and completing I/O operations.
@@ -292,7 +315,8 @@ func (ur *Uring) releaseRegisteredBufRings() error {
 // Wait flushes pending submissions, drives deferred task work when needed, and
 // collects completion events into cqes. On single-issuer rings it is not safe
 // for concurrent use with submit, Stop, or ResizeRings; caller must serialize
-// those operations. It returns the number of events received, or
+// those operations. It returns the number of events received, ErrCQOverflow
+// when the ring enters CQ overflow and no CQEs are immediately claimable, or
 // `iox.ErrWouldBlock` if the CQ is empty.
 //
 // CQEView provides direct field access to Res and Flags, and methods to access
@@ -403,20 +427,32 @@ func (ur *Uring) RegisteredBufferCount() int {
 // ========================================
 
 // SQAvailable returns the number of SQEs available for submission.
-// Higher layers can use this for admission control and backpressure.
-//
-//go:nosplit
+// Higher layers can use this for admission control and backpressure. On
+// single-issuer rings it is not safe for concurrent use with ResizeRings;
+// caller must serialize those operations.
 func (ur *Uring) SQAvailable() int {
+	ur.lockSubmitState()
+	defer ur.unlockSubmitState()
+	if ur.closed.Load() || ur.sq.kRingEntries == nil || ur.sq.kHead == nil || ur.sq.kTail == nil {
+		return 0
+	}
+
 	entries := int(*ur.sq.kRingEntries)
 	pending := ur.sqCount()
 	return entries - pending
 }
 
 // CQPending returns the number of CQEs waiting to be reaped.
-// Higher layers can use this to decide when to drain completions.
-//
-//go:nosplit
+// Higher layers can use this to decide when to drain completions. On
+// single-issuer rings it is not safe for concurrent use with ResizeRings;
+// caller must serialize those operations.
 func (ur *Uring) CQPending() int {
+	ur.lockSubmitState()
+	defer ur.unlockSubmitState()
+	if ur.closed.Load() || ur.cq.kHead == nil || ur.cq.kTail == nil {
+		return 0
+	}
+
 	h := atomic.LoadUint32(ur.cq.kHead)
 	t := atomic.LoadUint32(ur.cq.kTail)
 	return int(t - h)
@@ -714,9 +750,36 @@ func (ur *Uring) Multicast(sqeCtx SQEContext, targets SendTargets, bufIndex int,
 	if count == 0 {
 		return nil
 	}
+	if n < 0 {
+		return ErrInvalidParam
+	}
 
 	flags := ur.operationOptions(options)
 	ctx := sqeCtx.WithFlags(flags | ur.writeLikeOpFlags)
+
+	offsetInt := 0
+	userPayload := p
+	if bufIndex >= 0 {
+		buf := ur.RegisteredBuffer(bufIndex)
+		if buf == nil || offset < 0 || offset > int64(len(buf)) {
+			return ErrInvalidParam
+		}
+		offsetInt = int(offset)
+		if n > len(buf)-offsetInt {
+			return ErrInvalidParam
+		}
+	} else {
+		if offset < 0 || offset > int64(len(p)) {
+			return ErrInvalidParam
+		}
+		offsetInt = int(offset)
+		if n > len(p)-offsetInt {
+			return ErrInvalidParam
+		}
+		if offsetInt < len(p) {
+			userPayload = p[offsetInt:]
+		}
+	}
 
 	// Strategy: use zero-copy with registered buffers based on payload size and
 	// destination count. More destinations amortize ZC overhead (pinning, two-CQE).
@@ -753,13 +816,11 @@ func (ur *Uring) Multicast(sqeCtx SQEContext, targets SendTargets, bufIndex int,
 
 		var sendErr error
 		if useZeroCopy {
-			sendErr = ur.sendZeroCopyFixed(targetCtx, bufIndex, uint64(offset), n, 0)
+			sendErr = ur.sendZeroCopyFixed(targetCtx, bufIndex, uint64(offsetInt), n, 0)
 		} else if bufIndex >= 0 {
-			// Use registered buffer without zero-copy
-			sendErr = ur.writeFixed(targetCtx, bufIndex, uint64(offset), n)
+			sendErr = ur.sendFixed(targetCtx, bufIndex, uint64(offsetInt), n, 0)
 		} else {
-			// Use regular send with user buffer
-			sendErr = ur.send(targetCtx, 0, p, uint64(offset), n)
+			sendErr = ur.send(targetCtx, 0, userPayload, 0, n)
 		}
 		err = errors.Join(err, sendErr)
 	}
@@ -796,7 +857,15 @@ func (ur *Uring) MulticastZeroCopy(sqeCtx SQEContext, targets SendTargets, bufIn
 	if count == 0 {
 		return nil
 	}
-	if bufIndex < 0 || bufIndex >= len(ur.bufs) {
+	if n < 0 {
+		return ErrInvalidParam
+	}
+	buf := ur.RegisteredBuffer(bufIndex)
+	if buf == nil || offset < 0 || offset > int64(len(buf)) {
+		return ErrInvalidParam
+	}
+	offsetInt := int(offset)
+	if n > len(buf)-offsetInt {
 		return ErrInvalidParam
 	}
 
@@ -825,7 +894,7 @@ func (ur *Uring) MulticastZeroCopy(sqeCtx SQEContext, targets SendTargets, bufIn
 		threshold = 1536
 	}
 
-	// Fall back to writeFixed if below threshold
+	// Fall back to sendFixed if below threshold.
 	useZeroCopy := n >= threshold
 
 	var err error
@@ -834,9 +903,9 @@ func (ur *Uring) MulticastZeroCopy(sqeCtx SQEContext, targets SendTargets, bufIn
 		targetCtx := ctx.WithFD(fd)
 		var sendErr error
 		if useZeroCopy {
-			sendErr = ur.sendZeroCopyFixed(targetCtx, bufIndex, uint64(offset), n, 0)
+			sendErr = ur.sendZeroCopyFixed(targetCtx, bufIndex, uint64(offsetInt), n, 0)
 		} else {
-			sendErr = ur.writeFixed(targetCtx, bufIndex, uint64(offset), n)
+			sendErr = ur.sendFixed(targetCtx, bufIndex, uint64(offsetInt), n, 0)
 		}
 		err = errors.Join(err, sendErr)
 	}
@@ -1694,17 +1763,16 @@ func (ur *Uring) UringCmd(sqeCtx SQEContext, cmdOp uint32, cmdData []byte, optio
 }
 
 // Nop128 submits a 128-byte NOP operation.
-// The current ring implementation only maps 64-byte SQEs, so this returns
-// ErrNotSupported until SQE128 or SQE_MIXED ring wiring is added.
+// Requires a ring created with Options.SQE128; otherwise it returns
+// ErrNotSupported.
 func (ur *Uring) Nop128(sqeCtx SQEContext, options ...OpOptionFunc) error {
 	flags := ur.operationOptions(options)
 	return ur.ioUring.nop128(sqeCtx.WithFlags(flags))
 }
 
 // UringCmd128 submits a 128-byte passthrough command.
-// Provides 80 bytes of command data space (vs 48 bytes for standard UringCmd).
-// The current ring implementation only maps 64-byte SQEs, so this returns
-// ErrNotSupported until SQE128 or SQE_MIXED ring wiring is added.
+// It provides up to 80 bytes of inline command data inside the SQE and requires
+// a ring created with Options.SQE128; otherwise it returns ErrNotSupported.
 func (ur *Uring) UringCmd128(sqeCtx SQEContext, cmdOp uint32, cmdData []byte, options ...OpOptionFunc) error {
 	flags := ur.operationOptions(options)
 	return ur.ioUring.uringCmd128(sqeCtx.WithFlags(flags), cmdOp, cmdData)

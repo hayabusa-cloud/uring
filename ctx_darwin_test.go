@@ -7,6 +7,7 @@
 package uring_test
 
 import (
+	"errors"
 	"testing"
 
 	"code.hybscloud.com/uring"
@@ -105,5 +106,14 @@ func TestDarwinContextPoolsRoundTrip(t *testing.T) {
 	pools.PutExtended(ext1)
 	if got := pools.ExtendedAvailable(); got != 1 {
 		t.Fatalf("ExtendedAvailable() after PutExtended = %d, want 1", got)
+	}
+}
+
+func TestDarwinNewRejectsSQE128(t *testing.T) {
+	_, err := uring.New(func(opt *uring.Options) {
+		opt.SQE128 = true
+	})
+	if !errors.Is(err, uring.ErrNotSupported) {
+		t.Fatalf("New(SQE128): got %v, want %v", err, uring.ErrNotSupported)
 	}
 }

@@ -45,12 +45,15 @@ func (ur *ioUring) reserveSubmitSlot() (submitSlot, error) {
 	}
 
 	index := t & *ur.sq.kRingMask
-	return submitSlot{
-		index: index,
-		tail:  t,
-		sqe:   &ur.sq.sqes[index],
-		keep:  &ur.submit.keepAlive[index],
-	}, nil
+	slot := submitSlot{
+		index:  index,
+		tail:   t,
+		sqe:    ur.sq.sqeAt(index),
+		sqe128: ur.sq.sqe128At(index),
+		keep:   &ur.submit.keepAlive[index],
+	}
+	slot.reset()
+	return slot, nil
 }
 
 // abortSubmitSlot drops an unpublished reservation and unlocks submit state.

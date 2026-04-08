@@ -38,6 +38,8 @@ func (c *DirectCQE) BufID() uint16 { return cqeBufID(c.Flags) }
 func (c *DirectCQE) IsNotification() bool { return cqeIsNotification(c.Flags) }
 
 // WaitDirect retrieves completion events using Direct mode fast-path (darwin stub).
+// On single-issuer rings it is not safe for concurrent use with submit, Stop,
+// or ResizeRings; caller must serialize those operations.
 func (ur *Uring) WaitDirect(cqes []DirectCQE) (int, error) {
 	if err := ur.ioUring.enter(); err != nil {
 		return 0, err

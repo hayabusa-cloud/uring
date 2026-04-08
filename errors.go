@@ -48,6 +48,9 @@ var (
 	// ErrClosed indicates the ring has already been stopped.
 	ErrClosed = errors.New("uring: ring closed")
 
+	// ErrCQOverflow indicates the CQ overflow condition was observed while the CQ appeared empty.
+	ErrCQOverflow = errors.New("uring: completion queue overflow")
+
 	// ErrExists indicates the resource already exists.
 	ErrExists = errors.New("uring: already exists")
 

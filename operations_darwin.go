@@ -324,7 +324,10 @@ func (ur *ioUring) fadvise(sqeCtx SQEContext, off uint64, n int, advice int) err
 
 // send sends data on a socket.
 func (ur *ioUring) send(sqeCtx SQEContext, ioprio uint16, b []byte, off uint64, n int) error {
-	addr := uint64(uintptr(unsafe.Pointer(&b[0])))
+	if b == nil || len(b) < 1 {
+		return ErrInvalidParam
+	}
+	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(b))))
 	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_SEND), ioprio, off, addr, n, 0)
 }
 
@@ -380,8 +383,25 @@ func (ur *ioUring) socketDirect(sqeCtx SQEContext, domain, typ, proto int, fileI
 
 // sendZeroCopy sends with zero-copy.
 func (ur *ioUring) sendZeroCopy(sqeCtx SQEContext, b []byte, off uint64, n int, uflags int) error {
-	addr := uint64(uintptr(unsafe.Pointer(&b[0])))
+	if b == nil || len(b) < 1 {
+		return ErrInvalidParam
+	}
+	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(b))))
 	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_SEND_ZC), 0, off, addr, n, uint32(uflags))
+}
+
+// sendFixed sends with a registered buffer.
+func (ur *ioUring) sendFixed(sqeCtx SQEContext, bufIndex int, off uint64, n int, uflags int) error {
+	if bufIndex < 0 || bufIndex >= len(ur.bufs) {
+		return ErrInvalidParam
+	}
+	buf := ur.bufs[bufIndex]
+	if n < 0 || off > uint64(len(buf)) || uint64(n) > uint64(len(buf))-off {
+		return ErrInvalidParam
+	}
+	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(buf)))) + off
+	ctx := sqeCtx.WithOp(IORING_OP_SEND).WithBufGroup(uint16(bufIndex))
+	return ur.submitPacked9(ctx, IORING_RECVSEND_FIXED_BUF, 0, addr, n, uint32(uflags), 0, 0)
 }
 
 // sendZeroCopyFixed sends with zero-copy using registered buffer.
@@ -390,9 +410,12 @@ func (ur *ioUring) sendZeroCopyFixed(sqeCtx SQEContext, bufIndex int, off uint64
 		return ErrInvalidParam
 	}
 	buf := ur.bufs[bufIndex]
-	addr := uint64(uintptr(unsafe.Pointer(&buf[0])))
-	ioprio := uint16(IORING_RECVSEND_FIXED_BUF)
-	return ur.submitPacked9(sqeCtx.WithOp(IORING_OP_SEND_ZC), ioprio, off, addr, n, uint32(uflags), 0, int32(bufIndex))
+	if n < 0 || off > uint64(len(buf)) || uint64(n) > uint64(len(buf))-off {
+		return ErrInvalidParam
+	}
+	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(buf)))) + off
+	ctx := sqeCtx.WithOp(IORING_OP_SEND_ZC).WithBufGroup(uint16(bufIndex))
+	return ur.submitPacked9(ctx, IORING_RECVSEND_FIXED_BUF, 0, addr, n, uint32(uflags), 0, 0)
 }
 
 // bind binds a socket to an address.

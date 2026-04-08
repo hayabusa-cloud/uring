@@ -198,10 +198,11 @@ type submitState struct {
 }
 
 type submitSlot struct {
-	index uint32
-	tail  uint32
-	sqe   *ioUringSqe
-	keep  *submitKeepAlive
+	index  uint32
+	tail   uint32
+	sqe    *ioUringSqe
+	sqe128 *ioUringSqe128
+	keep   *submitKeepAlive
 }
 
 // ioUringFd represents a file descriptor in io_uring context.
@@ -265,16 +266,53 @@ func newIoUring(entries int, opts ...func(params *ioUringParams)) (*ioUring, err
 	return uring, nil
 }
 
+func (slot submitSlot) reset() {
+	if slot.sqe128 != nil {
+		*slot.sqe128 = ioUringSqe128{}
+		return
+	}
+	*slot.sqe = ioUringSqe{}
+}
+
+func (slot submitSlot) inlineCmdData128() []byte {
+	if slot.sqe128 == nil {
+		return nil
+	}
+	return unsafe.Slice((*byte)(unsafe.Pointer(&slot.sqe128.pad[0])), uringCmd128DataMax)
+}
+
+func sqeBytesFromFlags(flags uint32) int {
+	if flags&IORING_SETUP_SQE128 != 0 {
+		return int(unsafe.Sizeof(ioUringSqe128{}))
+	}
+	return int(unsafe.Sizeof(ioUringSqe{}))
+}
+
+func sqeStrideFromFlags(flags uint32) uintptr {
+	return uintptr(sqeBytesFromFlags(flags))
+}
+
+func (ur *ioUring) supportsOpcode(op uint8) bool {
+	for _, supported := range ur.ops {
+		if supported.op == op {
+			return true
+		}
+	}
+	return false
+}
+
 func (ur *ioUring) remapRings(params *ioUringParams) error {
 	ur.sq.ringSz = params.sqOff.array + uint32(unsafe.Sizeof(uint32(0)))*params.sqEntries
 	ur.cq.ringSz = params.cqOff.cqes + uint32(unsafe.Sizeof(ioUringCqe{}))*params.cqEntries
+	sqeStride := sqeStrideFromFlags(params.flags)
+	sqeMapSz := uintptr(params.sqEntries) * sqeStride
 
 	ptr, errno := zcall.Mmap(nil, uintptr(ur.sq.ringSz), PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, uintptr(ur.ringFd), uintptr(IORING_OFF_SQ_RING))
 	if errno != 0 {
 		return errFromErrno(errno)
 	}
 
-	sqesPtr, errno := zcall.Mmap(nil, uintptr(params.sqEntries)*unsafe.Sizeof(ioUringSqe{}), PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, uintptr(ur.ringFd), uintptr(IORING_OFF_SQES))
+	sqesPtr, errno := zcall.Mmap(nil, sqeMapSz, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, uintptr(ur.ringFd), uintptr(IORING_OFF_SQES))
 	if errno != 0 {
 		zcall.Munmap(ptr, uintptr(ur.sq.ringSz))
 		return errFromErrno(errno)
@@ -282,6 +320,8 @@ func (ur *ioUring) remapRings(params *ioUringParams) error {
 
 	ur.sq.ringPtr = ptr
 	ur.sq.sqesPtr = sqesPtr
+	ur.sq.sqeStride = sqeStride
+	ur.sq.sqeMapSz = sqeMapSz
 	ur.sq.kHead = (*uint32)(unsafe.Add(ptr, params.sqOff.head))
 	ur.sq.kTail = (*uint32)(unsafe.Add(ptr, params.sqOff.tail))
 	ur.sq.kRingMask = (*uint32)(unsafe.Add(ptr, params.sqOff.ringMask))
@@ -289,7 +329,6 @@ func (ur *ioUring) remapRings(params *ioUringParams) error {
 	ur.sq.kFlags = (*uint32)(unsafe.Add(ptr, params.sqOff.flags))
 	ur.sq.kDropped = (*uint32)(unsafe.Add(ptr, params.sqOff.dropped))
 	ur.sq.array = unsafe.Slice((*uint32)(unsafe.Add(ptr, params.sqOff.array)), int(params.sqEntries))
-	ur.sq.sqes = unsafe.Slice((*ioUringSqe)(sqesPtr), int(params.sqEntries))
 
 	ur.cq.kHead = (*uint32)(unsafe.Add(ptr, params.cqOff.head))
 	ur.cq.kTail = (*uint32)(unsafe.Add(ptr, params.cqOff.tail))
@@ -594,9 +633,9 @@ func (ur *ioUring) stop() error {
 }
 
 func (ur *ioUring) closeAfterFatalResize(remapErr error) error {
+	ur.closed.Store(true)
 	ur.clearAllKeepAlive()
 	err := ur.cleanupCoreRingResources()
-	ur.closed.Store(true)
 	return errors.Join(remapErr, err)
 }
 
@@ -633,7 +672,7 @@ func (ur *ioUring) clearRingViews() {
 
 func (ur *ioUring) unmapRings() {
 	if ur.sq.sqesPtr != nil {
-		zcall.Munmap(ur.sq.sqesPtr, uintptr(len(ur.sq.sqes))*unsafe.Sizeof(ioUringSqe{}))
+		zcall.Munmap(ur.sq.sqesPtr, ur.sq.sqeMapSz)
 	}
 	if ur.sq.ringPtr != nil {
 		zcall.Munmap(ur.sq.ringPtr, uintptr(ur.sq.ringSz))
@@ -766,6 +805,12 @@ func (ur *ioUring) sqCount() int {
 // Single-issuer rings rely on caller serialization here so the fast path can
 // avoid shared-submit locking.
 func (ur *ioUring) enter() error {
+	ur.lockSubmitState()
+	defer ur.unlockSubmitState()
+	if ur.closed.Load() || ur.sq.kFlags == nil || ur.sq.kHead == nil || ur.sq.kTail == nil || ur.sq.kRingMask == nil {
+		return ErrClosed
+	}
+
 	flags := atomic.LoadUint32(ur.sq.kFlags)
 	if flags&IORING_SQ_NEED_WAKEUP == IORING_SQ_NEED_WAKEUP {
 		_, err := ioUringEnter(ur.ringFd, uintptr(ur.params.sqEntries), 0, IORING_ENTER_SQ_WAKEUP)
@@ -775,10 +820,7 @@ func (ur *ioUring) enter() error {
 		}
 	}
 
-	ur.lockSubmitState()
-	err := ur.enterPending()
-	ur.unlockSubmitState()
-	return err
+	return ur.enterPending()
 }
 
 func (ur *ioUring) enterPending() error {
@@ -820,16 +862,45 @@ func (ur *ioUring) poll(n int) error {
 	}
 }
 
+func (ur *ioUring) cqEmptyErr() error {
+	overflowCount := uint32(0)
+	if ur.cq.kOverflow != nil {
+		overflowCount = atomic.LoadUint32(ur.cq.kOverflow)
+	}
+	if ur.sq.kFlags != nil && atomic.LoadUint32(ur.sq.kFlags)&IORING_SQ_CQ_OVERFLOW != 0 {
+		atomic.StoreUint32(&ur.cq.overflowSeen, overflowCount)
+		return ErrCQOverflow
+	}
+	if ur.cq.kOverflow == nil {
+		return iox.ErrWouldBlock
+	}
+	for {
+		seen := atomic.LoadUint32(&ur.cq.overflowSeen)
+		if seen == overflowCount {
+			return iox.ErrWouldBlock
+		}
+		if atomic.CompareAndSwapUint32(&ur.cq.overflowSeen, seen, overflowCount) {
+			return ErrCQOverflow
+		}
+	}
+}
+
 // wait spins for one CQE and returns a pointer directly into the CQ ring.
 // The returned *ioUringCqe is borrowed: it remains valid only until the next
 // CAS-advance of kHead (i.e., the next wait call). Callers must read all
 // needed fields before any subsequent completion-queue operation.
 func (ur *ioUring) wait() (*ioUringCqe, error) {
+	ur.lockSubmitState()
+	defer ur.unlockSubmitState()
+	if ur.closed.Load() || ur.cq.kHead == nil || ur.cq.kTail == nil || ur.cq.kRingMask == nil || len(ur.cq.cqes) == 0 {
+		return nil, ErrClosed
+	}
+
 	sw := spin.Wait{}
 	for {
 		h, t := atomic.LoadUint32(ur.cq.kHead), atomic.LoadUint32(ur.cq.kTail)
 		if h == t {
-			break
+			return nil, ur.cqEmptyErr()
 		}
 
 		// Acquire barrier makes CQE contents visible after reading head and tail.
@@ -842,8 +913,6 @@ func (ur *ioUring) wait() (*ioUringCqe, error) {
 		}
 		sw.Once()
 	}
-
-	return nil, iox.ErrWouldBlock
 }
 
 // waitBatch claims and copies multiple CQEs with one CAS.
@@ -852,12 +921,18 @@ func (ur *ioUring) waitBatch(cqes []CQEView) (int, error) {
 		return 0, nil
 	}
 
+	ur.lockSubmitState()
+	defer ur.unlockSubmitState()
+	if ur.closed.Load() || ur.cq.kHead == nil || ur.cq.kTail == nil || ur.cq.kRingMask == nil || len(ur.cq.cqes) == 0 {
+		return 0, ErrClosed
+	}
+
 	sw := spin.Wait{}
 	for {
 		h := atomic.LoadUint32(ur.cq.kHead)
 		t := atomic.LoadUint32(ur.cq.kTail)
 		if h == t {
-			return 0, iox.ErrWouldBlock
+			return 0, ur.cqEmptyErr()
 		}
 
 		// Calculate batch size: min(available, requested)
@@ -1043,12 +1118,25 @@ type ioUringSq struct {
 	kDropped     *uint32
 	kFlags       *uint32
 	array        []uint32
-	sqes         []ioUringSqe
 
-	ringPtr unsafe.Pointer // for Munmap
-	sqesPtr unsafe.Pointer // for Munmap
-	ringSz  uint32
+	ringPtr   unsafe.Pointer // for Munmap
+	sqesPtr   unsafe.Pointer // for Munmap
+	ringSz    uint32
+	sqeStride uintptr
+	sqeMapSz  uintptr
 }
+
+func (sq *ioUringSq) sqeAt(index uint32) *ioUringSqe {
+	return (*ioUringSqe)(unsafe.Add(sq.sqesPtr, uintptr(index)*sq.sqeStride))
+}
+
+func (sq *ioUringSq) sqe128At(index uint32) *ioUringSqe128 {
+	if sq.sqeStride != unsafe.Sizeof(ioUringSqe128{}) {
+		return nil
+	}
+	return (*ioUringSqe128)(unsafe.Add(sq.sqesPtr, uintptr(index)*sq.sqeStride))
+}
+
 type ioUringSqe struct {
 	opcode   uint8
 	flags    uint8
@@ -1066,6 +1154,13 @@ type ioUringSqe struct {
 	pad         [2]uint64
 }
 
+type ioUringSqe128 struct {
+	ioUringSqe
+	extra [64]byte
+}
+
+var _ [128 - unsafe.Sizeof(ioUringSqe128{})]struct{}
+
 type ioUringCq struct {
 	kHead        *uint32
 	kTail        *uint32
@@ -1074,7 +1169,8 @@ type ioUringCq struct {
 	kOverflow    *uint32
 	cqes         []ioUringCqe
 
-	ringSz uint32
+	ringSz       uint32
+	overflowSeen uint32
 }
 
 func (cq *ioUringCq) advance(nr uint32) {
@@ -1130,6 +1226,9 @@ var (
 	}
 	ioUringNoSQArrayOptions = func(params *ioUringParams) {
 		params.flags |= IORING_SETUP_NO_SQARRAY
+	}
+	ioUringSQE128Options = func(params *ioUringParams) {
+		params.flags |= IORING_SETUP_SQE128
 	}
 	ioUringIoPollOptions = func(params *ioUringParams) {
 		params.flags |= IORING_SETUP_IOPOLL
@@ -1654,7 +1753,10 @@ func (ur *ioUring) resizeRings(newSQSize, newCQSize uint32) error {
 	oldRingPtr := ur.sq.ringPtr
 	oldSqRingSz := ur.sq.ringSz
 	oldSqesPtr := ur.sq.sqesPtr
-	oldSqeMapSz := uintptr(len(ur.sq.sqes)) * unsafe.Sizeof(ioUringSqe{})
+	oldSqeMapSz := ur.sq.sqeMapSz
+	if ur.params.flags&IORING_SETUP_SQE128 != 0 {
+		params.flags |= IORING_SETUP_SQE128
+	}
 
 	_, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_REGISTER_RESIZE_RINGS, unsafe.Pointer(&params), 1)
 	if errno != 0 {

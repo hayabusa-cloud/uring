@@ -39,6 +39,7 @@ type Options struct {
 	MultiIssuers            bool
 	NotifySucceed           bool
 	IndirectSubmissionQueue bool
+	SQE128                  bool
 	HybridPolling           bool
 }
 
@@ -47,23 +48,10 @@ type Options struct {
 func New(options ...OptionFunc) (*Uring, error) {
 	opt := defaultOptions
 	opt.Apply(options...)
-	setupOpts := []func(params *ioUringParams){ioUringDisabledOptions}
-	if opt.MultiIssuers {
-		setupOpts = append(setupOpts, func(params *ioUringParams) {
-			params.flags |= IORING_SETUP_COOP_TASKRUN
-		})
-	} else {
-		setupOpts = append(setupOpts, func(params *ioUringParams) {
-			params.flags |= IORING_SETUP_SINGLE_ISSUER
-			params.flags |= IORING_SETUP_DEFER_TASKRUN
-		})
+	if opt.SQE128 {
+		return nil, ErrNotSupported
 	}
-	if !opt.IndirectSubmissionQueue {
-		setupOpts = append(setupOpts, ioUringNoSQArrayOptions)
-	}
-	if opt.HybridPolling {
-		setupOpts = append(setupOpts, ioUringHybridIoPollOptions)
-	}
+	setupOpts := newSetupOptions(opt, false)
 	r, err := newIoUring(opt.Entries, setupOpts...)
 	if err != nil {
 		return nil, err
@@ -91,6 +79,7 @@ func New(options ...OptionFunc) (*Uring, error) {
 	feat := Features{
 		SQEntries:         int(r.params.sqEntries),
 		CQEntries:         int(r.params.cqEntries),
+		SQEBytes:          sqeBytesFromFlags(r.params.flags),
 		UserDataByteOrder: binary.LittleEndian,
 	}
 	if isBigEndian {
@@ -105,7 +94,32 @@ func New(options ...OptionFunc) (*Uring, error) {
 type Features struct {
 	SQEntries         int
 	CQEntries         int
+	SQEBytes          int
 	UserDataByteOrder binary.ByteOrder
+}
+
+func newSetupOptions(opt Options, sqe128 bool) []func(params *ioUringParams) {
+	setupOpts := []func(params *ioUringParams){ioUringDisabledOptions}
+	if opt.MultiIssuers {
+		setupOpts = append(setupOpts, func(params *ioUringParams) {
+			params.flags |= IORING_SETUP_COOP_TASKRUN
+		})
+	} else {
+		setupOpts = append(setupOpts, func(params *ioUringParams) {
+			params.flags |= IORING_SETUP_SINGLE_ISSUER
+			params.flags |= IORING_SETUP_DEFER_TASKRUN
+		})
+	}
+	if !opt.IndirectSubmissionQueue {
+		setupOpts = append(setupOpts, ioUringNoSQArrayOptions)
+	}
+	if sqe128 {
+		setupOpts = append(setupOpts, ioUringSQE128Options)
+	}
+	if opt.HybridPolling {
+		setupOpts = append(setupOpts, ioUringHybridIoPollOptions)
+	}
+	return setupOpts
 }
 
 // Uring is the main io_uring interface for submitting and completing I/O operations.
@@ -565,9 +579,36 @@ func (ur *Uring) Multicast(sqeCtx SQEContext, targets SendTargets, bufIndex int,
 	if count == 0 {
 		return nil
 	}
+	if n < 0 {
+		return ErrInvalidParam
+	}
 
 	flags := ur.operationOptions(options)
 	ctx := sqeCtx.WithFlags(flags | ur.writeLikeOpFlags)
+
+	offsetInt := 0
+	userPayload := p
+	if bufIndex >= 0 {
+		buf := ur.RegisteredBuffer(bufIndex)
+		if buf == nil || offset < 0 || offset > int64(len(buf)) {
+			return ErrInvalidParam
+		}
+		offsetInt = int(offset)
+		if n > len(buf)-offsetInt {
+			return ErrInvalidParam
+		}
+	} else {
+		if offset < 0 || offset > int64(len(p)) {
+			return ErrInvalidParam
+		}
+		offsetInt = int(offset)
+		if n > len(p)-offsetInt {
+			return ErrInvalidParam
+		}
+		if offsetInt < len(p) {
+			userPayload = p[offsetInt:]
+		}
+	}
 
 	const zeroCopyThreshold = 8
 	const payloadThreshold = 4 * 1024
@@ -581,11 +622,11 @@ func (ur *Uring) Multicast(sqeCtx SQEContext, targets SendTargets, bufIndex int,
 
 		var sendErr error
 		if useZeroCopy {
-			sendErr = ur.sendZeroCopyFixed(targetCtx, bufIndex, uint64(offset), n, 0)
+			sendErr = ur.sendZeroCopyFixed(targetCtx, bufIndex, uint64(offsetInt), n, 0)
 		} else if bufIndex >= 0 {
-			sendErr = ur.writeFixed(targetCtx, bufIndex, uint64(offset), n)
+			sendErr = ur.sendFixed(targetCtx, bufIndex, uint64(offsetInt), n, 0)
 		} else {
-			sendErr = ur.send(targetCtx, 0, p, uint64(offset), n)
+			sendErr = ur.send(targetCtx, 0, userPayload, 0, n)
 		}
 		err = errors.Join(err, sendErr)
 	}
@@ -598,7 +639,15 @@ func (ur *Uring) MulticastZeroCopy(sqeCtx SQEContext, targets SendTargets, bufIn
 	if count == 0 {
 		return nil
 	}
-	if bufIndex < 0 || bufIndex >= len(ur.bufs) {
+	if n < 0 {
+		return ErrInvalidParam
+	}
+	buf := ur.RegisteredBuffer(bufIndex)
+	if buf == nil || offset < 0 || offset > int64(len(buf)) {
+		return ErrInvalidParam
+	}
+	offsetInt := int(offset)
+	if n > len(buf)-offsetInt {
 		return ErrInvalidParam
 	}
 
@@ -609,7 +658,7 @@ func (ur *Uring) MulticastZeroCopy(sqeCtx SQEContext, targets SendTargets, bufIn
 	for i := range count {
 		fd := targets.FD(i)
 		targetCtx := ctx.WithFD(fd)
-		sendErr := ur.sendZeroCopyFixed(targetCtx, bufIndex, uint64(offset), n, 0)
+		sendErr := ur.sendZeroCopyFixed(targetCtx, bufIndex, uint64(offsetInt), n, 0)
 		err = errors.Join(err, sendErr)
 	}
 	return err
