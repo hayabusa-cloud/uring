@@ -13,8 +13,10 @@ import (
 	"testing"
 	"time"
 
+	"code.hybscloud.com/iofd"
 	"code.hybscloud.com/iox"
 	"code.hybscloud.com/uring"
+	"code.hybscloud.com/zcall"
 )
 
 // testMultishotHandler implements MultishotHandler for testing.
@@ -83,10 +85,11 @@ func TestMultishotSubscriptionCreate(t *testing.T) {
 	}
 }
 
-// TestMultishotAcceptMultishot tests multishot accept operation.
-func TestMultishotAcceptMultishot(t *testing.T) {
+// TestSubmitAcceptMultishotCancelTerminates tests raw multishot accept cancellation CQEs.
+func TestSubmitAcceptMultishotCancelTerminates(t *testing.T) {
 	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
 		opt.Entries = uring.EntriesSmall
+		opt.NotifySucceed = true
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -99,9 +102,8 @@ func TestMultishotAcceptMultishot(t *testing.T) {
 		t.Fatalf("Listen: %v", err)
 	}
 	defer ln.Close()
-	addr := ln.Addr().(*net.TCPAddr)
+	addr := ln.Addr().String()
 
-	// Get the listener fd
 	lnFile, err := ln.(*net.TCPListener).File()
 	if err != nil {
 		t.Fatalf("File: %v", err)
@@ -109,160 +111,242 @@ func TestMultishotAcceptMultishot(t *testing.T) {
 	defer lnFile.Close()
 	fd := int32(lnFile.Fd())
 
-	handler := &testMultishotHandler{}
-	sqeCtx := uring.ForFD(fd)
-
-	// Submit multishot accept via Uring factory
-	sub, err := ring.AcceptMultishot(sqeCtx, handler)
-	if err != nil {
+	acceptCtx := uring.PackDirect(uring.IORING_OP_ACCEPT, 0, 0, fd)
+	if err := ring.SubmitAcceptMultishot(acceptCtx); err != nil {
 		// Multishot accept might not be supported on all kernels
-		t.Logf("AcceptMultishot returned error (may be unsupported): %v", err)
+		t.Logf("SubmitAcceptMultishot returned error (may be unsupported): %v", err)
 		return
 	}
 
-	if !sub.Active() {
-		t.Error("Subscription should be active after submission")
+	clientConn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("DialTimeout: %v", err)
 	}
+	defer clientConn.Close()
 
-	// Connect a client
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		conn, err := net.DialTimeout("tcp", addr.String(), 2*time.Second)
-		if err == nil {
-			conn.Close()
-		}
-	}()
-
-	// Wait for completion
-	cqes := make([]uring.CQEView, 16)
-	deadline := time.Now().Add(3 * time.Second)
+	acceptDeadline := time.Now().Add(2 * time.Second)
 	b := iox.Backoff{}
+	accepted := 0
+	hasMoreSeen := false
+	cqes := make([]uring.CQEView, 16)
 
-	for time.Now().Before(deadline) {
+	for accepted == 0 && time.Now().Before(acceptDeadline) {
 		n, err := ring.Wait(cqes)
 		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
 			t.Fatalf("Wait: %v", err)
 		}
-
 		for i := 0; i < n; i++ {
-			dispatchSimplifiedMultishotCQE(handler, cqes[i])
+			cqe := cqes[i]
+			if cqe.Op() != uring.IORING_OP_ACCEPT {
+				continue
+			}
+			if cqe.Res < 0 {
+				t.Fatalf("accept CQE failed: %d", cqe.Res)
+			}
+			accepted++
+			if cqe.HasMore() {
+				hasMoreSeen = true
+			}
+			closeTestFD(iofd.FD(cqe.Res))
 		}
-
-		if handler.resultCount.Load() > 0 || handler.errorCount.Load() > 0 {
-			break
+		if accepted == 0 {
+			b.Wait()
 		}
-		b.Wait()
 	}
 
-	// Cancel the subscription
-	if err := sub.Cancel(); err != nil {
-		t.Logf("Cancel returned error: %v", err)
+	if accepted > 0 && !hasMoreSeen {
+		t.Fatal("accept multishot CQE did not advertise continuation")
+	}
+	if accepted == 0 {
+		t.Skip("SubmitAcceptMultishot completion not received - timing-sensitive")
 	}
 
-	// Wait for stop callback
-	for i := 0; i < 10 && handler.stoppedCount.Load() == 0; i++ {
-		n, _ := ring.Wait(cqes)
-		for j := 0; j < n; j++ {
-			dispatchSimplifiedMultishotCQE(handler, cqes[j])
+	cancelCtx := uring.PackDirect(uring.IORING_OP_ASYNC_CANCEL, 0, 1, fd)
+	if err := ring.AsyncCancelFD(cancelCtx, false); err != nil {
+		t.Fatalf("AsyncCancelFD: %v", err)
+	}
+
+	terminalAccept := false
+	stopDeadline := time.Now().Add(3 * time.Second)
+	b.Reset()
+	for time.Now().Before(stopDeadline) && !terminalAccept {
+		n, err := ring.Wait(cqes)
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+			t.Fatalf("Wait after cancel: %v", err)
 		}
-		b.Wait()
+		for i := 0; i < n; i++ {
+			cqe := cqes[i]
+			switch cqe.Op() {
+			case uring.IORING_OP_ACCEPT:
+				if cqe.Res >= 0 {
+					accepted++
+					if cqe.HasMore() {
+						hasMoreSeen = true
+					}
+					closeTestFD(iofd.FD(cqe.Res))
+				} else if cqe.Res != -int32(uring.ECANCELED) {
+					t.Fatalf("terminal accept CQE failed: %d", cqe.Res)
+				}
+				if !cqe.HasMore() {
+					terminalAccept = true
+				}
+			case uring.IORING_OP_ASYNC_CANCEL:
+				// AsyncCancelFD completion is expected alongside the terminal accept CQE.
+			}
+		}
+		if !terminalAccept {
+			b.Wait()
+		}
 	}
 
-	t.Logf("results: %d, errors: %d, stopped: %d",
-		handler.resultCount.Load(),
-		handler.errorCount.Load(),
-		handler.stoppedCount.Load())
+	if !terminalAccept {
+		t.Fatal("SubmitAcceptMultishot cancel termination not received after successful accept")
+	}
 }
 
-// TestMultishotReceiveMultishot tests multishot receive operation.
-func TestMultishotReceiveMultishot(t *testing.T) {
+// TestSubmitReceiveMultishot tests raw multishot receive CQEs.
+func TestSubmitReceiveMultishot(t *testing.T) {
 	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
 		opt.Entries = uring.EntriesSmall
+		opt.NotifySucceed = true
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	mustStartRing(t, ring)
 
-	// Create socket pair
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Listen: %v", err)
+	if ring.RegisteredBufferCount() < 1 {
+		t.Skip("no registered buffers available")
 	}
-	defer ln.Close()
-	addr := ln.Addr().(*net.TCPAddr)
 
-	clientConn, err := net.DialTimeout("tcp", addr.String(), 2*time.Second)
+	fds, err := newUnixSocketPairForTest()
 	if err != nil {
-		t.Fatalf("Dial: %v", err)
+		t.Fatalf("socketpair: %v", err)
 	}
-	defer clientConn.Close()
+	defer closeTestFds(fds)
 
-	serverConn, err := ln.Accept()
-	if err != nil {
-		t.Fatalf("Accept: %v", err)
-	}
-	defer serverConn.Close()
-
-	serverFile, err := serverConn.(*net.TCPConn).File()
-	if err != nil {
-		t.Fatalf("File: %v", err)
-	}
-	defer serverFile.Close()
-	fd := int32(serverFile.Fd())
-
-	handler := &testMultishotHandler{}
-	// SQEContext with FD and buffer group
-	sqeCtx := uring.ForFD(fd).WithBufGroup(0)
-
-	// Submit multishot receive via Uring factory
-	sub, err := ring.ReceiveMultishot(sqeCtx, handler)
-	if err != nil {
+	pollFD := fds[0]
+	recvCtx := uring.ForFD(int32(fds[0]))
+	if err := ring.SubmitReceiveMultishot(
+		recvCtx,
+		&pollFD,
+		nil,
+		uring.WithIOPrio(uring.IORING_RECVSEND_POLL_FIRST),
+	); err != nil {
 		// May not be supported without buffer ring
-		t.Logf("ReceiveMultishot returned error (may require buffer ring): %v", err)
+		t.Logf("SubmitReceiveMultishot returned error (may require buffer ring): %v", err)
 		return
 	}
 
-	if !sub.Active() {
-		t.Error("Subscription should be active after submission")
+	cqes := make([]uring.CQEView, 16)
+	// Prime Wait: no data has been written yet, so any recv CQE here
+	// should carry Res==0 (multishot armed, no payload).
+	n, err := ring.Wait(cqes)
+	if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+		t.Fatalf("prime Wait: %v", err)
+	}
+	for i := 0; i < n; i++ {
+		cqe := cqes[i]
+		if cqe.Op() != uring.IORING_OP_RECV {
+			continue
+		}
+		if cqe.Res < 0 {
+			t.Fatalf("prime Wait recv CQE failed: %d", cqe.Res)
+		}
+		if cqe.Res > 0 {
+			t.Fatalf("prime Wait returned unexpected recv CQE: bufID=%d bytes=%d", cqe.BufID(), cqe.Res)
+		}
 	}
 
-	// Send data from client
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		clientConn.Write([]byte("test multishot recv"))
-	}()
+	payload := []byte("test multishot recv")
+	if n, errno := writeTestFD(fds[1], payload); errno != 0 {
+		t.Fatalf("Write payload: %v", zcall.Errno(errno))
+	} else if n != len(payload) {
+		t.Fatalf("Write payload bytes: got %d, want %d", n, len(payload))
+	}
 
-	// Wait for completion
-	cqes := make([]uring.CQEView, 16)
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	b := iox.Backoff{}
+	recvCount := 0
+	totalBytes := 0
+	hasMoreSeen := false
 
-	for time.Now().Before(deadline) {
+	for time.Now().Before(deadline) && totalBytes < len(payload) {
 		n, err := ring.Wait(cqes)
 		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
 			t.Fatalf("Wait: %v", err)
 		}
 
 		for i := 0; i < n; i++ {
-			dispatchSimplifiedMultishotCQE(handler, cqes[i])
+			cqe := cqes[i]
+			if cqe.Op() != uring.IORING_OP_RECV {
+				continue
+			}
+			if cqe.Res < 0 {
+				t.Fatalf("recv CQE failed: %d", cqe.Res)
+			}
+			if cqe.Res == 0 {
+				continue
+			}
+			if !cqe.HasBuffer() {
+				t.Fatal("recv CQE missing buffer-selection metadata")
+			}
+			recvCount++
+			totalBytes += int(cqe.Res)
+			if cqe.HasMore() {
+				hasMoreSeen = true
+			}
 		}
-
-		if handler.resultCount.Load() > 0 || handler.errorCount.Load() > 0 {
-			break
+		if totalBytes < len(payload) {
+			b.Wait()
 		}
-		b.Wait()
 	}
 
-	// Cancel the subscription
-	if err := sub.Cancel(); err != nil {
-		t.Logf("Cancel returned error: %v", err)
+	if recvCount == 0 {
+		t.Fatal("received 0 recv CQEs, want at least 1")
+	}
+	if totalBytes != len(payload) {
+		t.Fatalf("received %d bytes, want %d", totalBytes, len(payload))
+	}
+	if !hasMoreSeen {
+		t.Fatal("recv multishot CQE did not advertise continuation")
 	}
 
-	t.Logf("results: %d, errors: %d, stopped: %d",
-		handler.resultCount.Load(),
-		handler.errorCount.Load(),
-		handler.stoppedCount.Load())
+	cancelCtx := uring.PackDirect(uring.IORING_OP_ASYNC_CANCEL, 0, 1, int32(fds[0]))
+	if err := ring.AsyncCancelFD(cancelCtx, false); err != nil {
+		t.Fatalf("AsyncCancelFD: %v", err)
+	}
+
+	terminalRecv := false
+	stopDeadline := time.Now().Add(3 * time.Second)
+	b.Reset()
+	for time.Now().Before(stopDeadline) && !terminalRecv {
+		n, err := ring.Wait(cqes)
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+			t.Fatalf("Wait after cancel: %v", err)
+		}
+		for i := 0; i < n; i++ {
+			cqe := cqes[i]
+			switch cqe.Op() {
+			case uring.IORING_OP_RECV:
+				if cqe.Res < 0 && cqe.Res != -int32(uring.ECANCELED) {
+					t.Fatalf("terminal recv CQE failed: %d", cqe.Res)
+				}
+				if !cqe.HasMore() {
+					terminalRecv = true
+				}
+			case uring.IORING_OP_ASYNC_CANCEL:
+				// AsyncCancelFD completion is expected alongside the terminal recv CQE.
+			}
+		}
+		if !terminalRecv {
+			b.Wait()
+		}
+	}
+
+	if !terminalRecv {
+		t.Fatal("multishot recv did not terminate after cancel")
+	}
 }
 
 // TestMultishotHandlerStopRequest tests handler-initiated stop.
@@ -370,17 +454,25 @@ func TestMultishotPoolExhaustion(t *testing.T) {
 	sqeCtx := uring.ForFD(fd)
 
 	// Exhaust the pool
+	subs := make([]*uring.MultishotSubscription, 0, 2)
 	for i := 0; i < 2; i++ {
-		_, err := ring.AcceptMultishot(sqeCtx, handler)
+		sub, err := ring.AcceptMultishot(sqeCtx, handler)
 		if err != nil {
 			t.Logf("AcceptMultishot[%d]: %v", i, err)
+			continue
 		}
+		subs = append(subs, sub)
 	}
 
 	// Next operation should return ErrWouldBlock
 	_, err = ring.AcceptMultishot(sqeCtx, handler)
 	if !errors.Is(err, iox.ErrWouldBlock) {
 		t.Errorf("expected ErrWouldBlock when pool exhausted, got: %v", err)
+	}
+
+	// Cancel all subscriptions before ring teardown
+	for _, sub := range subs {
+		sub.Cancel()
 	}
 }
 
@@ -421,6 +513,19 @@ func TestMultishotCancelIdempotent(t *testing.T) {
 			t.Logf("Cancel[%d] returned error: %v", i, err)
 		}
 	}
+
+	// Drain terminal CQE to verify lifecycle convergence
+	cqes := make([]uring.CQEView, 16)
+	deadline := time.Now().Add(3 * time.Second)
+	b := iox.Backoff{}
+	for time.Now().Before(deadline) && sub.State() != uring.SubscriptionStopped {
+		_, err := ring.Wait(cqes)
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+			t.Fatalf("Wait: %v", err)
+		}
+		b.Wait()
+	}
+	t.Logf("final state: %v, stopped: %d", sub.State(), handler.stoppedCount.Load())
 }
 
 // TestSubscriptionState tests the SubscriptionState constants.
@@ -433,7 +538,8 @@ func TestSubscriptionState(t *testing.T) {
 	}
 }
 
-// TestMultishotStressAccept stress tests multishot accept with many connections.
+// TestMultishotStressAccept stress tests multishot accept with many connections
+// using raw SubmitAcceptMultishot and manual CQE processing.
 func TestMultishotStressAccept(t *testing.T) {
 	ring, err := uring.New(
 		testMinimalBufferOptions,
@@ -448,7 +554,6 @@ func TestMultishotStressAccept(t *testing.T) {
 	}
 	mustStartRing(t, ring)
 
-	// Create listener
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
@@ -463,16 +568,12 @@ func TestMultishotStressAccept(t *testing.T) {
 	defer lnFile.Close()
 	fd := int32(lnFile.Fd())
 
-	// Track accepts using the test handler
-	handler := &testMultishotHandler{}
-
-	sqeCtx := uring.ForFD(fd)
-	sub, err := ring.AcceptMultishot(sqeCtx, handler)
-	if err != nil {
-		t.Fatalf("AcceptMultishot: %v", err)
+	acceptCtx := uring.PackDirect(uring.IORING_OP_ACCEPT, 0, 0, fd)
+	if err := ring.SubmitAcceptMultishot(acceptCtx); err != nil {
+		t.Logf("SubmitAcceptMultishot: %v (may be unsupported)", err)
+		return
 	}
 
-	// Spawn connection goroutine
 	const numConnections = 50
 	go func() {
 		for i := 0; i < numConnections; i++ {
@@ -484,32 +585,63 @@ func TestMultishotStressAccept(t *testing.T) {
 		}
 	}()
 
-	// Event loop to process CQEs
 	cqes := make([]uring.CQEView, 64)
 	deadline := time.Now().Add(5 * time.Second)
 	b := iox.Backoff{}
+	accepted := 0
 
-	for time.Now().Before(deadline) && handler.resultCount.Load() < numConnections {
+	for time.Now().Before(deadline) && accepted < numConnections {
 		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
 			t.Logf("Wait: %v", err)
 		}
-
-		// Process CQEs - extended mode handles callbacks internally
-		for range n {
-			// CQE processing happens via handler callbacks
+		for i := 0; i < n; i++ {
+			cqe := cqes[i]
+			if cqe.Op() != uring.IORING_OP_ACCEPT {
+				continue
+			}
+			if cqe.Res >= 0 {
+				accepted++
+				closeTestFD(iofd.FD(cqe.Res))
+			}
 		}
-		_ = n
-
-		b.Wait()
+		if accepted < numConnections {
+			b.Wait()
+		}
 	}
 
-	// Cancel subscription
-	sub.Cancel()
+	cancelCtx := uring.PackDirect(uring.IORING_OP_ASYNC_CANCEL, 0, 1, fd)
+	if err := ring.AsyncCancelFD(cancelCtx, false); err != nil {
+		t.Fatalf("AsyncCancelFD: %v", err)
+	}
 
-	acceptCount := handler.resultCount.Load()
-	t.Logf("Accepted %d connections (target: %d)", acceptCount, numConnections)
-	if acceptCount < numConnections/2 {
-		t.Logf("Note: Accept count low - may be timing-related")
+	b.Reset()
+	terminalSeen := false
+	stopDeadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(stopDeadline) && !terminalSeen {
+		n, err := ring.Wait(cqes)
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+			t.Fatalf("Wait after cancel: %v", err)
+		}
+		for i := 0; i < n; i++ {
+			cqe := cqes[i]
+			if cqe.Op() == uring.IORING_OP_ACCEPT {
+				if cqe.Res >= 0 {
+					accepted++
+					closeTestFD(iofd.FD(cqe.Res))
+				}
+				if !cqe.HasMore() {
+					terminalSeen = true
+				}
+			}
+		}
+		if !terminalSeen {
+			b.Wait()
+		}
+	}
+
+	t.Logf("Accepted %d connections (target: %d)", accepted, numConnections)
+	if accepted < numConnections/2 {
+		t.Fatalf("accepted %d connections, want at least %d", accepted, numConnections/2)
 	}
 }
