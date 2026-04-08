@@ -21,10 +21,20 @@ type DirectCQE struct {
 	FD       iofd.FD
 }
 
-func (c *DirectCQE) IsSuccess() bool      { return cqeIsSuccess(c.Res) }
-func (c *DirectCQE) HasMore() bool        { return cqeHasMore(c.Flags) }
-func (c *DirectCQE) HasBuffer() bool      { return cqeHasBuffer(c.Flags) }
-func (c *DirectCQE) BufID() uint16        { return cqeBufID(c.Flags) }
+// IsSuccess reports whether the operation completed successfully.
+func (c *DirectCQE) IsSuccess() bool { return cqeIsSuccess(c.Res) }
+
+// HasMore reports whether more completions are coming (multishot).
+func (c *DirectCQE) HasMore() bool { return cqeHasMore(c.Flags) }
+
+// HasBuffer reports whether a buffer ID is available.
+func (c *DirectCQE) HasBuffer() bool { return cqeHasBuffer(c.Flags) }
+
+// BufID returns the buffer ID from CQE flags.
+// Only valid when HasBuffer() returns true.
+func (c *DirectCQE) BufID() uint16 { return cqeBufID(c.Flags) }
+
+// IsNotification reports whether this is a zero-copy notification CQE.
 func (c *DirectCQE) IsNotification() bool { return cqeIsNotification(c.Flags) }
 
 // WaitDirect retrieves completion events using Direct mode fast-path (darwin stub).
