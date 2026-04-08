@@ -264,8 +264,8 @@ func (m *ListenerManager) startSocket(domain, sockType, proto int, sa Sockaddr, 
 // ────────────────────────────────────────────────────────────────────
 
 // ListenerOp is a handle to a listener creation operation.
-// The caller (urex) drives the state machine; ListenerOp holds the FD
-// and provides convenience methods.
+// The caller drives the setup state machine; ListenerOp holds the listener FD
+// and provides convenience methods around it.
 type ListenerOp struct {
 	ring    *Uring
 	ext     *ExtSQE
@@ -316,14 +316,15 @@ func (op *ListenerOp) Close() {
 }
 
 // AcceptMultishot starts a multishot accept subscription on a ready listener.
+// Options are forwarded to [Uring.AcceptMultishot].
 // Returns ErrNotReady until the listener FD is set and valid.
-func (op *ListenerOp) AcceptMultishot(handler MultishotHandler) (*MultishotSubscription, error) {
+func (op *ListenerOp) AcceptMultishot(handler MultishotHandler, options ...OpOptionFunc) (*MultishotSubscription, error) {
 	fd := op.FD()
 	if fd < 0 {
 		return nil, ErrNotReady
 	}
 	sqeCtx := ForFD(int32(fd))
-	return op.ring.AcceptMultishot(sqeCtx, handler)
+	return op.ring.AcceptMultishot(sqeCtx, handler, options...)
 }
 
 // ────────────────────────────────────────────────────────────────────

@@ -120,7 +120,14 @@ func TestAcceptMultishotPreservesFlagsAndResetsSQE(t *testing.T) {
 	defer lnFile.Close()
 
 	flags := uint8(IOSQE_ASYNC | IOSQE_IO_LINK)
-	sub, err := ring.AcceptMultishot(ForFD(int32(lnFile.Fd())).WithFlags(flags), noopMultishotHandler{})
+	optionFlags := uint8(IOSQE_IO_DRAIN)
+	ioprio := uint16(IORING_ACCEPT_POLL_FIRST)
+	sub, err := ring.AcceptMultishot(
+		ForFD(int32(lnFile.Fd())).WithFlags(flags),
+		noopMultishotHandler{},
+		WithFlags(optionFlags),
+		WithIOPrio(ioprio),
+	)
 	if err != nil {
 		t.Fatalf("AcceptMultishot: %v", err)
 	}
@@ -132,8 +139,11 @@ func TestAcceptMultishotPreservesFlagsAndResetsSQE(t *testing.T) {
 	if got.SQE.opcode != IORING_OP_ACCEPT {
 		t.Fatalf("opcode: got %d, want %d", got.SQE.opcode, IORING_OP_ACCEPT)
 	}
-	if got.SQE.flags != flags {
-		t.Fatalf("flags: got %d, want %d", got.SQE.flags, flags)
+	if got.SQE.flags != flags|optionFlags {
+		t.Fatalf("flags: got %d, want %d", got.SQE.flags, flags|optionFlags)
+	}
+	if got.SQE.ioprio != ioprio|IORING_ACCEPT_MULTISHOT {
+		t.Fatalf("ioprio: got %#x, want %#x", got.SQE.ioprio, ioprio|IORING_ACCEPT_MULTISHOT)
 	}
 	if got.SQE.uflags != SOCK_NONBLOCK|SOCK_CLOEXEC {
 		t.Fatalf("uflags: got %#x, want %#x", got.SQE.uflags, SOCK_NONBLOCK|SOCK_CLOEXEC)
@@ -202,9 +212,16 @@ func TestReceiveMultishotPreservesFlagsAndResetsSQE(t *testing.T) {
 	defer serverFile.Close()
 
 	flags := uint8(IOSQE_ASYNC | IOSQE_IO_DRAIN)
+	optionFlags := uint8(IOSQE_IO_LINK)
 	bufGroup := uint16(17)
 	sqeCtx := ForFD(int32(serverFile.Fd())).WithFlags(flags).WithBufGroup(bufGroup)
-	sub, err := ring.ReceiveMultishot(sqeCtx, noopMultishotHandler{})
+	ioprio := uint16(IORING_RECVSEND_POLL_FIRST)
+	sub, err := ring.ReceiveMultishot(
+		sqeCtx,
+		noopMultishotHandler{},
+		WithFlags(optionFlags),
+		WithIOPrio(ioprio),
+	)
 	if err != nil {
 		t.Fatalf("ReceiveMultishot: %v", err)
 	}
@@ -216,8 +233,11 @@ func TestReceiveMultishotPreservesFlagsAndResetsSQE(t *testing.T) {
 	if got.SQE.opcode != IORING_OP_RECV {
 		t.Fatalf("opcode: got %d, want %d", got.SQE.opcode, IORING_OP_RECV)
 	}
-	if got.SQE.flags != flags|IOSQE_BUFFER_SELECT {
-		t.Fatalf("flags: got %d, want %d", got.SQE.flags, flags|IOSQE_BUFFER_SELECT)
+	if got.SQE.flags != flags|optionFlags|IOSQE_BUFFER_SELECT {
+		t.Fatalf("flags: got %d, want %d", got.SQE.flags, flags|optionFlags|IOSQE_BUFFER_SELECT)
+	}
+	if got.SQE.ioprio != ioprio|IORING_RECV_MULTISHOT {
+		t.Fatalf("ioprio: got %#x, want %#x", got.SQE.ioprio, ioprio|IORING_RECV_MULTISHOT)
 	}
 	if got.SQE.bufIndex != bufGroup {
 		t.Fatalf("bufIndex: got %d, want %d", got.SQE.bufIndex, bufGroup)

@@ -239,15 +239,19 @@ func (ur *Uring) newMultishotSubscription(
 // AcceptMultishot starts a multishot accept subscription.
 // The handler receives one `MultishotStep` per CQE and one terminal stop.
 // `step.CQE.Res` contains the accepted fd on success.
-func (ur *Uring) AcceptMultishot(sqeCtx SQEContext, handler MultishotHandler) (*MultishotSubscription, error) {
+// Options may add SQE control flags and accept-specific ioprio flags such as
+// `IORING_ACCEPT_POLL_FIRST`.
+func (ur *Uring) AcceptMultishot(sqeCtx SQEContext, handler MultishotHandler, options ...OpOptionFunc) (*MultishotSubscription, error) {
 	fd := sqeCtx.FD()
+	flags, ioprio := ur.flagsIOPrioOptions(options)
+	sqeFlags := sqeCtx.Flags() | flags
 	return ur.newMultishotSubscription(handler, func(ext *ExtSQE) {
 		ext.SQE.opcode = IORING_OP_ACCEPT
 		ext.SQE.fd = fd
 		ext.SQE.addr = 0
 		ext.SQE.len = 0
-		ext.SQE.flags = sqeCtx.Flags()
-		ext.SQE.ioprio = uint16(IORING_ACCEPT_MULTISHOT)
+		ext.SQE.flags = sqeFlags
+		ext.SQE.ioprio = uint16(ioprio | IORING_ACCEPT_MULTISHOT)
 		ext.SQE.uflags = SOCK_NONBLOCK | SOCK_CLOEXEC
 	})
 }
@@ -255,17 +259,21 @@ func (ur *Uring) AcceptMultishot(sqeCtx SQEContext, handler MultishotHandler) (*
 // ReceiveMultishot starts a multishot receive subscription with buffer selection.
 // The handler receives one `MultishotStep` per CQE and one terminal stop.
 // Use `step.CQE.BufID()` for the buffer ID and `step.CQE.Res` for the byte count.
-func (ur *Uring) ReceiveMultishot(sqeCtx SQEContext, handler MultishotHandler) (*MultishotSubscription, error) {
+// Options may add SQE control flags and recv-specific ioprio flags such as
+// `IORING_RECVSEND_POLL_FIRST`.
+func (ur *Uring) ReceiveMultishot(sqeCtx SQEContext, handler MultishotHandler, options ...OpOptionFunc) (*MultishotSubscription, error) {
 	fd := sqeCtx.FD()
 	bufGroup := sqeCtx.BufGroup()
+	flags, ioprio := ur.flagsIOPrioOptions(options)
+	sqeFlags := sqeCtx.Flags() | flags
 	return ur.newMultishotSubscription(handler, func(ext *ExtSQE) {
 		ext.SQE.opcode = IORING_OP_RECV
 		ext.SQE.fd = fd
 		ext.SQE.addr = 0
 		ext.SQE.len = 0
-		ext.SQE.flags = sqeCtx.Flags() | IOSQE_BUFFER_SELECT
+		ext.SQE.flags = sqeFlags | IOSQE_BUFFER_SELECT
 		ext.SQE.bufIndex = bufGroup
-		ext.SQE.ioprio = uint16(IORING_RECV_MULTISHOT)
+		ext.SQE.ioprio = uint16(ioprio | IORING_RECV_MULTISHOT)
 	})
 }
 

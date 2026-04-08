@@ -173,7 +173,7 @@ func (op *ListenerOp) Close() {
 }
 
 // AcceptMultishot starts accepting connections on this listener (darwin stub).
-func (op *ListenerOp) AcceptMultishot(handler MultishotHandler) (*MultishotSubscription, error) {
+func (op *ListenerOp) AcceptMultishot(handler MultishotHandler, options ...OpOptionFunc) (*MultishotSubscription, error) {
 	return nil, ErrNotSupported
 }
 

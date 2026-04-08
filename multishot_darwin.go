@@ -75,12 +75,12 @@ func (s *MultishotSubscription) State() SubscriptionState {
 }
 
 // AcceptMultishot creates a multishot accept subscription (stub on Darwin).
-func (ur *Uring) AcceptMultishot(sqeCtx SQEContext, handler MultishotHandler) (*MultishotSubscription, error) {
+func (ur *Uring) AcceptMultishot(sqeCtx SQEContext, handler MultishotHandler, options ...OpOptionFunc) (*MultishotSubscription, error) {
 	return nil, ErrNotSupported
 }
 
 // ReceiveMultishot creates a multishot receive subscription (stub on Darwin).
-func (ur *Uring) ReceiveMultishot(sqeCtx SQEContext, handler MultishotHandler) (*MultishotSubscription, error) {
+func (ur *Uring) ReceiveMultishot(sqeCtx SQEContext, handler MultishotHandler, options ...OpOptionFunc) (*MultishotSubscription, error) {
 	return nil, ErrNotSupported
 }
 

@@ -95,6 +95,10 @@ func (ur *Uring) pollRemoveOptions(opts []OpOptionFunc) (flags uint8) {
 }
 
 func (ur *Uring) msgOptions(opts []OpOptionFunc) (flags uint8, ioprio uint16) {
+	return ur.flagsIOPrioOptions(opts)
+}
+
+func (ur *Uring) flagsIOPrioOptions(opts []OpOptionFunc) (flags uint8, ioprio uint16) {
 	if len(opts) < 1 {
 		return uringOpFlagsNone, uringOpIOPrioNone
 	}
@@ -130,12 +134,7 @@ func (ur *Uring) timeoutRemoveOptions(opts []OpOptionFunc) (flags uint8) {
 }
 
 func (ur *Uring) acceptOptions(opts []OpOptionFunc) (flags uint8, ioprio uint16) {
-	if len(opts) < 1 {
-		return uringOpFlagsNone, uringOpIOPrioNone
-	}
-	opt := defaultUringOpOption
-	opt.Apply(opts...)
-	return opt.Flags, opt.IOPrio
+	return ur.flagsIOPrioOptions(opts)
 }
 
 func (ur *Uring) asyncCancelOptions(opts []OpOptionFunc) (flags uint8) {

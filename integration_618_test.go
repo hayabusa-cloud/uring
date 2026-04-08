@@ -149,6 +149,63 @@ func (h *integrationZCHandler) OnNotification(result int32) {
 	h.notified.Store(true)
 }
 
+func consumeAcceptCQEs(cqes []uring.CQEView) (accepted int, errRes int32) {
+	for i := 0; i < len(cqes); i++ {
+		cqe := cqes[i]
+		if cqe.Op() != uring.IORING_OP_ACCEPT {
+			continue
+		}
+		if cqe.Res < 0 {
+			return accepted, cqe.Res
+		}
+		accepted++
+		closeTestFD(iofd.FD(cqe.Res))
+	}
+	return accepted, 0
+}
+
+// TestIntegrationMultishotAcceptPrimeWaitSurfacesImmediateError verifies that
+// priming Wait callers inspect returned accept CQEs instead of silently
+// consuming an immediate kernel error.
+func TestIntegrationMultishotAcceptPrimeWaitSurfacesImmediateError(t *testing.T) {
+	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
+		opt.NotifySucceed = true
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	mustStartRing(t, ring)
+
+	sqeCtx := uring.PackDirect(uring.IORING_OP_ACCEPT, 0, 0, -1)
+	err = ring.SubmitAcceptMultishot(sqeCtx, uring.WithIOPrio(uring.IORING_ACCEPT_POLL_FIRST))
+	if err != nil {
+		t.Logf("SubmitAcceptMultishot: %v (may be unsupported)", err)
+		return
+	}
+
+	cqes := make([]uring.CQEView, 16)
+	deadline := time.Now().Add(time.Second)
+	b := iox.Backoff{}
+
+	for time.Now().Before(deadline) {
+		n, err := ring.Wait(cqes)
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+			t.Fatalf("prime Wait: %v", err)
+		}
+		accepted, errRes := consumeAcceptCQEs(cqes[:n])
+		if accepted != 0 {
+			t.Fatalf("prime Wait unexpectedly accepted %d connections", accepted)
+		}
+		if errRes != 0 {
+			return
+		}
+		b.Wait()
+	}
+
+	t.Fatal("prime Wait did not surface immediate accept error CQE")
+}
+
 // TestIntegrationMultishotAccept tests multishot accept on real listener.
 func TestIntegrationMultishotAccept(t *testing.T) {
 	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
@@ -180,27 +237,42 @@ func TestIntegrationMultishotAccept(t *testing.T) {
 	})
 
 	sqeCtx := uring.PackDirect(uring.IORING_OP_ACCEPT, 0, 0, listenerFD)
-	err = ring.SubmitAcceptMultishot(sqeCtx)
+	err = ring.SubmitAcceptMultishot(sqeCtx, uring.WithIOPrio(uring.IORING_ACCEPT_POLL_FIRST))
 	if err != nil {
 		t.Logf("SubmitAcceptMultishot: %v (may be unsupported)", err)
 		return
 	}
 
-	// Connect multiple clients
+	// Wait flushes pending submissions. Prime the multishot accept before
+	// dialing so the poll-first path is armed in-kernel for future connections.
+	cqes := make([]uring.CQEView, 16)
+	n, err := ring.Wait(cqes)
+	if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+		t.Fatalf("prime Wait: %v", err)
+	}
+	if accepted, errRes := consumeAcceptCQEs(cqes[:n]); errRes != 0 {
+		t.Fatalf("prime Wait accept CQE failed: %d", errRes)
+	} else if accepted != 0 {
+		t.Fatalf("prime Wait returned %d unexpected accept CQEs before dialing", accepted)
+	}
+
+	// Connect multiple clients and keep them alive until the server accepts them.
 	const numClients = 3
+	clients := make([]net.Conn, 0, numClients)
+	defer func() {
+		for _, conn := range clients {
+			conn.Close()
+		}
+	}()
 	for i := 0; i < numClients; i++ {
-		go func() {
-			time.Sleep(50 * time.Millisecond)
-			conn, err := net.DialTimeout("tcp", addr.String(), 2*time.Second)
-			if err == nil {
-				time.Sleep(100 * time.Millisecond)
-				conn.Close()
-			}
-		}()
+		conn, err := net.DialTimeout("tcp", addr.String(), 2*time.Second)
+		if err != nil {
+			t.Fatalf("DialTimeout[%d]: %v", i, err)
+		}
+		clients = append(clients, conn)
 	}
 
 	// Process completions
-	cqes := make([]uring.CQEView, 16)
 	deadline := time.Now().Add(5 * time.Second)
 	b := iox.Backoff{}
 	accepted := 0
@@ -210,17 +282,11 @@ func TestIntegrationMultishotAccept(t *testing.T) {
 		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
 			t.Fatalf("Wait: %v", err)
 		}
-		for i := 0; i < n; i++ {
-			cqe := cqes[i]
-			if cqe.Op() != uring.IORING_OP_ACCEPT {
-				continue
-			}
-			if cqe.Res < 0 {
-				t.Fatalf("accept CQE failed: %d", cqe.Res)
-			}
-			accepted++
-			closeTestFD(iofd.FD(cqe.Res))
+		delta, errRes := consumeAcceptCQEs(cqes[:n])
+		if errRes != 0 {
+			t.Fatalf("accept CQE failed: %d", errRes)
 		}
+		accepted += delta
 		b.Wait()
 	}
 
