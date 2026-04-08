@@ -6,31 +6,18 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
-  ci:
-    name: CI (Go ${{ matrix.go-version }}, ${{ matrix.goos }}/${{ matrix.goarch }})
-    runs-on: ${{ matrix.runs_on }}
+  build-and-check:
+    name: Build & Check (Go ${{ matrix.go-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     strategy:
+      fail-fast: false
       matrix:
-        go-version: ['1.26', 'stable']
-        include:
-          ## Waiting for the Ubuntu 26.04 runner to be available in GitHub Actions
-          - goos: linux
-            goarch: amd64
-            runs_on: ubuntu-latest
-            run_tests: false
-          - goos: linux
-            goarch: arm64
-            runs_on: ubuntu-latest
-            run_tests: false
-          - goos: linux
-            goarch: riscv64
-            runs_on: ubuntu-latest
-            run_tests: false
-          - goos: linux
-            goarch: loong64
-            runs_on: ubuntu-latest
-            run_tests: false
+        go-version: [ '1.26.x', 'stable' ]
     steps:
       - uses: actions/checkout@v6
 
@@ -40,7 +27,6 @@ jobs:
           go-version: ${{ matrix.go-version }}
 
       - name: Check formatting
-        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
         run: |
           output=$(gofmt -l .)
           if [ -n "$output" ]; then
@@ -49,17 +35,53 @@ jobs:
             exit 1
           fi
 
+      - name: Vet
+        run: |
+          go vet ./... 2>&1 | tee /tmp/vet.out || true
+          if [ -s /tmp/vet.out ]; then
+            grep -v -E "(^#|possible misuse of unsafe.Pointer)" /tmp/vet.out && exit 1 || true
+          fi
+
       - name: Build
         env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: '0'
         run: go build ./...
 
-      - name: Test
-        if: matrix.run_tests
+      ## TODO: Enable once ubuntu-26.04 runner lands (ETA: May 2026).
+      ## Ubuntu 26.04 ships kernel 7.0; io_uring features require >= 6.18.
+      ## Change runs-on to ubuntu-26.04 and uncomment the steps below.
+      ## Tracking: https://github.com/actions/runner-images/issues/13855
+      # - name: Test
+      #   run: go test -v -race -coverprofile=coverage.out ./...
+      # - name: Upload coverage to Codecov
+      #   if: matrix.go-version == 'stable'
+      #   uses: codecov/codecov-action@v5
+      #   with:
+      #     files: coverage.out
+      #     token: ${{ secrets.CODECOV_TOKEN }}
+
+  cross-build:
+    name: Cross-Build (linux/${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goarch: arm64 }
+          - { goarch: riscv64 }
+          - { goarch: loong64 }
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+
+      - name: Build
         env:
-          GOOS: ${{ matrix.goos }}
+          GOOS: linux
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: '0'
-        run: go test ./...
+        run: go build -v ./...
