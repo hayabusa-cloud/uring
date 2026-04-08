@@ -160,6 +160,10 @@ func (op *ListenerOp) closeFD() {
 }
 
 // Close releases resources (darwin stub).
+// Caller must drain all in-flight operations before calling Close.
+// Close is not safe for concurrent use.
+// Caller must serialize Close and only perform final cleanup after draining
+// pending listener setup CQEs.
 func (op *ListenerOp) Close() {
 	op.closed.Store(true)
 	op.closeFD()

@@ -476,6 +476,8 @@ func (r *ZCRXReceiver) Stopped() bool {
 // Close releases ZCRX resources after the receiver has retired and the owning
 // ring has been stopped. Returns iox.ErrWouldBlock while retirement is still
 // in flight or while the ring still owns the ZCRX IFQ registration.
+// Caller must drain all in-flight operations before calling Close.
+// Close is not safe for concurrent use.
 // Safe to call more than once; subsequent calls return nil.
 func (r *ZCRXReceiver) Close() error {
 	if !r.Stopped() {

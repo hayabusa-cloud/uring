@@ -306,6 +306,10 @@ func (op *ListenerOp) Ext() *ExtSQE {
 // Close releases resources. If the listener has an open FD, it is closed.
 // When a listener setup SQE is still in flight, Close keeps the pooled ExtSQE
 // borrowed until the caller drains that CQE and calls Close again.
+// Caller must drain all in-flight operations before calling Close.
+// Close is not safe for concurrent use.
+// Caller must serialize Close and only perform final cleanup after draining
+// pending listener setup CQEs.
 func (op *ListenerOp) Close() {
 	op.closed.Store(true)
 	op.closeFD()

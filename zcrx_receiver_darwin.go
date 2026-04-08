@@ -106,6 +106,8 @@ func (r *ZCRXReceiver) Stop() error { return nil }
 func (r *ZCRXReceiver) Stopped() bool { return true }
 
 // Close is a no-op stub on Darwin.
+// Caller must drain all in-flight operations before calling Close.
+// Close is not safe for concurrent use.
 // Safe to call more than once; subsequent calls return nil.
 func (r *ZCRXReceiver) Close() error { return nil }
 
