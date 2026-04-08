@@ -39,7 +39,12 @@ jobs:
         run: |
           go vet ./... 2>&1 | tee /tmp/vet.out || true
           if [ -s /tmp/vet.out ]; then
-            grep -v -E "(^#|possible misuse of unsafe.Pointer)" /tmp/vet.out && exit 1 || true
+            # Fresh runners may print module download chatter before real vet diagnostics.
+            grep -v -E "(^#|^go: downloading |possible misuse of unsafe.Pointer)" /tmp/vet.out > /tmp/vet.filtered || true
+            if [ -s /tmp/vet.filtered ]; then
+              cat /tmp/vet.filtered
+              exit 1
+            fi
           fi
 
       - name: Build
