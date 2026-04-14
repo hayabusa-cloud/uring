@@ -174,6 +174,21 @@ func (c SQEContext) WithFlags(flags uint8) SQEContext {
 	return c
 }
 
+// OrFlags returns a new context with flags ORed into the existing set.
+// For Direct mode, modifies the inline bits.
+// For Indirect/Extended modes, writes to the pointed-to SQE struct.
+func (c SQEContext) OrFlags(flags uint8) SQEContext {
+	if c.IsDirect() {
+		return c | SQEContext(flags)<<ctxFlagsShift
+	}
+	if c.IsExtended() {
+		c.ExtSQE().SQE.flags |= flags
+		return c
+	}
+	c.IndirectSQE().flags |= flags
+	return c
+}
+
 // WithBufGroup returns a new context with the buffer group replaced.
 // For Direct mode, modifies the inline bits.
 // For Indirect/Extended modes, writes to the pointed-to SQE struct.

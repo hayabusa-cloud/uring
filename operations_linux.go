@@ -395,7 +395,25 @@ func (ur *ioUring) openAt(sqeCtx SQEContext, pathname string, uflags int, mode u
 
 // close closes a file descriptor.
 func (ur *ioUring) close(sqeCtx SQEContext) error {
-	return ur.submitPacked3(sqeCtx.WithOp(IORING_OP_CLOSE), 0, 0, 0)
+	slot, err := ur.reserveSubmitSlot()
+	if err != nil {
+		return err
+	}
+	ctx := sqeCtx.WithOp(IORING_OP_CLOSE)
+	slot.fill3(ctx, 0, 0, 0)
+	if slot.sqe.flags&IOSQE_FIXED_FILE != 0 {
+		fileIndex := ctx.FD()
+		if fileIndex < 0 {
+			ur.abortSubmitSlot(slot)
+			return ErrInvalidParam
+		}
+		slot.sqe.flags &^= IOSQE_FIXED_FILE
+		slot.sqe.fd = 0
+		slot.sqe.spliceFdIn = int32(uint32(fileIndex) + 1)
+	}
+	mirrorExtendedSQE(ctx, slot.sqe)
+	ur.publishSubmitSlot(slot, ctx)
+	return nil
 }
 
 // statx gets file status.
@@ -429,7 +447,7 @@ func (ur *ioUring) read(sqeCtx SQEContext, ioprio uint16, p []byte, offset uint6
 // readWithBufferSelect submits a read with kernel buffer selection.
 func (ur *ioUring) readWithBufferSelect(sqeCtx SQEContext, n int, group uint16) error {
 	ctx := sqeCtx.WithOp(IORING_OP_READ).
-		WithFlags(sqeCtx.Flags() | IOSQE_BUFFER_SELECT).
+		OrFlags(IOSQE_BUFFER_SELECT).
 		WithBufGroup(group)
 	return ur.submitPacked9(ctx, 0, 0, 0, n, 0, 0, 0)
 }
@@ -490,7 +508,7 @@ func (ur *ioUring) receive(sqeCtx SQEContext, ioprio uint16, p []byte, offset ui
 // receiveWithBufferSelect submits a receive with kernel buffer selection.
 func (ur *ioUring) receiveWithBufferSelect(sqeCtx SQEContext, ioprio uint16, n int, group uint16) error {
 	ctx := sqeCtx.WithOp(IORING_OP_RECV).
-		WithFlags(sqeCtx.Flags() | IOSQE_BUFFER_SELECT).
+		OrFlags(IOSQE_BUFFER_SELECT).
 		WithBufGroup(group)
 	return ur.submitPacked9(ctx, ioprio, 0, 0, n, 0, 0, 0)
 }
@@ -500,7 +518,7 @@ func (ur *ioUring) receiveWithBufferSelect(sqeCtx SQEContext, ioprio uint16, n i
 // The CQE result contains the number of buffers consumed.
 func (ur *ioUring) receiveBundle(sqeCtx SQEContext, ioprio uint16, n int, group uint16) error {
 	ctx := sqeCtx.WithOp(IORING_OP_RECV).
-		WithFlags(sqeCtx.Flags() | IOSQE_BUFFER_SELECT).
+		OrFlags(IOSQE_BUFFER_SELECT).
 		WithBufGroup(group)
 	return ur.submitPacked9(ctx, ioprio|IORING_RECVSEND_BUNDLE, 0, 0, n, 0, 0, 0)
 }
@@ -756,7 +774,7 @@ func (ur *ioUring) sendtoZeroCopy(sqeCtx SQEContext, p []byte, offset uint64, n 
 		}
 		slot.keep.retainSockaddr(sa)
 		ctx := sqeCtx.WithOp(IORING_OP_SEND_ZC)
-		slot.fill9(ctx, 0, uint64(uintptr(saPtr)), dataAddr, n, msgFlags, 0, int32(saN))
+		slot.fill9(ctx, 0, uint64(uintptr(saPtr)), dataAddr+offset, n, msgFlags, 0, int32(saN))
 		ur.publishSubmitSlot(slot, ctx)
 		return nil
 	}
@@ -800,7 +818,7 @@ func (ur *ioUring) sendmsgZeroCopy(sqeCtx SQEContext, ioprio uint16, buffers [][
 // readMultiShot submits a multi-shot read operation.
 func (ur *ioUring) readMultiShot(sqeCtx SQEContext, offset uint64, n int, group uint16) error {
 	ctx := sqeCtx.WithOp(IORING_OP_READ_MULTISHOT).
-		WithFlags(sqeCtx.Flags() | IOSQE_BUFFER_SELECT).
+		OrFlags(IOSQE_BUFFER_SELECT).
 		WithBufGroup(group)
 	return ur.submitPacked9(ctx, 0, offset, 0, n, 0, 0, 0)
 }
