@@ -94,8 +94,8 @@ func (ur *ioUring) waitBatchDirect(cqes []DirectCQE) (int, error) {
 	}
 
 	ur.lockSubmitState()
-	defer ur.unlockSubmitState()
 	if ur.closed.Load() || ur.cq.kHead == nil || ur.cq.kTail == nil || ur.cq.kRingMask == nil || len(ur.cq.cqes) == 0 {
+		ur.unlockSubmitState()
 		return 0, ErrClosed
 	}
 
@@ -104,7 +104,9 @@ func (ur *ioUring) waitBatchDirect(cqes []DirectCQE) (int, error) {
 		h := atomic.LoadUint32(ur.cq.kHead)
 		t := atomic.LoadUint32(ur.cq.kTail)
 		if h == t {
-			return 0, ur.cqEmptyErr()
+			err := ur.cqEmptyErr()
+			ur.unlockSubmitState()
+			return 0, err
 		}
 
 		// Calculate batch size
@@ -117,17 +119,12 @@ func (ur *ioUring) waitBatchDirect(cqes []DirectCQE) (int, error) {
 		// Acquire barrier before reading CQE data
 		dwcas.BarrierAcquire()
 
-		// Claim the batch with single CAS
-		if !atomic.CompareAndSwapUint32(ur.cq.kHead, h, h+available) {
-			sw.Once()
-			continue
-		}
-
-		// Unpack Direct mode context directly - no mode checking
+		// Snapshot before publishing the head advance so copied CQEs cannot race
+		// kernel slot reuse after wrap.
 		mask := *ur.cq.kRingMask
 		n := int(available)
 		for i := range n {
-			e := &ur.cq.cqes[(h+uint32(i))&mask]
+			e := ur.cq.cqeAt((h + uint32(i)) & mask)
 			ctx := SQEContextFromRaw(e.userData)
 
 			cqes[i] = DirectCQE{
@@ -139,6 +136,11 @@ func (ur *ioUring) waitBatchDirect(cqes []DirectCQE) (int, error) {
 				FD:       iofd.FD(ctx.FD()),
 			}
 		}
+		if !atomic.CompareAndSwapUint32(ur.cq.kHead, h, h+available) {
+			sw.Once()
+			continue
+		}
+		ur.unlockSubmitState()
 		return n, nil
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -48,6 +49,14 @@ func logRingDiagnostics(t *testing.T, label string, ring *uring.Uring) {
 		info.NrRegisterOpcodes,
 		info.NrRequestOpcodes,
 	)
+}
+
+func skipIfXattrUnsupported(t *testing.T, op string, res int32) {
+	t.Helper()
+
+	if res == -int32(zcall.ENOTSUP) || res == -int32(zcall.EOPNOTSUPP) {
+		t.Skipf("%s not supported on this filesystem: res=%d", op, res)
+	}
 }
 
 // =============================================================================
@@ -242,6 +251,118 @@ func TestTimeoutUpdate(t *testing.T) {
 	})
 }
 
+func TestTimeoutRemove(t *testing.T) {
+	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
+		opt.NotifySucceed = true
+		opt.MultiIssuers = true
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	mustStartRing(t, ring)
+
+	timeoutCtx := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, 0, 0)
+	if err := ring.Timeout(timeoutCtx, time.Minute); err != nil {
+		t.Fatalf("Timeout: %v", err)
+	}
+
+	removeCtx := uring.PackDirect(uring.IORING_OP_TIMEOUT_REMOVE, 0, 0, 0)
+	if err := ring.TimeoutRemove(removeCtx, timeoutCtx.Raw()); err != nil {
+		t.Fatalf("TimeoutRemove: %v", err)
+	}
+
+	cqes := make([]uring.CQEView, 8)
+	deadline := time.Now().Add(time.Second)
+	timeoutRemoved := false
+	timeoutCanceled := false
+	b := iox.Backoff{}
+
+	for time.Now().Before(deadline) && (!timeoutRemoved || !timeoutCanceled) {
+		n, err := ring.Wait(cqes)
+		if err != nil &&
+			!errors.Is(err, iox.ErrWouldBlock) &&
+			!errors.Is(err, uring.ErrExists) {
+			t.Fatalf("Wait: %v", err)
+		}
+		for i := 0; i < n; i++ {
+			switch cqes[i].Op() {
+			case uring.IORING_OP_TIMEOUT_REMOVE:
+				if cqes[i].Res != 0 {
+					t.Fatalf("TimeoutRemove CQE res = %d, want 0", cqes[i].Res)
+				}
+				timeoutRemoved = true
+			case uring.IORING_OP_TIMEOUT:
+				if cqes[i].Res != -int32(zcall.ECANCELED) {
+					t.Fatalf("Timeout CQE res = %d, want %d", cqes[i].Res, -int32(zcall.ECANCELED))
+				}
+				timeoutCanceled = true
+			}
+		}
+		b.Wait()
+	}
+
+	if !timeoutRemoved || !timeoutCanceled {
+		t.Fatalf("timeout removal incomplete: remove=%t timeout=%t", timeoutRemoved, timeoutCanceled)
+	}
+}
+
+func TestUringLinkTimeoutCycle(t *testing.T) {
+	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
+		opt.NotifySucceed = true
+		opt.MultiIssuers = true
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	mustStartRing(t, ring)
+
+	nopCtx := uring.PackDirect(uring.IORING_OP_NOP, 0, 0, 0)
+	if err := ring.Nop(nopCtx, uring.WithFlags(uring.IOSQE_IO_LINK)); err != nil {
+		t.Fatalf("Nop: %v", err)
+	}
+
+	timeoutCtx := uring.PackDirect(uring.IORING_OP_LINK_TIMEOUT, 0, 0, 0)
+	if err := ring.LinkTimeout(timeoutCtx, 100*time.Millisecond); err != nil {
+		t.Fatalf("LinkTimeout: %v", err)
+	}
+
+	cqes := make([]uring.CQEView, 8)
+	deadline := time.Now().Add(time.Second)
+	nopDone := false
+	timeoutDone := false
+	b := iox.Backoff{}
+
+	for time.Now().Before(deadline) && (!nopDone || !timeoutDone) {
+		n, err := ring.Wait(cqes)
+		if err != nil &&
+			!errors.Is(err, iox.ErrWouldBlock) &&
+			!errors.Is(err, uring.ErrExists) {
+			t.Fatalf("Wait: %v", err)
+		}
+		for i := 0; i < n; i++ {
+			switch cqes[i].Op() {
+			case uring.IORING_OP_NOP:
+				if cqes[i].Res != 0 {
+					t.Fatalf("NOP CQE res = %d, want 0", cqes[i].Res)
+				}
+				nopDone = true
+			case uring.IORING_OP_LINK_TIMEOUT:
+				if cqes[i].Res != -int32(zcall.ECANCELED) {
+					t.Fatalf("LinkTimeout CQE res = %d, want %d", cqes[i].Res, -int32(zcall.ECANCELED))
+				}
+				timeoutDone = true
+			}
+		}
+		b.Wait()
+	}
+
+	if !nopDone || !timeoutDone {
+		t.Fatalf("linked timeout incomplete: nop=%t timeout=%t", nopDone, timeoutDone)
+	}
+}
+
 func TestUringFileReadWriteCycle(t *testing.T) {
 	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
 		opt.Entries = uring.EntriesSmall
@@ -330,14 +451,7 @@ func TestUringTCPSocketCycle(t *testing.T) {
 
 	// Close socket via io_uring
 	closeCtx := uring.PackDirect(uring.IORING_OP_CLOSE, 0, 0, socketFD)
-	if err := ring.Close(closeCtx); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-
-	_, ok = waitForOp(t, ring, uring.IORING_OP_CLOSE, time.Second)
-	if !ok {
-		t.Error("Close operation did not complete")
-	}
+	mustCloseAndWait(t, ring, closeCtx, time.Second, "TCP4 socket")
 }
 
 func TestUringTCPBindListenAccept(t *testing.T) {
@@ -392,8 +506,7 @@ func TestUringTCPBindListenAccept(t *testing.T) {
 
 	// Clean up - close server socket
 	closeCtx := uring.PackDirect(uring.IORING_OP_CLOSE, 0, 0, serverFD)
-	ring.Close(closeCtx)
-	waitForOp(t, ring, uring.IORING_OP_CLOSE, time.Second)
+	mustCloseAndWait(t, ring, closeCtx, time.Second, "server socket")
 }
 
 func TestUringUDPSocketCycle(t *testing.T) {
@@ -416,7 +529,7 @@ func TestUringUDPSocketCycle(t *testing.T) {
 	}
 
 	closeCtx := uring.PackDirect(uring.IORING_OP_CLOSE, 0, 0, ev.Res)
-	ring.Close(closeCtx)
+	mustCloseAndWait(t, ring, closeCtx, time.Second, "UDP4 socket")
 }
 
 func TestUringUnixSocketCycle(t *testing.T) {
@@ -439,7 +552,7 @@ func TestUringUnixSocketCycle(t *testing.T) {
 	}
 
 	closeCtx := uring.PackDirect(uring.IORING_OP_CLOSE, 0, 0, ev.Res)
-	ring.Close(closeCtx)
+	mustCloseAndWait(t, ring, closeCtx, time.Second, "Unix socket")
 }
 
 // =============================================================================
@@ -1036,8 +1149,7 @@ func TestAcceptDirect(t *testing.T) {
 
 	// Clean up
 	closeCtx := uring.PackDirect(uring.IORING_OP_CLOSE, 0, 0, serverFD)
-	ring.Close(closeCtx)
-	waitForOp(t, ring, uring.IORING_OP_CLOSE, time.Second)
+	mustCloseAndWait(t, ring, closeCtx, time.Second, "server socket")
 
 	ring.UnregisterFiles()
 	t.Logf("AcceptDirect allocated slot %d", allocatedSlot)
@@ -1086,8 +1198,7 @@ func TestSocketDirect(t *testing.T) {
 	// The socket is in the registered file table at allocatedSlot
 	// Close it using IOSQE_FIXED_FILE flag (close the direct descriptor)
 	closeCtx := uring.PackDirect(uring.IORING_OP_CLOSE, uring.IOSQE_FIXED_FILE, 0, allocatedSlot)
-	ring.Close(closeCtx)
-	waitForOp(t, ring, uring.IORING_OP_CLOSE, time.Second)
+	mustCloseAndWait(t, ring, closeCtx, time.Second, "direct socket")
 
 	ring.UnregisterFiles()
 	t.Logf("SocketDirect allocated slot %d", allocatedSlot)
@@ -1179,43 +1290,64 @@ func TestConnectWithDirectSocket(t *testing.T) {
 		t.Fatalf("Connect: %v", err)
 	}
 
-	// Wait for Connect to complete
-	ev, ok = waitForOp(t, ring, uring.IORING_OP_CONNECT, 2*time.Second)
-	if !ok {
+	// Connect and Accept can complete in either order once fixed-file connect works.
+	cqes := make([]uring.CQEView, 4)
+	deadline := time.Now().Add(2 * time.Second)
+	backoff := iox.Backoff{}
+	var connectCQE, acceptCQE uring.CQEView
+	connectDone := false
+	acceptDone := false
+	for time.Now().Before(deadline) && (!connectDone || !acceptDone) {
+		n, err := ring.Wait(cqes)
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+			t.Fatalf("Wait: %v", err)
+		}
+		if n > 0 {
+			backoff.Reset()
+		}
+		for i := 0; i < n; i++ {
+			switch cqes[i].Op() {
+			case uring.IORING_OP_CONNECT:
+				connectCQE = cqes[i]
+				connectDone = true
+			case uring.IORING_OP_ACCEPT:
+				acceptCQE = cqes[i]
+				acceptDone = true
+			}
+		}
+		if connectDone && connectCQE.Res < 0 {
+			break
+		}
+		backoff.Wait()
+	}
+	if !connectDone {
 		t.Fatal("Connect did not complete")
 	}
-	if ev.Res < 0 {
-		// ENOTSOCK (-88) indicates WSL2 doesn't properly support IOSQE_FIXED_FILE for connect
-		if ev.Res == -88 || ev.Res == -95 {
-			t.Skipf("Connect with direct socket failed: %d (WSL2 limitation)", ev.Res)
+	if connectCQE.Res < 0 {
+		if connectCQE.Res == -int32(zcall.EOPNOTSUPP) {
+			t.Skipf("Connect with direct socket not supported by kernel: %d", connectCQE.Res)
 		}
-		t.Fatalf("Connect failed: %d", ev.Res)
+		t.Fatalf("Connect failed: %d", connectCQE.Res)
 	}
-
-	// Wait for Accept
-	ev, ok = waitForOp(t, ring, uring.IORING_OP_ACCEPT, time.Second)
-	if !ok {
+	if !acceptDone {
 		t.Fatal("Accept did not complete")
 	}
-	if ev.Res < 0 {
-		t.Logf("Accept result: %d (may be expected in some scenarios)", ev.Res)
+	if acceptCQE.Res < 0 {
+		t.Logf("Accept result: %d (may be expected in some scenarios)", acceptCQE.Res)
 	} else {
 		// Close accepted FD
-		acceptedFD := ev.Res
+		acceptedFD := acceptCQE.Res
 		closeAcceptedCtx := uring.PackDirect(uring.IORING_OP_CLOSE, 0, 0, acceptedFD)
-		ring.Close(closeAcceptedCtx)
-		waitForOp(t, ring, uring.IORING_OP_CLOSE, time.Second)
+		mustCloseAndWait(t, ring, closeAcceptedCtx, time.Second, "accepted socket")
 	}
 
 	// Close direct client socket
 	closeClientCtx := uring.PackDirect(uring.IORING_OP_CLOSE, uring.IOSQE_FIXED_FILE, 0, clientSlot)
-	ring.Close(closeClientCtx)
-	waitForOp(t, ring, uring.IORING_OP_CLOSE, time.Second)
+	mustCloseAndWait(t, ring, closeClientCtx, time.Second, "direct client socket")
 
 	// Close server socket
 	closeServerCtx := uring.PackDirect(uring.IORING_OP_CLOSE, 0, 0, serverFD)
-	ring.Close(closeServerCtx)
-	waitForOp(t, ring, uring.IORING_OP_CLOSE, time.Second)
+	mustCloseAndWait(t, ring, closeServerCtx, time.Second, "server socket")
 
 	ring.UnregisterFiles()
 	t.Logf("Connect with direct socket (slot %d) succeeded", clientSlot)
@@ -1282,13 +1414,11 @@ func TestFixedFdInstall(t *testing.T) {
 
 	// Close the regular FD using io_uring
 	closeRegularCtx := uring.PackDirect(uring.IORING_OP_CLOSE, 0, 0, regularFD)
-	ring.Close(closeRegularCtx)
-	waitForOp(t, ring, uring.IORING_OP_CLOSE, time.Second)
+	mustCloseAndWait(t, ring, closeRegularCtx, time.Second, "regular socket FD")
 
 	// Close the direct descriptor (still valid after closing regular FD)
 	closeDirectCtx := uring.PackDirect(uring.IORING_OP_CLOSE, uring.IOSQE_FIXED_FILE, 0, directSlot)
-	ring.Close(closeDirectCtx)
-	waitForOp(t, ring, uring.IORING_OP_CLOSE, time.Second)
+	mustCloseAndWait(t, ring, closeDirectCtx, time.Second, "direct socket slot")
 
 	ring.UnregisterFiles()
 	t.Log("FixedFdInstall test passed - both descriptors worked independently")
@@ -1702,12 +1832,12 @@ func TestLinkedOperations(t *testing.T) {
 	// Chain 3 NOPs together with IOSQE_IO_LINK
 	// They should complete in submission order
 	for i := uint16(1); i <= 3; i++ {
-		flags := uint8(0)
+		ctx := uring.PackDirect(uring.IORING_OP_NOP, 0, i, 0)
+		var opts []uring.OpOptionFunc
 		if i < 3 {
-			flags = uring.IOSQE_IO_LINK // Link all but the last
+			opts = []uring.OpOptionFunc{uring.WithFlags(uring.IOSQE_IO_LINK)}
 		}
-		ctx := uring.PackDirect(uring.IORING_OP_NOP, flags, i, 0)
-		if err := ring.Nop(ctx); err != nil {
+		if err := ring.Nop(ctx, opts...); err != nil {
 			t.Fatalf("Nop[%d]: %v", i, err)
 		}
 	}
@@ -2181,6 +2311,9 @@ func TestPollUpdate(t *testing.T) {
 	if err := ring.PollAddMultishot(pollCtx, uring.EPOLLIN); err != nil {
 		t.Fatalf("PollAddMultishot: %v", err)
 	}
+	if _, err := ring.Wait(nil); err != nil {
+		t.Fatalf("Wait(nil): %v", err)
+	}
 
 	// Submit PollUpdate to change userData
 	updateCtx := uring.PackDirect(uring.IORING_OP_POLL_REMOVE, 0, 1, int32(readFD))
@@ -2192,9 +2325,22 @@ func TestPollUpdate(t *testing.T) {
 
 	// Collect CQEs
 	cqes := make([]uring.CQEView, 8)
-	n, err := ring.Wait(cqes)
-	if err != nil {
-		t.Fatalf("Wait: %v", err)
+	deadline := time.Now().Add(2 * time.Second)
+	b := iox.Backoff{}
+	n := 0
+	for time.Now().Before(deadline) {
+		n, err = ring.Wait(cqes)
+		if err != nil {
+			if errors.Is(err, iox.ErrWouldBlock) || errors.Is(err, uring.ErrExists) {
+				b.Wait()
+				continue
+			}
+			t.Fatalf("Wait: %v", err)
+		}
+		break
+	}
+	if n == 0 {
+		t.Fatal("PollUpdate did not complete")
 	}
 
 	// Analyze results
@@ -2236,6 +2382,839 @@ func TestPollUpdate(t *testing.T) {
 		_ = ring.PollUpdate(ctx, 0, 0, 0, uring.IORING_POLL_UPDATE_EVENTS|uring.IORING_POLL_UPDATE_USER_DATA)
 		t.Log("API signature verified")
 	})
+}
+
+// =============================================================================
+// Vectored I/O: ReadV / WriteV
+// =============================================================================
+
+func TestUringWriteVCycle(t *testing.T) {
+	ring := newTestRing(t, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
+		opt.NotifySucceed = true
+		opt.MultiIssuers = true
+	})
+
+	f, err := os.CreateTemp("", "uring_writev_*")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+
+	fd := int32(f.Fd())
+	header := []byte("HDR:")
+	payload := []byte("payload-data")
+	trailer := []byte(":END")
+	iovs := [][]byte{header, payload, trailer}
+	total := len(header) + len(payload) + len(trailer)
+
+	ctx := uring.PackDirect(uring.IORING_OP_WRITEV, 0, 0, fd)
+	if err := ring.WriteV(ctx, iovs); err != nil {
+		t.Fatalf("WriteV: %v", err)
+	}
+
+	ev, ok := waitForOp(t, ring, uring.IORING_OP_WRITEV, 5*time.Second)
+	if !ok {
+		t.Fatal("WriteV did not complete")
+	}
+	if ev.Res < 0 {
+		t.Fatalf("WriteV failed: %d", ev.Res)
+	}
+	if int(ev.Res) != total {
+		t.Errorf("WriteV: got %d, want %d", ev.Res, total)
+	}
+
+	f.Seek(0, 0)
+	got := make([]byte, total)
+	n, _ := f.Read(got)
+	want := "HDR:payload-data:END"
+	if string(got[:n]) != want {
+		t.Errorf("file content = %q, want %q", string(got[:n]), want)
+	}
+}
+
+func TestUringReadVCycle(t *testing.T) {
+	ring := newTestRing(t, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
+		opt.NotifySucceed = true
+		opt.MultiIssuers = true
+	})
+
+	f, err := os.CreateTemp("", "uring_readv_*")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+
+	data := "AAAAABBBBBCCCCC"
+	f.WriteString(data)
+	f.Seek(0, 0)
+
+	fd := int32(f.Fd())
+	buf1 := make([]byte, 5)
+	buf2 := make([]byte, 5)
+	buf3 := make([]byte, 5)
+	iovs := [][]byte{buf1, buf2, buf3}
+
+	ctx := uring.PackDirect(uring.IORING_OP_READV, 0, 0, fd)
+	if err := ring.ReadV(ctx, iovs); err != nil {
+		t.Fatalf("ReadV: %v", err)
+	}
+
+	ev, ok := waitForOp(t, ring, uring.IORING_OP_READV, 5*time.Second)
+	if !ok {
+		t.Fatal("ReadV did not complete")
+	}
+	if ev.Res < 0 {
+		t.Fatalf("ReadV failed: %d", ev.Res)
+	}
+	if int(ev.Res) != len(data) {
+		t.Errorf("ReadV: got %d bytes, want %d", ev.Res, len(data))
+	}
+	if string(buf1) != "AAAAA" {
+		t.Errorf("buf1 = %q, want AAAAA", buf1)
+	}
+	if string(buf2) != "BBBBB" {
+		t.Errorf("buf2 = %q, want BBBBB", buf2)
+	}
+	if string(buf3) != "CCCCC" {
+		t.Errorf("buf3 = %q, want CCCCC", buf3)
+	}
+}
+
+func TestUringWriteFixedCycle(t *testing.T) {
+	ring := newTestRing(t, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
+		opt.NotifySucceed = true
+		opt.MultiIssuers = true
+	})
+
+	if ring.RegisteredBufferCount() < 1 {
+		t.Skip("WriteFixed requires at least one registered buffer")
+	}
+
+	f, err := os.CreateTemp("", "uring_writefixed_*")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+
+	bufIndex := 0
+	buf := ring.RegisteredBuffer(bufIndex)
+	if buf == nil {
+		t.Fatal("RegisteredBuffer(0) returned nil")
+	}
+
+	message := []byte("Data written via WriteFixed")
+	copy(buf, message)
+
+	ctx := uring.PackDirect(uring.IORING_OP_WRITE, 0, 0, int32(f.Fd()))
+	if err := ring.WriteFixed(ctx, bufIndex, len(message)); err != nil {
+		t.Fatalf("WriteFixed: %v", err)
+	}
+
+	ev, ok := waitForOp(t, ring, uring.IORING_OP_WRITE_FIXED, 5*time.Second)
+	if !ok {
+		t.Fatal("WriteFixed did not complete")
+	}
+	if ev.Res < 0 {
+		t.Fatalf("WriteFixed failed: %d", ev.Res)
+	}
+	if int(ev.Res) != len(message) {
+		t.Errorf("WriteFixed: got %d, want %d", ev.Res, len(message))
+	}
+
+	if _, err := f.Seek(0, 0); err != nil {
+		t.Fatalf("Seek: %v", err)
+	}
+	got := make([]byte, len(message))
+	n, _ := f.Read(got)
+	if string(got[:n]) != string(message) {
+		t.Errorf("file content = %q, want %q", string(got[:n]), string(message))
+	}
+}
+
+func TestUringReadFixedCycle(t *testing.T) {
+	ring := newTestRing(t, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
+		opt.NotifySucceed = true
+		opt.MultiIssuers = true
+	})
+
+	if ring.RegisteredBufferCount() < 1 {
+		t.Skip("ReadFixed requires at least one registered buffer")
+	}
+
+	f, err := os.CreateTemp("", "uring_readfixed_*")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+
+	testData := "Content to read via ReadFixed"
+	if _, err := f.WriteString(testData); err != nil {
+		t.Fatalf("WriteString: %v", err)
+	}
+	if _, err := f.Seek(0, 0); err != nil {
+		t.Fatalf("Seek: %v", err)
+	}
+
+	ctx := uring.PackDirect(uring.IORING_OP_READ, 0, 0, int32(f.Fd()))
+	buf, err := ring.ReadFixed(ctx, 0, uring.WithN(len(testData)))
+	if err != nil {
+		t.Fatalf("ReadFixed: %v", err)
+	}
+
+	ev, ok := waitForOp(t, ring, uring.IORING_OP_READ_FIXED, 5*time.Second)
+	if !ok {
+		t.Fatal("ReadFixed did not complete")
+	}
+	if ev.Res < 0 {
+		t.Fatalf("ReadFixed failed: %d", ev.Res)
+	}
+	if int(ev.Res) != len(testData) {
+		t.Errorf("ReadFixed: got %d, want %d", ev.Res, len(testData))
+	}
+	if string(buf[:ev.Res]) != testData {
+		t.Errorf("ReadFixed data = %q, want %q", string(buf[:ev.Res]), testData)
+	}
+}
+
+// =============================================================================
+// Fsync / Fallocate / FTruncate / SyncFileRange
+// =============================================================================
+
+func TestUringSyncCycle(t *testing.T) {
+	ring := newTestRing(t, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
+		opt.NotifySucceed = true
+		opt.MultiIssuers = true
+	})
+
+	f, err := os.CreateTemp("", "uring_fsync_*")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+
+	f.WriteString("fsync test data")
+
+	fd := int32(f.Fd())
+	ctx := uring.PackDirect(uring.IORING_OP_FSYNC, 0, 0, fd)
+	if err := ring.Sync(ctx); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	ev, ok := waitForOp(t, ring, uring.IORING_OP_FSYNC, 5*time.Second)
+	if !ok {
+		t.Fatal("Sync did not complete")
+	}
+	if ev.Res < 0 {
+		t.Fatalf("Sync failed: %d", ev.Res)
+	}
+}
+
+func TestUringFallocateCycle(t *testing.T) {
+	ring := newTestRing(t, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
+		opt.NotifySucceed = true
+		opt.MultiIssuers = true
+	})
+
+	f, err := os.CreateTemp("", "uring_fallocate_*")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+
+	fd := int32(f.Fd())
+	ctx := uring.PackDirect(uring.IORING_OP_FALLOCATE, 0, 0, fd)
+	if err := ring.Fallocate(ctx, 0, 0, 4096); err != nil {
+		t.Fatalf("Fallocate: %v", err)
+	}
+
+	ev, ok := waitForOp(t, ring, uring.IORING_OP_FALLOCATE, 5*time.Second)
+	if !ok {
+		t.Fatal("Fallocate did not complete")
+	}
+	if ev.Res < 0 {
+		t.Fatalf("Fallocate failed: %d", ev.Res)
+	}
+
+	info, err := f.Stat()
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if info.Size() != 4096 {
+		t.Errorf("file size = %d, want 4096", info.Size())
+	}
+}
+
+func TestUringFTruncateCycle(t *testing.T) {
+	ring := newTestRing(t, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
+		opt.NotifySucceed = true
+		opt.MultiIssuers = true
+	})
+
+	f, err := os.CreateTemp("", "uring_ftruncate_*")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+
+	f.WriteString("some data that will be truncated to a shorter length")
+
+	fd := int32(f.Fd())
+	ctx := uring.PackDirect(uring.IORING_OP_FTRUNCATE, 0, 0, fd)
+	if err := ring.FTruncate(ctx, 10); err != nil {
+		t.Fatalf("FTruncate: %v", err)
+	}
+
+	ev, ok := waitForOp(t, ring, uring.IORING_OP_FTRUNCATE, 5*time.Second)
+	if !ok {
+		t.Fatal("FTruncate did not complete")
+	}
+	if ev.Res < 0 {
+		t.Fatalf("FTruncate failed: %d", ev.Res)
+	}
+
+	info, err := f.Stat()
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if info.Size() != 10 {
+		t.Errorf("file size = %d, want 10", info.Size())
+	}
+}
+
+func TestUringSyncFileRangeCycle(t *testing.T) {
+	ring := newTestRing(t, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
+		opt.NotifySucceed = true
+		opt.MultiIssuers = true
+	})
+
+	f, err := os.CreateTemp("", "uring_syncrange_*")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+
+	f.WriteString("sync file range test data")
+
+	fd := int32(f.Fd())
+	const SYNC_FILE_RANGE_WRITE = 2
+	ctx := uring.PackDirect(uring.IORING_OP_SYNC_FILE_RANGE, 0, 0, fd)
+	if err := ring.SyncFileRange(ctx, 0, 25, SYNC_FILE_RANGE_WRITE); err != nil {
+		t.Fatalf("SyncFileRange: %v", err)
+	}
+
+	ev, ok := waitForOp(t, ring, uring.IORING_OP_SYNC_FILE_RANGE, 5*time.Second)
+	if !ok {
+		t.Fatal("SyncFileRange did not complete")
+	}
+	if ev.Res < 0 {
+		t.Fatalf("SyncFileRange failed: %d", ev.Res)
+	}
+}
+
+// =============================================================================
+// Splice / Tee
+// =============================================================================
+
+func TestUringSpliceCycle(t *testing.T) {
+	ring := newTestRing(t, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
+		opt.NotifySucceed = true
+		opt.MultiIssuers = true
+	})
+
+	srcFile, err := os.CreateTemp("", "uring_splice_src_*")
+	if err != nil {
+		t.Fatalf("CreateTemp (src): %v", err)
+	}
+	defer os.Remove(srcFile.Name())
+	defer srcFile.Close()
+
+	testData := "splice zero-copy transfer"
+	srcFile.WriteString(testData)
+	srcFile.Seek(0, 0)
+
+	dstFile, err := os.CreateTemp("", "uring_splice_dst_*")
+	if err != nil {
+		t.Fatalf("CreateTemp (dst): %v", err)
+	}
+	defer os.Remove(dstFile.Name())
+	defer dstFile.Close()
+
+	var pipeFDs [2]int32
+	errno := zcall.Pipe2(&pipeFDs, zcall.O_NONBLOCK)
+	if errno != 0 {
+		t.Fatalf("pipe2: errno=%d", errno)
+	}
+	pipeRead, pipeWrite := pipeFDs[0], pipeFDs[1]
+	defer zcall.Close(uintptr(pipeRead))
+	defer zcall.Close(uintptr(pipeWrite))
+
+	// file → pipe
+	srcFD := int32(srcFile.Fd())
+	ctx1 := uring.PackDirect(uring.IORING_OP_SPLICE, 0, 0, pipeWrite)
+	if err := ring.Splice(ctx1, int(srcFD), len(testData)); err != nil {
+		t.Fatalf("Splice file→pipe: %v", err)
+	}
+
+	ev1, ok := waitForOp(t, ring, uring.IORING_OP_SPLICE, 5*time.Second)
+	if !ok {
+		t.Fatal("Splice file→pipe did not complete")
+	}
+	if ev1.Res <= 0 {
+		t.Skipf("Splice file→pipe returned %d", ev1.Res)
+	}
+
+	// pipe → file
+	dstFD := int32(dstFile.Fd())
+	ctx2 := uring.PackDirect(uring.IORING_OP_SPLICE, 0, 0, dstFD)
+	if err := ring.Splice(ctx2, int(pipeRead), int(ev1.Res)); err != nil {
+		t.Fatalf("Splice pipe→file: %v", err)
+	}
+
+	ev2, ok := waitForOp(t, ring, uring.IORING_OP_SPLICE, 5*time.Second)
+	if !ok {
+		t.Fatal("Splice pipe→file did not complete")
+	}
+	if ev2.Res < 0 {
+		t.Fatalf("Splice pipe→file failed: %d", ev2.Res)
+	}
+
+	dstFile.Seek(0, 0)
+	got := make([]byte, len(testData))
+	n, _ := dstFile.Read(got)
+	if string(got[:n]) != testData {
+		t.Errorf("dst content = %q, want %q", string(got[:n]), testData)
+	}
+}
+
+func TestUringTeeCycle(t *testing.T) {
+	ring := newTestRing(t, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
+		opt.NotifySucceed = true
+		opt.MultiIssuers = true
+	})
+
+	// Create two pipes: src and dst
+	var srcPipe, dstPipe [2]int32
+	if errno := zcall.Pipe2(&srcPipe, zcall.O_NONBLOCK); errno != 0 {
+		t.Fatalf("pipe2 (src): errno=%d", errno)
+	}
+	defer zcall.Close(uintptr(srcPipe[0]))
+	defer zcall.Close(uintptr(srcPipe[1]))
+
+	if errno := zcall.Pipe2(&dstPipe, zcall.O_NONBLOCK); errno != 0 {
+		t.Fatalf("pipe2 (dst): errno=%d", errno)
+	}
+	defer zcall.Close(uintptr(dstPipe[0]))
+	defer zcall.Close(uintptr(dstPipe[1]))
+
+	// Write data into source pipe
+	testData := []byte("tee duplicates data")
+	zcall.Write(uintptr(srcPipe[1]), testData)
+
+	// Tee: srcPipe[0] → dstPipe[1]
+	ctx := uring.PackDirect(uring.IORING_OP_TEE, 0, 0, dstPipe[1])
+	if err := ring.Tee(ctx, int(srcPipe[0]), len(testData)); err != nil {
+		t.Fatalf("Tee: %v", err)
+	}
+
+	ev, ok := waitForOp(t, ring, uring.IORING_OP_TEE, 5*time.Second)
+	if !ok {
+		t.Fatal("Tee did not complete")
+	}
+	if ev.Res <= 0 {
+		t.Skipf("Tee returned %d", ev.Res)
+	}
+
+	// Read from dst pipe to verify
+	got := make([]byte, len(testData))
+	n, _ := zcall.Read(uintptr(dstPipe[0]), got)
+	if string(got[:n]) != string(testData) {
+		t.Errorf("tee content = %q, want %q", string(got[:n]), testData)
+	}
+
+	// Source pipe should still have data (tee duplicates, doesn't consume)
+	srcGot := make([]byte, len(testData))
+	sn, _ := zcall.Read(uintptr(srcPipe[0]), srcGot)
+	if string(srcGot[:sn]) != string(testData) {
+		t.Errorf("source pipe content = %q, want %q (tee should not consume)", string(srcGot[:sn]), testData)
+	}
+}
+
+// =============================================================================
+// Filesystem: Statx, RenameAt, UnlinkAt, MkdirAt, SymlinkAt, LinkAt
+// =============================================================================
+
+func TestUringStatxCycle(t *testing.T) {
+	ring := newTestRing(t, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
+		opt.NotifySucceed = true
+		opt.MultiIssuers = true
+	})
+
+	f, err := os.CreateTemp("", "uring_statx_*")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	defer os.Remove(f.Name())
+	f.WriteString("statx test content")
+	f.Close()
+
+	var stat uring.Statx
+	const STATX_BASIC_STATS = 0x7ff
+	ctx := uring.PackDirect(uring.IORING_OP_STATX, 0, 0, uring.AT_FDCWD)
+	if err := ring.Statx(ctx, f.Name(), 0, STATX_BASIC_STATS, &stat); err != nil {
+		t.Fatalf("Statx: %v", err)
+	}
+
+	ev, ok := waitForOp(t, ring, uring.IORING_OP_STATX, 5*time.Second)
+	if !ok {
+		t.Fatal("Statx did not complete")
+	}
+	if ev.Res < 0 {
+		t.Fatalf("Statx failed: %d", ev.Res)
+	}
+
+	if stat.Size != 18 {
+		t.Errorf("Statx.Size = %d, want 18", stat.Size)
+	}
+	if stat.Mode&0o170000 != 0o100000 {
+		t.Errorf("Statx.Mode = 0o%o, want regular file", stat.Mode)
+	}
+}
+
+func TestUringMkdirAtCycle(t *testing.T) {
+	ring := newTestRing(t, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
+		opt.NotifySucceed = true
+		opt.MultiIssuers = true
+	})
+
+	dir := t.TempDir()
+	target := filepath.Join(dir, "newdir")
+
+	ctx := uring.PackDirect(uring.IORING_OP_MKDIRAT, 0, 0, uring.AT_FDCWD)
+	if err := ring.MkdirAt(ctx, target, 0o755); err != nil {
+		t.Fatalf("MkdirAt: %v", err)
+	}
+
+	ev, ok := waitForOp(t, ring, uring.IORING_OP_MKDIRAT, 5*time.Second)
+	if !ok {
+		t.Fatal("MkdirAt did not complete")
+	}
+	if ev.Res < 0 {
+		t.Fatalf("MkdirAt failed: %d", ev.Res)
+	}
+
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if !info.IsDir() {
+		t.Error("created path is not a directory")
+	}
+}
+
+func TestUringRenameAtCycle(t *testing.T) {
+	ring := newTestRing(t, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
+		opt.NotifySucceed = true
+		opt.MultiIssuers = true
+	})
+
+	dir := t.TempDir()
+	oldPath := filepath.Join(dir, "old.txt")
+	newPath := filepath.Join(dir, "new.txt")
+	os.WriteFile(oldPath, []byte("rename me"), 0o644)
+
+	ctx := uring.PackDirect(uring.IORING_OP_RENAMEAT, 0, 0, uring.AT_FDCWD)
+	if err := ring.RenameAt(ctx, oldPath, newPath, 0); err != nil {
+		t.Fatalf("RenameAt: %v", err)
+	}
+
+	ev, ok := waitForOp(t, ring, uring.IORING_OP_RENAMEAT, 5*time.Second)
+	if !ok {
+		t.Fatal("RenameAt did not complete")
+	}
+	if ev.Res < 0 {
+		t.Fatalf("RenameAt failed: %d", ev.Res)
+	}
+
+	if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
+		t.Error("old path still exists after rename")
+	}
+	got, err := os.ReadFile(newPath)
+	if err != nil {
+		t.Fatalf("ReadFile new: %v", err)
+	}
+	if string(got) != "rename me" {
+		t.Errorf("new file content = %q, want %q", got, "rename me")
+	}
+}
+
+func TestUringUnlinkAtCycle(t *testing.T) {
+	ring := newTestRing(t, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
+		opt.NotifySucceed = true
+		opt.MultiIssuers = true
+	})
+
+	dir := t.TempDir()
+	target := filepath.Join(dir, "delete_me.txt")
+	os.WriteFile(target, []byte("bye"), 0o644)
+
+	ctx := uring.PackDirect(uring.IORING_OP_UNLINKAT, 0, 0, uring.AT_FDCWD)
+	if err := ring.UnlinkAt(ctx, target, 0); err != nil {
+		t.Fatalf("UnlinkAt: %v", err)
+	}
+
+	ev, ok := waitForOp(t, ring, uring.IORING_OP_UNLINKAT, 5*time.Second)
+	if !ok {
+		t.Fatal("UnlinkAt did not complete")
+	}
+	if ev.Res < 0 {
+		t.Fatalf("UnlinkAt failed: %d", ev.Res)
+	}
+
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Error("file still exists after unlink")
+	}
+}
+
+func TestUringSymlinkAtCycle(t *testing.T) {
+	ring := newTestRing(t, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
+		opt.NotifySucceed = true
+		opt.MultiIssuers = true
+	})
+
+	dir := t.TempDir()
+	target := filepath.Join(dir, "real.txt")
+	link := filepath.Join(dir, "link.txt")
+	os.WriteFile(target, []byte("symlink target"), 0o644)
+
+	ctx := uring.PackDirect(uring.IORING_OP_SYMLINKAT, 0, 0, uring.AT_FDCWD)
+	if err := ring.SymlinkAt(ctx, target, link); err != nil {
+		t.Fatalf("SymlinkAt: %v", err)
+	}
+
+	ev, ok := waitForOp(t, ring, uring.IORING_OP_SYMLINKAT, 5*time.Second)
+	if !ok {
+		t.Fatal("SymlinkAt did not complete")
+	}
+	if ev.Res < 0 {
+		t.Fatalf("SymlinkAt failed: %d", ev.Res)
+	}
+
+	resolved, err := os.Readlink(link)
+	if err != nil {
+		t.Fatalf("Readlink: %v", err)
+	}
+	if resolved != target {
+		t.Errorf("symlink target = %q, want %q", resolved, target)
+	}
+}
+
+func TestUringLinkAtCycle(t *testing.T) {
+	ring := newTestRing(t, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
+		opt.NotifySucceed = true
+		opt.MultiIssuers = true
+	})
+
+	dir := t.TempDir()
+	target := filepath.Join(dir, "original.txt")
+	link := filepath.Join(dir, "hardlink.txt")
+	os.WriteFile(target, []byte("hard link target"), 0o644)
+
+	ctx := uring.PackDirect(uring.IORING_OP_LINKAT, 0, 0, uring.AT_FDCWD)
+	if err := ring.LinkAt(ctx, uring.AT_FDCWD, target, link, 0); err != nil {
+		t.Fatalf("LinkAt: %v", err)
+	}
+
+	ev, ok := waitForOp(t, ring, uring.IORING_OP_LINKAT, 5*time.Second)
+	if !ok {
+		t.Fatal("LinkAt did not complete")
+	}
+	if ev.Res < 0 {
+		t.Fatalf("LinkAt failed: %d", ev.Res)
+	}
+
+	got, err := os.ReadFile(link)
+	if err != nil {
+		t.Fatalf("ReadFile link: %v", err)
+	}
+	if string(got) != "hard link target" {
+		t.Errorf("link content = %q, want %q", got, "hard link target")
+	}
+
+	// Verify same inode
+	origInfo, _ := os.Stat(target)
+	linkInfo, _ := os.Stat(link)
+	if !os.SameFile(origInfo, linkInfo) {
+		t.Error("hard link does not point to same inode")
+	}
+}
+
+// =============================================================================
+// Xattr: FSetXattr / FGetXattr / SetXattr / GetXattr
+// =============================================================================
+
+func TestUringFSetXattrFGetXattrCycle(t *testing.T) {
+	ring := newTestRing(t, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
+		opt.NotifySucceed = true
+		opt.MultiIssuers = true
+	})
+
+	f, err := os.CreateTemp("", "uring_xattr_*")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+
+	fd := int32(f.Fd())
+	name := "user.test"
+	value := []byte("xattr-value")
+
+	// FSetXattr
+	setCtx := uring.PackDirect(uring.IORING_OP_FSETXATTR, 0, 0, fd)
+	if err := ring.FSetXattr(setCtx, name, value, 0); err != nil {
+		t.Fatalf("FSetXattr: %v", err)
+	}
+
+	ev, ok := waitForOp(t, ring, uring.IORING_OP_FSETXATTR, 5*time.Second)
+	if !ok {
+		t.Fatal("FSetXattr did not complete")
+	}
+	if ev.Res < 0 {
+		skipIfXattrUnsupported(t, "FSetXattr", ev.Res)
+		t.Fatalf("FSetXattr failed: %d", ev.Res)
+	}
+
+	// FGetXattr
+	getBuf := make([]byte, 64)
+	getCtx := uring.PackDirect(uring.IORING_OP_FGETXATTR, 0, 0, fd)
+	if err := ring.FGetXattr(getCtx, name, getBuf); err != nil {
+		t.Fatalf("FGetXattr: %v", err)
+	}
+
+	ev, ok = waitForOp(t, ring, uring.IORING_OP_FGETXATTR, 5*time.Second)
+	if !ok {
+		t.Fatal("FGetXattr did not complete")
+	}
+	if ev.Res < 0 {
+		skipIfXattrUnsupported(t, "FGetXattr", ev.Res)
+		t.Fatalf("FGetXattr failed: %d", ev.Res)
+	}
+	if string(getBuf[:ev.Res]) != string(value) {
+		t.Errorf("FGetXattr = %q, want %q", string(getBuf[:ev.Res]), value)
+	}
+}
+
+func TestUringSetXattrGetXattrCycle(t *testing.T) {
+	ring := newTestRing(t, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
+		opt.NotifySucceed = true
+		opt.MultiIssuers = true
+	})
+
+	f, err := os.CreateTemp("", "uring_xattr_path_*")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	defer os.Remove(f.Name())
+	f.Close()
+
+	name := "user.pathattr"
+	value := []byte("path-xattr-value")
+
+	// SetXattr
+	setCtx := uring.PackDirect(uring.IORING_OP_SETXATTR, 0, 0, 0)
+	if err := ring.SetXattr(setCtx, f.Name(), name, value, 0); err != nil {
+		t.Fatalf("SetXattr: %v", err)
+	}
+
+	ev, ok := waitForOp(t, ring, uring.IORING_OP_SETXATTR, 5*time.Second)
+	if !ok {
+		t.Fatal("SetXattr did not complete")
+	}
+	if ev.Res < 0 {
+		skipIfXattrUnsupported(t, "SetXattr", ev.Res)
+		t.Fatalf("SetXattr failed: %d", ev.Res)
+	}
+
+	// GetXattr
+	getBuf := make([]byte, 64)
+	getCtx := uring.PackDirect(uring.IORING_OP_GETXATTR, 0, 0, 0)
+	if err := ring.GetXattr(getCtx, f.Name(), name, getBuf); err != nil {
+		t.Fatalf("GetXattr: %v", err)
+	}
+
+	ev, ok = waitForOp(t, ring, uring.IORING_OP_GETXATTR, 5*time.Second)
+	if !ok {
+		t.Fatal("GetXattr did not complete")
+	}
+	if ev.Res < 0 {
+		skipIfXattrUnsupported(t, "GetXattr", ev.Res)
+		t.Fatalf("GetXattr failed: %d", ev.Res)
+	}
+	if string(getBuf[:ev.Res]) != string(value) {
+		t.Errorf("GetXattr = %q, want %q", string(getBuf[:ev.Res]), value)
+	}
+}
+
+// =============================================================================
+// FileAdvise (fadvise)
+// =============================================================================
+
+func TestUringFileAdviseCycle(t *testing.T) {
+	ring := newTestRing(t, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
+		opt.NotifySucceed = true
+		opt.MultiIssuers = true
+	})
+
+	f, err := os.CreateTemp("", "uring_fadvise_*")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+
+	f.WriteString("fadvise test data for sequential access hint")
+
+	fd := int32(f.Fd())
+	const POSIX_FADV_SEQUENTIAL = 2
+	ctx := uring.PackDirect(uring.IORING_OP_FADVISE, 0, 0, fd)
+	if err := ring.FileAdvise(ctx, 0, 45, POSIX_FADV_SEQUENTIAL); err != nil {
+		t.Fatalf("FileAdvise: %v", err)
+	}
+
+	ev, ok := waitForOp(t, ring, uring.IORING_OP_FADVISE, 5*time.Second)
+	if !ok {
+		t.Fatal("FileAdvise did not complete")
+	}
+	if ev.Res < 0 {
+		t.Fatalf("FileAdvise failed: %d", ev.Res)
+	}
 }
 
 // =============================================================================

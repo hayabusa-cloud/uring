@@ -22,6 +22,7 @@ import "unsafe"
 // live elsewhere when using pointer-bearing views.
 
 // ViewCtx creates a CtxRefs0 for accessing the UserData with 0 refs.
+// Raw overlay; caller must ensure pointer-free refs or keep roots externally.
 //
 // Example:
 //
@@ -34,6 +35,7 @@ func ViewCtx(sqe *ExtSQE) CtxRefs0 {
 }
 
 // ViewCtx1 creates a CtxRefs1 for accessing the UserData with 1 typed ref.
+// Raw overlay; caller must ensure pointer-free refs or keep roots externally.
 //
 // Example:
 //
@@ -44,6 +46,7 @@ func ViewCtx1[T1 any](sqe *ExtSQE) CtxRefs1[T1] {
 }
 
 // ViewCtx2 creates a CtxRefs2 for accessing the UserData with 2 typed refs.
+// Raw overlay; caller must ensure pointer-free refs or keep roots externally.
 //
 // Example:
 //
@@ -55,26 +58,31 @@ func ViewCtx2[T1, T2 any](sqe *ExtSQE) CtxRefs2[T1, T2] {
 }
 
 // ViewCtx3 creates a CtxRefs3 for accessing the UserData with 3 typed refs.
+// Raw overlay; caller must ensure pointer-free refs or keep roots externally.
 func ViewCtx3[T1, T2, T3 any](sqe *ExtSQE) CtxRefs3[T1, T2, T3] {
 	return CtxRefs3[T1, T2, T3]{sqe: sqe}
 }
 
 // ViewCtx4 creates a CtxRefs4 for accessing the UserData with 4 typed refs.
+// Raw overlay; caller must ensure pointer-free refs or keep roots externally.
 func ViewCtx4[T1, T2, T3, T4 any](sqe *ExtSQE) CtxRefs4[T1, T2, T3, T4] {
 	return CtxRefs4[T1, T2, T3, T4]{sqe: sqe}
 }
 
 // ViewCtx5 creates a CtxRefs5 for accessing the UserData with 5 typed refs.
+// Raw overlay; caller must ensure pointer-free refs or keep roots externally.
 func ViewCtx5[T1, T2, T3, T4, T5 any](sqe *ExtSQE) CtxRefs5[T1, T2, T3, T4, T5] {
 	return CtxRefs5[T1, T2, T3, T4, T5]{sqe: sqe}
 }
 
 // ViewCtx6 creates a CtxRefs6 for accessing the UserData with 6 typed refs.
+// Raw overlay; caller must ensure pointer-free refs or keep roots externally.
 func ViewCtx6[T1, T2, T3, T4, T5, T6 any](sqe *ExtSQE) CtxRefs6[T1, T2, T3, T4, T5, T6] {
 	return CtxRefs6[T1, T2, T3, T4, T5, T6]{sqe: sqe}
 }
 
 // ViewCtx7 creates a CtxRefs7 for accessing the UserData with 7 typed refs.
+// Raw overlay; caller must ensure pointer-free refs or keep roots externally.
 func ViewCtx7[T1, T2, T3, T4, T5, T6, T7 any](sqe *ExtSQE) CtxRefs7[T1, T2, T3, T4, T5, T6, T7] {
 	return CtxRefs7[T1, T2, T3, T4, T5, T6, T7]{sqe: sqe}
 }

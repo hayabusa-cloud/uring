@@ -107,6 +107,129 @@ func TestSharedSubmitInvalidInputDoesNotPoisonRing(t *testing.T) {
 
 		waitForNopCQE(t, ring)
 	})
+
+	t.Run("invalid readvFixed empty buffer list", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if err := ring.ioUring.readvFixed(PackDirect(0, 0, 0, 0), 0, nil); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("readvFixed error = %v, want %v", err, ErrInvalidParam)
+		}
+
+		done := make(chan error, 1)
+		go func() {
+			done <- ring.Nop(PackDirect(IORING_OP_NOP, 0, 3, 0))
+		}()
+
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Nop after empty readvFixed: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("Nop blocked after empty readvFixed")
+		}
+
+		waitForNopCQE(t, ring)
+	})
+
+	t.Run("invalid writevFixed length count", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if err := ring.ioUring.writevFixed(PackDirect(0, 0, 0, 0), 0, []int{0}, nil); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("writevFixed error = %v, want %v", err, ErrInvalidParam)
+		}
+
+		done := make(chan error, 1)
+		go func() {
+			done <- ring.Nop(PackDirect(IORING_OP_NOP, 0, 4, 0))
+		}()
+
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Nop after invalid writevFixed length count: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("Nop blocked after invalid writevFixed length count")
+		}
+
+		waitForNopCQE(t, ring)
+	})
+
+	t.Run("invalid writevFixed buffer length", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		buf := ring.RegisteredBuffer(0)
+		if buf == nil {
+			t.Fatal("RegisteredBuffer(0) = nil")
+		}
+		if err := ring.ioUring.writevFixed(PackDirect(0, 0, 0, 0), 0, []int{0}, []int{len(buf) + 1}); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("writevFixed error = %v, want %v", err, ErrInvalidParam)
+		}
+
+		done := make(chan error, 1)
+		go func() {
+			done <- ring.Nop(PackDirect(IORING_OP_NOP, 0, 5, 0))
+		}()
+
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Nop after invalid writevFixed buffer length: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("Nop blocked after invalid writevFixed buffer length")
+		}
+
+		waitForNopCQE(t, ring)
+	})
+
+	t.Run("invalid readFixed buffer index", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if _, err := ring.ioUring.readFixed(PackDirect(0, 0, 0, 0), -1, 0, 8); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("readFixed error = %v, want %v", err, ErrInvalidParam)
+		}
+
+		done := make(chan error, 1)
+		go func() {
+			done <- ring.Nop(PackDirect(IORING_OP_NOP, 0, 6, 0))
+		}()
+
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Nop after invalid readFixed: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("Nop blocked after invalid readFixed")
+		}
+
+		waitForNopCQE(t, ring)
+	})
+
+	t.Run("invalid writeFixed length", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		buf := ring.RegisteredBuffer(0)
+		if buf == nil {
+			t.Fatal("RegisteredBuffer(0) = nil")
+		}
+		if err := ring.ioUring.writeFixed(PackDirect(0, 0, 0, 0), 0, 0, len(buf)+1); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("writeFixed error = %v, want %v", err, ErrInvalidParam)
+		}
+
+		done := make(chan error, 1)
+		go func() {
+			done <- ring.Nop(PackDirect(IORING_OP_NOP, 0, 7, 0))
+		}()
+
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Nop after invalid writeFixed: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("Nop blocked after invalid writeFixed")
+		}
+
+		waitForNopCQE(t, ring)
+	})
 }
 
 func TestMultiIssuerSubmitAndWaitCanOverlap(t *testing.T) {
@@ -289,6 +412,56 @@ func TestSubmitKeepAliveRetainsBindAndXattrRoots(t *testing.T) {
 	})
 }
 
+func TestSubmitKeepAliveRetainsLinkTimeoutTimespec(t *testing.T) {
+	t.Run("linkTimeout retains timespec root", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		ts := &Timespec{Sec: 1, Nsec: 2}
+		ctx := PackDirect(0, IOSQE_IO_LINK, 0, 0)
+		if err := ring.ioUring.linkTimeout(ctx, ts, IORING_TIMEOUT_ABS); err != nil {
+			t.Fatalf("linkTimeout submit: %v", err)
+		}
+
+		tail := atomic.LoadUint32(ring.ioUring.sq.kTail)
+		idx := (tail - 1) & *ring.ioUring.sq.kRingMask
+		sqe := ring.ioUring.sq.sqeAt(idx)
+		keep := &ring.ioUring.submit.keepAlive[idx]
+		if sqe.opcode != IORING_OP_LINK_TIMEOUT {
+			t.Fatalf("linkTimeout opcode = %d, want %d", sqe.opcode, IORING_OP_LINK_TIMEOUT)
+		}
+		if sqe.addr != uint64(uintptr(unsafe.Pointer(&keep.timespec))) {
+			t.Fatal("linkTimeout did not stage the keepAlive timespec root")
+		}
+		if keep.timespec != *ts {
+			t.Fatalf("linkTimeout keepAlive timespec = %+v, want %+v", keep.timespec, *ts)
+		}
+		if sqe.len != 1 {
+			t.Fatalf("linkTimeout len = %d, want 1", sqe.len)
+		}
+		if sqe.uflags != IORING_TIMEOUT_ABS {
+			t.Fatalf("linkTimeout uflags = %#x, want %#x", sqe.uflags, IORING_TIMEOUT_ABS)
+		}
+	})
+
+	t.Run("linkTimeout nil timespec leaves addr zero", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		ctx := PackDirect(0, IOSQE_IO_LINK, 0, 0)
+		if err := ring.ioUring.linkTimeout(ctx, nil, 0); err != nil {
+			t.Fatalf("linkTimeout submit: %v", err)
+		}
+
+		tail := atomic.LoadUint32(ring.ioUring.sq.kTail)
+		idx := (tail - 1) & *ring.ioUring.sq.kRingMask
+		sqe := ring.ioUring.sq.sqeAt(idx)
+		keep := &ring.ioUring.submit.keepAlive[idx]
+		if sqe.addr != 0 {
+			t.Fatalf("linkTimeout addr = %#x, want 0", sqe.addr)
+		}
+		if keep.timespec != (Timespec{}) {
+			t.Fatalf("linkTimeout keepAlive timespec = %+v, want zero value", keep.timespec)
+		}
+	})
+}
+
 func TestSubmitKeepAliveRetainsOpenHowAndStatxRoots(t *testing.T) {
 	ring := newStartedSharedTestRing(t)
 
@@ -323,6 +496,122 @@ func TestSubmitKeepAliveRetainsOpenHowAndStatxRoots(t *testing.T) {
 		}
 		if ext.statx != stat {
 			t.Fatal("statx keepAlive did not retain the submitted Statx root")
+		}
+	})
+}
+
+func TestSubmitStagesFixedVectoredBuffers(t *testing.T) {
+	t.Run("readvFixed stages registered buffer iovecs", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if got := ring.RegisteredBufferCount(); got < 2 {
+			t.Fatalf("RegisteredBufferCount = %d, want at least 2", got)
+		}
+
+		f, err := os.CreateTemp("", "uring_submit_readvfixed_*")
+		if err != nil {
+			t.Fatalf("CreateTemp: %v", err)
+		}
+		defer os.Remove(f.Name())
+		defer f.Close()
+
+		buf0 := ring.RegisteredBuffer(0)
+		buf1 := ring.RegisteredBuffer(1)
+		ctx := PackDirect(0, 0, 0, int32(f.Fd()))
+		if err := ring.ReadvFixed(ctx, 41, []int{0, 1}); err != nil {
+			t.Fatalf("ReadvFixed submit: %v", err)
+		}
+
+		tail := atomic.LoadUint32(ring.ioUring.sq.kTail)
+		idx := (tail - 1) & *ring.ioUring.sq.kRingMask
+		sqe := ring.ioUring.sq.sqeAt(idx)
+		keep := &ring.ioUring.submit.keepAlive[idx]
+
+		if sqe.opcode != IORING_OP_READV_FIXED {
+			t.Fatalf("readvFixed opcode = %d, want %d", sqe.opcode, IORING_OP_READV_FIXED)
+		}
+		if sqe.flags != ring.readLikeOpFlags {
+			t.Fatalf("readvFixed flags = %#x, want %#x", sqe.flags, ring.readLikeOpFlags)
+		}
+		if sqe.fd != int32(f.Fd()) {
+			t.Fatalf("readvFixed fd = %d, want %d", sqe.fd, f.Fd())
+		}
+		if sqe.off != 41 {
+			t.Fatalf("readvFixed off = %d, want 41", sqe.off)
+		}
+		if sqe.len != 2 {
+			t.Fatalf("readvFixed len = %d, want 2", sqe.len)
+		}
+		if !keep.active {
+			t.Fatal("readvFixed keepAlive not active")
+		}
+		if len(keep.iovs) != 2 {
+			t.Fatalf("readvFixed iov count = %d, want 2", len(keep.iovs))
+		}
+		if sqe.addr != uint64(uintptr(unsafe.Pointer(&keep.iovs[0]))) {
+			t.Fatal("readvFixed sqe.addr does not point at staged iovecs")
+		}
+		if keep.iovs[0].Base != unsafe.SliceData(buf0) || keep.iovs[0].Len != uint64(len(buf0)) {
+			t.Fatal("readvFixed first iovec does not match registered buffer 0")
+		}
+		if keep.iovs[1].Base != unsafe.SliceData(buf1) || keep.iovs[1].Len != uint64(len(buf1)) {
+			t.Fatal("readvFixed second iovec does not match registered buffer 1")
+		}
+	})
+
+	t.Run("writevFixed stages registered buffer iovecs", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if got := ring.RegisteredBufferCount(); got < 2 {
+			t.Fatalf("RegisteredBufferCount = %d, want at least 2", got)
+		}
+
+		f, err := os.CreateTemp("", "uring_submit_writevfixed_*")
+		if err != nil {
+			t.Fatalf("CreateTemp: %v", err)
+		}
+		defer os.Remove(f.Name())
+		defer f.Close()
+
+		buf0 := ring.RegisteredBuffer(0)
+		buf1 := ring.RegisteredBuffer(1)
+		ctx := PackDirect(0, 0, 0, int32(f.Fd()))
+		if err := ring.WritevFixed(ctx, 73, []int{0, 1}, []int{17, 29}); err != nil {
+			t.Fatalf("WritevFixed submit: %v", err)
+		}
+
+		tail := atomic.LoadUint32(ring.ioUring.sq.kTail)
+		idx := (tail - 1) & *ring.ioUring.sq.kRingMask
+		sqe := ring.ioUring.sq.sqeAt(idx)
+		keep := &ring.ioUring.submit.keepAlive[idx]
+
+		if sqe.opcode != IORING_OP_WRITEV_FIXED {
+			t.Fatalf("writevFixed opcode = %d, want %d", sqe.opcode, IORING_OP_WRITEV_FIXED)
+		}
+		if sqe.flags != ring.writeLikeOpFlags {
+			t.Fatalf("writevFixed flags = %#x, want %#x", sqe.flags, ring.writeLikeOpFlags)
+		}
+		if sqe.fd != int32(f.Fd()) {
+			t.Fatalf("writevFixed fd = %d, want %d", sqe.fd, f.Fd())
+		}
+		if sqe.off != 73 {
+			t.Fatalf("writevFixed off = %d, want 73", sqe.off)
+		}
+		if sqe.len != 2 {
+			t.Fatalf("writevFixed len = %d, want 2", sqe.len)
+		}
+		if !keep.active {
+			t.Fatal("writevFixed keepAlive not active")
+		}
+		if len(keep.iovs) != 2 {
+			t.Fatalf("writevFixed iov count = %d, want 2", len(keep.iovs))
+		}
+		if sqe.addr != uint64(uintptr(unsafe.Pointer(&keep.iovs[0]))) {
+			t.Fatal("writevFixed sqe.addr does not point at staged iovecs")
+		}
+		if keep.iovs[0].Base != unsafe.SliceData(buf0) || keep.iovs[0].Len != 17 {
+			t.Fatal("writevFixed first iovec does not match staged length for buffer 0")
+		}
+		if keep.iovs[1].Base != unsafe.SliceData(buf1) || keep.iovs[1].Len != 29 {
+			t.Fatal("writevFixed second iovec does not match staged length for buffer 1")
 		}
 	})
 }

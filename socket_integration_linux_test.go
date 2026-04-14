@@ -15,6 +15,7 @@ import (
 	"code.hybscloud.com/iofd"
 	"code.hybscloud.com/iox"
 	"code.hybscloud.com/uring"
+	"code.hybscloud.com/zcall"
 )
 
 // =============================================================================
@@ -194,6 +195,8 @@ func TestTCPAcceptConnectSendReceive(t *testing.T) {
 func TestIPv6Sockets(t *testing.T) {
 	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
 		opt.Entries = uring.EntriesSmall
+		opt.NotifySucceed = true
+		opt.MultiIssuers = true
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -215,12 +218,9 @@ func TestIPv6Sockets(t *testing.T) {
 		}
 		t.Logf("TCP6 socket created: fd=%d", cqe.Res)
 
-		// Close the socket to avoid FD leak
-		closeCtx := uring.PackDirect(uring.IORING_OP_CLOSE, 0, 0, cqe.Res)
-		if err := ring.Close(closeCtx); err != nil {
-			t.Fatalf("Close TCP6: %v", err)
+		if errno := zcall.Close(uintptr(cqe.Res)); errno != 0 {
+			t.Fatalf("Close TCP6: %v", zcall.Errno(errno))
 		}
-		waitForOp(t, ring, uring.IORING_OP_CLOSE, 10*time.Second)
 	})
 
 	t.Run("UDP6Socket", func(t *testing.T) {
@@ -238,12 +238,9 @@ func TestIPv6Sockets(t *testing.T) {
 		}
 		t.Logf("UDP6 socket created: fd=%d", cqe.Res)
 
-		// Close the socket to avoid FD leak
-		closeCtx := uring.PackDirect(uring.IORING_OP_CLOSE, 0, 0, cqe.Res)
-		if err := ring.Close(closeCtx); err != nil {
-			t.Fatalf("Close UDP6: %v", err)
+		if errno := zcall.Close(uintptr(cqe.Res)); errno != 0 {
+			t.Fatalf("Close UDP6: %v", zcall.Errno(errno))
 		}
-		waitForOp(t, ring, uring.IORING_OP_CLOSE, 10*time.Second)
 	})
 }
 
@@ -374,5 +371,48 @@ func TestWriteFD(t *testing.T) {
 	}
 	if n != len(data) {
 		t.Errorf("ReadFD: n=%d, want %d", n, len(data))
+	}
+}
+
+// =============================================================================
+// Shutdown
+// =============================================================================
+
+func TestUringShutdownCycle(t *testing.T) {
+	ring := newTestRing(t, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
+		opt.NotifySucceed = true
+		opt.MultiIssuers = true
+	})
+
+	// Create a TCP socket to shut down
+	sockCtx := uring.PackDirect(uring.IORING_OP_SOCKET, 0, 0, 0)
+	if err := ring.TCP4Socket(sockCtx); err != nil {
+		t.Fatalf("TCP4Socket: %v", err)
+	}
+
+	ev, ok := waitForOp(t, ring, uring.IORING_OP_SOCKET, 5*time.Second)
+	if !ok {
+		t.Fatal("Socket creation did not complete")
+	}
+	if ev.Res < 0 {
+		t.Fatalf("Socket creation failed: %d", ev.Res)
+	}
+	sockFD := ev.Res
+	defer zcall.Close(uintptr(sockFD))
+
+	const SHUT_RDWR = 2
+	shutCtx := uring.PackDirect(uring.IORING_OP_SHUTDOWN, 0, 0, sockFD)
+	if err := ring.Shutdown(shutCtx, SHUT_RDWR); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	ev, ok = waitForOp(t, ring, uring.IORING_OP_SHUTDOWN, 5*time.Second)
+	if !ok {
+		t.Fatal("Shutdown did not complete")
+	}
+	// ENOTCONN (-107) is expected for an unconnected socket
+	if ev.Res < 0 && ev.Res != -107 {
+		t.Fatalf("Shutdown unexpected error: %d", ev.Res)
 	}
 }

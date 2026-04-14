@@ -500,8 +500,9 @@ connect/send 流程。
 
 ## 平台支持
 
-`uring` 的目标平台为 Go 1.26+ / Linux 6.18+。大部分实现文件和示例测试由 `//go:build linux` 约束。Darwin 文件提供 API
-兼容的模拟层或 stub，供 Darwin 平台编译使用，不影响上述 Linux 运行时基线。
+`uring` 的真实内核路径目标为 Go 1.26+ / Linux 6.18+。大部分实现文件和示例测试由 `//go:build linux`
+约束。Darwin 文件只为共享 API 表面提供编译 stub；Linux 专属能力仍然仅限 Linux，不改变上述 Linux
+运行时基线。
 
 ## 许可证
 

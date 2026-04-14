@@ -362,3 +362,71 @@ func TestForFD_Chaining(t *testing.T) {
 		t.Errorf("Flags() = %d, want %d", got, IOSQE_ASYNC)
 	}
 }
+
+func TestSQEContextMutatorsOnIndirectAndExtendedModes(t *testing.T) {
+	t.Run("indirect", func(t *testing.T) {
+		indirect := &IndirectSQE{}
+		ctx := PackIndirect(indirect)
+
+		ctx = ctx.WithOp(IORING_OP_SEND).WithFlags(IOSQE_BUFFER_SELECT | IOSQE_ASYNC).WithBufGroup(77).withFD(-9)
+
+		if got := ctx.Op(); got != IORING_OP_SEND {
+			t.Fatalf("Op() = %d, want %d", got, IORING_OP_SEND)
+		}
+		if got := ctx.Flags(); got != IOSQE_BUFFER_SELECT|IOSQE_ASYNC {
+			t.Fatalf("Flags() = %d, want %d", got, IOSQE_BUFFER_SELECT|IOSQE_ASYNC)
+		}
+		if got := ctx.BufGroup(); got != 77 {
+			t.Fatalf("BufGroup() = %d, want 77", got)
+		}
+		if got := ctx.FD(); got != -9 {
+			t.Fatalf("FD() = %d, want -9", got)
+		}
+
+		if indirect.opcode != IORING_OP_SEND {
+			t.Fatalf("indirect.opcode = %d, want %d", indirect.opcode, IORING_OP_SEND)
+		}
+		if indirect.flags != IOSQE_BUFFER_SELECT|IOSQE_ASYNC {
+			t.Fatalf("indirect.flags = %d, want %d", indirect.flags, IOSQE_BUFFER_SELECT|IOSQE_ASYNC)
+		}
+		if indirect.bufIndex != 77 {
+			t.Fatalf("indirect.bufIndex = %d, want 77", indirect.bufIndex)
+		}
+		if indirect.fd != -9 {
+			t.Fatalf("indirect.fd = %d, want -9", indirect.fd)
+		}
+	})
+
+	t.Run("extended", func(t *testing.T) {
+		ext := &ExtSQE{}
+		ctx := PackExtended(ext)
+
+		ctx = ctx.WithOp(IORING_OP_ACCEPT).WithFlags(IOSQE_FIXED_FILE | IOSQE_IO_LINK).WithBufGroup(91).withFD(33)
+
+		if got := ctx.Op(); got != IORING_OP_ACCEPT {
+			t.Fatalf("Op() = %d, want %d", got, IORING_OP_ACCEPT)
+		}
+		if got := ctx.Flags(); got != IOSQE_FIXED_FILE|IOSQE_IO_LINK {
+			t.Fatalf("Flags() = %d, want %d", got, IOSQE_FIXED_FILE|IOSQE_IO_LINK)
+		}
+		if got := ctx.BufGroup(); got != 91 {
+			t.Fatalf("BufGroup() = %d, want 91", got)
+		}
+		if got := ctx.FD(); got != 33 {
+			t.Fatalf("FD() = %d, want 33", got)
+		}
+
+		if ext.SQE.opcode != IORING_OP_ACCEPT {
+			t.Fatalf("ext.SQE.opcode = %d, want %d", ext.SQE.opcode, IORING_OP_ACCEPT)
+		}
+		if ext.SQE.flags != IOSQE_FIXED_FILE|IOSQE_IO_LINK {
+			t.Fatalf("ext.SQE.flags = %d, want %d", ext.SQE.flags, IOSQE_FIXED_FILE|IOSQE_IO_LINK)
+		}
+		if ext.SQE.bufIndex != 91 {
+			t.Fatalf("ext.SQE.bufIndex = %d, want 91", ext.SQE.bufIndex)
+		}
+		if ext.SQE.fd != 33 {
+			t.Fatalf("ext.SQE.fd = %d, want 33", ext.SQE.fd)
+		}
+	})
+}

@@ -251,7 +251,8 @@ func newIoUring(entries int, opts ...func(params *ioUringParams)) (*ioUring, err
 			ringSz: params.sqOff.array + uint32(unsafe.Sizeof(uint32(0)))*params.sqEntries,
 		},
 		cq: ioUringCq{
-			ringSz: params.cqOff.cqes + uint32(unsafe.Sizeof(ioUringCqe{}))*params.cqEntries,
+			ringSz:    params.cqOff.cqes + uint32(cqeBytesFromFlags(params.flags))*params.cqEntries,
+			cqeStride: cqeStrideFromFlags(params.flags),
 		},
 		ringFd:   fd,
 		bufs:     [][]byte{},
@@ -292,6 +293,24 @@ func sqeStrideFromFlags(flags uint32) uintptr {
 	return uintptr(sqeBytesFromFlags(flags))
 }
 
+func cqeBytesFromFlags(flags uint32) int {
+	if flags&IORING_SETUP_CQE32 != 0 {
+		return 2 * int(unsafe.Sizeof(ioUringCqe{}))
+	}
+	return int(unsafe.Sizeof(ioUringCqe{}))
+}
+
+func cqeStrideFromFlags(flags uint32) int {
+	return cqeBytesFromFlags(flags) / int(unsafe.Sizeof(ioUringCqe{}))
+}
+
+// ringMapSz returns the shared SQ/CQ mmap size for supported Linux kernels.
+// Linux 6.18+ advertises IORING_FEAT_SINGLE_MMAP, but the mapping must still
+// cover whichever ring layout is larger.
+func (ur *ioUring) ringMapSz() uintptr {
+	return uintptr(max(ur.sq.ringSz, ur.cq.ringSz))
+}
+
 func (ur *ioUring) supportsOpcode(op uint8) bool {
 	for _, supported := range ur.ops {
 		if supported.op == op {
@@ -303,18 +322,20 @@ func (ur *ioUring) supportsOpcode(op uint8) bool {
 
 func (ur *ioUring) remapRings(params *ioUringParams) error {
 	ur.sq.ringSz = params.sqOff.array + uint32(unsafe.Sizeof(uint32(0)))*params.sqEntries
-	ur.cq.ringSz = params.cqOff.cqes + uint32(unsafe.Sizeof(ioUringCqe{}))*params.cqEntries
+	ur.cq.ringSz = params.cqOff.cqes + uint32(cqeBytesFromFlags(params.flags))*params.cqEntries
+	ur.cq.cqeStride = cqeStrideFromFlags(params.flags)
 	sqeStride := sqeStrideFromFlags(params.flags)
 	sqeMapSz := uintptr(params.sqEntries) * sqeStride
+	ringMapSz := ur.ringMapSz()
 
-	ptr, errno := zcall.Mmap(nil, uintptr(ur.sq.ringSz), PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, uintptr(ur.ringFd), uintptr(IORING_OFF_SQ_RING))
+	ptr, errno := zcall.Mmap(nil, ringMapSz, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, uintptr(ur.ringFd), uintptr(IORING_OFF_SQ_RING))
 	if errno != 0 {
 		return errFromErrno(errno)
 	}
 
 	sqesPtr, errno := zcall.Mmap(nil, sqeMapSz, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, uintptr(ur.ringFd), uintptr(IORING_OFF_SQES))
 	if errno != 0 {
-		zcall.Munmap(ptr, uintptr(ur.sq.ringSz))
+		zcall.Munmap(ptr, ringMapSz)
 		return errFromErrno(errno)
 	}
 
@@ -335,7 +356,7 @@ func (ur *ioUring) remapRings(params *ioUringParams) error {
 	ur.cq.kRingMask = (*uint32)(unsafe.Add(ptr, params.cqOff.ringMask))
 	ur.cq.kRingEntries = (*uint32)(unsafe.Add(ptr, params.cqOff.ringEntries))
 	ur.cq.kOverflow = (*uint32)(unsafe.Add(ptr, params.cqOff.overflow))
-	ur.cq.cqes = unsafe.Slice((*ioUringCqe)(unsafe.Add(ptr, params.cqOff.cqes)), int(params.cqEntries))
+	ur.cq.cqes = unsafe.Slice((*ioUringCqe)(unsafe.Add(ptr, params.cqOff.cqes)), int(params.cqEntries)*ur.cq.cqeStride)
 
 	return nil
 }
@@ -675,7 +696,7 @@ func (ur *ioUring) unmapRings() {
 		zcall.Munmap(ur.sq.sqesPtr, ur.sq.sqeMapSz)
 	}
 	if ur.sq.ringPtr != nil {
-		zcall.Munmap(ur.sq.ringPtr, uintptr(ur.sq.ringSz))
+		zcall.Munmap(ur.sq.ringPtr, ur.ringMapSz())
 	}
 	ur.clearRingViews()
 }
@@ -806,8 +827,8 @@ func (ur *ioUring) sqCount() int {
 // avoid shared-submit locking.
 func (ur *ioUring) enter() error {
 	ur.lockSubmitState()
-	defer ur.unlockSubmitState()
 	if ur.closed.Load() || ur.sq.kFlags == nil || ur.sq.kHead == nil || ur.sq.kTail == nil || ur.sq.kRingMask == nil {
+		ur.unlockSubmitState()
 		return ErrClosed
 	}
 
@@ -816,11 +837,14 @@ func (ur *ioUring) enter() error {
 		_, err := ioUringEnter(ur.ringFd, uintptr(ur.params.sqEntries), 0, IORING_ENTER_SQ_WAKEUP)
 		// ErrExists/ErrInProgress means another enter is already in progress.
 		if err != nil && err != ErrExists && err != ErrInProgress {
+			ur.unlockSubmitState()
 			return err
 		}
 	}
 
-	return ur.enterPending()
+	err := ur.enterPending()
+	ur.unlockSubmitState()
+	return err
 }
 
 func (ur *ioUring) enterPending() error {
@@ -891,8 +915,8 @@ func (ur *ioUring) cqEmptyErr() error {
 // needed fields before any subsequent completion-queue operation.
 func (ur *ioUring) wait() (*ioUringCqe, error) {
 	ur.lockSubmitState()
-	defer ur.unlockSubmitState()
 	if ur.closed.Load() || ur.cq.kHead == nil || ur.cq.kTail == nil || ur.cq.kRingMask == nil || len(ur.cq.cqes) == 0 {
+		ur.unlockSubmitState()
 		return nil, ErrClosed
 	}
 
@@ -900,30 +924,33 @@ func (ur *ioUring) wait() (*ioUringCqe, error) {
 	for {
 		h, t := atomic.LoadUint32(ur.cq.kHead), atomic.LoadUint32(ur.cq.kTail)
 		if h == t {
-			return nil, ur.cqEmptyErr()
+			err := ur.cqEmptyErr()
+			ur.unlockSubmitState()
+			return nil, err
 		}
 
 		// Acquire barrier makes CQE contents visible after reading head and tail.
 		dwcas.BarrierAcquire()
 
-		e := &ur.cq.cqes[h&*ur.cq.kRingMask]
+		e := ur.cq.cqeAt(h & *ur.cq.kRingMask)
 		ok := atomic.CompareAndSwapUint32(ur.cq.kHead, h, h+1)
 		if ok {
+			ur.unlockSubmitState()
 			return e, nil
 		}
 		sw.Once()
 	}
 }
 
-// waitBatch claims and copies multiple CQEs with one CAS.
+// waitBatch snapshots and claims multiple CQEs with one CAS.
 func (ur *ioUring) waitBatch(cqes []CQEView) (int, error) {
 	if len(cqes) == 0 {
 		return 0, nil
 	}
 
 	ur.lockSubmitState()
-	defer ur.unlockSubmitState()
 	if ur.closed.Load() || ur.cq.kHead == nil || ur.cq.kTail == nil || ur.cq.kRingMask == nil || len(ur.cq.cqes) == 0 {
+		ur.unlockSubmitState()
 		return 0, ErrClosed
 	}
 
@@ -932,7 +959,9 @@ func (ur *ioUring) waitBatch(cqes []CQEView) (int, error) {
 		h := atomic.LoadUint32(ur.cq.kHead)
 		t := atomic.LoadUint32(ur.cq.kTail)
 		if h == t {
-			return 0, ur.cqEmptyErr()
+			err := ur.cqEmptyErr()
+			ur.unlockSubmitState()
+			return 0, err
 		}
 
 		// Calculate batch size: min(available, requested)
@@ -945,23 +974,23 @@ func (ur *ioUring) waitBatch(cqes []CQEView) (int, error) {
 		// Acquire barrier before reading CQE data
 		dwcas.BarrierAcquire()
 
-		// Claim the entire batch with single CAS
-		if !atomic.CompareAndSwapUint32(ur.cq.kHead, h, h+available) {
-			sw.Once()
-			continue
-		}
-
-		// Copy all claimed CQEs (ring slots are now ours until kernel wraps)
+		// Snapshot the batch before publishing the head advance so value copies
+		// cannot race kernel reuse after ring wrap.
 		mask := *ur.cq.kRingMask
 		n := int(available)
 		for i := range n {
-			e := &ur.cq.cqes[(h+uint32(i))&mask]
+			e := ur.cq.cqeAt((h + uint32(i)) & mask)
 			cqes[i] = CQEView{
 				Res:   e.res,
 				Flags: e.flags,
 				ctx:   SQEContextFromRaw(e.userData),
 			}
 		}
+		if !atomic.CompareAndSwapUint32(ur.cq.kHead, h, h+available) {
+			sw.Once()
+			continue
+		}
+		ur.unlockSubmitState()
 		return n, nil
 	}
 }
@@ -1168,6 +1197,7 @@ type ioUringCq struct {
 	kRingEntries *uint32
 	kOverflow    *uint32
 	cqes         []ioUringCqe
+	cqeStride    int
 
 	ringSz       uint32
 	overflowSeen uint32
@@ -1176,6 +1206,14 @@ type ioUringCq struct {
 func (cq *ioUringCq) advance(nr uint32) {
 	// Userspace advances kHead after consuming CQEs (kernel updates kTail)
 	atomic.AddUint32(cq.kHead, nr)
+}
+
+func (cq *ioUringCq) cqeAt(index uint32) *ioUringCqe {
+	stride := cq.cqeStride
+	if stride == 0 {
+		stride = 1
+	}
+	return &cq.cqes[int(index)*stride]
 }
 
 type ioUringCqe struct {
@@ -1751,7 +1789,7 @@ func (ur *ioUring) resizeRings(newSQSize, newCQSize uint32) error {
 	oldKeepAliveHead := ur.submit.keepAliveHead
 	oldKeepAlive := ur.submit.keepAlive
 	oldRingPtr := ur.sq.ringPtr
-	oldSqRingSz := ur.sq.ringSz
+	oldRingMapSz := ur.ringMapSz()
 	oldSqesPtr := ur.sq.sqesPtr
 	oldSqeMapSz := ur.sq.sqeMapSz
 	if ur.params.flags&IORING_SETUP_SQE128 != 0 {
@@ -1764,7 +1802,7 @@ func (ur *ioUring) resizeRings(newSQSize, newCQSize uint32) error {
 	}
 
 	zcall.Munmap(oldSqesPtr, oldSqeMapSz)
-	zcall.Munmap(oldRingPtr, uintptr(oldSqRingSz))
+	zcall.Munmap(oldRingPtr, oldRingMapSz)
 	ur.clearRingViews()
 	if err := ur.remapRings(&params); err != nil {
 		return ur.closeAfterFatalResize(fmt.Errorf("remap resized rings: %w", err))

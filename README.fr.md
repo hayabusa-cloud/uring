@@ -541,9 +541,10 @@ Au niveau du package, `listener_example_test.go` couvre la création de listener
 
 `uring` cible Go 1.26+ et Linux 6.18+ pour le chemin réel adossé au noyau.
 La plupart des fichiers d'implémentation et des tests d'exemple portent la
-directive `//go:build linux`. Les fichiers Darwin fournissent des surfaces
-simulées ou des stubs compatibles avec l'API pour les builds Darwin ; ils ne
-modifient en rien la base d'exécution Linux décrite ci-dessus.
+directive `//go:build linux`. Les fichiers Darwin fournissent uniquement des
+stubs de compilation pour la surface partagée ; les capacités propres à Linux
+restent propres à Linux et ne modifient en rien la base d'exécution Linux
+décrite ci-dessus.
 
 ## Licence
 

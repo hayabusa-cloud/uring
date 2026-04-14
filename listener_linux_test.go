@@ -476,3 +476,84 @@ func TestListenerOpFDBeforeReady(t *testing.T) {
 func TestListenerContextSize(t *testing.T) {
 	t.Log("listenerCtx and listenerCtxData size assertions passed at compile time")
 }
+
+func TestListenerManagerRingAndPool(t *testing.T) {
+	ring, err := uring.New(testMinimalBufferOptions)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	mustStartRing(t, ring)
+
+	pool := uring.NewContextPools(16)
+	manager := uring.NewListenerManager(ring, pool)
+
+	if manager.Ring() != ring {
+		t.Error("Ring() did not return the expected Uring instance")
+	}
+	if manager.Pool() != pool {
+		t.Error("Pool() did not return the expected ContextPools instance")
+	}
+}
+
+func TestListenerManagerListenTCP6(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping listener chain test in short mode")
+	}
+
+	ring, err := uring.New(
+		testMinimalBufferOptions,
+		func(opts *uring.Options) {
+			opts.Entries = uring.EntriesSmall
+		},
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	mustStartRing(t, ring)
+
+	pool := uring.NewContextPools(16)
+	manager := uring.NewListenerManager(ring, pool)
+
+	handler := newTestListenerHandler()
+	addr := &net.TCPAddr{IP: net.IPv6loopback, Port: 0}
+	op, err := manager.ListenTCP6(addr, 128, handler)
+	if err != nil {
+		if errors.Is(err, iox.ErrWouldBlock) {
+			t.Skip("context pool exhausted")
+		}
+		t.Fatalf("ListenTCP6: %v", err)
+	}
+	defer op.Close()
+
+	ready, listenerProgress := waitForListenerCondition(t, ring, op, listenerTestTimeout, func() bool {
+		select {
+		case <-handler.ready:
+			return true
+		default:
+			return false
+		}
+	})
+	if !ready {
+		skipIfNoListenerProgress(t, listenerProgress)
+		t.Fatal("TCP6 listener did not become ready")
+	}
+
+	if handler.errorReceived.Load() {
+		t.Errorf("OnError was called: op=%d, err=%v", handler.errorOp.Load(), handler.lastError)
+	}
+	if !handler.socketCalled.Load() || !handler.boundCalled.Load() || !handler.listenCalled.Load() {
+		t.Fatalf(
+			"listener callbacks incomplete: socket=%v bind=%v listen=%v",
+			handler.socketCalled.Load(),
+			handler.boundCalled.Load(),
+			handler.listenCalled.Load(),
+		)
+	}
+
+	fd := op.FD()
+	if fd < 0 {
+		t.Errorf("expected valid FD, got %d", fd)
+	}
+	op.Close()
+	assertListenerFDClosed(t, fd)
+}

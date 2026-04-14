@@ -83,16 +83,17 @@ func TestSQEContextWithFlags(t *testing.T) {
 		t.Errorf("Flags: got %d, want %d", ctx.Flags(), flags)
 	}
 
-	// WithFlags REPLACES flags (not OR) - useful for changing flag set
+	// WithFlags REPLACES flags (not OR) - useful for changing or clearing the
+	// exact flag set.
 	newFlags := uint8(uring.IOSQE_IO_DRAIN)
 	ctx2 := ctx.WithFlags(newFlags)
 	if ctx2.Flags() != newFlags {
 		t.Errorf("WithFlags: got %d, want %d", ctx2.Flags(), newFlags)
 	}
 
-	// To combine flags, compute the union before calling WithFlags
+	// To add flags while preserving existing bits, use OrFlags.
 	combinedFlags := flags | uring.IOSQE_IO_DRAIN
-	ctx3 := ctx.WithFlags(combinedFlags)
+	ctx3 := ctx.OrFlags(uring.IOSQE_IO_DRAIN)
 	if ctx3.Flags() != combinedFlags {
 		t.Errorf("Combined flags: got %d, want %d", ctx3.Flags(), combinedFlags)
 	}

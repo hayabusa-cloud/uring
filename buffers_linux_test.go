@@ -7,12 +7,18 @@
 package uring
 
 import (
+	"errors"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
+	"unsafe"
 
+	"code.hybscloud.com/iox"
 	"code.hybscloud.com/spin"
+	"code.hybscloud.com/zcall"
 )
 
 func skipIfLowMemory(t *testing.T, needed int) {
@@ -36,6 +42,38 @@ func skipIfLowMemory(t *testing.T, needed int) {
 			}
 			return
 		}
+	}
+}
+
+func waitForProvideCQEs(t *testing.T, ur *ioUring, want int) {
+	t.Helper()
+
+	if err := ur.enter(); err != nil {
+		t.Fatalf("enter: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	backoff := iox.Backoff{}
+	got := 0
+	for got < want {
+		if time.Now().After(deadline) {
+			t.Fatalf("completion timeout after %d/%d CQEs", got, want)
+		}
+		if err := ur.poll(want - got); err != nil {
+			t.Fatalf("poll: %v", err)
+		}
+		cqe, err := ur.wait()
+		if errors.Is(err, iox.ErrWouldBlock) {
+			backoff.Wait()
+			continue
+		}
+		if err != nil {
+			t.Fatalf("wait: %v", err)
+		}
+		if cqe.res < 0 {
+			t.Fatalf("completion %d: %v", got, errFromErrno(uintptr(-cqe.res)))
+		}
+		got++
 	}
 }
 
@@ -248,6 +286,88 @@ func TestUringProvideBuffers_SetGIDOffset(t *testing.T) {
 	}
 }
 
+func TestUringProvideBuffersAccessors(t *testing.T) {
+	pb := newUringProvideBuffers(3, 1<<16)
+	pb.setGIDOffset(41)
+
+	if pb.size != 4 {
+		t.Fatalf("size = %d, want 4", pb.size)
+	}
+	if pb.gn != 2 {
+		t.Fatalf("gn = %d, want 2", pb.gn)
+	}
+	if pb.n != 1<<15 {
+		t.Fatalf("n = %d, want %d", pb.n, 1<<15)
+	}
+	if pb.gMask != 1 {
+		t.Fatalf("gMask = %d, want 1", pb.gMask)
+	}
+
+	group0 := pb.buf(bufferGroupIndex(pb.gidOffset), 5)
+	group1 := pb.buf(bufferGroupIndex(pb.gidOffset+1), 7)
+	if len(group0) != pb.size {
+		t.Fatalf("group0 len = %d, want %d", len(group0), pb.size)
+	}
+	if len(group1) != pb.size {
+		t.Fatalf("group1 len = %d, want %d", len(group1), pb.size)
+	}
+
+	wantPtr0 := unsafe.Pointer(unsafe.Add(pb.ptr, pb.size*5))
+	wantPtr1 := unsafe.Pointer(unsafe.Add(pb.ptr, pb.size*(pb.n+7)))
+	gotPtr0 := unsafe.Pointer(unsafe.SliceData(group0))
+	gotPtr1 := unsafe.Pointer(unsafe.SliceData(group1))
+	if gotPtr0 != wantPtr0 {
+		t.Fatalf("group0 ptr = %p, want %p", gotPtr0, wantPtr0)
+	}
+	if gotPtr1 != wantPtr1 {
+		t.Fatalf("group1 ptr = %p, want %p", gotPtr1, wantPtr1)
+	}
+
+	group0[0] = 0x5a
+	group1[0] = 0x6b
+	group1[1] = 0x7c
+
+	if pb.mem[pb.size*5] != 0x5a {
+		t.Fatalf("backing mem[0] = %x, want 0x5a", pb.mem[pb.size*5])
+	}
+
+	fd := &mockPollFd{fd: 3}
+	data := pb.data(fd, 7, 2)
+	if len(data) != 2 {
+		t.Fatalf("data len = %d, want 2", len(data))
+	}
+	if unsafe.Pointer(unsafe.SliceData(data)) != wantPtr1 {
+		t.Fatalf("data ptr = %p, want %p", unsafe.Pointer(unsafe.SliceData(data)), wantPtr1)
+	}
+	if data[0] != 0x6b || data[1] != 0x7c {
+		t.Fatalf("data = %#v, want [%#x %#x]", data, byte(0x6b), byte(0x7c))
+	}
+}
+
+func TestUringProvideBuffersRegister(t *testing.T) {
+	ur := newTestIoUring(t)
+	pb := newUringProvideBuffers(64, 4)
+	pb.setGIDOffset(9)
+
+	if err := pb.register(ur, 0); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	waitForProvideCQEs(t, ur, pb.gn)
+	runtime.KeepAlive(pb)
+}
+
+func TestUringProvideBuffersProvide(t *testing.T) {
+	ur := newTestIoUring(t)
+	pb := newUringProvideBuffers(64, 4)
+	data := make([]byte, 48)
+
+	if err := pb.provide(ur, 0, 23, data, 7); err != nil {
+		t.Fatalf("provide: %v", err)
+	}
+	waitForProvideCQEs(t, ur, 1)
+	runtime.KeepAlive(data)
+}
+
 func TestNewUringBufferGroups(t *testing.T) {
 	t.Run("valid scale", func(t *testing.T) {
 		bg := newUringBufferGroups(1)
@@ -368,12 +488,6 @@ func TestUringBufferGroups_BufGroupBySize(t *testing.T) {
 		}
 	})
 }
-
-type mockPollFd struct {
-	fd int
-}
-
-func (m *mockPollFd) Fd() int { return m.fd }
 
 // Helper to close file descriptor
 func closefd(fd int) {
@@ -703,5 +817,256 @@ func TestUringBufferGroups_Buf_AllTiers(t *testing.T) {
 		if len(buf) != tt.size {
 			t.Errorf("tier %d: buf len = %d, want %d", tt.tier, len(buf), tt.size)
 		}
+	}
+}
+
+func TestUringProvideBufferGroupsRegister(t *testing.T) {
+	ur := newTestIoUring(t)
+	cfg := BufferGroupsConfig{
+		PicoNum:   2,
+		NanoNum:   2,
+		MicroNum:  2,
+		SmallNum:  2,
+		MediumNum: 2,
+		BigNum:    2,
+		LargeNum:  2,
+		GreatNum:  2,
+		HugeNum:   2,
+		VastNum:   2,
+	}
+	bg := newUringBufferGroupsWithConfig(1, cfg)
+	bg.setGIDOffset(30)
+
+	if err := bg.register(ur, 0); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	waitForProvideCQEs(t, ur, 10)
+	runtime.KeepAlive(bg)
+}
+
+func TestUringProvideBufferGroupsProvide(t *testing.T) {
+	ur := newTestIoUring(t)
+	bg := newUringBufferGroupsWithConfig(2, BufferGroupsConfig{
+		PicoNum:   2,
+		MediumNum: 2,
+	})
+	bg.setGIDOffset(13)
+	data := make([]byte, BufferSizePico)
+
+	group := bg.bufGroupBySize(&mockPollFd{fd: 3}, BufferSizePico)
+	if err := bg.provide(ur, 0, group, data, 5); err != nil {
+		t.Fatalf("provide: %v", err)
+	}
+	waitForProvideCQEs(t, ur, 1)
+	runtime.KeepAlive(data)
+}
+
+func TestBufferRingsBundleIteratorRecycle(t *testing.T) {
+	const (
+		bufSize   = 16
+		ringCount = 4
+		gidOffset = 11
+		group     = 11
+	)
+
+	backing := make([]byte, ringCount*bufSize)
+	slots := make([]ioUringBuf, ringCount)
+	br := (*ioUringBufRing)(unsafe.Pointer(&slots[0]))
+
+	rings := &uringBufferRings{
+		rings:   []*ioUringBufRing{br},
+		locks:   []spin.Lock{{}},
+		counts:  []uintptr{0},
+		masks:   []uintptr{ringCount - 1},
+		sizes:   []int{bufSize},
+		buffers: [][]byte{backing},
+	}
+
+	cqe := CQEView{
+		Res:   2 * bufSize,
+		Flags: 0 << IORING_CQE_BUFFER_SHIFT,
+	}
+
+	if _, ok := rings.bundleIterator(cqe, -1, gidOffset, group); ok {
+		t.Fatal("bundleIterator accepted a negative ring index")
+	}
+
+	iter, ok := rings.bundleIterator(cqe, 0, gidOffset, group)
+	if !ok {
+		t.Fatal("bundleIterator returned false for a valid buffer ring")
+	}
+	if iter.gidOffset != gidOffset || iter.group != group {
+		t.Fatalf("iterator captured (%d, %d), want (%d, %d)", iter.gidOffset, iter.group, gidOffset, group)
+	}
+
+	ur := &Uring{
+		ioUring:     &ioUring{},
+		bufferRings: rings,
+	}
+	iter.Recycle(ur)
+
+	if rings.counts[0] != 0 {
+		t.Fatalf("counts after Recycle = %d, want 0", rings.counts[0])
+	}
+	if br.tail != 2 {
+		t.Fatalf("ring tail after Recycle = %d, want 2", br.tail)
+	}
+
+	wantAddr0 := uint64(uintptr(unsafe.Pointer(&backing[0])))
+	wantAddr1 := uint64(uintptr(unsafe.Pointer(&backing[bufSize])))
+
+	if slots[0].addr != wantAddr0 || slots[0].len != bufSize || slots[0].bid != 0 {
+		t.Fatalf("slot 0 = {addr:%d len:%d bid:%d}, want {addr:%d len:%d bid:%d}", slots[0].addr, slots[0].len, slots[0].bid, wantAddr0, bufSize, 0)
+	}
+	if slots[1].addr != wantAddr1 || slots[1].len != bufSize || slots[1].bid != 1 {
+		t.Fatalf("slot 1 = {addr:%d len:%d bid:%d}, want {addr:%d len:%d bid:%d}", slots[1].addr, slots[1].len, slots[1].bid, wantAddr1, bufSize, 1)
+	}
+}
+
+func TestBufferRingsReleaseUnmapsAndResetsState(t *testing.T) {
+	ptr, errno := zcall.Mmap(nil, ioUringBufSize, zcall.PROT_READ|zcall.PROT_WRITE, zcall.MAP_SHARED|zcall.MAP_ANONYMOUS, ^uintptr(0), 0)
+	if errno != 0 {
+		t.Fatalf("mmap: %v", errFromErrno(errno))
+	}
+
+	rings := &uringBufferRings{
+		rings:    []*ioUringBufRing{(*ioUringBufRing)(ptr)},
+		backings: [][]byte{nil},
+		gids:     []uint16{23},
+		locks:    []spin.Lock{{}},
+		counts:   []uintptr{1},
+		masks:    []uintptr{0},
+		sizes:    []int{64},
+		buffers:  [][]byte{make([]byte, 64)},
+	}
+
+	if err := rings.release(nil); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	if rings.rings != nil || rings.backings != nil || rings.gids != nil || rings.locks != nil ||
+		rings.counts != nil || rings.masks != nil || rings.sizes != nil || rings.buffers != nil {
+		t.Fatalf("release did not reset state: %+v", rings)
+	}
+}
+
+func TestBufferRingsRegisterBuffersTracksGroups(t *testing.T) {
+	ur := newTestIoUring(t)
+	rings := newUringBufferRings()
+	buffers := newUringProvideBuffers(2, 1<<16)
+	buffers.setGIDOffset(41)
+
+	if err := rings.registerBuffers(ur, buffers); err != nil {
+		t.Fatalf("registerBuffers: %v", err)
+	}
+
+	if len(rings.rings) != buffers.gn {
+		t.Fatalf("len(rings) = %d, want %d", len(rings.rings), buffers.gn)
+	}
+	for i := range buffers.gn {
+		if rings.rings[i] == nil {
+			t.Fatalf("rings[%d] = nil", i)
+		}
+		if rings.gids[i] != uint16(i)+buffers.gidOffset {
+			t.Fatalf("gid[%d] = %d, want %d", i, rings.gids[i], uint16(i)+buffers.gidOffset)
+		}
+		if rings.counts[i] != uintptr(buffers.n) {
+			t.Fatalf("count[%d] = %d, want %d", i, rings.counts[i], buffers.n)
+		}
+		if rings.masks[i] != uintptr(buffers.n-1) {
+			t.Fatalf("mask[%d] = %d, want %d", i, rings.masks[i], buffers.n-1)
+		}
+		if rings.sizes[i] != buffers.size {
+			t.Fatalf("size[%d] = %d, want %d", i, rings.sizes[i], buffers.size)
+		}
+
+		wantBuf := buffers.mem[buffers.size*buffers.n*i : buffers.size*buffers.n*(i+1)]
+		if got, want := unsafe.Pointer(unsafe.SliceData(rings.buffers[i])), unsafe.Pointer(unsafe.SliceData(wantBuf)); got != want {
+			t.Fatalf("buffers[%d] ptr = %p, want %p", i, got, want)
+		}
+		if len(rings.backings[i]) == 0 {
+			t.Fatalf("backing[%d] is empty", i)
+		}
+	}
+
+	rings.advance(ur)
+	for i, br := range rings.rings {
+		if rings.counts[i] != 0 {
+			t.Fatalf("count[%d] after advance = %d, want 0", i, rings.counts[i])
+		}
+		if br.tail != uint16(buffers.n) {
+			t.Fatalf("tail[%d] after advance = %d, want %d", i, br.tail, buffers.n)
+		}
+	}
+
+	if err := rings.release(ur); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+}
+
+func TestBufferRingsRegisterGroupRejectsNonPowerOfTwoEntries(t *testing.T) {
+	ur := newTestIoUring(t)
+	rings := newUringBufferRings()
+
+	_, err := rings.registerGroup(ur, 3, 9, make([]byte, 3*64), 64)
+	if !errors.Is(err, ErrInvalidParam) {
+		t.Fatalf("registerGroup(non-power-of-two) = %v, want %v", err, ErrInvalidParam)
+	}
+}
+
+func TestBufferRingsRegisterGroupsCoversEnabledTiers(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  BufferGroupsConfig
+		tier uint16
+		size int
+	}{
+		{"pico", BufferGroupsConfig{PicoNum: 1}, bufferGroupIndexPico, BufferSizePico},
+		{"nano", BufferGroupsConfig{NanoNum: 1}, bufferGroupIndexNano, BufferSizeNano},
+		{"micro", BufferGroupsConfig{MicroNum: 1}, bufferGroupIndexMicro, BufferSizeMicro},
+		{"small", BufferGroupsConfig{SmallNum: 1}, bufferGroupIndexSmall, BufferSizeSmall},
+		{"medium", BufferGroupsConfig{MediumNum: 1}, bufferGroupIndexMedium, BufferSizeMedium},
+		{"big", BufferGroupsConfig{BigNum: 1}, bufferGroupIndexBig, BufferSizeBig},
+		{"large", BufferGroupsConfig{LargeNum: 1}, bufferGroupIndexLarge, BufferSizeLarge},
+		{"great", BufferGroupsConfig{GreatNum: 1}, bufferGroupIndexGreat, BufferSizeGreat},
+		{"huge", BufferGroupsConfig{HugeNum: 1}, bufferGroupIndexHuge, BufferSizeHuge},
+		{"vast", BufferGroupsConfig{VastNum: 1}, bufferGroupIndexVast, BufferSizeVast},
+		{"giant", BufferGroupsConfig{GiantNum: 1}, bufferGroupIndexGiant, BufferSizeGiant},
+		{"titan", BufferGroupsConfig{TitanNum: 1}, bufferGroupIndexTitan, BufferSizeTitan},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ur := newTestIoUring(t)
+			rings := newUringBufferRings()
+			groups := newUringBufferGroupsWithConfig(1, tt.cfg)
+			groups.setGIDOffset(13)
+
+			if err := rings.registerGroups(ur, groups); err != nil {
+				t.Fatalf("registerGroups: %v", err)
+			}
+			if len(rings.rings) != 1 {
+				t.Fatalf("len(rings) = %d, want 1", len(rings.rings))
+			}
+			if rings.rings[0] == nil {
+				t.Fatal("rings[0] = nil")
+			}
+			if rings.gids[0] != 13+tt.tier {
+				t.Fatalf("gid = %d, want %d", rings.gids[0], 13+tt.tier)
+			}
+			if rings.sizes[0] != tt.size {
+				t.Fatalf("size = %d, want %d", rings.sizes[0], tt.size)
+			}
+			if rings.counts[0] != 1 {
+				t.Fatalf("count = %d, want 1", rings.counts[0])
+			}
+			if rings.masks[0] != 0 {
+				t.Fatalf("mask = %d, want 0", rings.masks[0])
+			}
+
+			if err := rings.release(ur); err != nil {
+				t.Fatalf("release: %v", err)
+			}
+		})
 	}
 }

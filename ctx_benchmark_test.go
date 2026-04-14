@@ -105,6 +105,15 @@ func BenchmarkSQEContext_WithFlags(b *testing.B) {
 	}
 }
 
+func BenchmarkSQEContext_OrFlags(b *testing.B) {
+	ctx := uring.PackDirect(uring.IORING_OP_NOP, uring.IOSQE_IO_LINK, 0, 0)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = ctx.OrFlags(uring.IOSQE_FIXED_FILE)
+	}
+}
+
 // Benchmark chained modifications
 func BenchmarkSQEContext_ChainedWith(b *testing.B) {
 	ctx := uring.PackDirect(uring.IORING_OP_NOP, 0, 0, 0)

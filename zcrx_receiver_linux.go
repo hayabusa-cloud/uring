@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"unsafe"
 
+	"code.hybscloud.com/dwcas"
 	"code.hybscloud.com/iobuf"
 	"code.hybscloud.com/iofd"
 	"code.hybscloud.com/iox"
@@ -156,6 +157,8 @@ func (q *zcrxRefillQ) push(offset, token uint64, length int) error {
 	q.rqes[idx].Off = (offset & ^uint64(IORING_ZCRX_AREA_MASK)) | token
 	q.rqes[idx].Len = uint32(length)
 	q.tail++
+	// Release barrier makes the descriptor visible before the tail update.
+	dwcas.BarrierRelease()
 	atomic.StoreUint32(q.kTail, q.tail)
 	return nil
 }

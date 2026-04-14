@@ -545,8 +545,9 @@ A nivel de paquete, `listener_example_test.go` cubre la creación de listeners c
 `uring` apunta a Go 1.26+ y Linux 6.18+ en la ruta real respaldada por el
 kernel. La mayoría de los archivos de implementación y tests de ejemplo
 están protegidos con `//go:build linux`. Los archivos de Darwin proporcionan
-superficies simuladas o stubs compatibles con la API para compilaciones en
-Darwin; no alteran la línea base de ejecución en Linux descrita arriba.
+solo stubs de compilación para la superficie compartida; las capacidades
+exclusivas de Linux siguen siendo exclusivas de Linux y no alteran la línea
+base de ejecución en Linux descrita arriba.
 
 ## Licencia
 
