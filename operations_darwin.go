@@ -298,22 +298,32 @@ func (ur *ioUring) openAt(sqeCtx SQEContext, pathname string, openFlags int, mod
 
 // close closes a file descriptor.
 func (ur *ioUring) close(sqeCtx SQEContext) error {
-	return ur.submitPacked(sqeCtx.WithOp(IORING_OP_CLOSE), func(e *ioUringSqe) {
+	ctx := sqeCtx.WithOp(IORING_OP_CLOSE)
+	if ctx.Flags()&IOSQE_FIXED_FILE != 0 && ctx.FD() < 0 {
+		return ErrInvalidParam
+	}
+	return ur.submitPacked(ctx, func(e *ioUringSqe) {
 		e.opcode = IORING_OP_CLOSE
-		e.flags = sqeCtx.Flags()
-		e.fd = sqeCtx.FD()
+		e.flags = ctx.Flags()
+		e.fd = ctx.FD()
+		if e.flags&IOSQE_FIXED_FILE != 0 {
+			fileIndex := ctx.FD()
+			e.flags &^= IOSQE_FIXED_FILE
+			e.fd = 0
+			e.spliceFdIn = int32(uint32(fileIndex) + 1)
+		}
 	})
 }
 
 // read performs a read operation.
 func (ur *ioUring) read(sqeCtx SQEContext, ioprio uint16, b []byte, off uint64, n int) error {
-	addr := uint64(uintptr(unsafe.Pointer(&b[0])))
+	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(b))))
 	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_READ), ioprio, off, addr, n, 0)
 }
 
 // write performs a write operation.
 func (ur *ioUring) write(sqeCtx SQEContext, ioprio uint16, b []byte, off uint64, n int) error {
-	addr := uint64(uintptr(unsafe.Pointer(&b[0])))
+	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(b))))
 	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_WRITE), ioprio, off, addr, n, 0)
 }
 
@@ -333,14 +343,13 @@ func (ur *ioUring) send(sqeCtx SQEContext, ioprio uint16, b []byte, off uint64, 
 
 // receive receives data from a socket.
 func (ur *ioUring) receive(sqeCtx SQEContext, ioprio uint16, b []byte, off uint64, n int) error {
-	addr := uint64(uintptr(unsafe.Pointer(&b[0])))
+	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(b))))
 	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_RECV), ioprio, off, addr, n, 0)
 }
 
 // receiveWithBufferSelect receives with kernel buffer selection.
 func (ur *ioUring) receiveWithBufferSelect(sqeCtx SQEContext, ioprio uint16, bufSize int, bufGroup uint16) error {
-	ctx := sqeCtx.WithOp(IORING_OP_RECV).WithBufGroup(bufGroup)
-	return ur.submitPacked6(ctx, ioprio, 0, 0, bufSize, 0)
+	return ErrNotSupported
 }
 
 // splice transfers data between file descriptors.
@@ -357,8 +366,7 @@ func (ur *ioUring) splice(sqeCtx SQEContext, fdIn int, offIn, offOut *int64, n i
 
 // provideBuffers provides buffers to the kernel.
 func (ur *ioUring) provideBuffers(sqeCtx SQEContext, nbufs int, bid int, ptr unsafe.Pointer, bufLen int, bgid uint16) error {
-	addr := uint64(uintptr(ptr))
-	return ur.submitPacked9(sqeCtx.WithOp(IORING_OP_PROVIDE_BUFFERS), 0, uint64(bid), addr, nbufs, uint32(bufLen), 0, int32(bgid))
+	return ErrNotSupported
 }
 
 // tee duplicates data between pipes.
@@ -435,8 +443,7 @@ func (ur *ioUring) listen(sqeCtx SQEContext, backlog int) error {
 
 // readWithBufferSelect performs read with kernel buffer selection.
 func (ur *ioUring) readWithBufferSelect(sqeCtx SQEContext, n int, bgid uint16) error {
-	ctx := sqeCtx.WithOp(IORING_OP_READ).WithBufGroup(bgid)
-	return ur.submitPacked6(ctx, 0, 0, 0, n, 0)
+	return ErrNotSupported
 }
 
 // pipe creates a pipe using io_uring (Darwin stub).

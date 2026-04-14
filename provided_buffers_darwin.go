@@ -39,25 +39,22 @@ func (g *uringProvideBuffers) setGIDOffset(offset int) {
 	g.gidOffset = uint16(offset)
 }
 
-func (g *uringProvideBuffers) register(ur *ioUring, flags uint8) error {
+func (g *uringProvideBuffers) register(_ *ioUring, _ uint8) error {
 	g.mem = iobuf.AlignedMem(g.size*g.n, iobuf.PageSize)
 	g.ptr = unsafe.Pointer(unsafe.SliceData(g.mem))
-
-	sqeCtx := PackDirect(0, flags, g.gidOffset, 0)
-	err := ur.provideBuffers(sqeCtx, g.n, 0, g.ptr, g.size, g.gidOffset)
-	if err != nil {
-		return err
-	}
 	return nil
 }
 
-func (g *uringProvideBuffers) provide(ur *ioUring, flags uint8, group, index uint16, n int) error {
+func (g *uringProvideBuffers) provide(_ *ioUring, _ uint8, _ uint16, index uint16, n int) error {
+	if g.ptr == nil || len(g.mem) != g.size*g.n {
+		return ErrInvalidParam
+	}
+	if int(index) >= g.n || n < 0 || n > g.size {
+		return ErrInvalidParam
+	}
 	offset := int(index) * g.size
-	ptr := unsafe.Add(g.ptr, offset)
-	sqeCtx := PackDirect(0, flags, group, 0)
-	err := ur.provideBuffers(sqeCtx, 1, int(index), ptr, n, group)
-	if err != nil {
-		return err
+	if offset+n > len(g.mem) {
+		return ErrInvalidParam
 	}
 	return nil
 }

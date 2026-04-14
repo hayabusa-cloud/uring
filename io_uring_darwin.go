@@ -838,7 +838,24 @@ func (ur *ioUring) doConnect(sqe *ioUringSqe) int32 {
 }
 
 func (ur *ioUring) doClose(sqe *ioUringSqe) int32 {
-	err := syscall.Close(int(sqe.fd))
+	fd := sqe.fd
+	if sqe.spliceFdIn != 0 {
+		fileIndex := int(sqe.spliceFdIn) - 1
+		if fileIndex < 0 || fileIndex >= len(ur.files) {
+			return -int32(syscall.EBADF)
+		}
+		fd = ur.files[fileIndex]
+		if fd < 0 {
+			return -int32(syscall.EBADF)
+		}
+		err := syscall.Close(int(fd))
+		if err != nil {
+			return -int32(err.(syscall.Errno))
+		}
+		ur.files[fileIndex] = -1
+		return 0
+	}
+	err := syscall.Close(int(fd))
 	if err != nil {
 		return -int32(err.(syscall.Errno))
 	}
