@@ -532,8 +532,8 @@ The package-level `listener_example_test.go` covers listener creation with multi
 
 `uring` targets Go 1.26+ and Linux 6.18+ on the real kernel-backed path. Most
 source files and example tests carry a `//go:build linux` guard. Darwin files
-provide API-compatible stubs for Darwin builds; they do not change the Linux
-runtime baseline.
+provide compile stubs for the shared surface only; Linux-only capabilities
+remain Linux-only and do not change the Linux runtime baseline.
 
 ## License
 
