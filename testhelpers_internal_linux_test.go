@@ -7,6 +7,7 @@
 package uring
 
 import (
+	"sync/atomic"
 	"testing"
 
 	"code.hybscloud.com/zcall"
@@ -29,6 +30,42 @@ func mustStartRing(tb testing.TB, ring *Uring) {
 			tb.Fatalf("Stop: %v", err)
 		}
 	})
+}
+
+func newWrapperTestRing(t *testing.T) *Uring {
+	t.Helper()
+
+	ring, err := New(testMinimalBufferOptions, func(opt *Options) {
+		opt.Entries = EntriesNano
+		opt.MultiIssuers = true
+		opt.NotifySucceed = true
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := ring.ioUring.stop(); err != nil {
+			t.Fatalf("stop: %v", err)
+		}
+	})
+	return ring
+}
+
+type mockPollFd struct {
+	fd int
+}
+
+func (m *mockPollFd) Fd() int { return m.fd }
+
+func lastSubmittedSQE(t *testing.T, ring *Uring) *ioUringSqe {
+	t.Helper()
+
+	tail := atomic.LoadUint32(ring.ioUring.sq.kTail)
+	if tail == 0 {
+		t.Fatal("no SQE submitted")
+	}
+	idx := (tail - 1) & *ring.ioUring.sq.kRingMask
+	return ring.ioUring.sq.sqeAt(idx)
 }
 
 func dispatchSimplifiedMultishotCQE(handler MultishotHandler, cqe CQEView) bool {

@@ -15,7 +15,9 @@ import (
 
 	"code.hybscloud.com/iofd"
 	"code.hybscloud.com/iox"
+	"code.hybscloud.com/sock"
 	"code.hybscloud.com/uring"
+	"code.hybscloud.com/zcall"
 )
 
 // BenchmarkZeroCopyVsNormal compares zero-copy and normal send at various sizes.
@@ -248,10 +250,56 @@ func (p *benchPollFd) Fd() int          { return int(p.fd) }
 func (p *benchPollFd) Events() uint32   { return 0 }
 func (p *benchPollFd) SetEvents(uint32) {}
 
+func startSocketPairDrainer(tb testing.TB, fd iofd.FD) func() {
+	tb.Helper()
+
+	drainFD := fd
+	if err := sock.SetNonBlock(&drainFD, true); err != nil {
+		tb.Fatalf("SetNonBlock: %v", err)
+	}
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+
+		buf := make([]byte, 65536)
+		backoff := iox.Backoff{}
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+
+			n, errno := readTestFD(drainFD, buf)
+			switch {
+			case errno == 0:
+				if n == 0 {
+					return
+				}
+				backoff.Reset()
+			case errno == uintptr(zcall.EAGAIN), errno == uintptr(zcall.EWOULDBLOCK):
+				backoff.Wait()
+			default:
+				return
+			}
+		}
+	}()
+
+	return func() {
+		close(stop)
+		<-done
+	}
+}
+
 // TestZeroCopyVsNormalComparison runs a quick comparison test.
 // This is for testing, not benchmarking - use the benchmark for accurate measurements.
 // Note: Uses fewer iterations to avoid timeout in constrained environments (e.g., WSL2).
 func TestZeroCopyVsNormalComparison(t *testing.T) {
+	if raceEnabled {
+		t.Skip("skipping timing comparison under race detector")
+	}
 	if testing.Short() {
 		t.Skip("skipping comparison test in short mode")
 	}
@@ -293,21 +341,12 @@ func measureNormalSend(t *testing.T, payloadSize, iterations int) int64 {
 		t.Fatalf("socketpair: %v", err)
 	}
 	defer closeTestFds(fds)
+	stopDrain := startSocketPairDrainer(t, fds[0])
+	defer stopDrain()
 
 	payload := make([]byte, payloadSize)
 	cqes := make([]uring.CQEView, 16)
 	pollFd := &benchPollFd{fd: fds[1]}
-
-	// Drain in background
-	go func() {
-		buf := make([]byte, 65536)
-		for {
-			_, errno := readTestFD(fds[0], buf)
-			if errno != 0 && errno != 11 {
-				return
-			}
-		}
-	}()
 
 	start := time.Now()
 	b := iox.Backoff{}
@@ -318,13 +357,19 @@ func measureNormalSend(t *testing.T, payloadSize, iterations int) int64 {
 			t.Fatalf("Send: %v", err)
 		}
 
+		completed := false
 		deadline := time.Now().Add(time.Second)
 		for time.Now().Before(deadline) {
 			n, _ := ring.Wait(cqes)
 			if n > 0 {
+				b.Reset()
+				completed = true
 				break
 			}
 			b.Wait()
+		}
+		if !completed {
+			t.Skip("skipping comparison test: send completion did not arrive in time")
 		}
 	}
 	elapsed := time.Since(start)
@@ -355,20 +400,11 @@ func measureZeroCopySend(t *testing.T, payloadSize, iterations int) int64 {
 		t.Fatalf("socketpair: %v", err)
 	}
 	defer closeTestFds(fds)
+	stopDrain := startSocketPairDrainer(t, fds[0])
+	defer stopDrain()
 
 	cqes := make([]uring.CQEView, 16)
 	targets := &singleTarget{fd: fds[1]}
-
-	// Drain in background
-	go func() {
-		buf := make([]byte, 65536)
-		for {
-			_, errno := readTestFD(fds[0], buf)
-			if errno != 0 && errno != 11 {
-				return
-			}
-		}
-	}()
 
 	start := time.Now()
 	eopnotsupp := false
@@ -389,6 +425,7 @@ func measureZeroCopySend(t *testing.T, payloadSize, iterations int) int64 {
 				b.Wait()
 				continue
 			}
+			b.Reset()
 			for j := 0; j < n; j++ {
 				cqe := &cqes[j]
 				op := cqe.Op()
@@ -410,6 +447,9 @@ func measureZeroCopySend(t *testing.T, payloadSize, iterations int) int64 {
 				}
 			}
 		}
+		if !opDone || !notifDone {
+			t.Skip("skipping comparison test: zero-copy completion did not arrive in time")
+		}
 	}
 	elapsed := time.Since(start)
 
@@ -424,6 +464,9 @@ func measureZeroCopySend(t *testing.T, payloadSize, iterations int) int64 {
 // TestMultiDestinationComparison tests the multicast scenario.
 // Note: Uses smaller destination counts to avoid timeout in constrained environments.
 func TestMultiDestinationComparison(t *testing.T) {
+	if raceEnabled {
+		t.Skip("skipping timing comparison under race detector")
+	}
 	if testing.Short() {
 		t.Skip("skipping multi-destination test in short mode")
 	}
@@ -464,6 +507,7 @@ func measureNormalMultiSend(t *testing.T, payloadSize, numDest, iterations int) 
 
 	// Create socket pairs
 	var pairs [][2]iofd.FD
+	var stopDrainers []func()
 	for i := 0; i < numDest; i++ {
 		fds, err := newUnixSocketPairForTest()
 		if err != nil {
@@ -473,18 +517,13 @@ func measureNormalMultiSend(t *testing.T, payloadSize, numDest, iterations int) 
 			t.Fatalf("socketpair: %v", err)
 		}
 		pairs = append(pairs, fds)
-
-		// Drain in background
-		go func(rfd iofd.FD) {
-			buf := make([]byte, 65536)
-			for {
-				_, errno := readTestFD(rfd, buf)
-				if errno != 0 && errno != 11 {
-					return
-				}
-			}
-		}(fds[0])
+		stopDrainers = append(stopDrainers, startSocketPairDrainer(t, fds[0]))
 	}
+	defer func() {
+		for i := len(stopDrainers) - 1; i >= 0; i-- {
+			stopDrainers[i]()
+		}
+	}()
 	defer func() {
 		for _, p := range pairs {
 			closeTestFds(p)
@@ -516,7 +555,11 @@ func measureNormalMultiSend(t *testing.T, payloadSize, numDest, iterations int) 
 				b.Wait()
 				continue
 			}
+			b.Reset()
 			completed += n
+		}
+		if completed < numDest {
+			t.Skipf("skipping comparison test: received %d/%d send completions", completed, numDest)
 		}
 	}
 	elapsed := time.Since(start)
@@ -545,6 +588,7 @@ func measureZeroCopyMultiSend(t *testing.T, payloadSize, numDest, iterations int
 	// Create socket pairs
 	var pairs [][2]iofd.FD
 	var writers []iofd.FD
+	var stopDrainers []func()
 	for i := 0; i < numDest; i++ {
 		fds, err := newUnixSocketPairForTest()
 		if err != nil {
@@ -555,18 +599,13 @@ func measureZeroCopyMultiSend(t *testing.T, payloadSize, numDest, iterations int
 		}
 		pairs = append(pairs, fds)
 		writers = append(writers, fds[1])
-
-		// Drain in background
-		go func(rfd iofd.FD) {
-			buf := make([]byte, 65536)
-			for {
-				_, errno := readTestFD(rfd, buf)
-				if errno != 0 && errno != 11 {
-					return
-				}
-			}
-		}(fds[0])
+		stopDrainers = append(stopDrainers, startSocketPairDrainer(t, fds[0]))
 	}
+	defer func() {
+		for i := len(stopDrainers) - 1; i >= 0; i-- {
+			stopDrainers[i]()
+		}
+	}()
 	defer func() {
 		for _, p := range pairs {
 			closeTestFds(p)
@@ -595,6 +634,7 @@ func measureZeroCopyMultiSend(t *testing.T, payloadSize, numDest, iterations int
 				b.Wait()
 				continue
 			}
+			b.Reset()
 			for j := 0; j < n; j++ {
 				cqe := &cqes[j]
 				op := cqe.Op()
@@ -609,6 +649,9 @@ func measureZeroCopyMultiSend(t *testing.T, payloadSize, numDest, iterations int
 					completed++
 				}
 			}
+		}
+		if completed < numDest {
+			t.Skipf("skipping comparison test: received %d/%d zero-copy completions", completed, numDest)
 		}
 	}
 	elapsed := time.Since(start)

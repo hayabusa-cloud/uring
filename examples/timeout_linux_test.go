@@ -298,8 +298,8 @@ func TestLinkedTimeout(t *testing.T) {
 
 	// Submit a NOP with IOSQE_IO_LINK flag, followed by LinkTimeout
 	// The NOP will complete immediately, so the timeout should be cancelled
-	nopCtx := uring.PackDirect(uring.IORING_OP_NOP, uring.IOSQE_IO_LINK, 1, 0) // bufGroup=1 to identify
-	if err := ring.Nop(nopCtx); err != nil {
+	nopCtx := uring.PackDirect(uring.IORING_OP_NOP, 0, 1, 0) // bufGroup=1 to identify
+	if err := ring.Nop(nopCtx, uring.WithFlags(uring.IOSQE_IO_LINK)); err != nil {
 		t.Fatalf("Nop submit: %v", err)
 	}
 

@@ -345,3 +345,32 @@ func TestMultishotSubscriberCallbacks(t *testing.T) {
 		t.Error("stop callback not called")
 	}
 }
+
+// =============================================================================
+// handler_noop.go coverage — exercise noop handler methods
+// =============================================================================
+
+func TestNoopHandlerMethods(t *testing.T) {
+	// NoopMultishotHandler
+	var mh uring.NoopMultishotHandler
+	mh.OnMultishotStop(nil, false)
+	mh.OnMultishotStop(errors.New("test"), true)
+
+	// NoopListenerHandler
+	var lh uring.NoopListenerHandler
+	lh.OnListening()
+	lh.OnError(0, errors.New("test"))
+
+	// NoopIncrementalHandler
+	var ih uring.NoopIncrementalHandler
+	ih.OnData(nil, false)
+	ih.OnData([]byte("data"), true)
+	ih.OnComplete()
+	ih.OnError(errors.New("test"))
+
+	// NoopZCHandler
+	var zh uring.NoopZCHandler
+	zh.OnCompleted(0)
+	zh.OnCompleted(42)
+	zh.OnNotification(0)
+}

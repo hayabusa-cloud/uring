@@ -266,3 +266,23 @@ func TestIncrementalStaticHandlerReturnsExtSQEOnNilHandler(t *testing.T) {
 		t.Fatal("expected static nil-handler path to return ExtSQE to pool")
 	}
 }
+
+func TestIncrementalRecvAppliesReadLikeFlags(t *testing.T) {
+	ring := newWrapperTestRing(t)
+	ring.readLikeOpFlags = IOSQE_FIXED_FILE
+
+	pool := NewContextPools(1)
+	receiver := NewIncrementalReceiver(ring, pool, 7, 256, make([]byte, 256), 1)
+
+	if err := receiver.Recv(11, nil); err != nil {
+		t.Fatalf("Recv: %v", err)
+	}
+
+	sqe := lastSubmittedSQE(t, ring)
+	if got, want := sqe.flags, uint8(IOSQE_BUFFER_SELECT|IOSQE_FIXED_FILE); got != want {
+		t.Fatalf("SQE.flags = %#x, want %#x", got, want)
+	}
+	if got := sqe.bufIndex; got != 7 {
+		t.Fatalf("SQE.bufIndex = %d, want 7", got)
+	}
+}

@@ -321,6 +321,20 @@ func TestMultishotSubscriptionSubmitCancelStateTracksEnqueue(t *testing.T) {
 	}
 }
 
+func TestMultishotSubscriptionUnsubscribeMarksSuppressedWhenStopped(t *testing.T) {
+	sub := &MultishotSubscription{}
+	sub.state.Store(uint32(SubscriptionStopped))
+
+	sub.Unsubscribe()
+
+	if !sub.unsubscribed.Load() {
+		t.Fatal("Unsubscribe() did not mark the subscription unsubscribed")
+	}
+	if got := sub.State(); got != SubscriptionStopped {
+		t.Fatalf("State after Unsubscribe() = %v, want %v", got, SubscriptionStopped)
+	}
+}
+
 func TestMultishotCancellingStillDeliversSteps(t *testing.T) {
 	pool := NewContextPools(16)
 

@@ -128,9 +128,9 @@ func TestPollCancelByFD(t *testing.T) {
 		t.Fatalf("PollAdd: %v", err)
 	}
 	t.Log("Submitted PollAdd (will be cancelled)")
-
-	// Give poll time to register with the kernel
-	time.Sleep(10 * time.Millisecond)
+	if _, err := ring.Wait(nil); err != nil {
+		t.Fatalf("Wait(nil): %v", err)
+	}
 
 	// Cancel by file descriptor
 	cancelCtx := uring.PackDirect(uring.IORING_OP_ASYNC_CANCEL, 0, 0, int32(readFD))

@@ -63,6 +63,9 @@ func waitForOp(t *testing.T, ring *uring.Uring, op uint8, timeout time.Duration)
 			!errors.Is(err, uring.ErrExists) {
 			t.Fatalf("Wait: %v", err)
 		}
+		if n > 0 {
+			b.Reset()
+		}
 		for j := 0; j < n; j++ {
 			if cqes[j].Op() == op {
 				return cqes[j], true
@@ -80,6 +83,22 @@ func isWSL2() bool {
 	}
 	lower := strings.ToLower(string(data))
 	return strings.Contains(lower, "microsoft") || strings.Contains(lower, "wsl")
+}
+
+func mustCloseAndWait(t *testing.T, ring *uring.Uring, ctx uring.SQEContext, timeout time.Duration, label string) {
+	t.Helper()
+
+	if err := ring.Close(ctx); err != nil {
+		t.Fatalf("Close %s: %v", label, err)
+	}
+
+	ev, ok := waitForOp(t, ring, uring.IORING_OP_CLOSE, timeout)
+	if !ok {
+		t.Fatalf("%s close did not complete", label)
+	}
+	if ev.Res < 0 {
+		t.Fatalf("%s close failed: %d", label, ev.Res)
+	}
 }
 
 func newUnixSocketPairForTest() ([2]iofd.FD, error) {
