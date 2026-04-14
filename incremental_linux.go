@@ -108,7 +108,7 @@ func (r *IncrementalReceiver) Recv(fd iofd.FD, handler IncrementalHandler) error
 	ext.SQE.fd = int32(fd)
 	ext.SQE.addr = 0 // Kernel selects buffer
 	ext.SQE.len = uint32(r.bufSize)
-	ext.SQE.flags = IOSQE_BUFFER_SELECT
+	ext.SQE.flags = IOSQE_BUFFER_SELECT | r.ring.readLikeOpFlags
 	ext.SQE.bufIndex = r.groupID
 
 	sqeCtx := PackExtended(ext)
