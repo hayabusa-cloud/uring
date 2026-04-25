@@ -427,8 +427,8 @@ func (ur *Uring) RegisteredBufferCount() int {
 // ========================================
 
 // SQAvailable returns the number of SQEs available for submission.
-// Higher layers can use this for admission control and backpressure. On
-// single-issuer rings it is not safe for concurrent use with ResizeRings;
+// Caller-side runtime code can use this for admission control and
+// backpressure. On single-issuer rings it is not safe for concurrent use with ResizeRings;
 // caller must serialize those operations.
 func (ur *Uring) SQAvailable() int {
 	ur.lockSubmitState()
@@ -443,8 +443,8 @@ func (ur *Uring) SQAvailable() int {
 }
 
 // CQPending returns the number of CQEs waiting to be reaped.
-// Higher layers can use this to decide when to drain completions. On
-// single-issuer rings it is not safe for concurrent use with ResizeRings;
+// Caller-side runtime code can use this to decide when to drain
+// completions. On single-issuer rings it is not safe for concurrent use with ResizeRings;
 // caller must serialize those operations.
 func (ur *Uring) CQPending() int {
 	ur.lockSubmitState()
@@ -462,8 +462,8 @@ func (ur *Uring) CQPending() int {
 // Required for cross-ring operations via IORING_OP_MSG_RING.
 //
 //go:nosplit
-func (ur *Uring) RingFD() int {
-	return ur.ringFd
+func (ur *Uring) RingFD() iofd.FD {
+	return iofd.FD(ur.ringFd)
 }
 
 // ========================================
@@ -1757,7 +1757,7 @@ func (ur *Uring) MsgRingFD(sqeCtx SQEContext, srcFD uint32, dstSlot uint32, user
 
 // UringCmd submits a generic passthrough command.
 // The cmdOp specifies the command operation, and cmdData provides optional data.
-// The framework retains cmdData until the kernel consumes the SQE. Because the
+// The submission path retains cmdData until the kernel consumes the SQE. Because the
 // kernel driver may hold cmdData asynchronously until the CQE is posted, caller
 // must keep cmdData valid until the completion is reaped.
 func (ur *Uring) UringCmd(sqeCtx SQEContext, cmdOp uint32, cmdData []byte, options ...OpOptionFunc) error {

@@ -50,7 +50,7 @@ func (s MultishotStep) Final() bool {
 }
 
 // MultishotHandler handles multishot step observations and the terminal stop.
-// Retry or resubmission policy stays above `uring`.
+// Retry or resubmission policy stays in caller-side runtime code above `uring`.
 type MultishotHandler interface {
 	// OnMultishotStep handles one observed CQE.
 	// Return `MultishotStop` to request async cancellation after a non-final step.
@@ -129,7 +129,7 @@ type MultishotSubscription struct {
 	ring         *Uring
 	ext          atomic.Pointer[ExtSQE] // ExtSQE retained until terminal cleanup
 	userData     uint64                 // Kernel-visible user_data for cancellation
-	handler      MultishotHandler       // Convenience callback adapter; routing policy stays above `uring`
+	handler      MultishotHandler       // Convenience callback adapter; routing policy stays in the caller-side runtime
 	state        atomic.Uint32          // Long-lived subscription state
 	canceling    atomic.Bool            // Serializes cancel submission without claiming kernel progress early
 	unsubscribed atomic.Bool            // Suppresses callbacks that have not started yet

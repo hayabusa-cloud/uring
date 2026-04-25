@@ -6,8 +6,9 @@
 // Its core Linux `io_uring` implementation was refactored from
 // `code.hybscloud.com/sox` into this dedicated package. It prepares SQEs,
 // decodes CQEs, transports submission context through `user_data`, and exposes
-// kernel-boundary facts; dispatch, retry, and other orchestration policy stay in
-// higher layers.
+// kernel-boundary facts. Dispatch, retry, completion correlation, and
+// connection/session orchestration stay in caller-side runtime code above this
+// boundary.
 //
 //	// Create TCP socket
 //	socketCtx := uring.PackDirect(uring.IORING_OP_SOCKET, 0, 0, 0)
@@ -43,7 +44,7 @@
 //	sqeCtx := uring.ForFD(listenerFD)
 //	sub, err := ring.AcceptMultishot(sqeCtx, handler)
 //
-//	// Process CQEs - higher layers decide how to route decoded CQEs
+//	// Process CQEs - caller-side runtime code routes decoded CQEs
 //	for i := range n {
 //	    dispatch(handler, cqes[i])
 //	}
@@ -137,6 +138,25 @@
 // `MultishotStop` to request cancellation after the current step. The request
 // is local until the cancel SQE is successfully enqueued.
 //
+// # Token Affinity at the Multishot Seam
+//
+// One live subscription names one live backend obligation. The kernel may
+// emit multiple CQEs against the same SQE before the obligation terminates;
+// each CQE carries `IORING_CQE_F_MORE` until the last. The package preserves
+// a one-to-one correspondence between a submitted [ExtSQE] (and its encoded
+// `user_data`) and the logical subscription, releasing the ExtSQE to its
+// pool only when the terminating CQE (`!HasMore()`) is observed. This is
+// the kernel-side foot of the affine-token discipline that caller runtimes
+// enforce at their own seams: an intermediate CQE discharges no obligation,
+// and the terminal CQE discharges exactly one.
+//
+// # Runtime Boundary
+//
+// uring is a kernel boundary, not a scheduler. It owns SQE encoding, CQE
+// observation, `user_data` identity, capability exposure, and kernel-facing
+// lifetimes. Runtime policy, connection routing, batching, retries, parking,
+// and terminal resource release belong above this package.
+//
 // # Buffer Groups
 //
 // Buffer groups enable kernel-side buffer selection for receive operations.
@@ -204,9 +224,11 @@
 //
 // Zero-copy receive (ZCRX):
 //   - [Uring.QueryZCRX], [Uring.RegisterZCRXIfq]
-//   - [NewZCRXReceiver] requires a ring created with 32-byte CQEs. The
-//     current [Options] surface does not expose `IORING_SETUP_CQE32`, so the
-//     standard [New] path returns [ErrNotSupported] for this constructor.
+//   - [NewZCRXReceiver] is wired for rings created with 32-byte CQEs. The
+//     current [Options] surface does not expose `IORING_SETUP_CQE32`, so rings
+//     created through the standard [New] path return [ErrNotSupported] from
+//     this constructor. Until a CQE32 setup path is exposed, the receiver docs
+//     describe the boundary contract rather than a runnable public setup recipe.
 //
 // # Performance
 //

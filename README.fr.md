@@ -16,7 +16,9 @@ rings, prépare les SQE, décode les CQE, achemine l'identité de soumission via
 de buffers, les opérations multishot ainsi que les primitives de mise en place des listeners.
 
 `uring` repose sur une conception à interface explicite : la mécanique côté noyau et les faits de complétion observables
-se situent au bord de l'API, tandis que la politique et la composition relèvent des couches supérieures.
+se situent au bord de l'API, tandis que la politique et la composition relèvent des couches supérieures. Le code runtime
+côté appelant possède la corrélation des complétions, retry/backoff, le routage des handlers et des sessions, le cycle
+de vie des connexions et la libération terminale des ressources.
 
 Les surfaces principales sont :
 
@@ -89,10 +91,9 @@ l'appel enter vers le noyau, nécessaire pour que le deferred task work progress
 sérialiser `Wait`/`enter` avec les opérations de submit-state. `iox.ErrWouldBlock` signale qu'aucune complétion n'est
 observable à l'interface courante. Cette erreur est définie dans `code.hybscloud.com/iox`.
 
-`Start` et `Stop` constituent la paire de cycle de vie du ring. `Stop` est
-idempotent et rend le ring définitivement inutilisable ; on ne doit donc
-l'appeler qu'après avoir drainé toutes les opérations en vol, récupéré les CQE
-en attente et arrêté les abonnements multishot encore actifs.
+`Start` et `Stop` constituent la paire de cycle de vie du ring. `Stop` est idempotent et rend le ring définitivement
+inutilisable ; on ne doit donc l'appeler qu'après avoir drainé toutes les opérations en vol, récupéré les CQE en attente
+et arrêté les abonnements multishot encore actifs.
 
 ## Types et opérations
 
@@ -252,16 +253,32 @@ L'implémentation se structure autour des couches suivantes :
 2. `Start` enregistre les buffers et active le ring conformément à la base fixe Linux 6.18+.
 3. Les méthodes d'opération publient l'intention en écrivant des SQE.
 4. `Wait` purge les soumissions et renvoie des vues CQE empruntées.
-5. Les couches supérieures décident de l'ordonnancement, des reprises, du parking et de l'orchestration.
+5. Le code runtime côté appelant décide de l'ordonnancement, des reprises, du parking, du routage connexion/session et
+   de la politique terminale des ressources.
 
 De cette manière, `uring` reste focalisé sur la mécanique côté noyau tout en préservant la sémantique des complétions au
 travers de l'interface.
 
+## Frontière runtime
+
+Les couches runtime au-dessus de `uring` doivent l'utiliser comme backend noyau, pas comme ordonnanceur. La frontière
+idéale est unidirectionnelle : `uring` prépare les SQE, récupère les CQE, préserve `user_data`, expose `res` et flags
+des CQE, et rapporte les faits de propriété ; le code runtime côté appelant corrèle ces observations avec ses propres
+tokens, applique retry/backoff, route les handlers et sessions, regroupe les soumissions et libère les ressources
+terminales.
+
+Un pont runtime peut consommer les CQE en mode Extended lorsque l'exécution abstraite a besoin des faits de complétion.
+Un runtime par connexion peut aussi sonder directement les CQE Extended bruts lorsqu'il a besoin du résultat CQE, des
+flags, du buffer ID et du token encodé avant de réduire l'événement en callbacks de handler.
+
+Les couches de contexte et d'exécution abstraite au-dessus de cette frontière ne modifient pas le rôle de frontière
+noyau de `uring`.
+
 ## Patrons pour la couche applicative
 
 `uring` expose les mécanismes tournés vers le noyau ; l'ordonnancement, les tentatives de reprise, le suivi de
-connexions et l'interprétation du protocole relèvent des couches supérieures. Les patrons ci-dessous illustrent les
-façons courantes de structurer cette couche supérieure.
+connexions et l'interprétation du protocole relèvent des couches supérieures. Les patrons ci-dessous décrivent la
+frontière qu'un runtime côté appelant doit préserver.
 
 ### Boucle d'événements propriétaire du ring
 
@@ -309,7 +326,7 @@ renvoie `iox.ErrWouldBlock` ou ne récupère aucun CQE, puis `backoff.Reset()` a
 ### Cycle de vie des souscriptions multishot
 
 Une opération multishot produit un flux de CQEs jusqu'à ce que le noyau envoie un CQE final (sans `IORING_CQE_F_MORE`).
-La couche framework suit les souscriptions et gère la re-soumission :
+Le code runtime côté appelant suit les souscriptions et gère la re-soumission :
 
 ```go
 handler := uring.NewMultishotSubscriber().
@@ -369,7 +386,7 @@ ring.PutExtSQE(ext)
 
 On maintient les racines de pointeurs Go actives accessibles en dehors de `UserData`. Le GC ne trace pas ces octets
 bruts. Le jeu de racines sidecar rattaché à chaque slot `ExtSQE` s'en charge pour les protocoles internes multishot et
-listener, mais le code framework qui place des refs typés doit les garder accessibles de manière indépendante.
+listener, mais le code runtime appelant qui place des refs typés doit les garder accessibles de manière indépendante.
 
 ### Composition de délais
 
@@ -391,17 +408,17 @@ if err := ring.LinkTimeout(timeoutCtx, 5*time.Second); err != nil {
 }
 ```
 
-La couche framework gère les deux issues : une réception réussie annule le timeout, et un timeout déclenché annule la
-réception. Les deux produisent des CQEs que la boucle de distribution doit observer.
+La couche runtime appelante gère les deux issues : une réception réussie annule le timeout, et un timeout déclenché
+annule la réception. Les deux produisent des CQEs que la boucle de distribution doit observer.
 
 ## Parcours TCP courants
 
 Les parcours les plus concis, à lire en regard des tests :
 
-| Scénario | API principales | Référence |
-|----------|-----------------|-----------|
+| Scénario     | API principales                                                  | Référence                                                                         |
+|--------------|------------------------------------------------------------------|-----------------------------------------------------------------------------------|
 | Serveur echo | `ListenerManager`, `AcceptMultishot`, `ReceiveMultishot`, `Send` | `listener_example_test.go`, `examples/multishot_test.go`, `examples/echo_test.go` |
-| Client | `TCP4Socket`, `Connect`, `Send`, `Receive` | `socket_integration_test.go` |
+| Client       | `TCP4Socket`, `Connect`, `Send`, `Receive`                       | `socket_integration_linux_test.go`                                                |
 
 ### Serveur echo TCP
 
@@ -465,20 +482,21 @@ if err := ring.Receive(recvCtx, &clientFD, buf); err != nil {
 ```
 
 On réutilise la boucle `Wait` décrite dans la section cycle de vie du ring après chaque soumission pour observer la
-complétion correspondante. Le fichier `socket_integration_test.go` couvre le flux connect/send côté client TCP.
+complétion correspondante. Le fichier `socket_integration_linux_test.go` couvre le flux connect/send côté client TCP.
 
 ## Réception zero-copy (ZCRX)
 
 `ZCRXReceiver` gère la réception zero-copy depuis une file RX matérielle de NIC via `io_uring`.
 
-`NewZCRXReceiver` nécessite un ring créé avec des CQE de 32 octets (`IORING_SETUP_CQE32`). La surface `Options` actuelle
-n'expose pas ce drapeau de configuration ; par conséquent, les rings créés via le chemin standard de `New` conduisent ce
-constructeur à renvoyer `ErrNotSupported`.
+`NewZCRXReceiver` est prévu pour les rings créés avec des CQE de 32 octets (`IORING_SETUP_CQE32`). La surface `Options`
+actuelle n'expose pas ce drapeau de configuration ; par conséquent, les rings créés via le chemin standard de `New`
+conduisent ce constructeur à renvoyer `ErrNotSupported`. Tant qu'un chemin de configuration CQE32 n'est pas exposé,
+cette section documente le contrat de frontière du récepteur plutôt qu'une recette publique exécutable.
 
 ### Cycle de vie
 
-1. Sur un ring créé avec des CQE de 32 octets, on crée le récepteur via `NewZCRXReceiver`. Le constructeur enregistre la
-   file d'interface ZCRX, mappe la zone de remplissage et prépare le refill ring.
+1. Avec un ring compatible CQE32, on crée le récepteur via `NewZCRXReceiver`. Le constructeur enregistre la file
+   d'interface ZCRX, mappe la zone de remplissage et prépare le refill ring.
 2. Appelez `Start` pour soumettre l'opération étendue `RECV_ZC` sur le ring.
 3. Sur le chemin de dispatch des CQE, les complétions ZCRX sont acheminées vers le `ZCRXHandler` :
     - `OnData` livre un `ZCRXBuffer` pointant vers la zone mappée par la NIC. On appelle `Release` une fois le
@@ -518,10 +536,10 @@ Les tests d'exemple dans `uring/examples/` illustrent l'API en situation concrè
 - `buffer_ring_test.go`, fourniture de buffer rings et groupes de buffers multi-tailles
 - `context_test.go`, flux `SQEContext` direct, indirect et extended, plus accès via `CQEView`
 - `echo_test.go`, parcours serveur echo TCP et ping-pong UDP
-- `timeout_test.go`, opérations de timeout et linked-timeout
+- `timeout_linux_test.go`, opérations de timeout et linked-timeout
 
 Au niveau du package, `listener_example_test.go` couvre la création de listener et l'accept multishot, tandis que
-`socket_integration_test.go` couvre le flux client TCP connect/send.
+`socket_integration_linux_test.go` couvre le flux client TCP connect/send.
 
 ## Notes opérationnelles
 
@@ -539,12 +557,10 @@ Au niveau du package, `listener_example_test.go` couvre la création de listener
 
 ## Support de plateforme
 
-`uring` cible Go 1.26+ et Linux 6.18+ pour le chemin réel adossé au noyau.
-La plupart des fichiers d'implémentation et des tests d'exemple portent la
-directive `//go:build linux`. Les fichiers Darwin fournissent uniquement des
-stubs de compilation pour la surface partagée ; les capacités propres à Linux
-restent propres à Linux et ne modifient en rien la base d'exécution Linux
-décrite ci-dessus.
+`uring` cible Go 1.26+ et Linux 6.18+ pour le chemin réel adossé au noyau. La plupart des fichiers d'implémentation et
+des tests d'exemple portent la directive `//go:build linux`. Les fichiers Darwin fournissent uniquement des stubs de
+compilation pour la surface partagée ; les capacités propres à Linux restent propres à Linux et ne modifient en rien la
+base d'exécution Linux décrite ci-dessus.
 
 ## Licence
 
