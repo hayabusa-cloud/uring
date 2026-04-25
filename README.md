@@ -16,7 +16,8 @@ CQEs, carries submission identity through `user_data`, and provides buffer regis
 listener-setup primitives.
 
 `uring` draws a clear boundary: kernel-facing mechanics and observable completion facts live at the API edge; policy and
-composition stay above it.
+composition stay above it. Caller-side runtime code owns completion correlation, retry/backoff, handler and session
+routing, connection lifecycle, and terminal resource release.
 
 The primary surfaces are:
 
@@ -52,7 +53,7 @@ Container runtimes block `io_uring` syscalls by default. See [SETUP.md](./SETUP.
 
 ## Ring lifecycle
 
-`New` returns an unstarted ring and eagerly constructs the context pools. Call `Start` before submitting operations — it
+`New` returns an unstarted ring and eagerly constructs the context pools. Call `Start` before submitting operations; it
 registers ring resources and enables the ring. `uring` assumes the 6.18+ baseline and carries no fallback branches for
 older kernels.
 
@@ -88,9 +89,8 @@ keeps deferred task work moving once the SQ drains; the caller must serialize `W
 operations. `iox.ErrWouldBlock` signals that no completion is currently observable at the boundary. The error is defined
 in `code.hybscloud.com/iox`.
 
-`Start` and `Stop` form the ring lifecycle pair. `Stop` is idempotent and
-renders the ring permanently unusable — call it only after you have drained
-all in-flight operations, reaped outstanding CQEs, and quiesced live multishot
+`Start` and `Stop` form the ring lifecycle pair. `Stop` is idempotent and renders the ring permanently unusable; call it
+only after you have drained all in-flight operations, reaped outstanding CQEs, and quiesced live multishot
 subscriptions.
 
 ## Types and operations
@@ -130,9 +130,8 @@ Operations:
 | Ring msg | `MsgRing`, `MsgRingFD`, `FixedFdInstall`, `FilesUpdate` |
 | Cmd | `UringCmd`, `UringCmd128`, `Nop`, `Nop128` |
 
-`Nop128` and `UringCmd128` require a ring created with `Options.SQE128` and
-kernel support for the corresponding opcodes. Without both, they return
-`ErrNotSupported`.
+`Nop128` and `UringCmd128` require a ring created with `Options.SQE128` and kernel support for the corresponding
+opcodes. Without both, they return `ErrNotSupported`.
 
 `Uring.Close` submits `IORING_OP_CLOSE` for a target file descriptor. It is not a ring teardown method.
 
@@ -161,7 +160,7 @@ time. `WithFlags` replaces the entire flag set, so compute unions before calling
 When you need caller-owned metadata beyond the 64-bit direct layout, borrow an `ExtSQE`, write into its `UserData`
 through `Ctx*Of` or `ViewCtx*`, and pack it back into an `SQEContext`. Prefer scalar payloads. If a raw overlay or typed
 view stores Go pointers, interfaces, func values, slices, strings, maps, chans, or structs containing them, keep the
-live roots outside `UserData` — the GC does not trace those raw bytes.
+live roots outside `UserData`; the GC does not trace those raw bytes.
 
 ```go
 ext := ring.ExtSQE()
@@ -172,12 +171,12 @@ sqeCtx := uring.PackExtended(ext)
 fmt.Printf("sqe context mode=%d seq=%d\n", sqeCtx.Mode(), meta.Val1)
 ```
 
-`NewContextPools` returns pools that are ready to use. Call `Reset` only once
-all borrowed contexts have been returned and you want to reuse the pool set.
+`NewContextPools` returns pools that are ready to use. Call `Reset` only once all borrowed contexts have been returned
+and you want to reuse the pool set.
 
 ### Completion dispatch with `CQEView`
 
-There is no separate completion-context type. All completion dispatch goes through `CQEView` — call `cqe.Context()` to
+There is no separate completion-context type. All completion dispatch goes through `CQEView`; call `cqe.Context()` to
 recover the original submission token.
 
 ```go
@@ -250,14 +249,28 @@ The implementation sits at this boundary:
 2. `Start` registers buffers and enables the ring for the 6.18+ baseline.
 3. Operation methods express intent by writing SQEs.
 4. `Wait` flushes submissions and returns borrowed CQE views.
-5. Higher layers decide scheduling, retries, parking, and orchestration.
+5. Caller-side runtime code decides scheduling, retries, parking, connection/session routing, and terminal resource
+   policy.
 
 This keeps `uring` focused on kernel-facing mechanics and preserves completion meaning across the boundary.
+
+## Runtime boundary
+
+Runtime layers above `uring` should use it as the kernel backend, not as a scheduler. The ideal seam is one-way: `uring`
+prepares SQEs, reaps CQEs, preserves `user_data`, exposes CQE `res` and flags, and reports ownership facts; caller-side
+runtime code correlates those observations with its own tokens, applies retry/backoff, routes handlers and sessions,
+batches submissions, and releases terminal resources.
+
+A runtime bridge can consume Extended-mode CQEs when abstract execution needs completion facts. A connection-scoped
+runtime can also poll raw Extended CQEs directly when it needs the CQE result, flags, buffer ID, and encoded token
+before reducing the event to handler callbacks.
+
+Context and abstract-execution layers above this boundary do not change `uring`'s kernel-boundary role.
 
 ## Application-layer patterns
 
 `uring` exposes kernel mechanics; scheduling, retry, connection tracking, and protocol interpretation belong in the
-layers above it. The patterns below outline common ways to structure that upper layer.
+layers above it. The patterns below describe the boundary a caller-side runtime must preserve.
 
 ### Ring-owning event loop
 
@@ -303,24 +316,24 @@ after any batch with `n > 0`.
 
 ### Multishot subscription lifecycle
 
-A multishot operation produces a stream of CQEs until the kernel sends a final one (without `IORING_CQE_F_MORE`). The
-framework layer tracks subscriptions and handles resubmission:
+A multishot operation produces a stream of CQEs until the kernel sends a final one (without `IORING_CQE_F_MORE`).
+Caller-side runtime code tracks subscriptions and handles resubmission:
 
 ```go
 handler := uring.NewMultishotSubscriber().
-OnStep(func(step uring.MultishotStep) uring.MultishotAction {
-if step.Err != nil {
-return uring.MultishotStop
-}
-connFD := iofd.FD(step.CQE.Res)
-registerConnection(connFD)
-return uring.MultishotContinue
-}).
-OnStop(func (err error, cancelled bool) {
-if !cancelled {
-resubscribeAccept()
-}
-})
+    OnStep(func(step uring.MultishotStep) uring.MultishotAction {
+        if step.Err != nil {
+            return uring.MultishotStop
+        }
+        connFD := iofd.FD(step.CQE.Res)
+        registerConnection(connFD)
+        return uring.MultishotContinue
+    }).
+    OnStop(func(err error, cancelled bool) {
+        if !cancelled {
+            resubscribeAccept()
+        }
+    })
 
 _, err := ring.AcceptMultishot(acceptCtx, handler.Handler())
 ```
@@ -335,8 +348,8 @@ table:
 
 ```go
 type ConnState struct {
-Addr    netip.AddrPort
-Created int64
+    Addr    netip.AddrPort
+    Created int64
 }
 
 ext := ring.ExtSQE()
@@ -346,8 +359,8 @@ ctx.Val1 = sequenceNumber
 
 sqeCtx := uring.PackExtended(ext)
 if err := ring.Send(sqeCtx, &fd, payload); err != nil {
-ring.PutExtSQE(ext)
-return err
+    ring.PutExtSQE(ext)
+    return err
 }
 ```
 
@@ -362,8 +375,8 @@ ring.PutExtSQE(ext)
 ```
 
 Keep live Go pointer roots reachable outside `UserData`. The GC does not trace those raw bytes. The sidecar root set
-attached to each `ExtSQE` slot handles this for internal multishot and listener protocols, but framework code that
-places typed refs must keep them reachable independently.
+attached to each `ExtSQE` slot handles this for internal multishot and listener protocols, but caller-side runtime code
+that places typed refs must keep them reachable independently.
 
 ### Deadline composition
 
@@ -372,35 +385,36 @@ race: exactly one completes, and the other is cancelled.
 
 ```go
 recvCtx := uring.ForFD(fd).
-WithOp(uring.IORING_OP_RECV).
-WithBufGroup(group)
+    WithOp(uring.IORING_OP_RECV).
+    WithBufGroup(group)
 
 if err := ring.Receive(recvCtx, &fd, nil, uring.WithFlags(uring.IOSQE_IO_LINK)); err != nil {
-return err
+    return err
 }
 
 timeoutCtx := uring.PackDirect(uring.IORING_OP_LINK_TIMEOUT, 0, 0, 0)
 if err := ring.LinkTimeout(timeoutCtx, 5*time.Second); err != nil {
-return err
+    return err
 }
 ```
 
-The framework layer handles both outcomes: a successful receive cancels the timeout, and a fired timeout cancels the
+The caller-side runtime handles both outcomes: a successful receive cancels the timeout, and a fired timeout cancels the
 receive. Both produce CQEs that the dispatch loop must observe.
 
 ## TCP usage patterns
 
 These are the shortest flows, meant to be read alongside the tests:
 
-| Scenario | Main APIs | Reference |
-|----------|-----------|-----------|
+| Scenario    | Main APIs                                                        | Reference                                                                         |
+|-------------|------------------------------------------------------------------|-----------------------------------------------------------------------------------|
 | Echo server | `ListenerManager`, `AcceptMultishot`, `ReceiveMultishot`, `Send` | `listener_example_test.go`, `examples/multishot_test.go`, `examples/echo_test.go` |
-| Client | `TCP4Socket`, `Connect`, `Send`, `Receive` | `socket_integration_test.go` |
+| Client      | `TCP4Socket`, `Connect`, `Send`, `Receive`                       | `socket_integration_linux_test.go`                                                |
 
 ### TCP echo server
 
-`ListenerManager` prepares the socket → bind → listen chain for you. Once the listener is live, start multishot accept
-and multishot receive on the connection FDs.
+`ListenerManager` prepares the socket → bind → listen chain for you. The listener handler's bool-return callbacks are
+control-flow hooks: `true` advances to the next setup phase, `false` aborts before it. Once the listener is live, start
+multishot accept and multishot receive on the connection FDs.
 
 ```go
 pool := uring.NewContextPools(32)
@@ -458,24 +472,25 @@ if err := ring.Receive(recvCtx, &clientFD, buf); err != nil {
 ```
 
 After each submit, reuse the `Wait` loop from the ring lifecycle section to observe the matching completion.
-`socket_integration_test.go` at the package level covers the connect/send cycle.
+`socket_integration_linux_test.go` at the package level covers the connect/send cycle.
 
 ## Zero-copy receive (ZCRX)
 
 `ZCRXReceiver` drives zero-copy receive from a NIC hardware RX queue through `io_uring`.
 
-`NewZCRXReceiver` requires a ring with 32-byte CQEs (`IORING_SETUP_CQE32`). The current `Options` surface does not
+`NewZCRXReceiver` is wired for rings with 32-byte CQEs (`IORING_SETUP_CQE32`). The current `Options` surface does not
 expose that setup flag, so rings created through the standard `New` path cause this constructor to return
-`ErrNotSupported`.
+`ErrNotSupported`. Until a CQE32 setup path is exposed, this section documents the receiver boundary contract rather
+than a runnable public setup recipe.
 
 ### Lifecycle
 
-1. Create the receiver with `NewZCRXReceiver` on a ring with 32-byte CQEs. The constructor registers the ZCRX interface
+1. With a CQE32-enabled ring, create the receiver with `NewZCRXReceiver`. The constructor registers the ZCRX interface
    queue, maps the refill area, and prepares the refill ring.
 2. Call `Start` to submit the extended `RECV_ZC` operation.
 3. On the CQE dispatch path, ZCRX completions route to the `ZCRXHandler`:
-   - `OnData` delivers a `ZCRXBuffer` pointing into the NIC-mapped area. Call `Release` when done to return the slot to
-     the kernel. Return `false` to request a best-effort stop.
+    - `OnData` delivers a `ZCRXBuffer` pointing into the NIC-mapped area. Call `Release` when done to return the slot to
+      the kernel. Return `false` to request a best-effort stop.
    - `OnError` delivers CQE errors. Return `false` to request a best-effort stop.
    - `OnStopped` fires once during terminal retirement, before the state reaches `Stopped`.
 4. Call `Stop` to submit an async cancel. The receiver transitions through `Stopping` → `Retiring` → `Stopped`.
@@ -510,10 +525,10 @@ The example tests in `uring/examples/` show the API in practice.
 - `buffer_ring_test.go`, buffer ring provisioning and multi-size buffer groups
 - `context_test.go`, direct, indirect, and extended `SQEContext` flows plus `CQEView` access
 - `echo_test.go`, TCP echo server and UDP ping-pong flows
-- `timeout_test.go`, timeout and linked-timeout operations
+- `timeout_linux_test.go`, timeout and linked-timeout operations
 
 The package-level `listener_example_test.go` covers listener creation with multishot accept, and
-`socket_integration_test.go` covers the TCP client connect/send flow.
+`socket_integration_linux_test.go` covers the TCP client connect/send flow.
 
 ## Operational notes
 
@@ -521,7 +536,7 @@ The package-level `listener_example_test.go` covers listener creation with multi
 - `ring.Features` reports actual SQ/CQ entry counts, SQE slot width, and the byte order used to interpret `user_data`.
 - Leave `MultiIssuers` unset for the default single-issuer configuration (`SINGLE_ISSUER` + `DEFER_TASKRUN`) when a
   single execution path serializes submit-state operations (`submit`, `Wait`/`enter`, `Stop`, and resize). Set it only
-  when multiple goroutines need concurrent submission or wait-side enter — this switches the ring to the shared-submit
+  when multiple goroutines need concurrent submission or wait-side enter; this switches the ring to the shared-submit
   `COOP_TASKRUN` configuration.
 - `EpollWait` requires `timeout` to remain `0`; use `LinkTimeout` when you need a deadline.
 - Release or discard borrowed completion views and pooled contexts promptly.
@@ -530,10 +545,9 @@ The package-level `listener_example_test.go` covers listener creation with multi
 
 ## Platform support
 
-`uring` targets Go 1.26+ and Linux 6.18+ on the real kernel-backed path. Most
-source files and example tests carry a `//go:build linux` guard. Darwin files
-provide compile stubs for the shared surface only; Linux-only capabilities
-remain Linux-only and do not change the Linux runtime baseline.
+`uring` targets Go 1.26+ and Linux 6.18+ on the real kernel-backed path. Most source files and example tests carry a
+`//go:build linux` guard. Darwin files provide compile stubs for the shared surface only; Linux-only capabilities remain
+Linux-only and do not change the Linux runtime baseline.
 
 ## License
 

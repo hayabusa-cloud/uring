@@ -9,9 +9,9 @@ package uring
 import "code.hybscloud.com/iofd"
 
 // CQEView provides a view into a completion queue entry.
-// It exposes kernel completion facts directly and lets higher layers decide
-// how to route or interpret them. When available, it also exposes the
-// submission context that produced those facts.
+// It exposes kernel completion facts directly and lets caller-side runtime
+// code decide how to route or interpret them. When available,
+// it also exposes the submission context that produced those facts.
 //
 // # Property Patterns
 //
@@ -32,7 +32,7 @@ import "code.hybscloud.com/iofd"
 //	    }
 //	    fmt.Printf("completed op=%d on fd=%d with res=%d\n", cqe.Op(), cqe.FD(), cqe.Res)
 //	    if cqe.HasMore() {
-//	        // Higher layers decide whether to keep routing this live stream.
+//	        // Caller-side runtime code decides whether to keep routing this live stream.
 //	    }
 //	    if cqe.FullSQE() {
 //	        // Indirect and Extended modes also expose the submitted SQE.

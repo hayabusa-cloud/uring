@@ -17,7 +17,8 @@ registro de buffers, operaciones multishot y primitivas de configuración de lis
 
 El diseño sigue un principio de frontera explícita: la mecánica orientada al kernel y los hechos observables de
 completado permanecen en el borde de la API, mientras que la política y la composición quedan por encima de esa
-frontera.
+frontera. El código runtime del llamador posee la correlación de completados, retry/backoff, el enrutamiento de handlers
+y sesiones, el ciclo de vida de conexiones y la liberación terminal de recursos.
 
 Las superficies principales son:
 
@@ -91,10 +92,9 @@ kernel necesario para que el deferred task work avance una vez vaciada la SQ; el
 con las operaciones de submit-state. `iox.ErrWouldBlock` indica que no hay ningún completado observable en el límite
 actual. Este error está definido en `code.hybscloud.com/iox`.
 
-`Start` y `Stop` forman el par de ciclo de vida del ring. `Stop` es
-idempotente y deja el ring permanentemente inutilizable, por lo que solo
-debe llamarse tras drenar todas las operaciones en vuelo, recoger los CQE
-pendientes y detener las suscripciones multishot activas.
+`Start` y `Stop` forman el par de ciclo de vida del ring. `Stop` es idempotente y deja el ring permanentemente
+inutilizable, por lo que solo debe llamarse tras drenar todas las operaciones en vuelo, recoger los CQE pendientes y
+detener las suscripciones multishot activas.
 
 ## Tipos y operaciones
 
@@ -255,16 +255,31 @@ La frontera de implementación se define así:
 2. `Start` registra los buffers y habilita el ring para la línea base fija de Linux 6.18+.
 3. Los métodos de operación declaran intención escribiendo SQE.
 4. `Wait` vacía los envíos y devuelve observaciones prestadas de CQE.
-5. Las capas superiores deciden planificación, reintentos, parking y orquestación.
+5. El código runtime del llamador decide planificación, reintentos, parking, enrutamiento de conexión/sesión y política
+   terminal de recursos.
 
 De este modo, `uring` se mantiene centrado en la mecánica frente al kernel y preserva el significado de los completados
 a través de la frontera.
 
+## Frontera de runtime
+
+Las capas runtime por encima de `uring` deben usarlo como backend de kernel, no como planificador. La frontera ideal es
+unidireccional: `uring` prepara SQEs, recoge CQEs, preserva `user_data`, expone `res` y flags de CQE, e informa hechos
+de propiedad; el código runtime del llamador correlaciona esas observaciones con sus propios tokens, aplica
+retry/backoff, enruta handlers y sesiones, agrupa envíos y libera recursos terminales.
+
+Un puente runtime puede consumir CQEs en modo Extended cuando la ejecución abstracta necesita hechos de completado. Un
+runtime por conexión también puede sondear CQEs Extended raw directamente cuando necesita resultado de CQE, flags,
+buffer ID y token codificado antes de reducir el evento a callbacks de handler.
+
+Las capas de contexto y ejecución abstracta por encima de esta frontera no cambian el rol de `uring` como frontera del
+kernel.
+
 ## Patrones para la capa de aplicación
 
 `uring` expone los mecanismos orientados al kernel; la planificación, los reintentos, el seguimiento de conexiones y la
-interpretación del protocolo corresponden a las capas superiores. Los patrones siguientes muestran formas habituales de
-estructurar esa capa superior.
+interpretación del protocolo corresponden a las capas superiores. Los patrones siguientes describen la frontera que debe
+preservar un runtime del llamador.
 
 ### Bucle de eventos propietario del ring
 
@@ -311,24 +326,24 @@ devuelva `iox.ErrWouldBlock` o no recoja ningún CQE, y `backoff.Reset()` tras c
 
 ### Ciclo de vida de suscripciones multishot
 
-Una operación multishot genera un flujo de CQEs hasta que el kernel envía uno final (sin `IORING_CQE_F_MORE`). La capa
-de framework rastrea las suscripciones y gestiona la reemisión:
+Una operación multishot genera un flujo de CQEs hasta que el kernel envía uno final (sin `IORING_CQE_F_MORE`). El código
+runtime del llamador rastrea las suscripciones y gestiona la reemisión:
 
 ```go
 handler := uring.NewMultishotSubscriber().
-OnStep(func(step uring.MultishotStep) uring.MultishotAction {
-if step.Err != nil {
-return uring.MultishotStop
-}
-connFD := iofd.FD(step.CQE.Res)
-registerConnection(connFD)
-return uring.MultishotContinue
-}).
-OnStop(func (err error, cancelled bool) {
-if !cancelled {
-resubscribeAccept()
-}
-})
+    OnStep(func(step uring.MultishotStep) uring.MultishotAction {
+        if step.Err != nil {
+            return uring.MultishotStop
+        }
+        connFD := iofd.FD(step.CQE.Res)
+        registerConnection(connFD)
+        return uring.MultishotContinue
+    }).
+    OnStop(func(err error, cancelled bool) {
+        if !cancelled {
+            resubscribeAccept()
+        }
+    })
 
 _, err := ring.AcceptMultishot(acceptCtx, handler.Handler())
 ```
@@ -344,8 +359,8 @@ necesidad de una tabla de búsqueda global:
 
 ```go
 type ConnState struct {
-Addr    netip.AddrPort
-Created int64
+    Addr    netip.AddrPort
+    Created int64
 }
 
 ext := ring.ExtSQE()
@@ -355,8 +370,8 @@ ctx.Val1 = sequenceNumber
 
 sqeCtx := uring.PackExtended(ext)
 if err := ring.Send(sqeCtx, &fd, payload); err != nil {
-ring.PutExtSQE(ext)
-return err
+    ring.PutExtSQE(ext)
+    return err
 }
 ```
 
@@ -372,7 +387,8 @@ ring.PutExtSQE(ext)
 
 Mantenga las raíces de punteros Go activas accesibles fuera de `UserData`. El GC no rastrea esos bytes crudos. El
 conjunto de raíces sidecar adjunto a cada slot `ExtSQE` se encarga de esto para los protocolos internos multishot y
-listener, pero el código de framework que coloca refs tipados debe mantenerlos accesibles de forma independiente.
+listener, pero el código de runtime del llamador que coloca refs tipados debe mantenerlos accesibles de forma
+independiente.
 
 ### Composición de plazos
 
@@ -381,30 +397,30 @@ compiten: exactamente uno se completa y el otro se cancela.
 
 ```go
 recvCtx := uring.ForFD(fd).
-WithOp(uring.IORING_OP_RECV).
-WithBufGroup(group)
+    WithOp(uring.IORING_OP_RECV).
+    WithBufGroup(group)
 
 if err := ring.Receive(recvCtx, &fd, nil, uring.WithFlags(uring.IOSQE_IO_LINK)); err != nil {
-return err
+    return err
 }
 
 timeoutCtx := uring.PackDirect(uring.IORING_OP_LINK_TIMEOUT, 0, 0, 0)
 if err := ring.LinkTimeout(timeoutCtx, 5*time.Second); err != nil {
-return err
+    return err
 }
 ```
 
-La capa de framework maneja ambos resultados: una recepción exitosa cancela el timeout, y un timeout disparado cancela
-la recepción. Ambos producen CQEs que el bucle de despacho debe observar.
+La capa de runtime del llamador maneja ambos resultados: una recepción exitosa cancela el timeout, y un timeout
+disparado cancela la recepción. Ambos producen CQEs que el bucle de despacho debe observar.
 
 ## Patrones de uso en TCP
 
 Los siguientes son los flujos más cortos, pensados para leer junto con los tests:
 
-| Escenario | API principales | Referencia |
-|-----------|-----------------|------------|
+| Escenario     | API principales                                                  | Referencia                                                                        |
+|---------------|------------------------------------------------------------------|-----------------------------------------------------------------------------------|
 | Servidor echo | `ListenerManager`, `AcceptMultishot`, `ReceiveMultishot`, `Send` | `listener_example_test.go`, `examples/multishot_test.go`, `examples/echo_test.go` |
-| Cliente | `TCP4Socket`, `Connect`, `Send`, `Receive` | `socket_integration_test.go` |
+| Cliente       | `TCP4Socket`, `Connect`, `Send`, `Receive`                       | `socket_integration_linux_test.go`                                                |
 
 ### Servidor echo TCP
 
@@ -468,24 +484,25 @@ if err := ring.Receive(recvCtx, &clientFD, buf); err != nil {
 ```
 
 Reutilice el bucle `Wait` de la sección de ciclo de vida del ring tras cada envío para observar el completado
-correspondiente. El archivo `socket_integration_test.go` cubre el flujo de connect/send.
+correspondiente. El archivo `socket_integration_linux_test.go` cubre el flujo de connect/send.
 
 ## Recepción zero-copy (ZCRX)
 
 `ZCRXReceiver` gestiona la recepción zero-copy desde una cola RX de hardware de NIC mediante `io_uring`.
 
-`NewZCRXReceiver` requiere un ring creado con CQE de 32 bytes (`IORING_SETUP_CQE32`). La superficie actual de `Options`
-no expone ese flag de configuración, de modo que los rings creados por la ruta estándar de `New` provocan que este
-constructor devuelva `ErrNotSupported`.
+`NewZCRXReceiver` está preparado para rings con CQE de 32 bytes (`IORING_SETUP_CQE32`). La superficie actual de
+`Options` no expone ese flag de configuración, de modo que los rings creados por la ruta estándar de `New` provocan que
+este constructor devuelva `ErrNotSupported`. Hasta que se exponga una ruta de configuración CQE32, esta sección
+documenta el contrato de frontera del receptor y no una receta pública ejecutable.
 
 ### Ciclo de vida
 
-1. Sobre un ring con CQE de 32 bytes, cree el receptor con `NewZCRXReceiver`. El constructor registra la cola de
+1. Con un ring habilitado para CQE32, cree el receptor con `NewZCRXReceiver`. El constructor registra la cola de
    interfaz ZCRX, mapea el área de refill y prepara el refill ring.
 2. Llame a `Start` para enviar la operación extendida `RECV_ZC` en el ring.
 3. En la ruta de despacho de CQE, los completados ZCRX se enrutan al `ZCRXHandler`:
-   - `OnData` entrega un `ZCRXBuffer` que apunta al área mapeada por la NIC. Llame a `Release` al terminar para reponer
-     el slot ante el kernel. Devuelva `false` para solicitar una parada de mejor esfuerzo.
+    - `OnData` entrega un `ZCRXBuffer` que apunta al área mapeada por la NIC. Llame a `Release` al terminar para reponer
+      el slot ante el kernel. Devuelva `false` para solicitar una parada de mejor esfuerzo.
    - `OnError` entrega errores de CQE. Devuelva `false` para solicitar una parada de mejor esfuerzo.
    - `OnStopped` se ejecuta una vez durante la retirada terminal, antes de que el estado pase a `Stopped`.
 4. Llame a `Stop` para enviar un async cancel. El receptor transita por `Stopping` → `Retiring` → `Stopped`.
@@ -521,10 +538,10 @@ Los tests de ejemplo en `uring/examples/` ilustran la API en la práctica.
 - `buffer_ring_test.go`, provisión de buffer rings y grupos de buffers de varios tamaños
 - `context_test.go`, flujos `SQEContext` direct, indirect y extended, con acceso desde `CQEView`
 - `echo_test.go`, flujos de servidor echo TCP y UDP ping-pong
-- `timeout_test.go`, operaciones de timeout y linked-timeout
+- `timeout_linux_test.go`, operaciones de timeout y linked-timeout
 
 A nivel de paquete, `listener_example_test.go` cubre la creación de listeners con accept multishot, y
-`socket_integration_test.go` cubre el flujo del cliente TCP de connect/send.
+`socket_integration_linux_test.go` cubre el flujo del cliente TCP de connect/send.
 
 ## Notas operativas
 
@@ -542,12 +559,10 @@ A nivel de paquete, `listener_example_test.go` cubre la creación de listeners c
 
 ## Soporte de plataforma
 
-`uring` apunta a Go 1.26+ y Linux 6.18+ en la ruta real respaldada por el
-kernel. La mayoría de los archivos de implementación y tests de ejemplo
-están protegidos con `//go:build linux`. Los archivos de Darwin proporcionan
-solo stubs de compilación para la superficie compartida; las capacidades
-exclusivas de Linux siguen siendo exclusivas de Linux y no alteran la línea
-base de ejecución en Linux descrita arriba.
+`uring` apunta a Go 1.26+ y Linux 6.18+ en la ruta real respaldada por el kernel. La mayoría de los archivos de
+implementación y tests de ejemplo están protegidos con `//go:build linux`. Los archivos de Darwin proporcionan solo
+stubs de compilación para la superficie compartida; las capacidades exclusivas de Linux siguen siendo exclusivas de
+Linux y no alteran la línea base de ejecución en Linux descrita arriba.
 
 ## Licencia
 
