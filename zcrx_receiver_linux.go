@@ -358,6 +358,7 @@ func (r *ZCRXReceiver) Start(fd iofd.FD, handler ZCRXHandler) error {
 		return err
 	}
 
+	ext.SQE = ioUringSqe{}
 	ext.SQE.opcode = IORING_OP_RECV_ZC
 	ext.SQE.flags = 0
 	ext.SQE.ioprio = uint16(IORING_RECV_MULTISHOT)
