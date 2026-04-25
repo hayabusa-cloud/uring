@@ -114,7 +114,7 @@ func (t *ZCTracker) SendZC(fd iofd.FD, buf []byte, handler ZCHandler, options ..
 	ctx := zcInitCtx(ext, t, handler)
 	ctx.Fn = zcTrackerCQEHandler
 
-	// Set up ExtSQE.SQE fields directly for Extended mode
+	ext.SQE = ioUringSqe{}
 	ext.SQE.opcode = IORING_OP_SEND_ZC
 	ext.SQE.flags = flags | t.ring.writeLikeOpFlags
 	ext.SQE.ioprio = ioprio
@@ -156,8 +156,8 @@ func (t *ZCTracker) SendZCFixed(fd iofd.FD, bufIndex int, offset int, length int
 	ctx := zcInitCtx(ext, t, handler)
 	ctx.Fn = zcTrackerCQEHandler
 
-	// Set up ExtSQE.SQE fields for registered buffer zero-copy send.
-	// IORING_RECVSEND_FIXED_BUF goes in ioprio (not IOSQE_FIXED_FILE in flags).
+	ext.SQE = ioUringSqe{}
+	// IORING_RECVSEND_FIXED_BUF goes in ioprio, not IOSQE_FIXED_FILE in flags.
 	ext.SQE.opcode = IORING_OP_SEND_ZC
 	ext.SQE.flags = flags | t.ring.writeLikeOpFlags
 	ext.SQE.ioprio = ioprio | IORING_RECVSEND_FIXED_BUF

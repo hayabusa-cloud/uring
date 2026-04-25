@@ -103,7 +103,7 @@ func (r *IncrementalReceiver) Recv(fd iofd.FD, handler IncrementalHandler) error
 	ctx := incInitCtx(ext, r, handler)
 	ctx.Fn = incrementalCQEHandler
 
-	// Set up SQE for RECV with buffer selection
+	ext.SQE = ioUringSqe{}
 	ext.SQE.opcode = IORING_OP_RECV
 	ext.SQE.fd = int32(fd)
 	ext.SQE.addr = 0 // Kernel selects buffer
