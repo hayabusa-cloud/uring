@@ -8,6 +8,8 @@ package uring
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -39,55 +41,68 @@ func newTestIoUring(t *testing.T, options ...func(*ioUringParams)) *ioUring {
 func newPollingDirectFilePath(t *testing.T) string {
 	t.Helper()
 
+	var probeErr error
 	for _, base := range []string{".", "/var/tmp"} {
-		path, ok := newDirectFilePathInDir(t, base)
-		if ok {
+		path, err := newDirectFilePathInDir(t, base)
+		if err == nil {
 			return path
 		}
+		probeErr = errors.Join(probeErr, fmt.Errorf("%s: %w", base, err))
 	}
 
-	t.Skip("polling direct-I/O file test requires a writable block-backed filesystem; current working directory and /var/tmp are unsupported")
+	t.Skipf("polling direct-I/O file test requires a writable block-backed filesystem; no usable path found in current working directory or /var/tmp; probe errors: %v", probeErr)
 	return ""
 }
 
-func newDirectFilePathInDir(t *testing.T, base string) (string, bool) {
+func newDirectFilePathInDir(t *testing.T, base string) (string, error) {
 	t.Helper()
 
 	info, err := os.Stat(base)
-	if err != nil || !info.IsDir() {
-		return "", false
+	if err != nil {
+		return "", fmt.Errorf("stat base: %w", err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("base is not a directory")
 	}
 
 	dir, err := os.MkdirTemp(base, "uring-direct-*")
 	if err != nil {
-		return "", false
+		return "", fmt.Errorf("create probe dir: %w", err)
 	}
 
 	probe := filepath.Join(dir, "probe_direct.txt")
 	f, err := os.OpenFile(probe, os.O_RDWR|os.O_CREATE|zcall.O_DIRECT, 0660)
 	if err != nil {
 		_ = os.RemoveAll(dir)
-		return "", false
+		return "", fmt.Errorf("open O_DIRECT probe: %w", err)
 	}
 	block := AlignedMemBlock()
 	n, writeErr := f.Write(block)
 	closeErr := f.Close()
 	_ = os.Remove(probe)
-	if writeErr != nil || closeErr != nil || n != len(block) {
+	if writeErr != nil {
 		_ = os.RemoveAll(dir)
-		return "", false
+		return "", fmt.Errorf("write O_DIRECT probe: %w", writeErr)
+	}
+	if closeErr != nil {
+		_ = os.RemoveAll(dir)
+		return "", fmt.Errorf("close O_DIRECT probe: %w", closeErr)
+	}
+	if n != len(block) {
+		_ = os.RemoveAll(dir)
+		return "", fmt.Errorf("short O_DIRECT probe write: wrote %d of %d bytes", n, len(block))
 	}
 	t.Cleanup(func() {
 		_ = os.RemoveAll(dir)
 	})
 
-	return filepath.Join(dir, "test_f_direct.txt"), true
+	return filepath.Join(dir, "test_f_direct.txt"), nil
 }
 
 func TestIOUring_BasicUsage(t *testing.T) {
-	fr := func(t *testing.T, ur *ioUring) {
-		defer os.Remove("test_f_direct.txt")
-		f, err := os.OpenFile("test_f_direct.txt", os.O_RDWR|os.O_CREATE|zcall.O_DIRECT, 0660)
+	fr := func(t *testing.T, ur *ioUring, path string) {
+		defer os.Remove(path)
+		f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|zcall.O_DIRECT, 0660)
 		if err != nil {
 			t.Errorf("open file: %v", err)
 			return
@@ -385,7 +400,7 @@ func TestIOUring_BasicUsage(t *testing.T) {
 
 	t.Run("normal mode read file", func(t *testing.T) {
 		ur := newTestIoUring(t)
-		fr(t, ur)
+		fr(t, ur, "test_f_direct.txt")
 	})
 
 	t.Run("normal mode write file", func(t *testing.T) {
@@ -410,7 +425,7 @@ func TestIOUring_BasicUsage(t *testing.T) {
 
 	t.Run("sq poll mode read file", func(t *testing.T) {
 		ur := newTestIoUring(t, ioUringSqPollOptions)
-		fr(t, ur)
+		fr(t, ur, newPollingDirectFilePath(t))
 	})
 
 	t.Run("sq poll mode write file", func(t *testing.T) {
