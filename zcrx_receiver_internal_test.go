@@ -232,6 +232,25 @@ func TestZCRXRefillQSeedUsesChunkBoundaries(t *testing.T) {
 	}
 }
 
+func TestZCRXRefillQAvailableTracksProducerCapacity(t *testing.T) {
+	head := uint32(2)
+	tail := uint32(5)
+	q := &zcrxRefillQ{
+		kHead:   &head,
+		kTail:   &tail,
+		entries: 8,
+		tail:    tail,
+	}
+
+	if got := q.available(); got != 5 {
+		t.Fatalf("available: got %d, want 5", got)
+	}
+	head = 5
+	if got := q.available(); got != 8 {
+		t.Fatalf("available after kernel advance: got %d, want 8", got)
+	}
+}
+
 func TestZCRXBufferReleasePublishesOriginalSlotLength(t *testing.T) {
 	head := uint32(0)
 	tail := uint32(0)
@@ -624,6 +643,93 @@ func TestZCRXReceiverStopUsesAtomicUserData(t *testing.T) {
 	}
 }
 
+func TestZCRXReceiverActiveReportsOnlyActiveState(t *testing.T) {
+	r := &ZCRXReceiver{}
+	if r.Active() {
+		t.Fatal("Active: idle receiver should report false")
+	}
+	r.state.Store(zcrxStateActive)
+	if !r.Active() {
+		t.Fatal("Active: active receiver should report true")
+	}
+	r.state.Store(zcrxStateStopping)
+	if r.Active() {
+		t.Fatal("Active: stopping receiver should report false")
+	}
+}
+
+func TestZCRXReceiverCQEHandlerDispatchesAnchoredReceiver(t *testing.T) {
+	pool := NewContextPools(4)
+	ext := pool.Extended()
+	if ext == nil {
+		t.Fatal("pool exhausted")
+	}
+	h := &zcrxRecordingHandler{}
+	r := &ZCRXReceiver{
+		pool:    pool,
+		handler: h,
+		ext:     ext,
+	}
+	r.state.Store(zcrxStateActive)
+	extAnchors(ext).owner = r
+
+	raw := &zcrxCQE32{}
+	raw.base.userData = PackExtended(ext).Raw()
+	raw.base.flags = IORING_CQE_F_MORE
+
+	zcrxCQEHandler(nil, nil, &raw.base)
+
+	if len(h.data) != 1 {
+		t.Fatalf("OnData calls: got %d, want 1", len(h.data))
+	}
+	if got := h.data[0].Len(); got != 0 {
+		t.Fatalf("buffer length: got %d, want 0", got)
+	}
+	if h.stopped != 0 {
+		t.Fatalf("OnStopped calls: got %d, want 0 for nonterminal CQE", h.stopped)
+	}
+	if !r.Active() {
+		t.Fatal("receiver should remain active after nonterminal CQE")
+	}
+}
+
+func TestZCRXReceiverCQEHandlerIgnoresNonExtendedAndUnownedContexts(t *testing.T) {
+	zcrxCQEHandler(nil, nil, &ioUringCqe{})
+
+	pool := NewContextPools(2)
+	ext := pool.Extended()
+	if ext == nil {
+		t.Fatal("pool exhausted")
+	}
+	zcrxCQEHandler(nil, nil, &ioUringCqe{
+		userData: PackExtended(ext).Raw(),
+	})
+}
+
+func TestZCRXReceiverDeliverErrorWithoutHandlerRequestsStop(t *testing.T) {
+	prev := zcrxAsyncCancelByUserData
+	defer func() { zcrxAsyncCancelByUserData = prev }()
+
+	calls := 0
+	zcrxAsyncCancelByUserData = func(ring *Uring, userData uint64) error {
+		calls++
+		return nil
+	}
+
+	r := &ZCRXReceiver{}
+	r.state.Store(zcrxStateActive)
+	r.userData.Store(99)
+
+	r.deliverError(errors.New("bad cqe"))
+
+	if calls != 1 {
+		t.Fatalf("cancel calls: got %d, want 1", calls)
+	}
+	if got := r.state.Load(); got != zcrxStateStopping {
+		t.Fatalf("state: got %d, want %d", got, zcrxStateStopping)
+	}
+}
+
 func TestZCRXReceiverHandleCQETerminalSuccessProcessesFinalPayload(t *testing.T) {
 	pool := NewContextPools(4)
 	ext := pool.Extended()
@@ -806,4 +912,31 @@ func TestZCRXReceiverCloseRequiresStoppedAndClosedRing(t *testing.T) {
 	if r.area.size != 0 {
 		t.Fatalf("area.size: got %d, want 0", r.area.size)
 	}
+}
+
+func TestZCRXErrFromResultNonNegativeIsNil(t *testing.T) {
+	if err := errFromResult(0); err != nil {
+		t.Fatalf("errFromResult(0): got %v, want nil", err)
+	}
+	if err := errFromResult(5); err != nil {
+		t.Fatalf("errFromResult(5): got %v, want nil", err)
+	}
+}
+
+func TestZCRXMmapHelpersAllocateWritableMemory(t *testing.T) {
+	size := int(iobuf.PageSize)
+
+	area, err := mmapArea(size, false)
+	if err != nil {
+		t.Fatalf("mmapArea: %v", err)
+	}
+	defer munmapArea(area, size)
+	*(*byte)(area) = 0x5a
+
+	ring, err := mmapRing(size)
+	if err != nil {
+		t.Fatalf("mmapRing: %v", err)
+	}
+	defer munmapRing(ring, size)
+	*(*byte)(ring) = 0xa5
 }
