@@ -80,16 +80,16 @@ const (
 	IORING_OP_LAST
 )
 
-// Timeout clock and behavior flags — mirrors Linux IORING_TIMEOUT_* constants.
+// Timeout clock and behavior flags mirror Linux IORING_TIMEOUT_* constants.
 // Defined here so darwin build stubs share the same named constants.
 const (
-	IORING_TIMEOUT_ABS           uint32 = 1 << iota // 0x01 — absolute timestamp
-	IORING_TIMEOUT_UPDATE                           // 0x02 — update existing timeout
-	IORING_TIMEOUT_BOOTTIME                         // 0x04 — use CLOCK_BOOTTIME
-	IORING_TIMEOUT_REALTIME                         // 0x08 — use CLOCK_REALTIME
-	IORING_LINK_TIMEOUT_UPDATE                      // 0x10 — update linked timeout
-	IORING_TIMEOUT_ETIME_SUCCESS                    // 0x20 — convert -ETIME to success
-	IORING_TIMEOUT_MULTISHOT                        // 0x40 — repeat on expiry
+	IORING_TIMEOUT_ABS           uint32 = 1 << iota // 0x01, absolute timestamp
+	IORING_TIMEOUT_UPDATE                           // 0x02, update existing timeout
+	IORING_TIMEOUT_BOOTTIME                         // 0x04, use CLOCK_BOOTTIME
+	IORING_TIMEOUT_REALTIME                         // 0x08, use CLOCK_REALTIME
+	IORING_LINK_TIMEOUT_UPDATE                      // 0x10, update linked timeout
+	IORING_TIMEOUT_ETIME_SUCCESS                    // 0x20, convert -ETIME to success
+	IORING_TIMEOUT_MULTISHOT                        // 0x40, repeat on expiry
 
 	IORING_TIMEOUT_CLOCK_MASK  = IORING_TIMEOUT_BOOTTIME | IORING_TIMEOUT_REALTIME
 	IORING_TIMEOUT_UPDATE_MASK = IORING_TIMEOUT_UPDATE | IORING_LINK_TIMEOUT_UPDATE

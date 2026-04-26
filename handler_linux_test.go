@@ -347,7 +347,7 @@ func TestMultishotSubscriberCallbacks(t *testing.T) {
 }
 
 // =============================================================================
-// handler_noop.go coverage — exercise noop handler methods
+// handler_noop.go coverage exercises noop handler methods.
 // =============================================================================
 
 func TestNoopHandlerMethods(t *testing.T) {

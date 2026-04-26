@@ -171,7 +171,7 @@ func TestListenerAbortPreservesResources(t *testing.T) {
 
 	// After abort, caller still owns the ExtSQE
 	if op.Ext() == nil {
-		t.Fatal("ExtSQE is nil after abort — caller should still own it")
+		t.Fatal("ExtSQE is nil after abort; caller should still own it")
 	}
 	// FD was set by driveListenerCQE via op.SetFD
 	fd := op.FD()
@@ -237,7 +237,7 @@ func TestListenerOpCloseReleasesResources(t *testing.T) {
 	closed = true
 
 	if op.Ext() != nil {
-		t.Fatal("ExtSQE not nil after Close — should be released to pool")
+		t.Fatal("ExtSQE not nil after Close; should be released to pool")
 	}
 	if got := op.FD(); got >= 0 {
 		t.Fatalf("FD = %d after Close, want < 0", got)
