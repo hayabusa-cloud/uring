@@ -29,10 +29,18 @@ const (
 )
 
 // ListenerHandler receives completion events during listener creation (darwin stub).
+// The bool-return callbacks are authoritative control-flow hooks: returning true
+// advances to the next setup phase, while false aborts before submitting it.
 type ListenerHandler interface {
+	// OnSocketCreated reports that socket creation succeeded. Return true to
+	// continue listener setup or false to abort it.
 	OnSocketCreated(fd iofd.FD) bool
+	// OnBound reports that bind succeeded. Return true to continue listener
+	// setup or false to abort it.
 	OnBound() bool
+	// OnListening reports that the socket is now listening.
 	OnListening()
+	// OnError reports a terminal failure for the current setup stage.
 	OnError(op uint8, err error)
 }
 
@@ -182,4 +190,4 @@ func (op *ListenerOp) AcceptMultishot(handler MultishotHandler, options ...OpOpt
 }
 
 // ErrNotReady indicates the listener is not yet ready for accept.
-var ErrNotReady = errors.New("listener not ready")
+var ErrNotReady = errors.New("uring: listener not ready")
