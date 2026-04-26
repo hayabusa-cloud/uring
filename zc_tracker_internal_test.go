@@ -101,3 +101,50 @@ func TestZCTrackerNotificationReturnsExtSQEOnUnexpectedState(t *testing.T) {
 		t.Fatal("expected notification CQE to return ExtSQE to pool")
 	}
 }
+
+func TestZCTrackerCQEHandlerDispatchesAnchoredTracker(t *testing.T) {
+	pool := NewContextPools(4)
+	ext := pool.Extended()
+	if ext == nil {
+		t.Fatal("pool exhausted")
+	}
+	h := &zcContractHandler{}
+	tracker := &ZCTracker{pool: pool}
+	_ = zcInitCtx(ext, tracker, h)
+	userData := PackExtended(ext).Raw()
+
+	zcTrackerCQEHandler(nil, nil, &ioUringCqe{
+		userData: userData,
+		res:      44,
+		flags:    IORING_CQE_F_MORE,
+	})
+	zcTrackerCQEHandler(nil, nil, &ioUringCqe{
+		userData: userData,
+		res:      -7,
+		flags:    IORING_CQE_F_NOTIF,
+	})
+
+	if len(h.completed) != 1 || h.completed[0] != 44 {
+		t.Fatalf("OnCompleted results: got %v, want [44]", h.completed)
+	}
+	if len(h.notified) != 1 || h.notified[0] != 44 {
+		t.Fatalf("OnNotification results: got %v, want [44]", h.notified)
+	}
+	if got := pool.Extended(); got == nil {
+		t.Fatal("expected notification CQE to return ExtSQE to pool")
+	}
+}
+
+func TestZCTrackerCQEHandlerIgnoresNonExtendedAndUnownedContexts(t *testing.T) {
+	zcTrackerCQEHandler(nil, nil, &ioUringCqe{})
+
+	pool := NewContextPools(2)
+	ext := pool.Extended()
+	if ext == nil {
+		t.Fatal("pool exhausted")
+	}
+	zcTrackerCQEHandler(nil, nil, &ioUringCqe{
+		userData: PackExtended(ext).Raw(),
+		flags:    IORING_CQE_F_MORE,
+	})
+}
