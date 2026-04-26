@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -33,6 +34,54 @@ func newTestIoUring(t *testing.T, options ...func(*ioUringParams)) *ioUring {
 		}
 	})
 	return ur
+}
+
+func newPollingDirectFilePath(t *testing.T) string {
+	t.Helper()
+
+	for _, base := range []string{".", "/var/tmp"} {
+		path, ok := newDirectFilePathInDir(t, base)
+		if ok {
+			return path
+		}
+	}
+
+	t.Skip("polling direct-I/O file test requires a writable block-backed filesystem; current working directory and /var/tmp are unsupported")
+	return ""
+}
+
+func newDirectFilePathInDir(t *testing.T, base string) (string, bool) {
+	t.Helper()
+
+	info, err := os.Stat(base)
+	if err != nil || !info.IsDir() {
+		return "", false
+	}
+
+	dir, err := os.MkdirTemp(base, "uring-direct-*")
+	if err != nil {
+		return "", false
+	}
+
+	probe := filepath.Join(dir, "probe_direct.txt")
+	f, err := os.OpenFile(probe, os.O_RDWR|os.O_CREATE|zcall.O_DIRECT, 0660)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return "", false
+	}
+	block := AlignedMemBlock()
+	n, writeErr := f.Write(block)
+	closeErr := f.Close()
+	_ = os.Remove(probe)
+	if writeErr != nil || closeErr != nil || n != len(block) {
+		_ = os.RemoveAll(dir)
+		return "", false
+	}
+	t.Cleanup(func() {
+		_ = os.RemoveAll(dir)
+	})
+
+	return filepath.Join(dir, "test_f_direct.txt"), true
 }
 
 func TestIOUring_BasicUsage(t *testing.T) {
@@ -115,9 +164,9 @@ func TestIOUring_BasicUsage(t *testing.T) {
 		}
 	}
 
-	fw := func(t *testing.T, ur *ioUring) {
-		defer os.Remove("test_f_direct.txt")
-		f, err := os.OpenFile("test_f_direct.txt", os.O_RDWR|os.O_CREATE|zcall.O_DIRECT, 0660)
+	fw := func(t *testing.T, ur *ioUring, path string) {
+		defer os.Remove(path)
+		f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|zcall.O_DIRECT, 0660)
 		if err != nil {
 			t.Errorf("open file: %v", err)
 			return
@@ -341,7 +390,7 @@ func TestIOUring_BasicUsage(t *testing.T) {
 
 	t.Run("normal mode write file", func(t *testing.T) {
 		ur := newTestIoUring(t)
-		fw(t, ur)
+		fw(t, ur, "test_f_direct.txt")
 	})
 
 	t.Run("normal mode read socket", func(t *testing.T) {
@@ -356,7 +405,7 @@ func TestIOUring_BasicUsage(t *testing.T) {
 
 	t.Run("io poll mode write file", func(t *testing.T) {
 		ur := newTestIoUring(t, ioUringIoPollOptions)
-		fw(t, ur)
+		fw(t, ur, newPollingDirectFilePath(t))
 	})
 
 	t.Run("sq poll mode read file", func(t *testing.T) {
@@ -366,7 +415,7 @@ func TestIOUring_BasicUsage(t *testing.T) {
 
 	t.Run("sq poll mode write file", func(t *testing.T) {
 		ur := newTestIoUring(t, ioUringSqPollOptions)
-		fw(t, ur)
+		fw(t, ur, newPollingDirectFilePath(t))
 	})
 
 	t.Run("sq poll mode read socket", func(t *testing.T) {
@@ -381,7 +430,7 @@ func TestIOUring_BasicUsage(t *testing.T) {
 
 	t.Run("io sq poll mode write file", func(t *testing.T) {
 		ur := newTestIoUring(t, ioUringIoPollOptions, ioUringSqPollOptions)
-		fw(t, ur)
+		fw(t, ur, newPollingDirectFilePath(t))
 	})
 }
 
