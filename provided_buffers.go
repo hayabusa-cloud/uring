@@ -15,10 +15,10 @@ import (
 
 func newUringProvideBuffers(size, n int) *uringProvideBuffers {
 	if size < 2 || size > (1<<28) {
-		panic("size must be between 2 and 268435456")
+		panic("uring: size must be between 2 and 268435456")
 	}
 	if n < 2 || n > (1<<28) {
-		panic("n must be between 2 and 268435456")
+		panic("uring: n must be between 2 and 268435456")
 	}
 	size = roundToPowerOf2(size)
 	n = roundToPowerOf2(n)
@@ -102,7 +102,7 @@ func newUringBufferGroups(scale int) *uringProvideBufferGroups {
 // Tiers with zero count are not allocated.
 func newUringBufferGroupsWithConfig(scale int, cfg BufferGroupsConfig) *uringProvideBufferGroups {
 	if scale < 1 || scale > (1<<12) {
-		panic("scale must be between 1 and 4096")
+		panic("uring: scale must be between 1 and 4096")
 	}
 	scale = roundToPowerOf2(scale)
 	mask := scale - 1

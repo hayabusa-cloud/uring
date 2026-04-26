@@ -419,7 +419,7 @@ func (ur *ioUring) feature(feat uint32) bool {
 // registerBuffers registers buffers for fixed I/O.
 func (ur *ioUring) registerBuffers(addr unsafe.Pointer, n, size int) error {
 	if ur.bufs != nil && len(ur.bufs) > 0 {
-		panic("io-uring buffers already registered")
+		panic("uring: io-uring buffers already registered")
 	}
 	if n < 1 || size < 1 {
 		return ErrInvalidParam
@@ -435,7 +435,7 @@ func (ur *ioUring) registerBuffers(addr unsafe.Pointer, n, size int) error {
 // unregisterBuffers unregisters fixed buffers.
 func (ur *ioUring) unregisterBuffers() error {
 	if ur.bufs == nil || len(ur.bufs) < 1 {
-		panic("no io-uring buffers registered")
+		panic("uring: no io-uring buffers registered")
 	}
 	ur.bufs = [][]byte{}
 	return nil

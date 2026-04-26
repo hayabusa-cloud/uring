@@ -52,7 +52,7 @@ func NewContextPools(capacity int) *ContextPools {
 
 func alignPoolCapacity(capacity int) int {
 	if capacity < 1 || capacity > math.MaxUint32 {
-		panic("capacity must be between 1 and MaxUint32")
+		panic("uring: capacity must be between 1 and MaxUint32")
 	}
 	return roundToPowerOf2(capacity)
 }
@@ -192,7 +192,7 @@ func (q *contextPoolQueue) put(entry uint32) {
 			continue
 		}
 		if t == h+q.capacity {
-			panic("context pool overflow")
+			panic("uring: context pool overflow")
 		}
 
 		turn := (t / q.capacity) & contextPoolEntryTurnMask

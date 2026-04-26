@@ -365,7 +365,7 @@ func (ur *Uring) getBufferGid(f PollFd, size int) uint16 {
 	} else if ur.bufferGroups != nil {
 		return ur.bufferGroups.bufGroupBySize(f, size)
 	}
-	panic("Uring has neither buffers nor bufferGroups set")
+	panic("uring: Uring has neither buffers nor bufferGroups set")
 }
 
 func (ur *Uring) buf(bufGroup bufferGroupIndex, bufIndex uint32) []byte {
@@ -374,5 +374,5 @@ func (ur *Uring) buf(bufGroup bufferGroupIndex, bufIndex uint32) []byte {
 	} else if ur.bufferGroups != nil {
 		return ur.bufferGroups.buf(bufGroup, bufIndex)
 	}
-	panic("Uring has neither buffers nor bufferGroups set")
+	panic("uring: Uring has neither buffers nor bufferGroups set")
 }

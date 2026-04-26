@@ -24,7 +24,7 @@ type uringProvideBuffers struct {
 
 func newUringProvideBuffers(size, n int) *uringProvideBuffers {
 	if size < 1 || n < 1 {
-		panic("size and n must be positive")
+		panic("uring: size and n must be positive")
 	}
 	n = roundToPowerOf2(n)
 
@@ -91,7 +91,7 @@ func newUringBufferGroups(scale int) *uringProvideBufferGroups {
 
 func newUringBufferGroupsWithConfig(scale int, cfg BufferGroupsConfig) *uringProvideBufferGroups {
 	if scale < 1 || scale > (1<<12) {
-		panic("scale must be between 1 and 4096")
+		panic("uring: scale must be between 1 and 4096")
 	}
 	scale = roundToPowerOf2(scale)
 	if cfg.PicoNum > 0 {

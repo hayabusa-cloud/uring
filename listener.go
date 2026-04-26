@@ -33,10 +33,18 @@ const (
 )
 
 // ListenerHandler receives completion events during listener setup.
+// The bool-return callbacks are authoritative control-flow hooks: returning true
+// advances to the next setup phase, while false aborts before submitting it.
 type ListenerHandler interface {
+	// OnSocketCreated reports that socket creation succeeded. Return true to
+	// continue listener setup or false to abort it.
 	OnSocketCreated(fd iofd.FD) bool
+	// OnBound reports that bind succeeded. Return true to continue listener
+	// setup or false to abort it.
 	OnBound() bool
+	// OnListening reports that the socket is now listening.
 	OnListening()
+	// OnError reports a terminal failure for the current setup stage.
 	OnError(op uint8, err error)
 }
 
@@ -52,7 +60,7 @@ type listenerCtxData struct {
 	Domain      uint16        // 2 bytes
 	Backlog     int32         // 4 bytes
 	SockaddrLen uint16        // 2 bytes
-	Sockaddr    [30]byte      // 30 bytes — fits sockaddr_in (16) and sockaddr_in6 (28)
+	Sockaddr    [30]byte      // 30 bytes, fits sockaddr_in (16) and sockaddr_in6 (28)
 }
 
 var _ [40 - unsafe.Sizeof(listenerCtxData{})]struct{}
@@ -114,9 +122,7 @@ func DecodeListenerCQE(cqe CQEView) (ListenerStep, bool) {
 	return step, true
 }
 
-// ────────────────────────────────────────────────────────────────────
-// Stateless SQE preparation — fill fields, no submit, no policy
-// ────────────────────────────────────────────────────────────────────
+// Stateless SQE preparation: fill fields, no submit, no policy.
 
 // PrepareListenerSocket fills ext's SQE for IORING_OP_SOCKET and stores
 // the sockaddr + backlog for subsequent stages. Small sockaddrs stay inline
@@ -181,9 +187,7 @@ func SetListenerReady(ext *ExtSQE) {
 	ctx.Data.State = ListenerStateReady
 }
 
-// ────────────────────────────────────────────────────────────────────
-// ListenerManager — thin convenience for initial SOCKET submission
-// ────────────────────────────────────────────────────────────────────
+// ListenerManager is a thin convenience for initial SOCKET submission.
 
 // ListenerManager provides convenience methods for starting async listener
 // creation. It prepares the initial SOCKET SQE and submits it.
@@ -259,9 +263,7 @@ func (m *ListenerManager) startSocket(domain, sockType, proto int, sa Sockaddr, 
 	return op, nil
 }
 
-// ────────────────────────────────────────────────────────────────────
-// ListenerOp — thin handle for a listener creation in progress
-// ────────────────────────────────────────────────────────────────────
+// ListenerOp is a thin handle for a listener creation in progress.
 
 // ListenerOp is a handle to a listener creation operation.
 // The caller drives the setup state machine; ListenerOp holds the listener FD
@@ -439,4 +441,4 @@ func (op *ListenerOp) releaseExt() {
 }
 
 // ErrNotReady indicates the listener is not yet ready for accept.
-var ErrNotReady = errors.New("listener not ready")
+var ErrNotReady = errors.New("uring: listener not ready")
