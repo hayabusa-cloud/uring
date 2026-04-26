@@ -15,7 +15,7 @@ import (
 )
 
 // ExtCQE is a zero-overhead CQE for Extended mode operations.
-// It provides direct access to the ExtSQE pointer without mode checking.
+// It provides direct access to the borrowed ExtSQE pointer without mode checking.
 //
 // Use WaitExtended when your application exclusively uses Extended mode
 // (PackExtended) for all submissions. This avoids the 3-way mode check
@@ -25,7 +25,7 @@ import (
 type ExtCQE struct {
 	Res   int32   // Completion result (bytes transferred or negative errno)
 	Flags uint32  // CQE flags (IORING_CQE_F_*)
-	Ext   *ExtSQE // Pointer to ExtSQE with full context
+	Ext   *ExtSQE // Borrowed ExtSQE with full context
 }
 
 // IsSuccess reports whether the operation completed successfully.
@@ -85,7 +85,7 @@ func (c *ExtCQE) FD() iofd.FD {
 	return iofd.FD(c.Ext.SQE.fd)
 }
 
-// WaitExtended retrieves completion events using Extended mode fast-path.
+// WaitExtended retrieves completion events using the Extended mode fast path.
 // This method skips mode detection since all CQEs are assumed to be
 // from Extended mode submissions (PackExtended).
 //
@@ -94,6 +94,9 @@ func (c *ExtCQE) FD() iofd.FD {
 //
 // On single-issuer rings it is not safe for concurrent use with submit, Stop,
 // or ResizeRings; caller must serialize those operations.
+// Caller-side completion code must keep completion referents reachable until
+// CQE reap and serialize retirement.
+// For multishot CQEs, return Ext to the pool only after !HasMore().
 // Returns the number of CQEs retrieved, ErrCQOverflow when the ring enters CQ
 // overflow and no CQEs are immediately claimable, or iox.ErrWouldBlock if none
 // are available.

@@ -120,7 +120,7 @@ func TestGCSafetyIncrementalReceiverBackingRetained(t *testing.T) {
 
 	// The receiver is still alive and holds the backing slice via its
 	// bufBacking field. Read through the raw pointer to verify the data
-	// survived GC — if the receiver failed to keep it alive, we would
+	// survived GC. If the receiver failed to keep it alive, we would
 	// see corruption or a crash.
 	retained := unsafe.Slice((*byte)(backingPtr), backingLen)
 	for i, b := range retained {
