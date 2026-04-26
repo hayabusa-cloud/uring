@@ -10,15 +10,17 @@ import (
 	"errors"
 	"syscall"
 
+	"code.hybscloud.com/iofd"
 	"code.hybscloud.com/iox"
 )
 
 // Common errors for semantic consistency across the ecosystem (Darwin stub).
+// Aliased to iofd so message identity matches the Linux build.
 var (
-	ErrInvalidParam = errors.New("invalid parameter")
-	ErrInterrupted  = errors.New("interrupted")
-	ErrNoMemory     = errors.New("no memory")
-	ErrPermission   = errors.New("permission denied")
+	ErrInvalidParam = iofd.ErrInvalidParam
+	ErrInterrupted  = iofd.ErrInterrupted
+	ErrNoMemory     = iofd.ErrNoMemory
+	ErrPermission   = iofd.ErrPermission
 )
 
 // Error definitions for uring operations.

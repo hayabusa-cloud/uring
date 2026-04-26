@@ -1512,7 +1512,7 @@ func TestMsgRingSelf(t *testing.T) {
 	// Send message to self
 	const testUserData int64 = 0xDEADBEEF
 	const testResult int32 = 99
-	ctx := uring.PackDirect(uring.IORING_OP_MSG_RING, 0, 0, int32(ringFD))
+	ctx := uring.PackDirect(uring.IORING_OP_MSG_RING, 0, 0, ringFD.Raw())
 	err = ring.MsgRing(ctx, testUserData, testResult)
 	if err != nil {
 		t.Fatalf("MsgRing: %v", err)
@@ -1593,7 +1593,7 @@ func TestMsgRing(t *testing.T) {
 	// The context FD specifies the target ring
 	const testUserData int64 = 0x12345678
 	const testResult int32 = 42
-	ctx := uring.PackDirect(uring.IORING_OP_MSG_RING, 0, 0, int32(targetFD))
+	ctx := uring.PackDirect(uring.IORING_OP_MSG_RING, 0, 0, targetFD.Raw())
 	t.Log("Submitting MsgRing...")
 	err = srcRing.MsgRing(ctx, testUserData, testResult)
 	if err != nil {
@@ -1716,7 +1716,7 @@ func TestMsgRingFD(t *testing.T) {
 	const testUserData int64 = 0xFD5E7D
 	srcFDSlot := uint32(0)
 	dstFDSlot := uint32(0)
-	ctx := uring.PackDirect(uring.IORING_OP_MSG_RING, 0, 0, int32(targetFD))
+	ctx := uring.PackDirect(uring.IORING_OP_MSG_RING, 0, 0, targetFD.Raw())
 	err = srcRing.MsgRingFD(ctx, srcFDSlot, dstFDSlot, testUserData, false)
 	if err != nil {
 		t.Fatalf("MsgRingFD: %v", err)

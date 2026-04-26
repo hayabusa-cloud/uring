@@ -351,8 +351,8 @@ func (ur *Uring) CQPending() int {
 // Darwin stub returns -1 (no real io_uring).
 //
 //go:nosplit
-func (ur *Uring) RingFD() int {
-	return -1
+func (ur *Uring) RingFD() iofd.FD {
+	return iofd.InvalidFD
 }
 
 // MsgRing sends a message to another io_uring instance.
