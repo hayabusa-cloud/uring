@@ -7,6 +7,7 @@
 package uring_test
 
 import (
+	"strconv"
 	"testing"
 
 	"code.hybscloud.com/uring"
@@ -103,28 +104,62 @@ func TestLockedMemForBudget(t *testing.T) {
 
 func TestMultiSizeBufferScale(t *testing.T) {
 	tests := []struct {
-		name     string
-		budget   int
-		minScale int
-		maxScale int
+		name   string
+		budget int
+		want   int
 	}{
-		{"16MiB", 16 * uring.MiB, 1, 1},
-		{"64MiB", 64 * uring.MiB, 1, 2},
-		{"256MiB", 256 * uring.MiB, 1, 4},
-		{"1GiB", 1 * uring.GiB, 1, 8},
-		{"4GiB", 4 * uring.GiB, 1, 16},
+		{"16MiB", 16 * uring.MiB, 0},
+		{"64MiB", 64 * uring.MiB, 0},
+		{"128MiB", 128 * uring.MiB, 0},
+		{"256MiB", 256 * uring.MiB, 1},
+		{"512MiB", 512 * uring.MiB, 2},
+		{"1GiB", 1 * uring.GiB, 4},
+		{"4GiB", 4 * uring.GiB, 16},
+		{"8GiB", 8 * uring.GiB, 32},
+		{"16GiB", 16 * uring.GiB, 64},
+		{"32GiB", 32 * uring.GiB, 128},
+		{"64GiB", 64 * uring.GiB, 256},
+		{"128GiB", 128 * uring.GiB, 512},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			opts := uring.OptionsForBudget(tt.budget)
-			if opts.MultiSizeBuffer < tt.minScale || opts.MultiSizeBuffer > tt.maxScale {
-				t.Fatalf("got MultiSizeBuffer=%d, want between %d and %d",
-					opts.MultiSizeBuffer, tt.minScale, tt.maxScale)
+			if opts.MultiSizeBuffer != tt.want {
+				t.Fatalf("got MultiSizeBuffer=%d, want %d",
+					opts.MultiSizeBuffer, tt.want)
 			}
-			// Verify it's a power of 2
-			if opts.MultiSizeBuffer&(opts.MultiSizeBuffer-1) != 0 {
+			if opts.MultiSizeBuffer > 0 && opts.MultiSizeBuffer&(opts.MultiSizeBuffer-1) != 0 {
 				t.Fatalf("MultiSizeBuffer=%d is not a power of 2", opts.MultiSizeBuffer)
+			}
+		})
+	}
+}
+
+func TestOptionsForBudgetDefaultBufferGroupsFit(t *testing.T) {
+	budgets := []int{
+		16 * uring.MiB,
+		64 * uring.MiB,
+		128 * uring.MiB,
+		256 * uring.MiB,
+		512 * uring.MiB,
+		1 * uring.GiB,
+		2 * uring.GiB,
+		4 * uring.GiB,
+		8 * uring.GiB,
+	}
+	baseMem := cfgBaseMemForTest(uring.DefaultBufferGroupsConfig())
+
+	for _, budget := range budgets {
+		t.Run(budgetName(budget), func(t *testing.T) {
+			opts := uring.OptionsForBudget(budget)
+			bufferMem := bufferGroupMemForBudget(budget)
+			used := baseMem * opts.MultiSizeBuffer
+			if used > bufferMem {
+				t.Fatalf("default buffer groups overflow budget: used=%d bufferMem=%d scale=%d", used, bufferMem, opts.MultiSizeBuffer)
+			}
+			if opts.MultiSizeBuffer == 0 && bufferMem >= baseMem {
+				t.Fatalf("default buffer groups fit in %d bytes but MultiSizeBuffer is disabled", bufferMem)
 			}
 		})
 	}
@@ -132,26 +167,101 @@ func TestMultiSizeBufferScale(t *testing.T) {
 
 func TestBufferConfigForBudget(t *testing.T) {
 	tests := []struct {
-		name     string
-		budget   int
-		minScale int
-		maxScale int
+		name      string
+		budget    int
+		wantScale int
+		wantTiers int
 	}{
-		{"16MiB", 16 * uring.MiB, 1, 1},
-		{"64MiB", 64 * uring.MiB, 1, 2},
-		{"256MiB", 256 * uring.MiB, 1, 4},
+		{"16MiB", 16 * uring.MiB, 0, 0},
+		{"64MiB", 64 * uring.MiB, 1, 5},
+		{"128MiB", 128 * uring.MiB, 1, 6},
+		{"256MiB", 256 * uring.MiB, 1, 7},
+		{"512MiB", 512 * uring.MiB, 1, 8},
+		{"1GiB", 1 * uring.GiB, 1, 9},
+		{"2GiB", 2 * uring.GiB, 1, 10},
+		{"4GiB", 4 * uring.GiB, 1, 11},
+		{"8GiB", 8 * uring.GiB, 1, 12},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg, scale := uring.BufferConfigForBudget(tt.budget)
-			if scale < tt.minScale || scale > tt.maxScale {
-				t.Fatalf("got scale=%d, want between %d and %d",
-					scale, tt.minScale, tt.maxScale)
+			if scale != tt.wantScale {
+				t.Fatalf("got scale=%d, want %d", scale, tt.wantScale)
 			}
-			// Verify config has some tiers enabled
-			if cfg.PicoNum == 0 {
-				t.Fatal("PicoNum should not be zero")
+			if tiers := countEnabledTiers(cfg); tiers != tt.wantTiers {
+				t.Fatalf("enabled tiers=%d, want %d", tiers, tt.wantTiers)
+			}
+		})
+	}
+}
+
+func TestBufferConfigForBudget_BudgetSafetyInvariant(t *testing.T) {
+	budgets := []int{
+		16 * uring.MiB,
+		32 * uring.MiB,
+		64 * uring.MiB,
+		128 * uring.MiB,
+		256 * uring.MiB,
+		512 * uring.MiB,
+		1 * uring.GiB,
+		2 * uring.GiB,
+		4 * uring.GiB,
+		8 * uring.GiB,
+	}
+
+	for _, budget := range budgets {
+		t.Run(budgetName(budget), func(t *testing.T) {
+			cfg, scale := uring.BufferConfigForBudget(budget)
+			bufferMem := bufferGroupMemForBudget(budget)
+			baseMem := cfgBaseMemForTest(cfg)
+
+			if scale < 0 {
+				t.Fatalf("scale=%d, want non-negative", scale)
+			}
+			if scale > 0 && scale&(scale-1) != 0 {
+				t.Fatalf("scale=%d is not a power of 2", scale)
+			}
+			if baseMem == 0 {
+				if scale != 0 {
+					t.Fatalf("zero config must have zero scale, got %d", scale)
+				}
+				return
+			}
+
+			used := baseMem * scale
+			if used > bufferMem {
+				t.Fatalf("budget overflow: base=%d scale=%d used=%d bufferMem=%d", baseMem, scale, used, bufferMem)
+			}
+			if scale < 1 {
+				t.Fatalf("non-zero config must have positive scale, got %d", scale)
+			}
+		})
+	}
+}
+
+func TestBufferConfigForBudget_PicksLargestFittingTierSet(t *testing.T) {
+	tests := []struct {
+		name      string
+		budget    int
+		wantTiers int
+	}{
+		{"below_minimal", 16 * uring.MiB, 0},
+		{"minimal", 64 * uring.MiB, 5},
+		{"big", 128 * uring.MiB, 6},
+		{"default", 256 * uring.MiB, 7},
+		{"great", 512 * uring.MiB, 8},
+		{"huge", 1 * uring.GiB, 9},
+		{"vast", 2 * uring.GiB, 10},
+		{"giant", 4 * uring.GiB, 11},
+		{"full", 8 * uring.GiB, 12},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, _ := uring.BufferConfigForBudget(tt.budget)
+			if tiers := countEnabledTiers(cfg); tiers != tt.wantTiers {
+				t.Fatalf("enabled tiers=%d, want %d", tiers, tt.wantTiers)
 			}
 		})
 	}
@@ -312,21 +422,22 @@ func TestOptionsForSystem(t *testing.T) {
 		systemMemory int
 		minEntries   int
 		maxEntries   int
+		wantScale    int
 	}{
-		// 512MB * 25% = 128 MiB budget → EntriesMedium (2048)
-		{"512MB", uring.MachineMemory512MB, 2048, 2048},
+		// 512MB * 25% = 128 MiB budget → EntriesMedium (2048), default buffer groups do not fit
+		{"512MB", uring.MachineMemory512MB, 2048, 2048, 0},
 		// 1GB * 25% = 256 MiB budget → EntriesLarge (8192)
-		{"1GB", uring.MachineMemory1GB, 8192, 8192},
+		{"1GB", uring.MachineMemory1GB, 8192, 8192, 1},
 		// 2GB * 25% = 512 MiB budget → EntriesLarge (8192)
-		{"2GB", uring.MachineMemory2GB, 8192, 8192},
+		{"2GB", uring.MachineMemory2GB, 8192, 8192, 2},
 		// 4GB * 25% = 1 GiB budget → EntriesHuge (32768)
-		{"4GB", uring.MachineMemory4GB, 32768, 32768},
+		{"4GB", uring.MachineMemory4GB, 32768, 32768, 4},
 		// 8GB * 25% = 2 GiB budget → EntriesHuge (32768)
-		{"8GB", uring.MachineMemory8GB, 32768, 32768},
+		{"8GB", uring.MachineMemory8GB, 32768, 32768, 8},
 		// 16GB * 25% = 4 GiB budget → EntriesHuge (32768)
-		{"16GB", uring.MachineMemory16GB, 32768, 32768},
+		{"16GB", uring.MachineMemory16GB, 32768, 32768, 16},
 		// 32GB * 25% = 8 GiB budget → EntriesHuge (32768)
-		{"32GB", uring.MachineMemory32GB, 32768, 32768},
+		{"32GB", uring.MachineMemory32GB, 32768, 32768, 32},
 	}
 
 	for _, tt := range tests {
@@ -340,8 +451,8 @@ func TestOptionsForSystem(t *testing.T) {
 			if opts.LockedBufferMem == 0 {
 				t.Fatal("LockedBufferMem should not be zero")
 			}
-			if opts.MultiSizeBuffer == 0 {
-				t.Fatal("MultiSizeBuffer should not be zero")
+			if opts.MultiSizeBuffer != tt.wantScale {
+				t.Fatalf("MultiSizeBuffer=%d, want %d", opts.MultiSizeBuffer, tt.wantScale)
 			}
 		})
 	}
@@ -380,5 +491,52 @@ func TestOptionsForSystem_Equivalence(t *testing.T) {
 	if optsSystem.MultiSizeBuffer != optsBudget.MultiSizeBuffer {
 		t.Fatalf("MultiSizeBuffer mismatch: system=%d, budget=%d",
 			optsSystem.MultiSizeBuffer, optsBudget.MultiSizeBuffer)
+	}
+}
+
+func cfgBaseMemForTest(cfg uring.BufferGroupsConfig) int {
+	return cfg.PicoNum*uring.BufferSizePico +
+		cfg.NanoNum*uring.BufferSizeNano +
+		cfg.MicroNum*uring.BufferSizeMicro +
+		cfg.SmallNum*uring.BufferSizeSmall +
+		cfg.MediumNum*uring.BufferSizeMedium +
+		cfg.BigNum*uring.BufferSizeBig +
+		cfg.LargeNum*uring.BufferSizeLarge +
+		cfg.GreatNum*uring.BufferSizeGreat +
+		cfg.HugeNum*uring.BufferSizeHuge +
+		cfg.VastNum*uring.BufferSizeVast +
+		cfg.GiantNum*uring.BufferSizeGiant +
+		cfg.TitanNum*uring.BufferSizeTitan
+}
+
+func bufferGroupMemForBudget(budget int) int {
+	clamped := budget
+	if clamped < 16*uring.MiB {
+		clamped = 16 * uring.MiB
+	}
+	if clamped > 128*uring.GiB {
+		clamped = 128 * uring.GiB
+	}
+
+	opts := uring.OptionsForBudget(clamped)
+	bufferMem := clamped - opts.LockedBufferMem - opts.Entries*96
+	if bufferMem < 0 {
+		return 0
+	}
+	return bufferMem
+}
+
+func budgetName(budget int) string {
+	switch budget {
+	case 1 * uring.GiB:
+		return "1GiB"
+	case 2 * uring.GiB:
+		return "2GiB"
+	case 4 * uring.GiB:
+		return "4GiB"
+	case 8 * uring.GiB:
+		return "8GiB"
+	default:
+		return strconv.Itoa(budget/uring.MiB) + "MiB"
 	}
 }

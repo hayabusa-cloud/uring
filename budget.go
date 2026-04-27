@@ -67,6 +67,7 @@ func OptionsForSystem(systemMemory int) Options {
 //   - Ring entries: sized to match expected throughput (more budget = more entries)
 //   - Registered buffers: 25% for zero-copy operations (minimum 8 MiB, no maximum cap)
 //   - Buffer groups: use the remaining budget after registered buffers and ring overhead
+//   - Multi-size buffer groups use the default tier set and are disabled when it does not fit
 //
 // Example:
 //
@@ -86,30 +87,33 @@ func OptionsForBudget(budget int) Options {
 		bufferGroupMem = 0
 	}
 
-	cfg := bufferConfigForMem(bufferGroupMem)
-	scale := scaleForMem(bufferGroupMem, cfg)
+	scale := scaleForMem(bufferGroupMem, DefaultBufferGroupsConfig())
 
 	return Options{
 		Entries:         entries,
 		LockedBufferMem: lockedMem,
-		MultiSizeBuffer: scale,
 		ReadBufferSize:  bufferSizeDefault,
 		ReadBufferNum:   entries * 2,
 		WriteBufferSize: bufferSizeDefault,
 		WriteBufferNum:  entries,
+		MultiSizeBuffer: scale,
 	}
 }
 
-// BufferConfigForBudget returns a BufferGroupsConfig and scale for the given memory budget.
-// Use this when you want fine-grained control over Options while using
-// budget-based buffer configuration.
+// BufferConfigForBudget returns the BufferGroupsConfig and scale selected for
+// the given memory budget. Use this when you need to inspect or model the
+// largest tier set that fits in the remaining buffer-group memory.
 //
-// Budget handling matches OptionsForBudget:
+// Budget handling matches OptionsForBudget's memory reservation:
 //   - registered buffers use 25% of the budget (minimum 8 MiB)
 //   - ring overhead is reserved from the same budget
 //   - buffer groups use the remaining memory
+//   - if the remaining memory cannot fit the minimal tier set, the returned config is empty and scale is 0
 //
-// The returned scale should be passed to Options.MultiSizeBuffer.
+// OptionsForBudget does not carry BufferGroupsConfig through Options. It sets
+// Options.MultiSizeBuffer from the default buffer-group shape that New actually
+// allocates, so the scale returned here can differ from OptionsForBudget for
+// budgets where a smaller tier set fits but the default tier set does not.
 //
 // Example:
 //
@@ -180,10 +184,12 @@ func bufferConfigForMem(mem int) BufferGroupsConfig {
 	// Tiers 0-11 (Full): +2048 = 4095 MiB
 
 	switch {
-	case mem < 32*MiB:
+	case mem < 31*MiB:
+		return BufferGroupsConfig{}
+	case mem < 63*MiB:
 		// Minimal: Pico-Medium (5 tiers)
 		return MinimalBufferGroupsConfig()
-	case mem < 64*MiB:
+	case mem < 127*MiB:
 		// Pico-Big (6 tiers)
 		return BufferGroupsConfig{
 			PicoNum:   DefaultBufferNumPico,
@@ -193,26 +199,34 @@ func bufferConfigForMem(mem int) BufferGroupsConfig {
 			MediumNum: DefaultBufferNumMedium,
 			BigNum:    DefaultBufferNumBig,
 		}
-	case mem < 128*MiB:
+	case mem < 255*MiB:
 		// Default: Pico-Large (7 tiers)
 		return DefaultBufferGroupsConfig()
-	case mem < 256*MiB:
+	case mem < 511*MiB:
 		// Pico-Great (8 tiers)
 		cfg := DefaultBufferGroupsConfig()
 		cfg.GreatNum = DefaultBufferNumGreat
 		return cfg
-	case mem < 512*MiB:
+	case mem < 1023*MiB:
 		// Pico-Huge (9 tiers)
 		cfg := DefaultBufferGroupsConfig()
 		cfg.GreatNum = DefaultBufferNumGreat
 		cfg.HugeNum = DefaultBufferNumHuge
 		return cfg
-	case mem < 1*GiB:
+	case mem < 2047*MiB:
 		// Pico-Vast (10 tiers)
 		cfg := DefaultBufferGroupsConfig()
 		cfg.GreatNum = DefaultBufferNumGreat
 		cfg.HugeNum = DefaultBufferNumHuge
 		cfg.VastNum = DefaultBufferNumVast
+		return cfg
+	case mem < 4095*MiB:
+		// Pico-Giant (11 tiers)
+		cfg := DefaultBufferGroupsConfig()
+		cfg.GreatNum = DefaultBufferNumGreat
+		cfg.HugeNum = DefaultBufferNumHuge
+		cfg.VastNum = DefaultBufferNumVast
+		cfg.GiantNum = DefaultBufferNumGiant
 		return cfg
 	default:
 		// Full: all 12 tiers
@@ -220,20 +234,24 @@ func bufferConfigForMem(mem int) BufferGroupsConfig {
 	}
 }
 
-// scaleForMem calculates the scale factor for the given config and memory.
+// scaleForMem calculates the largest power-of-two scale that fits within mem.
 func scaleForMem(mem int, cfg BufferGroupsConfig) int {
 	baseMem := cfgBaseMem(cfg)
 	if baseMem == 0 {
-		return 1
+		return 0
 	}
 	scale := mem / baseMem
-	if scale < 1 {
-		scale = 1
-	}
 	if scale > 4096 {
 		scale = 4096
 	}
-	return roundToPowerOf2(scale)
+	if scale < 1 {
+		return 0
+	}
+	ret := 1
+	for ret <= scale/2 {
+		ret <<= 1
+	}
+	return ret
 }
 
 // cfgBaseMem calculates the base memory usage for a config at scale=1.
