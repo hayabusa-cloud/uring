@@ -34,6 +34,9 @@ The primary surfaces are:
 uname -r
 ```
 
+`uring` assumes the 6.18+ baseline and carries no fallback branches for older kernels. Boot a supported kernel instead
+of expecting compatibility shims inside this package.
+
 Debian 13's stable kernel track may still be below 6.18. See [Debian 13 kernel upgrade](#debian-13-kernel-upgrade) for
 the backports path to a kernel that meets the requirement.
 
@@ -70,9 +73,9 @@ if err := ring.Start(); err != nil {
 }
 defer ring.Stop()
 
-fd := int32(file.Fd())
+fd := iofd.NewFD(int(file.Fd()))
 buf := make([]byte, 4096)
-ctx := uring.PackDirect(uring.IORING_OP_READ, 0, 0, fd)
+ctx := uring.PackDirect(uring.IORING_OP_READ, 0, 0, 0).WithFD(fd)
 if err := ring.Read(ctx, buf); err != nil {
     return err
 }
@@ -97,7 +100,7 @@ for {
     backoff.Reset()
     for i := range n {
         cqe := cqes[i]
-        if cqe.Op() != uring.IORING_OP_READ || int32(cqe.FD()) != fd {
+		if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
             continue
         }
         if cqe.Res < 0 {
@@ -275,7 +278,7 @@ fixed operation completes:
 buf := ring.RegisteredBuffer(0)
 copy(buf, payload)
 
-ctx := uring.PackDirect(uring.IORING_OP_WRITE, 0, 0, int32(file.Fd()))
+ctx := uring.PackDirect(uring.IORING_OP_WRITE_FIXED, 0, 0, int32(file.Fd()))
 if err := ring.WriteFixed(ctx, 0, len(payload)); err != nil {
     return err
 }
@@ -285,8 +288,7 @@ For socket receive with kernel buffer selection, pass `nil` as the receive buffe
 The completion reports which buffer was selected:
 
 ```go
-recvCtx := uring.ForFD(int32(socketFD)).
-    WithOp(uring.IORING_OP_RECV)
+recvCtx := uring.PackDirect(uring.IORING_OP_RECV, 0, 0, 0)
 
 if err := ring.Receive(recvCtx, &socketFD, nil, uring.WithReadBufferSize(uring.BufferSizeSmall)); err != nil {
     return err

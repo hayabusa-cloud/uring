@@ -13,19 +13,19 @@ Langue: [English](./README.md) | [简体中文](./README.zh-CN.md) | [Español](
 
 `uring` est le package de l'espace de travail qui expose l'interface noyau Linux `io_uring`. Il crée et démarre les
 rings, prépare les SQE, décode les CQE, achemine l'identité de soumission via `user_data`, et fournit l'enregistrement
-de buffers, les opérations multishot ainsi que les primitives de mise en place des listeners.
+de tampons, les opérations multishot ainsi que les primitives de mise en place des écouteurs.
 
 `uring` repose sur une conception à interface explicite : la mécanique côté noyau et les faits de complétion observables
-se situent au bord de l'API, tandis que la politique et la composition relèvent des couches supérieures. Le code runtime
-côté appelant possède la corrélation des complétions, retry/backoff, le routage des handlers et des sessions, le cycle
-de vie des connexions et la libération terminale des ressources.
+se situent au bord de l'API, tandis que la politique et la composition relèvent des couches supérieures. Le code
+d'exécution côté appelant possède la corrélation des complétions, les tentatives de reprise et l'attente progressive, le
+routage des gestionnaires et des sessions, le cycle de vie des connexions et la libération terminale des ressources.
 
 Les surfaces principales sont :
 
 - `Uring`, le handle du ring actif et son jeu d'opérations
 - `SQEContext`, l'identité de soumission acheminée dans `user_data`
 - `CQEView`, la vue de complétion empruntée renvoyée par `Wait`
-- la fourniture de buffers, via buffers enregistrés et groupes de buffers multi-tailles
+- la fourniture de tampons, via tampons enregistrés et groupes de tampons multi-tailles
 
 ## Installation
 
@@ -35,8 +35,12 @@ Les surfaces principales sont :
 uname -r
 ```
 
+`uring` suppose la base 6.18+ et ne contient aucune branche de repli pour les noyaux plus anciens. Démarrez un noyau
+pris en charge
+plutôt que d'attendre des branches de compatibilité dans ce package.
+
 Sous Debian 13, le noyau de la branche stable peut rester en deçà de ce seuil. Consultez la section sur la mise à niveau
-du noyau Debian 13 ci-dessous si vous avez besoin du noyau Debian le plus récent satisfaisant l'exigence 6.18.
+du noyau Debian 13 ci-dessous si vous avez besoin d'un noyau Debian plus récent satisfaisant l'exigence 6.18.
 
 ```bash
 go get code.hybscloud.com/uring
@@ -50,7 +54,7 @@ empaqueté par Debian. Consultez [SETUP.md](./SETUP.md) pour la marche à suivre
 ### Dépannage
 
 La création du ring peut renvoyer `ENOMEM`, `EPERM` ou `ENOSYS` selon les limites memlock, la configuration sysctl ou le
-support noyau. Les runtimes de conteneurs bloquent les appels système `io_uring` par défaut.
+support noyau. Les environnements d'exécution de conteneurs bloquent les appels système `io_uring` par défaut.
 Consultez [SETUP.md](./SETUP.md) pour le diagnostic et la résolution.
 
 ## Cycle de vie du ring
@@ -73,9 +77,9 @@ if err := ring.Start(); err != nil {
 }
 defer ring.Stop()
 
-fd := int32(file.Fd())
+fd := iofd.NewFD(int(file.Fd()))
 buf := make([]byte, 4096)
-ctx := uring.PackDirect(uring.IORING_OP_READ, 0, 0, fd)
+ctx := uring.PackDirect(uring.IORING_OP_READ, 0, 0, 0).WithFD(fd)
 if err := ring.Read(ctx, buf); err != nil {
     return err
 }
@@ -100,7 +104,7 @@ for {
     backoff.Reset()
     for i := range n {
         cqe := cqes[i]
-        if cqe.Op() != uring.IORING_OP_READ || int32(cqe.FD()) != fd {
+		if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
             continue
         }
         if cqe.Res < 0 {
@@ -113,9 +117,9 @@ for {
 ```
 
 `Wait` purge les soumissions en attente avant de récupérer les complétions. Sur un ring mono-émetteur, il émet aussi
-l'appel enter vers le noyau, nécessaire pour que le deferred task work progresse une fois la SQ vidée ; l'appelant doit
-sérialiser `Wait`/`enter` avec les opérations de submit-state. `iox.OutcomeWouldBlock` signale qu'aucune complétion n'
-est observable à l'interface courante.
+l'entrée noyau nécessaire pour que le travail différé progresse une fois la SQ vidée ; l'appelant doit
+sérialiser `Wait`/`enter` avec les opérations d'état de soumission. `iox.OutcomeWouldBlock` signale qu'aucune complétion
+n'est observable à l'interface courante.
 
 `Start` et `Stop` constituent la paire de cycle de vie du ring. `Stop` est idempotent et rend le ring définitivement
 inutilisable ; on ne doit donc l'appeler qu'après avoir drainé toutes les opérations en vol, récupéré les CQE en attente
@@ -123,21 +127,21 @@ et arrêté les abonnements multishot encore actifs.
 
 ## Types et opérations
 
-| Type | Rôle |
-|------|------|
-| `Uring` | Initialisation du ring, soumission, récupération des complétions, et méthodes d'opération |
-| `Options` | Entrées du ring, budget de buffers enregistrés, échelle des groupes de buffers et visibilité des complétions |
-| `SQEContext` | Identité de soumission compacte stockée dans `user_data` |
-| `CQEView` | Enregistrement de complétion emprunté avec accesseurs de contexte décodé |
-| `ListenerOp` | Handle d'une opération de création de listener avec FD et helpers accept |
-| `BundleIterator` | Itère sur les buffers consommés lors d'une réception bundle |
-| `IncrementalReceiver` | Gère les réceptions incrémentales de buffer-ring (`IOU_PBUF_RING_INC`) |
-| `ZCTracker` | Suit le cycle de vie à deux CQE de l'envoi zero-copy |
-| `ContextPools` | Pools pour contextes de soumission indirects et étendus |
-| `ZCRXReceiver` | Cycle de vie de réception zero-copy sur une file RX de NIC |
-| `ZCRXConfig` | Configuration d'une instance de réception ZCRX |
-| `ZCRXHandler` | Interface de rappel pour données, erreurs et arrêt ZCRX |
-| `ZCRXBuffer` | Vue de réception zero-copy livrée, avec remplissage par le kernel à la libération |
+| Type                  | Rôle                                                                                                         |
+|-----------------------|--------------------------------------------------------------------------------------------------------------|
+| `Uring`               | Initialisation du ring, soumission, récupération des complétions, et méthodes d'opération                    |
+| `Options`             | Entrées du ring, budget de tampons enregistrés, échelle des groupes de tampons et visibilité des complétions |
+| `SQEContext`          | Identité de soumission compacte stockée dans `user_data`                                                     |
+| `CQEView`             | Enregistrement de complétion emprunté avec accesseurs de contexte décodé                                     |
+| `ListenerOp`          | Gestionnaire d'une opération de création d'écouteur avec FD et auxiliaires accept                            |
+| `BundleIterator`      | Itère sur les tampons consommés lors d'une réception groupée                                                 |
+| `IncrementalReceiver` | Gère les réceptions incrémentales de buffer-ring (`IOU_PBUF_RING_INC`)                                       |
+| `ZCTracker`           | Suit le cycle de vie à deux CQE de l'envoi sans copie                                                        |
+| `ContextPools`        | Pools pour contextes de soumission indirects et étendus                                                      |
+| `ZCRXReceiver`        | Cycle de vie de réception sans copie sur une file RX de NIC                                                  |
+| `ZCRXConfig`          | Configuration d'une instance de réception ZCRX                                                               |
+| `ZCRXHandler`         | Interface de rappel pour données, erreurs et arrêt ZCRX                                                      |
+| `ZCRXBuffer`          | Vue de réception sans copie livrée, avec remplissage par le noyau à la libération                            |
 
 Opérations :
 
@@ -166,8 +170,8 @@ destruction du ring.
 
 ## Transport du contexte
 
-`SQEContext` est le jeton d'identité principal de `uring`. En mode direct, il encode l'opcode, les flags SQE,
-l'identifiant de groupe de buffers et le descripteur de fichier dans une seule valeur de 64 bits.
+`SQEContext` est le jeton d'identité principal de `uring`. En mode direct, il encode l'opcode, les fanions SQE,
+l'identifiant de groupe de tampons et le descripteur de fichier dans une seule valeur de 64 bits.
 
 ```go
 sqeCtx := uring.ForFD(fd).
@@ -184,13 +188,13 @@ Les trois modes de contexte sont :
 | Extended | Pointeur vers `ExtSQE`          | SQE complet plus 64 octets de données utilisateur                |
 
 Sur le chemin courant, on part de `ForFD` ou `PackDirect` en n'ajoutant que les bits que l'on souhaite retrouver à la
-complétion. `WithFlags` remplace la totalité des flags : il convient donc de calculer les unions avant l'appel.
+complétion. `WithFlags` remplace la totalité des fanions : il convient donc de calculer les unions avant l'appel.
 
 Lorsqu'on a besoin de métadonnées contrôlées par l'appelant au-delà du layout direct sur 64 bits, on emprunte un
 `ExtSQE`, on écrit dans son champ `UserData` via `Ctx*Of` ou `ViewCtx*`, puis on le ré-encode en `SQEContext`. Préférez
-des charges scalaires à cet endroit. Si un overlay brut ou une vue typée y stocke des pointeurs Go, des interfaces, des
-valeurs func, des slices, des strings, des maps, des chans ou des structs qui en contiennent, conservez les racines
-vivantes en dehors de `UserData`, car le GC ne trace pas ces octets bruts.
+des charges scalaires à cet endroit. Si une superposition brute ou une vue typée y stocke des pointeurs Go, des
+interfaces, des valeurs de fonction, des tranches, des chaînes, des tables de hachage, des canaux ou des structures qui
+en contiennent, conservez les racines vivantes en dehors de `UserData`, car le GC ne trace pas ces octets bruts.
 
 ```go
 ext := ring.ExtSQE()
@@ -206,7 +210,7 @@ empruntés et uniquement si vous souhaitez réutiliser l'ensemble de pools.
 
 ### Dispatch des complétions avec `CQEView`
 
-`uring` n'expose pas de type dédié au contexte de complétion. Le dispatch des complétions passe par `CQEView` ; on
+`uring` n'expose pas de type dédié au contexte de complétion. La distribution des complétions passe par `CQEView` ; on
 appelle `cqe.Context()` pour récupérer le jeton de soumission d'origine.
 
 ```go
@@ -244,21 +248,22 @@ for i := 0; i < n; i++ {
 }
 ```
 
-À la complétion, `CQEView` décode le mode de contexte à la demande. `CQEView`, `IndirectSQE`, `ExtSQE` et les buffers
+À la complétion, `CQEView` décode le mode de contexte à la demande. `CQEView`, `IndirectSQE`, `ExtSQE` et les tampons
 empruntés ne doivent pas survivre au-delà de leur durée de vie documentée.
 
-## Fourniture de buffers
+## Fourniture de tampons
 
-`uring` propose trois chemins pratiques pour les buffers. Les buffers enregistrés sont épinglés au démarrage du ring et
-servent aux I/O fichier fixed-buffer. Les provided buffer rings laissent le noyau choisir un buffer de réception et
-renvoyer son ID dans le CQE. Les réceptions bundle consomment une plage logique contiguë de buffers fournis et
+`uring` propose trois chemins pratiques pour les tampons. Les tampons enregistrés sont épinglés au démarrage du ring et
+servent aux I/O fichier sur tampon fixe. Les anneaux de tampons fournis laissent le noyau choisir un tampon de réception
+et
+renvoyer son ID dans le CQE. Les réceptions groupées consomment une plage logique contiguë de tampons fournis et
 l'exposent via `BundleIterator`.
 
-- des buffers fournis de taille fixe via `ReadBufferSize` et `ReadBufferNum`
-- des groupes de buffers multi-tailles via `MultiSizeBuffer`
-- des buffers fixes enregistrés via `LockedBufferMem`, `RegisteredBuffer`, `ReadFixed` et `WriteFixed`
+- des tampons fournis de taille fixe via `ReadBufferSize` et `ReadBufferNum`
+- des groupes de tampons multi-tailles via `MultiSizeBuffer`
+- des tampons fixes enregistrés via `LockedBufferMem`, `RegisteredBuffer`, `ReadFixed` et `WriteFixed`
 
-Pour la plupart des systèmes, les helpers de configuration offrent un point d'entrée direct :
+Pour la plupart des systèmes, les fonctions auxiliaires de configuration offrent un point d'entrée direct :
 
 ```go
 opts := uring.OptionsForSystem(uring.MachineMemory4GB)
@@ -275,25 +280,24 @@ cfg, scale := uring.BufferConfigForBudget(256 * uring.MiB)
 fmt.Printf("buffer tiers=%+v scale=%d\n", cfg, scale)
 ```
 
-L'I/O fixed-buffer utilise un buffer enregistré par index. La slice renvoyée appartient au ring ; gardez-la vivante
-jusqu'à la complétion de l'opération fixed :
+L'I/O sur tampon fixe utilise un tampon enregistré par index. La tranche renvoyée appartient au ring ; gardez-la vivante
+jusqu'à la complétion de l'opération fixe :
 
 ```go
 buf := ring.RegisteredBuffer(0)
 copy(buf, payload)
 
-ctx := uring.PackDirect(uring.IORING_OP_WRITE, 0, 0, int32(file.Fd()))
+ctx := uring.PackDirect(uring.IORING_OP_WRITE_FIXED, 0, 0, int32(file.Fd()))
 if err := ring.WriteFixed(ctx, 0, len(payload)); err != nil {
     return err
 }
 ```
 
-Pour recevoir sur un socket avec sélection de buffer par le noyau, passez `nil` comme buffer de réception et demandez la
-classe de taille voulue. La complétion indique quel buffer a été choisi :
+Pour recevoir sur un socket avec sélection de tampon par le noyau, passez `nil` comme tampon de réception et demandez la
+classe de taille voulue. La complétion indique quel tampon a été choisi :
 
 ```go
-recvCtx := uring.ForFD(int32(socketFD)).
-    WithOp(uring.IORING_OP_RECV)
+recvCtx := uring.PackDirect(uring.IORING_OP_RECV, 0, 0, 0)
 
 if err := ring.Receive(recvCtx, &socketFD, nil, uring.WithReadBufferSize(uring.BufferSizeSmall)); err != nil {
     return err
@@ -305,7 +309,7 @@ if cqe.HasBuffer() {
 }
 ```
 
-Les réceptions bundle utilisent le même stockage de provided buffers, mais peuvent consommer plusieurs buffers avec un
+Les réceptions groupées utilisent le même stockage de tampons fournis, mais peuvent consommer plusieurs tampons avec un
 seul CQE. Traitez l'itérateur, puis recyclez les slots consommés :
 
 ```go
@@ -321,14 +325,14 @@ if it, ok := ring.BundleIterator(cqe, cqe.BufGroup()); ok {
 }
 ```
 
-Les buffers enregistrés nécessitent de la mémoire épinglée. En cas d'échec de l'enregistrement de buffers volumineux,
+Les tampons enregistrés nécessitent de la mémoire épinglée. En cas d'échec de l'enregistrement de tampons volumineux,
 augmentez `RLIMIT_MEMLOCK` ou réduisez le budget mémoire.
 
-## Opérations multishot et listener
+## Opérations multishot et écouteur
 
 `AcceptMultishot`, `ReceiveMultishot`, `SubmitAcceptMultishot`, `SubmitAcceptDirectMultishot`, `SubmitReceiveMultishot` et `SubmitReceiveBundleMultishot` soumettent des opérations socket multishot.
 
-La politique de routage des CQE reste hors du package. La mise en place du listener progresse via `DecodeListenerCQE`,
+La politique de routage des CQE reste hors du package. La mise en place de l'écouteur progresse via `DecodeListenerCQE`,
 `PrepareListenerBind`, `PrepareListenerListen` et `SetListenerReady` ; c'est l'appelant qui décide de la distribution
 des complétions et de l'arrêt de la chaîne.
 
@@ -336,27 +340,33 @@ des complétions et de l'arrêt de la chaîne.
 
 L'implémentation se structure autour des couches suivantes :
 
-1. `New` construit un ring noyau désactivé, crée les pools de contexte et détermine la stratégie de buffers.
-2. `Start` enregistre les buffers et active le ring conformément à la base fixe Linux 6.18+.
+1. `New` construit un ring noyau désactivé, crée les pools de contexte et détermine la stratégie de tampons.
+2. `Start` enregistre les tampons et active le ring conformément à la base fixe Linux 6.18+.
 3. Les méthodes d'opération publient l'intention en écrivant des SQE.
 4. `Wait` purge les soumissions et renvoie des vues CQE empruntées.
-5. Le code runtime côté appelant décide de l'ordonnancement, des reprises, du parking, du routage connexion/session et
+5. Le code d'exécution côté appelant décide de l'ordonnancement, des reprises, de l'attente, du routage
+   connexion/session et
    de la politique terminale des ressources.
 
 De cette manière, `uring` reste focalisé sur la mécanique côté noyau tout en préservant la sémantique des complétions au
 travers de l'interface.
 
-## Frontière runtime
+## Frontière d'exécution
 
-Les couches runtime au-dessus de `uring` doivent l'utiliser comme backend noyau, pas comme ordonnanceur. La frontière
-idéale est unidirectionnelle : `uring` prépare les SQE, récupère les CQE, préserve `user_data`, expose `res` et flags
-des CQE, et rapporte les faits de propriété ; le code runtime côté appelant corrèle ces observations avec ses propres
-tokens, applique retry/backoff, route les handlers et sessions, regroupe les soumissions et libère les ressources
+Les couches d'exécution au-dessus de `uring` doivent l'utiliser comme backend noyau, pas comme ordonnanceur. La
+frontière
+idéale est unidirectionnelle : `uring` prépare les SQE, récupère les CQE, préserve `user_data`, expose `res` et fanions
+des CQE, et rapporte les faits de propriété ; le code d'exécution côté appelant corrèle ces observations avec ses
+propres
+jetons, applique les reprises et l'attente progressive, route les gestionnaires et sessions, regroupe les soumissions et
+libère les ressources
 terminales.
 
-Un pont runtime peut consommer les CQE en mode Extended lorsque l'exécution abstraite a besoin des faits de complétion.
-Un runtime par connexion peut aussi sonder directement les CQE Extended bruts lorsqu'il a besoin du résultat CQE, des
-flags, du buffer ID et du token encodé avant de réduire l'événement en callbacks de handler.
+Un pont d'exécution peut consommer les CQE en mode Extended lorsque l'exécution abstraite a besoin des faits de
+complétion.
+Un environnement d'exécution par connexion peut aussi sonder directement les CQE Extended bruts lorsqu'il a besoin du
+résultat CQE, des
+fanions, de l'ID de tampon et du jeton encodé avant de réduire l'événement en rappels de gestionnaire.
 
 Les couches de contexte et d'exécution abstraite au-dessus de cette frontière ne modifient pas le rôle de frontière
 noyau de `uring`.
@@ -365,11 +375,12 @@ noyau de `uring`.
 
 `uring` expose les mécanismes tournés vers le noyau ; l'ordonnancement, les tentatives de reprise, le suivi de
 connexions et l'interprétation du protocole relèvent des couches supérieures. Les patrons ci-dessous décrivent la
-frontière qu'un runtime côté appelant doit préserver.
+frontière qu'un environnement d'exécution côté appelant doit préserver.
 
 ### Boucle d'événements propriétaire du ring
 
-En mode single-issuer (le mode par défaut), une seule goroutine sérialise toutes les opérations côté submit. Une boucle
+En mode mono-émetteur (le mode par défaut), une seule goroutine sérialise toutes les opérations côté soumission. Une
+boucle
 classique soumet le travail en attente, applique un `iox.Backoff` détenu par l'appelant quand `Wait` ne signale aucun
 progrès observable, puis distribue les complétions :
 
@@ -406,14 +417,15 @@ func runLoop(ring *uring.Uring, stop <-chan struct{}) error {
 ```
 
 Les méthodes du ring, dont `Send`, `Receive`, `AcceptMultishot` et `Wait`, s'exécutent sur cette goroutine. Le travail
-provenant d'autres goroutines entre dans la boucle via un canal ou une file lock-free ; on n'appelle pas directement les
+provenant d'autres goroutines entre dans la boucle via un canal ou une file sans verrou ; on n'appelle pas directement
+les
 méthodes du ring depuis l'extérieur. `iox.Backoff` reste côté appelant : on appelle `backoff.Wait()` quand `Wait` se
 classe comme `iox.OutcomeWouldBlock` ou ne récupère aucun CQE, puis `backoff.Reset()` après tout lot avec `n > 0`.
 
 ### Cycle de vie des souscriptions multishot
 
 Une opération multishot produit un flux de CQEs jusqu'à ce que le noyau envoie un CQE final (sans `IORING_CQE_F_MORE`).
-Le code runtime côté appelant suit les souscriptions et gère la re-soumission :
+Le code d'exécution côté appelant suit les souscriptions et gère la re-soumission :
 
 ```go
 handler := uring.NewMultishotSubscriber().
@@ -440,7 +452,8 @@ et la re-souscription conditionnelle.
 
 ### État par connexion via des contextes typés
 
-Les contextes étendus transportent les références par connexion tout au long du cycle submit → complete, sans recourir à
+Les contextes étendus transportent les références par connexion tout au long du cycle soumission → complétion, sans
+recourir à
 une table de correspondance globale :
 
 ```go
@@ -473,11 +486,12 @@ ring.PutExtSQE(ext)
 
 On maintient les racines de pointeurs Go actives accessibles en dehors de `UserData`. Le GC ne trace pas ces octets
 bruts. Le jeu de racines sidecar rattaché à chaque slot `ExtSQE` s'en charge pour les protocoles internes multishot et
-listener, mais le code runtime appelant qui place des refs typés doit les garder accessibles de manière indépendante.
+d'écouteur, mais le code d'exécution appelant qui place des refs typés doit les garder accessibles de manière
+indépendante.
 
 ### Composition de délais
 
-`LinkTimeout` attache un délai au SQE précédent via une chaîne `IOSQE_IO_LINK`. L'opération et le timeout entrent en
+`LinkTimeout` attache un délai au SQE précédent via une chaîne `IOSQE_IO_LINK`. L'opération et le délai entrent en
 concurrence : l'un aboutit, l'autre est annulé.
 
 ```go
@@ -495,7 +509,7 @@ if err := ring.LinkTimeout(timeoutCtx, 5*time.Second); err != nil {
 }
 ```
 
-La couche runtime appelante gère les deux issues : une réception réussie annule le timeout, et un timeout déclenché
+La couche d'exécution appelante gère les deux issues : une réception réussie annule le délai, et un délai déclenché
 annule la réception. Les deux produisent des CQEs que la boucle de distribution doit observer.
 
 ## Parcours TCP courants
@@ -535,8 +549,9 @@ if err != nil {
 defer recvSub.Cancel()
 ```
 
-`listener_example_test.go` couvre la mise en place du listener avec accept multishot, `examples/multishot_test.go`
-détaille les CQE côté handler pour le multishot receive, et `examples/echo_test.go` illustre le parcours echo loopback
+`listener_example_test.go` couvre la mise en place de l'écouteur avec accept multishot, `examples/multishot_test.go`
+détaille les CQE côté gestionnaire pour le multishot receive, et `examples/echo_test.go` illustre le parcours echo
+loopback
 complet.
 
 ### Client TCP
@@ -571,28 +586,29 @@ if err := ring.Receive(recvCtx, &clientFD, buf); err != nil {
 On réutilise la boucle `Wait` décrite dans la section cycle de vie du ring après chaque soumission pour observer la
 complétion correspondante. Le fichier `socket_integration_linux_test.go` couvre le flux connect/send côté client TCP.
 
-## Réception zero-copy (ZCRX)
+## Réception sans copie (ZCRX)
 
-`ZCRXReceiver` gère la réception zero-copy depuis une file RX matérielle de NIC via `io_uring`.
+`ZCRXReceiver` gère la réception sans copie depuis une file RX matérielle de NIC via `io_uring`.
 
 `NewZCRXReceiver` est prévu pour les rings créés avec des CQE de 32 octets (`IORING_SETUP_CQE32`). La surface `Options`
-actuelle n'expose pas ce drapeau de configuration ; par conséquent, les rings créés via le chemin standard de `New`
+actuelle n'expose pas ce fanion de configuration ; par conséquent, les rings créés via le chemin standard de `New`
 conduisent ce constructeur à renvoyer `ErrNotSupported`. Tant qu'un chemin de configuration CQE32 n'est pas exposé,
 cette section documente le contrat de frontière du récepteur plutôt qu'une recette publique exécutable.
 
 ### Cycle de vie
 
 1. Avec un ring compatible CQE32, on crée le récepteur via `NewZCRXReceiver`. Le constructeur enregistre la file
-   d'interface ZCRX, mappe la zone de remplissage et prépare le refill ring.
+   d'interface ZCRX, mappe la zone de remplissage et prépare le ring de remplissage.
 2. Appelez `Start` pour soumettre l'opération étendue `RECV_ZC` sur le ring.
-3. Sur le chemin de dispatch des CQE, les complétions ZCRX sont acheminées vers le `ZCRXHandler` :
+3. Sur le chemin de distribution des CQE, les complétions ZCRX sont acheminées vers le `ZCRXHandler` :
     - `OnData` livre un `ZCRXBuffer` pointant vers la zone mappée par la NIC. On appelle `Release` une fois le
       traitement terminé pour restituer le slot au noyau. Renvoyer `false` demande un arrêt au mieux.
     - `OnError` livre les erreurs CQE. Renvoyer `false` demande un arrêt au mieux.
    - `OnStopped` s'exécute une fois lors du retrait terminal avant que l'état ne devienne `Stopped`.
-4. On appelle `Stop` pour soumettre un async cancel. Le récepteur transite par `Stopping` → `Retiring` → `Stopped`.
+4. On appelle `Stop` pour soumettre une annulation asynchrone. Le récepteur transite par `Stopping` → `Retiring` →
+   `Stopped`.
 5. On interroge `Stopped` jusqu'à ce qu'il renvoie `true`, on arrête le ring propriétaire, puis on appelle `Close` pour
-   libérer la zone mappée et le mapping du refill ring.
+   libérer la zone mappée et le mappage du ring de remplissage.
 
 ### Machine à états
 
@@ -602,11 +618,12 @@ Idle → Active → Stopping → Retiring → Stopped
 
 `Stop` revient à l'état `Active` si la soumission d'annulation échoue. `Close` est idempotent.
 
-### Contrat du handler
+### Contrat du gestionnaire
 
-- `OnData` et `OnError` sont appelés en série depuis la goroutine de dispatch CQE.
-- `Release` est mono-producteur : il ne doit être appelé que depuis la goroutine de dispatch.
-- `Stop` ne doit être appelé que lorsqu'il est garanti non concurrent avec le dispatch CQE. Il s'agit d'un contrat de
+- `OnData` et `OnError` sont appelés en série depuis la goroutine de distribution CQE.
+- `Release` est mono-producteur : il ne doit être appelé que depuis la goroutine de distribution.
+- `Stop` ne doit être appelé que lorsqu'il est garanti non concurrent avec la distribution CQE. Il s'agit d'un contrat
+  de
   sérialisation côté appelant.
 
 ## Exemples
@@ -615,37 +632,41 @@ Les tests d'exemple dans `uring/examples/` illustrent l'API en situation concrè
 
 - `multishot_test.go`, accept multishot, réception multishot et arrêt d'abonnement
 - `file_io_test.go`, lectures, écritures et traitement par lots
-- `fixed_buffers_test.go`, buffers enregistrés et I/O sur buffers fixes
+- `fixed_buffers_test.go`, tampons enregistrés et I/O sur tampons fixes
 - `vectored_io_test.go`, opérations de lecture et écriture vectorisées
-- `splice_tee_test.go`, transfert de données zero-copy avec splice et tee
-- `zerocopy_test.go`, chemins d'envoi zero-copy et suivi des complétions
+- `splice_tee_test.go`, transfert de données sans copie avec splice et tee
+- `zerocopy_test.go`, chemins d'envoi sans copie et suivi des complétions
 - `poll_test.go`, flux de disponibilité par poll
-- `buffer_ring_test.go`, fourniture de buffer rings et groupes de buffers multi-tailles
+- `buffer_ring_test.go`, fourniture de rings de tampons et groupes de tampons multi-tailles
 - `context_test.go`, flux `SQEContext` direct, indirect et extended, plus accès via `CQEView`
 - `echo_test.go`, parcours serveur echo TCP et ping-pong UDP
-- `timeout_linux_test.go`, opérations de timeout et linked-timeout
+- `timeout_linux_test.go`, opérations de délai et de délai lié
 
-Au niveau du package, `listener_example_test.go` couvre la création de listener et l'accept multishot, tandis que
+Au niveau du package, `listener_example_test.go` couvre la création d'écouteur et l'accept multishot, tandis que
 `socket_integration_linux_test.go` couvre le flux client TCP connect/send.
 
 ## Notes opérationnelles
 
 - Activez `NotifySucceed` pour obtenir un CQE visible à chaque opération réussie.
-- `ring.Features` indique le nombre effectif d'entrées SQ et CQ, la largeur des slots SQE, ainsi que l'ordre des octets
+- `ring.Features` indique le nombre effectif d'entrées SQ et CQ, la largeur des emplacements SQE, ainsi que l'ordre des
+  octets
   utilisé par le package pour interpréter `user_data`.
 - Laissez `MultiIssuers` désactivé pour la configuration mono-émetteur par défaut (`SINGLE_ISSUER` + `DEFER_TASKRUN`),
-  dans laquelle un seul chemin d'exécution de l'appelant sérialise les opérations de submit-state (`submit`, `Wait`/
-  `enter`, `Stop` et resize). N'activez ce drapeau que lorsque plusieurs goroutines nécessitent une soumission
-  concurrente ou un enter côté wait ; cela bascule le ring vers la configuration de soumission partagée `COOP_TASKRUN`.
+  dans laquelle un seul chemin d'exécution de l'appelant sérialise les opérations d'état de soumission (`submit`,
+  `Wait`/
+  `enter`, `Stop` et resize). N'activez ce fanion que lorsque plusieurs goroutines nécessitent une soumission
+  concurrente ou une entrée côté attente ; cela bascule le ring vers la configuration de soumission partagée
+  `COOP_TASKRUN`.
 - `EpollWait` exige que `timeout` vaille `0` ; utilisez `LinkTimeout` si vous avez besoin d'une échéance.
 - Les vues de complétion empruntées et les contextes issus des pools doivent être libérés ou abandonnés sans délai.
-- `ListenerOp.Close` ferme le FD du listener immédiatement. Si un CQE de mise en place est encore en attente, drainez-le
+- `ListenerOp.Close` ferme le FD de l'écouteur immédiatement. Si un CQE de mise en place est encore en attente,
+  drainez-le
   d'abord, puis rappelez `Close` pour restituer le `ExtSQE` emprunté au pool.
 
 ## Support de plateforme
 
 `uring` cible Go 1.26+ et Linux 6.18+ pour le chemin réel adossé au noyau. La plupart des fichiers d'implémentation et
-des tests d'exemple portent la directive `//go:build linux`. Les fichiers Darwin fournissent uniquement des stubs de
+des tests d'exemple portent la directive `//go:build linux`. Les fichiers Darwin fournissent uniquement des bouchons de
 compilation pour la surface partagée ; les capacités propres à Linux restent propres à Linux et ne modifient en rien la
 base d'exécution Linux décrite ci-dessus.
 
