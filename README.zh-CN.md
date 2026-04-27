@@ -108,7 +108,8 @@ for {
 ```
 
 `Wait` 先刷新待提交项，再回收完成事件。在单提交者 ring 上，它还会在 SQ 排空后向内核发起进入调用，以推进延迟任务执行；调用方需保证
-`Wait`/`enter` 与提交状态操作串行执行。`iox.OutcomeWouldBlock` 表示当前边界上没有可观察到的完成事件。
+`Wait`/`enter` 与提交状态操作串行执行。当 `Wait` 返回的 `err` 经 `iox.Classify(err)` 分类为
+`iox.OutcomeWouldBlock` 时，表示当前边界上没有可观察到的完成事件。
 
 `Start` 与 `Stop` 是 ring 生命周期的配对操作。`Stop` 幂等但不可逆，调用后 ring 将永久不可用。调用 `Stop`
 前，需确保所有进行中的操作已完成、未处理的 CQE 已回收、活跃的 multishot 订阅已终止。
@@ -262,7 +263,8 @@ Fixed-buffer I/O 通过索引使用注册缓冲区。返回的切片属于 ring 
 buf := ring.RegisteredBuffer(0)
 copy(buf, payload)
 
-ctx := uring.PackDirect(uring.IORING_OP_WRITE_FIXED, 0, 0, int32(file.Fd()))
+fd := iofd.NewFD(int(file.Fd()))
+ctx := uring.PackDirect(uring.IORING_OP_WRITE_FIXED, 0, 0, 0).WithFD(fd)
 if err := ring.WriteFixed(ctx, 0, len(payload)); err != nil {
     return err
 }

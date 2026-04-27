@@ -197,9 +197,12 @@
 // receives over contiguous ranges of provided buffers.
 //
 //	opts := uring.OptionsForBudget(256 * uring.MiB)
-//	ring, _ := uring.New(func(opt *uring.Options) {
+//	ring, err := uring.New(func(opt *uring.Options) {
 //	    *opt = opts
 //	})
+//	if err != nil {
+//	    return err
+//	}
 //
 //	cfg, scale := uring.BufferConfigForBudget(256 * uring.MiB)
 //	fmt.Printf("buffer tiers=%+v scale=%d\n", cfg, scale)
@@ -207,10 +210,11 @@
 // A registered fixed buffer is ring-owned memory addressed by index. Keep the
 // buffer live until the fixed operation completes.
 //
+//	fd := iofd.NewFD(int(file.Fd()))
 //	buf := ring.RegisteredBuffer(0)
 //	copy(buf, payload)
 //
-//	writeCtx := uring.PackDirect(uring.IORING_OP_WRITE_FIXED, 0, 0, int32(file.Fd()))
+//	writeCtx := uring.PackDirect(uring.IORING_OP_WRITE_FIXED, 0, 0, 0).WithFD(fd)
 //	if err := ring.WriteFixed(writeCtx, 0, len(payload)); err != nil {
 //	    return err
 //	}

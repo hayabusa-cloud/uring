@@ -122,9 +122,8 @@ for {
 
 `Wait` vacía los envíos pendientes antes de recoger completados. En rings de emisor único, también realiza la entrada al
 kernel necesaria para que el trabajo diferido avance una vez vaciada la SQ; el llamador debe serializar `Wait`/`enter`
-con las operaciones de estado de envío. `iox.OutcomeWouldBlock` indica que no hay ningún completado observable en el
-límite
-actual.
+con las operaciones de estado de envío. Si `iox.Classify(err) == iox.OutcomeWouldBlock`, eso indica que no hay ningún
+completado observable en el límite actual.
 
 `Start` y `Stop` forman el par de ciclo de vida del ring. `Stop` es idempotente y deja el ring permanentemente
 inutilizable, por lo que solo debe llamarse tras drenar todas las operaciones en vuelo, recoger los CQE pendientes y
@@ -293,7 +292,8 @@ termine la operación fija:
 buf := ring.RegisteredBuffer(0)
 copy(buf, payload)
 
-ctx := uring.PackDirect(uring.IORING_OP_WRITE_FIXED, 0, 0, int32(file.Fd()))
+fd := iofd.NewFD(int(file.Fd()))
+ctx := uring.PackDirect(uring.IORING_OP_WRITE_FIXED, 0, 0, 0).WithFD(fd)
 if err := ring.WriteFixed(ctx, 0, len(payload)); err != nil {
     return err
 }

@@ -118,8 +118,8 @@ for {
 
 `Wait` purge les soumissions en attente avant de récupérer les complétions. Sur un ring mono-émetteur, il émet aussi
 l'entrée noyau nécessaire pour que le travail différé progresse une fois la SQ vidée ; l'appelant doit
-sérialiser `Wait`/`enter` avec les opérations d'état de soumission. `iox.OutcomeWouldBlock` signale qu'aucune complétion
-n'est observable à l'interface courante.
+sérialiser `Wait`/`enter` avec les opérations d'état de soumission. Lorsque `iox.Classify(err)` produit
+`iox.OutcomeWouldBlock`, aucune complétion n'est observable à l'interface courante.
 
 `Start` et `Stop` constituent la paire de cycle de vie du ring. `Stop` est idempotent et rend le ring définitivement
 inutilisable ; on ne doit donc l'appeler qu'après avoir drainé toutes les opérations en vol, récupéré les CQE en attente
@@ -287,7 +287,8 @@ jusqu'à la complétion de l'opération fixe :
 buf := ring.RegisteredBuffer(0)
 copy(buf, payload)
 
-ctx := uring.PackDirect(uring.IORING_OP_WRITE_FIXED, 0, 0, int32(file.Fd()))
+fd := iofd.NewFD(int(file.Fd()))
+ctx := uring.PackDirect(uring.IORING_OP_WRITE_FIXED, 0, 0, 0).WithFD(fd)
 if err := ring.WriteFixed(ctx, 0, len(payload)); err != nil {
     return err
 }

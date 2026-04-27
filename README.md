@@ -114,7 +114,8 @@ for {
 
 `Wait` flushes pending submissions, then reaps completions. On single-issuer rings it also issues the kernel enter that
 keeps deferred task work moving once the SQ drains; the caller must serialize `Wait`/`enter` with submit-state
-operations. `iox.OutcomeWouldBlock` means no completion is currently observable at the boundary.
+operations. If `iox.Classify(err)` yields `iox.OutcomeWouldBlock`, no completion is currently observable at the
+boundary.
 
 `Start` and `Stop` form the ring lifecycle pair. `Stop` is idempotent and renders the ring permanently unusable; call it
 only after you have drained all in-flight operations, reaped outstanding CQEs, and quiesced live multishot
@@ -278,7 +279,8 @@ fixed operation completes:
 buf := ring.RegisteredBuffer(0)
 copy(buf, payload)
 
-ctx := uring.PackDirect(uring.IORING_OP_WRITE_FIXED, 0, 0, int32(file.Fd()))
+fd := iofd.NewFD(int(file.Fd()))
+ctx := uring.PackDirect(uring.IORING_OP_WRITE_FIXED, 0, 0, 0).WithFD(fd)
 if err := ring.WriteFixed(ctx, 0, len(payload)); err != nil {
     return err
 }

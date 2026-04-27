@@ -111,7 +111,8 @@ for {
 
 `Wait` は未送信の SQE をフラッシュしてから完了を回収します。単一発行者リングでは、SQ が空になったあとも遅延タスクを進めるためのカーネル
 enter も発行します。呼び出し側は `Wait`/`enter` と他の発行状態操作を直列化する必要があります。
-`iox.OutcomeWouldBlock` は、現時点で境界上に観測可能な完了がないことを示します。
+`Wait` が返した `err` を `iox.Classify(err)` で分類して `iox.OutcomeWouldBlock` になった場合、それは現時点で
+境界上に観測可能な完了がないことを示します。
 
 `Start` と `Stop` がリングのライフサイクルを構成します。`Stop` は冪等ですが、呼び出すとリングは恒久的に使用不能になります。進行中の操作をすべて完了させ、未回収の
 CQE を回収し、multishot サブスクリプションを停止してから呼び出してください。
@@ -272,7 +273,8 @@ fmt.Printf("buffer tiers=%+v scale=%d\n", cfg, scale)
 buf := ring.RegisteredBuffer(0)
 copy(buf, payload)
 
-ctx := uring.PackDirect(uring.IORING_OP_WRITE_FIXED, 0, 0, int32(file.Fd()))
+fd := iofd.NewFD(int(file.Fd()))
+ctx := uring.PackDirect(uring.IORING_OP_WRITE_FIXED, 0, 0, 0).WithFD(fd)
 if err := ring.WriteFixed(ctx, 0, len(payload)); err != nil {
     return err
 }
