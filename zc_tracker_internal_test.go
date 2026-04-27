@@ -53,6 +53,16 @@ func TestZCTrackerNotificationUsesStoredCompletionResult(t *testing.T) {
 	}
 }
 
+func TestZCTrackerDataTryInvokeOnceIsAffine(t *testing.T) {
+	var data zcTrackerData
+	if !data.tryInvokeOnce() {
+		t.Fatal("first invocation was rejected")
+	}
+	if data.tryInvokeOnce() {
+		t.Fatal("second invocation was accepted")
+	}
+}
+
 func TestZCTrackerHandleCQEUsesNoopHandlerWhenNil(t *testing.T) {
 	pool := NewContextPools(4)
 	ext := pool.Extended()
