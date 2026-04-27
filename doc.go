@@ -3,36 +3,66 @@
 // license that can be found in the LICENSE file.
 
 // Package uring provides the kernel-boundary `io_uring` surface for Linux 6.18+.
-// Its core Linux `io_uring` implementation was refactored from
+// `uring` assumes the 6.18+ baseline and carries no fallback branches for older
+// kernels. Its core Linux `io_uring` implementation was refactored from
 // `code.hybscloud.com/sox` into this dedicated package. It prepares SQEs,
 // decodes CQEs, transports submission context through `user_data`, and exposes
 // kernel-boundary facts. Dispatch, retry, completion correlation, and
 // connection/session orchestration stay in caller-side runtime code above this
 // boundary.
 //
-//	// Create TCP socket
-//	socketCtx := uring.PackDirect(uring.IORING_OP_SOCKET, 0, 0, 0)
-//	ring.TCP4Socket(socketCtx)
+// A typical caller starts the ring, submits an operation, and then treats the
+// completion queue as the source of truth for kernel results. Semantic
+// no-progress conditions such as [iox.ErrWouldBlock] are classified through
+// [iox.Classify] instead of being treated as ordinary failures.
 //
-//	// Submit low-level multishot accept (one SQE, multiple CQEs)
-//	acceptCtx := uring.PackDirect(uring.IORING_OP_ACCEPT, 0, 0, listenerFD)
-//	ring.SubmitAcceptMultishot(acceptCtx)
+//	ring, err := uring.New(func(opt *uring.Options) {
+//	    opt.Entries = uring.EntriesMedium
+//	})
+//	if err != nil {
+//	    return err
+//	}
+//	if err := ring.Start(); err != nil {
+//	    return err
+//	}
+//	defer ring.Stop()
 //
-//	// Start multishot receive with buffer selection
-//	recvCtx := uring.ForFD(clientFD).WithBufGroup(bufGroupID)
-//	sub, err := ring.ReceiveMultishot(recvCtx, recvHandler)
-//
-// Completions return the kernel result together with the submission context.
+//	fd := iofd.NewFD(int(file.Fd()))
+//	buf := make([]byte, 4096)
+//	ctx := uring.PackDirect(uring.IORING_OP_READ, 0, 0, 0).WithFD(fd)
+//	if err := ring.Read(ctx, buf); err != nil {
+//	    return err
+//	}
 //
 //	cqes := make([]uring.CQEView, 64)
-//	n, err := ring.Wait(cqes)  // Poll CQ, returns iox.ErrWouldBlock if empty
+//	var backoff iox.Backoff
 //
-//	for i := range n {
-//	    cqe := cqes[i]
-//	    if cqe.Res < 0 {
-//	        return fmt.Errorf("completion failed: op=%d fd=%d res=%d", cqe.Op(), cqe.FD(), cqe.Res)
+//	for {
+//	    n, err := ring.Wait(cqes)
+//	    switch iox.Classify(err) {
+//	    case iox.OutcomeWouldBlock:
+//	        backoff.Wait()
+//	        continue
+//	    case iox.OutcomeFailure:
+//	        return err
 //	    }
-//	    fmt.Printf("completed op=%d on fd=%d with res=%d\n", cqe.Op(), cqe.FD(), cqe.Res)
+//	    if n == 0 {
+//	        backoff.Wait()
+//	        continue
+//	    }
+//
+//	    backoff.Reset()
+//	    for i := range n {
+//	        cqe := cqes[i]
+//	        if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
+//	            continue
+//	        }
+//	        if cqe.Res < 0 {
+//	            return fmt.Errorf("uring read failed: res=%d", cqe.Res)
+//	        }
+//	        handle(buf[:int(cqe.Res)])
+//	        return nil
+//	    }
 //	}
 //
 // [Uring.SubmitAcceptMultishot], [Uring.SubmitReceiveMultishot], and
@@ -161,12 +191,60 @@
 //
 // Buffer groups enable kernel-side buffer selection for receive operations.
 // The kernel picks an available buffer from the group at completion time;
-// userspace does not select or assign buffers per receive.
+// userspace does not select or assign buffers per receive. The package exposes
+// three practical buffer-management paths: registered fixed buffers for
+// fixed-buffer file I/O, provided buffers selected by the kernel, and bundle
+// receives over contiguous ranges of provided buffers.
 //
 //	opts := uring.OptionsForBudget(256 * uring.MiB)
-//	ring, _ := uring.New(func(opt *uring.Options) {
+//	ring, err := uring.New(func(opt *uring.Options) {
 //	    *opt = opts
 //	})
+//	if err != nil {
+//	    return err
+//	}
+//
+//	cfg, scale := uring.BufferConfigForBudget(256 * uring.MiB)
+//	fmt.Printf("buffer tiers=%+v scale=%d\n", cfg, scale)
+//
+// A registered fixed buffer is ring-owned memory addressed by index. Keep the
+// buffer live until the fixed operation completes.
+//
+//	fd := iofd.NewFD(int(file.Fd()))
+//	buf := ring.RegisteredBuffer(0)
+//	copy(buf, payload)
+//
+//	writeCtx := uring.PackDirect(uring.IORING_OP_WRITE_FIXED, 0, 0, 0).WithFD(fd)
+//	if err := ring.WriteFixed(writeCtx, 0, len(payload)); err != nil {
+//	    return err
+//	}
+//
+// For socket receive with kernel buffer selection, pass nil as the receive
+// buffer and request the desired read-buffer size class. The matching CQE
+// reports which buffer group and buffer ID were consumed.
+//
+//	recvCtx := uring.PackDirect(uring.IORING_OP_RECV, 0, 0, 0)
+//	if err := ring.Receive(recvCtx, &socketFD, nil, uring.WithReadBufferSize(uring.BufferSizeSmall)); err != nil {
+//	    return err
+//	}
+//
+//	if cqe.HasBuffer() {
+//	    fmt.Printf("kernel selected group=%d id=%d\n", cqe.BufGroup(), cqe.BufID())
+//	}
+//
+// Bundle receives may consume more than one provided buffer in one CQE.
+// Process the iterator and then recycle the consumed slots.
+//
+//	if err := ring.ReceiveBundle(recvCtx, &socketFD, uring.WithReadBufferSize(uring.BufferSizeSmall)); err != nil {
+//	    return err
+//	}
+//
+//	if it, ok := ring.BundleIterator(cqe, cqe.BufGroup()); ok {
+//	    for buf := range it.All() {
+//	        handle(buf)
+//	    }
+//	    it.Recycle(ring)
+//	}
 //
 // # Supported Operations
 //
