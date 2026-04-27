@@ -20,6 +20,57 @@ func TestOptionsApplySupportsPackageOptionHelpers(t *testing.T) {
 	}
 }
 
+func TestOptionsForBudgetDisablesMultiSizeWhenDefaultGroupsDoNotFit(t *testing.T) {
+	opts := OptionsForBudget(64 * MiB)
+	if opts.MultiSizeBuffer != 0 {
+		t.Fatalf("MultiSizeBuffer = %d, want 0", opts.MultiSizeBuffer)
+	}
+
+	ring, err := New(func(opt *Options) { *opt = opts })
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer func() {
+		if err := ring.Stop(); err != nil {
+			t.Fatalf("Stop failed: %v", err)
+		}
+	}()
+
+	if ring.bufferGroups != nil {
+		t.Fatal("bufferGroups is not nil")
+	}
+	if ring.buffers == nil {
+		t.Fatal("buffers is nil")
+	}
+}
+
+func TestNewUsesDefaultMultiSizeBufferGroups(t *testing.T) {
+	opts := OptionsForBudget(256 * MiB)
+	if opts.MultiSizeBuffer != 1 {
+		t.Fatalf("MultiSizeBuffer = %d, want 1", opts.MultiSizeBuffer)
+	}
+
+	ring, err := New(func(opt *Options) { *opt = opts })
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer func() {
+		if err := ring.Stop(); err != nil {
+			t.Fatalf("Stop failed: %v", err)
+		}
+	}()
+
+	if ring.bufferGroups == nil {
+		t.Fatal("bufferGroups is nil")
+	}
+	if ring.bufferGroups.scale != opts.MultiSizeBuffer {
+		t.Fatalf("bufferGroups.scale = %d, want %d", ring.bufferGroups.scale, opts.MultiSizeBuffer)
+	}
+	if wantCfg := DefaultBufferGroupsConfig(); ring.bufferGroups.cfg != wantCfg {
+		t.Fatalf("bufferGroups.cfg = %+v, want %+v", ring.bufferGroups.cfg, wantCfg)
+	}
+}
+
 func TestFlagOnlyOptionHelpersDefaultAndOverride(t *testing.T) {
 	var ur Uring
 	opts := []OpOptionFunc{WithFlags(7)}

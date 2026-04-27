@@ -67,7 +67,7 @@ func OptionsForSystem(systemMemory int) Options {
 //   - Ring entries: sized to match expected throughput (more budget = more entries)
 //   - Registered buffers: 25% for zero-copy operations (minimum 8 MiB, no maximum cap)
 //   - Buffer groups: use the remaining budget after registered buffers and ring overhead
-//   - Multi-size buffer groups are disabled when the remaining budget cannot fit the minimal tier set
+//   - Multi-size buffer groups use the default tier set and are disabled when it does not fit
 //
 // Example:
 //
@@ -87,31 +87,33 @@ func OptionsForBudget(budget int) Options {
 		bufferGroupMem = 0
 	}
 
-	cfg := bufferConfigForMem(bufferGroupMem)
-	scale := scaleForMem(bufferGroupMem, cfg)
+	scale := scaleForMem(bufferGroupMem, DefaultBufferGroupsConfig())
 
 	return Options{
 		Entries:         entries,
 		LockedBufferMem: lockedMem,
-		MultiSizeBuffer: scale,
 		ReadBufferSize:  bufferSizeDefault,
 		ReadBufferNum:   entries * 2,
 		WriteBufferSize: bufferSizeDefault,
 		WriteBufferNum:  entries,
+		MultiSizeBuffer: scale,
 	}
 }
 
-// BufferConfigForBudget returns a BufferGroupsConfig and scale for the given memory budget.
-// Use this when you want fine-grained control over Options while using
-// budget-based buffer configuration.
+// BufferConfigForBudget returns the BufferGroupsConfig and scale selected for
+// the given memory budget. Use this when you need to inspect or model the
+// largest tier set that fits in the remaining buffer-group memory.
 //
-// Budget handling matches OptionsForBudget:
+// Budget handling matches OptionsForBudget's memory reservation:
 //   - registered buffers use 25% of the budget (minimum 8 MiB)
 //   - ring overhead is reserved from the same budget
 //   - buffer groups use the remaining memory
 //   - if the remaining memory cannot fit the minimal tier set, the returned config is empty and scale is 0
 //
-// The returned scale should be passed to Options.MultiSizeBuffer.
+// OptionsForBudget does not carry BufferGroupsConfig through Options. It sets
+// Options.MultiSizeBuffer from the default buffer-group shape that New actually
+// allocates, so the scale returned here can differ from OptionsForBudget for
+// budgets where a smaller tier set fits but the default tier set does not.
 //
 // Example:
 //
