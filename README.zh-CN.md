@@ -50,8 +50,8 @@ Ring 创建可能返回 `ENOMEM`、`EPERM` 或 `ENOSYS`，原因分别涉及 mem
 
 ## Ring 生命周期
 
-`New` 返回一个未启动的 ring，提交操作前须先调用 `Start`。`New` 会预先构建上下文池，`Start` 则负责注册资源并启用 ring。
-`uring` 固定以 Linux 6.18+ 为基线，启动路径中不包含低版本回退逻辑。
+`New` 返回一个未启动的 ring，提交操作前须先调用 `Start`。`New` 会预先构建上下文池，`Start` 则负责注册资源并启用
+ring。下面的示例提交一次文件读取，等待匹配的 CQE，并使用 `iox.Classify` 保持 `ErrWouldBlock` 的“暂无进展”语义，而不是把它当作失败处理。
 
 ```go
 ring, err := uring.New(func(o *uring.Options) {
@@ -64,25 +64,49 @@ if err != nil {
 if err := ring.Start(); err != nil {
     return err
 }
+defer ring.Stop()
 
-cqes := make([]uring.CQEView, 64)
-n, err := ring.Wait(cqes)
-if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+fd := int32(file.Fd())
+buf := make([]byte, 4096)
+ctx := uring.PackDirect(uring.IORING_OP_READ, 0, 0, fd)
+if err := ring.Read(ctx, buf); err != nil {
     return err
 }
 
-for i := range n {
-    cqe := cqes[i]
-    if cqe.Res < 0 {
-        return fmt.Errorf("completion failed: op=%d fd=%d res=%d", cqe.Op(), cqe.FD(), cqe.Res)
+cqes := make([]uring.CQEView, 64)
+var backoff iox.Backoff
+
+for {
+    n, err := ring.Wait(cqes)
+    switch iox.Classify(err) {
+    case iox.OutcomeWouldBlock:
+        backoff.Wait()
+        continue
+    case iox.OutcomeFailure:
+        return err
     }
-    fmt.Printf("completed op=%d on fd=%d with res=%d\n", cqe.Op(), cqe.FD(), cqe.Res)
+    if n == 0 {
+        backoff.Wait()
+        continue
+    }
+
+    backoff.Reset()
+    for i := range n {
+        cqe := cqes[i]
+        if cqe.Op() != uring.IORING_OP_READ || int32(cqe.FD()) != fd {
+            continue
+        }
+        if cqe.Res < 0 {
+            return fmt.Errorf("uring read failed: res=%d", cqe.Res)
+        }
+        handle(buf[:int(cqe.Res)])
+        return nil
+    }
 }
 ```
 
 `Wait` 先刷新待提交项，再回收完成事件。在单提交者 ring 上，它还会在 SQ 排空后向内核发起 enter 调用以推进 deferred task
-work；调用方需保证 `Wait`/`enter` 与 submit-state 操作的串行执行。`iox.ErrWouldBlock` 表示当前没有可回收的完成事件，该错误定义在
-`code.hybscloud.com/iox` 中。
+work；调用方需保证 `Wait`/`enter` 与 submit-state 操作的串行执行。`iox.OutcomeWouldBlock` 表示当前边界上没有可观察到的完成事件。
 
 `Start` 与 `Stop` 是 ring 生命周期的配对操作。`Stop` 幂等但不可逆，调用后 ring 将永久不可用。调用 `Stop` 前，需确保所有
 in-flight 操作已完成、未处理的 CQE 已回收、活跃的 multishot 订阅已终止。
@@ -171,8 +195,14 @@ fmt.Printf("sqe context mode=%d seq=%d\n", sqeCtx.Mode(), meta.Val1)
 cqes := make([]uring.CQEView, 64)
 
 n, err := ring.Wait(cqes)
-if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+switch iox.Classify(err) {
+case iox.OutcomeWouldBlock:
+    return iox.ErrWouldBlock
+case iox.OutcomeFailure:
     return err
+}
+if n == 0 {
+    return iox.ErrWouldBlock
 }
 
 for i := 0; i < n; i++ {
@@ -200,10 +230,13 @@ for i := 0; i < n; i++ {
 
 ## 缓冲区供给
 
-`uring` 提供两种接收缓冲区策略：
+`uring` 提供三类常用缓冲区路径：注册缓冲区在 ring 启动时固定并用于 fixed-buffer 文件 I/O；provided buffer ring
+让内核在接收完成时选择缓冲区，并在 CQE 中返回 buffer ID；bundle receive 可以在一个 CQE 中消耗一段连续的逻辑缓冲区范围，并通过
+`BundleIterator` 暴露该范围。
 
 - 通过 `ReadBufferSize` 与 `ReadBufferNum` 配置固定尺寸提供缓冲区
 - 通过 `MultiSizeBuffer` 启用多尺寸缓冲区组
+- 通过 `LockedBufferMem`、`RegisteredBuffer`、`ReadFixed` 与 `WriteFixed` 使用注册固定缓冲区
 
 多数场景下，直接使用配置辅助函数即可：
 
@@ -214,7 +247,55 @@ ring, err := uring.New(func(o *uring.Options) {
 })
 ```
 
-需要从显式内存预算出发时使用 `OptionsForBudget`；需要查看某预算对应的分层布局时使用 `BufferConfigForBudget`。
+需要从显式内存预算出发时使用 `OptionsForBudget`；需要查看某预算对应的分层布局时使用 `BufferConfigForBudget`：
+
+```go
+cfg, scale := uring.BufferConfigForBudget(256 * uring.MiB)
+fmt.Printf("buffer tiers=%+v scale=%d\n", cfg, scale)
+```
+
+Fixed-buffer I/O 通过索引使用注册缓冲区。返回的切片属于 ring 内存；在 fixed 操作完成前保持其有效：
+
+```go
+buf := ring.RegisteredBuffer(0)
+copy(buf, payload)
+
+ctx := uring.PackDirect(uring.IORING_OP_WRITE, 0, 0, int32(file.Fd()))
+if err := ring.WriteFixed(ctx, 0, len(payload)); err != nil {
+    return err
+}
+```
+
+Socket 接收若要使用内核 buffer selection，传入 `nil` 作为接收缓冲区，并指定所需的尺寸级别。完成事件会报告内核选择的缓冲区：
+
+```go
+recvCtx := uring.ForFD(int32(socketFD)).
+    WithOp(uring.IORING_OP_RECV)
+
+if err := ring.Receive(recvCtx, &socketFD, nil, uring.WithReadBufferSize(uring.BufferSizeSmall)); err != nil {
+    return err
+}
+
+// 稍后，在 Wait 返回匹配 CQE 后：
+if cqe.HasBuffer() {
+    fmt.Printf("kernel selected group=%d id=%d\n", cqe.BufGroup(), cqe.BufID())
+}
+```
+
+Bundle receive 使用同一套 provided-buffer 存储，但一个 CQE 可能消耗多个缓冲区。处理迭代器后，将消耗的槽位回收：
+
+```go
+if err := ring.ReceiveBundle(recvCtx, &socketFD, uring.WithReadBufferSize(uring.BufferSizeSmall)); err != nil {
+    return err
+}
+
+if it, ok := ring.BundleIterator(cqe, cqe.BufGroup()); ok {
+    for buf := range it.All() {
+        handle(buf)
+    }
+    it.Recycle(ring)
+}
+```
 
 注册缓冲区需要锁定内存。若大规模注册失败，可提高 `RLIMIT_MEMLOCK` 或缩减预算。
 
@@ -270,11 +351,11 @@ func runLoop(ring *uring.Uring, stop <-chan struct{}) error {
         }
 
         n, err := ring.Wait(cqes)
-        if errors.Is(err, iox.ErrWouldBlock) {
+        switch iox.Classify(err) {
+        case iox.OutcomeWouldBlock:
             backoff.Wait()
             continue
-        }
-        if err != nil {
+        case iox.OutcomeFailure:
             return err
         }
         if n == 0 {
@@ -291,7 +372,7 @@ func runLoop(ring *uring.Uring, stop <-chan struct{}) error {
 ```
 
 所有 ring 方法，包括 `Send`、`Receive`、`AcceptMultishot` 和 `Wait`，均在该 goroutine 上执行。来自其他 goroutine 的工作通过
-channel 或无锁队列进入循环，不可直接调用 ring 方法。`iox.Backoff` 由调用方持有：`Wait` 返回 `iox.ErrWouldBlock`，或一次
+channel 或无锁队列进入循环，不可直接调用 ring 方法。`iox.Backoff` 由调用方持有：`Wait` 分类为 `iox.OutcomeWouldBlock`，或一次
 `Wait` 没有回收到任何 CQE 时，调用 `backoff.Wait()`；回收到 `n > 0` 的 CQE 批次后，调用 `backoff.Reset()`。
 
 ### Multishot 订阅生命周期

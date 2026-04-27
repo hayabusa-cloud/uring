@@ -53,7 +53,8 @@ Debian 13 の安定版トラックが提供するカーネルは 6.12 です。`
 ## リングのライフサイクル
 
 `New` は未開始状態のリングを返します。操作の発行に先立ち `Start` を呼び出してください。`New` がコンテキストプールを即座に構築し、
-`Start` がリングリソースの登録と有効化を行います。Linux 6.18+ を固定のベースラインとしており、それ以前のカーネル向けのフォールバックは持ちません。
+`Start` がリングリソースの登録と有効化を行います。次の例ではファイル read を発行し、対応する CQE を待ち、`iox.Classify`
+によって `ErrWouldBlock` を失敗ではなく「進展なし」の意味として扱います。
 
 ```go
 ring, err := uring.New(func(o *uring.Options) {
@@ -66,25 +67,50 @@ if err != nil {
 if err := ring.Start(); err != nil {
     return err
 }
+defer ring.Stop()
 
-cqes := make([]uring.CQEView, 64)
-n, err := ring.Wait(cqes)
-if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+fd := int32(file.Fd())
+buf := make([]byte, 4096)
+ctx := uring.PackDirect(uring.IORING_OP_READ, 0, 0, fd)
+if err := ring.Read(ctx, buf); err != nil {
     return err
 }
 
-for i := range n {
-    cqe := cqes[i]
-    if cqe.Res < 0 {
-        return fmt.Errorf("completion failed: op=%d fd=%d res=%d", cqe.Op(), cqe.FD(), cqe.Res)
+cqes := make([]uring.CQEView, 64)
+var backoff iox.Backoff
+
+for {
+    n, err := ring.Wait(cqes)
+    switch iox.Classify(err) {
+    case iox.OutcomeWouldBlock:
+        backoff.Wait()
+        continue
+    case iox.OutcomeFailure:
+        return err
     }
-    fmt.Printf("completed op=%d on fd=%d with res=%d\n", cqe.Op(), cqe.FD(), cqe.Res)
+    if n == 0 {
+        backoff.Wait()
+        continue
+    }
+
+    backoff.Reset()
+    for i := range n {
+        cqe := cqes[i]
+        if cqe.Op() != uring.IORING_OP_READ || int32(cqe.FD()) != fd {
+            continue
+        }
+        if cqe.Res < 0 {
+            return fmt.Errorf("uring read failed: res=%d", cqe.Res)
+        }
+        handle(buf[:int(cqe.Res)])
+        return nil
+    }
 }
 ```
 
 `Wait` は未送信の SQE をフラッシュしてから完了を回収します。単一発行者リングでは、SQ が空になったあとも deferred task work
 を駆動するための kernel enter を併せて発行します。呼び出し側は `Wait`/`enter` と他の submit-state 操作を直列化する必要があります。
-`iox.ErrWouldBlock` は、現時点で観測可能な完了がないことを示します。このエラーは `code.hybscloud.com/iox` で定義されています。
+`iox.OutcomeWouldBlock` は、現時点で境界上に観測可能な完了がないことを示します。
 
 `Start` と `Stop` がリングのライフサイクルを構成します。`Stop` は冪等ですが、 呼び出すとリングは恒久的に使用不能になります。in-flight
 操作をすべて完了させ、 未回収の CQE を回収し、multishot サブスクリプションを停止してから 呼び出してください。
@@ -178,8 +204,14 @@ fmt.Printf("sqe context mode=%d seq=%d\n", sqeCtx.Mode(), meta.Val1)
 cqes := make([]uring.CQEView, 64)
 
 n, err := ring.Wait(cqes)
-if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+switch iox.Classify(err) {
+case iox.OutcomeWouldBlock:
+    return iox.ErrWouldBlock
+case iox.OutcomeFailure:
     return err
+}
+if n == 0 {
+    return iox.ErrWouldBlock
 }
 
 for i := 0; i < n; i++ {
@@ -208,10 +240,13 @@ for i := 0; i < n; i++ {
 
 ## バッファ供給
 
-`uring` は 2 種類の受信バッファ戦略に対応しています。
+`uring` には実用上 3 つのバッファ経路があります。登録バッファはリング開始時に固定され、fixed-buffer ファイル I/O
+で使います。provided buffer ring ではカーネルが受信バッファを選び、選択された buffer ID を CQE に返します。bundle receive は
+1 つの CQE で連続した論理バッファ範囲を消費し、その範囲を `BundleIterator` で公開します。
 
 - `ReadBufferSize`・`ReadBufferNum` による固定サイズの provided buffer
 - `MultiSizeBuffer` によるマルチサイズ buffer group
+- `LockedBufferMem`・`RegisteredBuffer`・`ReadFixed`・`WriteFixed` による登録 fixed buffer
 
 多くの場合、設定ヘルパーから始めるのが簡単です。
 
@@ -224,6 +259,57 @@ ring, err := uring.New(func(o *uring.Options) {
 
 メモリ予算を明示的に指定したい場合は `OptionsForBudget` を、予算に対して選択される tier 構成を確認したい場合は
 `BufferConfigForBudget` を使用してください。
+
+```go
+cfg, scale := uring.BufferConfigForBudget(256 * uring.MiB)
+fmt.Printf("buffer tiers=%+v scale=%d\n", cfg, scale)
+```
+
+Fixed-buffer I/O は登録済みバッファをインデックスで参照します。返されるスライスはリング所有のメモリなので、fixed
+操作が完了するまで有効に保ってください。
+
+```go
+buf := ring.RegisteredBuffer(0)
+copy(buf, payload)
+
+ctx := uring.PackDirect(uring.IORING_OP_WRITE, 0, 0, int32(file.Fd()))
+if err := ring.WriteFixed(ctx, 0, len(payload)); err != nil {
+    return err
+}
+```
+
+ソケット受信でカーネルの buffer selection を使う場合は、受信バッファとして `nil` を渡し、必要なサイズクラスを指定します。完了
+CQE には選択されたバッファが記録されます。
+
+```go
+recvCtx := uring.ForFD(int32(socketFD)).
+    WithOp(uring.IORING_OP_RECV)
+
+if err := ring.Receive(recvCtx, &socketFD, nil, uring.WithReadBufferSize(uring.BufferSizeSmall)); err != nil {
+    return err
+}
+
+// 後で、Wait が対応する CQE を返したあと:
+if cqe.HasBuffer() {
+    fmt.Printf("kernel selected group=%d id=%d\n", cqe.BufGroup(), cqe.BufID())
+}
+```
+
+Bundle receive は同じ provided-buffer ストレージを使いますが、1 つの CQE
+で複数のバッファを消費することがあります。イテレータを処理したら、消費したスロットを回収してください。
+
+```go
+if err := ring.ReceiveBundle(recvCtx, &socketFD, uring.WithReadBufferSize(uring.BufferSizeSmall)); err != nil {
+    return err
+}
+
+if it, ok := ring.BundleIterator(cqe, cqe.BufGroup()); ok {
+    for buf := range it.All() {
+        handle(buf)
+    }
+    it.Recycle(ring)
+}
+```
 
 登録バッファにはピン留めされたメモリが必要です。大きなバッファの登録に失敗する場合は `RLIMIT_MEMLOCK`
 を引き上げるか、メモリ予算を小さくしてください。
@@ -281,11 +367,11 @@ func runLoop(ring *uring.Uring, stop <-chan struct{}) error {
         }
 
         n, err := ring.Wait(cqes)
-        if errors.Is(err, iox.ErrWouldBlock) {
+        switch iox.Classify(err) {
+        case iox.OutcomeWouldBlock:
             backoff.Wait()
             continue
-        }
-        if err != nil {
+        case iox.OutcomeFailure:
             return err
         }
         if n == 0 {
@@ -303,7 +389,7 @@ func runLoop(ring *uring.Uring, stop <-chan struct{}) error {
 
 `Send`、`Receive`、`AcceptMultishot`、`Wait` などのリングメソッドはすべてこの goroutine 上で実行します。他の goroutine
 からの作業はチャネルまたはロックフリーキューを経由してループに渡します。リングメソッドを直接呼び出してはなりません。
-`iox.Backoff` は呼び出し側が所有します。`Wait` が `iox.ErrWouldBlock` を返した場合、または CQE を 1 件も回収できなかった場合は
+`iox.Backoff` は呼び出し側が所有します。`Wait` が `iox.OutcomeWouldBlock` に分類された場合、または CQE を 1 件も回収できなかった場合は
 `backoff.Wait()` を呼び、`n > 0` のバッチを回収できたら `backoff.Reset()` を呼びます。
 
 ### マルチショットサブスクリプションのライフサイクル

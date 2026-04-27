@@ -57,8 +57,9 @@ Consulte [SETUP.md](./SETUP.md) para el diagnóstico y la resolución.
 ## Ciclo de vida del ring
 
 `New` devuelve un ring sin iniciar. Antes de enviar operaciones es necesario llamar a `Start`. `Start` registra los
-recursos del ring y lo habilita; `New`, por su parte, construye los pools de contexto de forma anticipada. En Linux,
-`uring` asume la línea base fija de 6.18+ y no mantiene ramas de fallback para versiones anteriores.
+recursos del ring y lo habilita; `New`, por su parte, construye los pools de contexto de forma anticipada. El ejemplo
+siguiente envía una lectura de archivo, espera el CQE correspondiente y usa `iox.Classify` para conservar
+`ErrWouldBlock` como resultado semántico de falta de progreso, no como fallo.
 
 ```go
 ring, err := uring.New(func(o *uring.Options) {
@@ -71,26 +72,51 @@ if err != nil {
 if err := ring.Start(); err != nil {
     return err
 }
+defer ring.Stop()
 
-cqes := make([]uring.CQEView, 64)
-n, err := ring.Wait(cqes)
-if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+fd := int32(file.Fd())
+buf := make([]byte, 4096)
+ctx := uring.PackDirect(uring.IORING_OP_READ, 0, 0, fd)
+if err := ring.Read(ctx, buf); err != nil {
     return err
 }
 
-for i := range n {
-    cqe := cqes[i]
-    if cqe.Res < 0 {
-        return fmt.Errorf("completion failed: op=%d fd=%d res=%d", cqe.Op(), cqe.FD(), cqe.Res)
+cqes := make([]uring.CQEView, 64)
+var backoff iox.Backoff
+
+for {
+    n, err := ring.Wait(cqes)
+    switch iox.Classify(err) {
+    case iox.OutcomeWouldBlock:
+        backoff.Wait()
+        continue
+    case iox.OutcomeFailure:
+        return err
     }
-    fmt.Printf("completed op=%d on fd=%d with res=%d\n", cqe.Op(), cqe.FD(), cqe.Res)
+    if n == 0 {
+        backoff.Wait()
+        continue
+    }
+
+    backoff.Reset()
+    for i := range n {
+        cqe := cqes[i]
+        if cqe.Op() != uring.IORING_OP_READ || int32(cqe.FD()) != fd {
+            continue
+        }
+        if cqe.Res < 0 {
+            return fmt.Errorf("uring read failed: res=%d", cqe.Res)
+        }
+        handle(buf[:int(cqe.Res)])
+        return nil
+    }
 }
 ```
 
 `Wait` vacía los envíos pendientes antes de recoger completados. En rings de emisor único, también realiza el enter del
 kernel necesario para que el deferred task work avance una vez vaciada la SQ; el llamador debe serializar `Wait`/`enter`
-con las operaciones de submit-state. `iox.ErrWouldBlock` indica que no hay ningún completado observable en el límite
-actual. Este error está definido en `code.hybscloud.com/iox`.
+con las operaciones de submit-state. `iox.OutcomeWouldBlock` indica que no hay ningún completado observable en el límite
+actual.
 
 `Start` y `Stop` forman el par de ciclo de vida del ring. `Stop` es idempotente y deja el ring permanentemente
 inutilizable, por lo que solo debe llamarse tras drenar todas las operaciones en vuelo, recoger los CQE pendientes y
@@ -188,8 +214,14 @@ invoque `cqe.Context()` cuando necesite recuperar el token de envío original.
 cqes := make([]uring.CQEView, 64)
 
 n, err := ring.Wait(cqes)
-if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+switch iox.Classify(err) {
+case iox.OutcomeWouldBlock:
+    return iox.ErrWouldBlock
+case iox.OutcomeFailure:
     return err
+}
+if n == 0 {
+    return iox.ErrWouldBlock
 }
 
 for i := 0; i < n; i++ {
@@ -218,10 +250,14 @@ Al completarse la operación, `CQEView` decodifica el modo de contexto correspon
 
 ## Provisión de buffers
 
-`uring` ofrece dos estrategias de buffers de recepción:
+`uring` ofrece tres rutas prácticas para buffers. Los buffers registrados quedan fijados durante el arranque del ring y
+se usan con I/O de archivo fixed-buffer. Los provided buffer rings permiten que el kernel elija un buffer de recepción y
+devuelva su ID en el CQE. Las recepciones bundle consumen un rango lógico contiguo de buffers provistos y lo exponen
+mediante `BundleIterator`.
 
 - buffers provistos de tamaño fijo mediante `ReadBufferSize` y `ReadBufferNum`
 - grupos de buffers de varios tamaños mediante `MultiSizeBuffer`
+- buffers fijos registrados mediante `LockedBufferMem`, `RegisteredBuffer`, `ReadFixed` y `WriteFixed`
 
 En la mayoría de los sistemas, los helpers de configuración ofrecen un punto de partida directo:
 
@@ -233,7 +269,58 @@ ring, err := uring.New(func(o *uring.Options) {
 ```
 
 Use `OptionsForBudget` para partir de un presupuesto de memoria explícito, y `BufferConfigForBudget` para inspeccionar
-la distribución por niveles elegida para dicho presupuesto.
+la distribución por niveles elegida para dicho presupuesto:
+
+```go
+cfg, scale := uring.BufferConfigForBudget(256 * uring.MiB)
+fmt.Printf("buffer tiers=%+v scale=%d\n", cfg, scale)
+```
+
+El I/O fixed-buffer usa un buffer registrado por índice. La slice devuelta pertenece al ring; manténgala viva hasta que
+la operación fixed termine:
+
+```go
+buf := ring.RegisteredBuffer(0)
+copy(buf, payload)
+
+ctx := uring.PackDirect(uring.IORING_OP_WRITE, 0, 0, int32(file.Fd()))
+if err := ring.WriteFixed(ctx, 0, len(payload)); err != nil {
+    return err
+}
+```
+
+Para recibir en socket con selección de buffer por el kernel, pase `nil` como buffer de recepción y solicite la clase de
+tamaño deseada. La completación indica qué buffer fue elegido:
+
+```go
+recvCtx := uring.ForFD(int32(socketFD)).
+    WithOp(uring.IORING_OP_RECV)
+
+if err := ring.Receive(recvCtx, &socketFD, nil, uring.WithReadBufferSize(uring.BufferSizeSmall)); err != nil {
+    return err
+}
+
+// Más tarde, cuando Wait devuelva el CQE correspondiente:
+if cqe.HasBuffer() {
+    fmt.Printf("kernel selected group=%d id=%d\n", cqe.BufGroup(), cqe.BufID())
+}
+```
+
+Las recepciones bundle usan el mismo almacenamiento de provided buffers, pero pueden consumir más de un buffer en un
+solo CQE. Procese el iterador y después recicle los slots consumidos:
+
+```go
+if err := ring.ReceiveBundle(recvCtx, &socketFD, uring.WithReadBufferSize(uring.BufferSizeSmall)); err != nil {
+    return err
+}
+
+if it, ok := ring.BundleIterator(cqe, cqe.BufGroup()); ok {
+    for buf := range it.All() {
+        handle(buf)
+    }
+    it.Recycle(ring)
+}
+```
 
 Los buffers registrados requieren memoria fijada (pinned). Si el registro de buffers grandes falla, aumente
 `RLIMIT_MEMLOCK` o reduzca el presupuesto.
@@ -299,11 +386,11 @@ func runLoop(ring *uring.Uring, stop <-chan struct{}) error {
         }
 
         n, err := ring.Wait(cqes)
-        if errors.Is(err, iox.ErrWouldBlock) {
+        switch iox.Classify(err) {
+        case iox.OutcomeWouldBlock:
             backoff.Wait()
             continue
-        }
-        if err != nil {
+        case iox.OutcomeFailure:
             return err
         }
         if n == 0 {
@@ -322,7 +409,7 @@ func runLoop(ring *uring.Uring, stop <-chan struct{}) error {
 Todos los métodos del ring, incluidos `Send`, `Receive`, `AcceptMultishot` y `Wait`, se ejecutan en esta goroutine. El
 trabajo procedente de otras goroutines entra en el bucle a través de un canal o una cola lock-free; no se deben invocar
 los métodos del ring directamente. `iox.Backoff` sigue siendo propiedad del llamador: use `backoff.Wait()` cuando `Wait`
-devuelva `iox.ErrWouldBlock` o no recoja ningún CQE, y `backoff.Reset()` tras cualquier lote con `n > 0`.
+se clasifique como `iox.OutcomeWouldBlock` o no recoja ningún CQE, y `backoff.Reset()` tras cualquier lote con `n > 0`.
 
 ### Ciclo de vida de suscripciones multishot
 
