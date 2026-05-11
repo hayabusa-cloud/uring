@@ -27,8 +27,8 @@ import "code.hybscloud.com/iofd"
 //	for i := range n {
 //	    cqe := cqes[i]
 //	    // Observe the kernel facts first.
-//	    if cqe.Res < 0 {
-//	        return fmt.Errorf("completion failed: op=%d fd=%d res=%d", cqe.Op(), cqe.FD(), cqe.Res)
+//	    if err := cqe.Err(); err != nil {
+//	        return fmt.Errorf("completion failed: op=%d fd=%d: %w", cqe.Op(), cqe.FD(), err)
 //	    }
 //	    fmt.Printf("completed op=%d on fd=%d with res=%d\n", cqe.Op(), cqe.FD(), cqe.Res)
 //	    if cqe.HasMore() {

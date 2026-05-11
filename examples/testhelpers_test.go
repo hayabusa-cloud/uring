@@ -97,8 +97,8 @@ func closeFd(fd uintptr) {
 // cancellation serialization, unsubscribe suppression, or ExtSQE retirement.
 func dispatchSimplifiedMultishotCQE(handler uring.MultishotHandler, cqe uring.CQEView) bool {
 	step := uring.MultishotStep{CQE: cqe}
-	if cqe.Res < 0 {
-		step.Err = zcall.Errno(uintptr(-cqe.Res))
+	if err := cqe.Err(); err != nil {
+		step.Err = err
 		step.Cancelled = cqe.Res == -int32(uring.ECANCELED)
 	}
 

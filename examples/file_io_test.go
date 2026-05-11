@@ -68,8 +68,8 @@ func TestFileWriteRead(t *testing.T) {
 	if !ok {
 		t.Fatal("Write did not complete")
 	}
-	if cqe.Res < 0 {
-		t.Fatalf("Write failed: %d", cqe.Res)
+	if err := cqe.Err(); err != nil {
+		t.Fatalf("Write failed: %v", err)
 	}
 	if int(cqe.Res) != len(testData) {
 		t.Errorf("Write: got %d bytes, want %d", cqe.Res, len(testData))
@@ -92,8 +92,8 @@ func TestFileWriteRead(t *testing.T) {
 	if !ok {
 		t.Fatal("Read did not complete")
 	}
-	if cqe.Res < 0 {
-		t.Fatalf("Read failed: %d", cqe.Res)
+	if err := cqe.Err(); err != nil {
+		t.Fatalf("Read failed: %v", err)
 	}
 	t.Logf("Read completed: %d bytes", cqe.Res)
 
@@ -157,8 +157,8 @@ func TestBatchedFileOps(t *testing.T) {
 		}
 		for i := 0; i < n; i++ {
 			if cqes[i].Op() == uring.IORING_OP_WRITE {
-				if cqes[i].Res < 0 {
-					t.Errorf("Write failed: %d", cqes[i].Res)
+				if err := cqes[i].Err(); err != nil {
+					t.Errorf("Write failed: %v", err)
 				}
 				completed++
 			}
