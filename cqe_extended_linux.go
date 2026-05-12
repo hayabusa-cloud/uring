@@ -94,6 +94,8 @@ func (c *ExtCQE) FD() iofd.FD {
 //
 // On single-issuer rings it is not safe for concurrent use with submit, Stop,
 // or ResizeRings; caller must serialize those operations.
+// On IOPOLL rings WaitExtended also performs the nonblocking poll enter needed
+// to make completions visible.
 // Caller-side completion code must keep completion referents reachable until
 // CQE reap and serialize retirement.
 // For multishot CQEs, return Ext to the pool only after !HasMore().
@@ -124,9 +126,11 @@ func (ur *ioUring) waitBatchExtended(cqes []ExtCQE) (int, error) {
 		h := atomic.LoadUint32(ur.cq.kHead)
 		t := atomic.LoadUint32(ur.cq.kTail)
 		if h == t {
-			err := ur.cqEmptyErr()
-			ur.unlockSubmitState()
-			return 0, err
+			if err := ur.observeCQEmptyLocked(); err != nil {
+				ur.unlockSubmitState()
+				return 0, err
+			}
+			continue
 		}
 
 		// Calculate batch size

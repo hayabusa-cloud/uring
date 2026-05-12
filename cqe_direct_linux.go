@@ -77,6 +77,8 @@ func (c *DirectCQE) IsNotification() bool {
 //
 // On single-issuer rings it is not safe for concurrent use with submit, Stop,
 // or ResizeRings; caller must serialize those operations.
+// On IOPOLL rings WaitDirect also performs the nonblocking poll enter needed
+// to make completions visible.
 // Returns the number of CQEs retrieved, ErrCQOverflow when the ring enters CQ
 // overflow and no CQEs are immediately claimable, or iox.ErrWouldBlock if none
 // are available.
@@ -104,9 +106,11 @@ func (ur *ioUring) waitBatchDirect(cqes []DirectCQE) (int, error) {
 		h := atomic.LoadUint32(ur.cq.kHead)
 		t := atomic.LoadUint32(ur.cq.kTail)
 		if h == t {
-			err := ur.cqEmptyErr()
-			ur.unlockSubmitState()
-			return 0, err
+			if err := ur.observeCQEmptyLocked(); err != nil {
+				ur.unlockSubmitState()
+				return 0, err
+			}
+			continue
 		}
 
 		// Calculate batch size

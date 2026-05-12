@@ -827,27 +827,37 @@ func (ur *ioUring) sqCount() int {
 // avoid shared-submit locking.
 func (ur *ioUring) enter() error {
 	ur.lockSubmitState()
-	if ur.closed.Load() || ur.sq.kFlags == nil || ur.sq.kHead == nil || ur.sq.kTail == nil || ur.sq.kRingMask == nil {
+	if ur.closed.Load() || ur.sq.kFlags == nil || ur.sq.kHead == nil || ur.sq.kTail == nil {
 		ur.unlockSubmitState()
 		return ErrClosed
 	}
 
-	flags := atomic.LoadUint32(ur.sq.kFlags)
-	if flags&IORING_SQ_NEED_WAKEUP == IORING_SQ_NEED_WAKEUP {
-		_, err := ioUringEnter(ur.ringFd, uintptr(ur.params.sqEntries), 0, IORING_ENTER_SQ_WAKEUP)
-		// ErrExists/ErrInProgress means another enter is already in progress.
-		if err != nil && err != ErrExists && err != ErrInProgress {
-			ur.unlockSubmitState()
-			return err
-		}
+	if err := ur.wakeSQPollLocked(); err != nil {
+		ur.unlockSubmitState()
+		return err
 	}
-
-	err := ur.enterPending()
+	if err := ur.flushSubmitLocked(); err != nil {
+		ur.unlockSubmitState()
+		return err
+	}
 	ur.unlockSubmitState()
-	return err
+	return nil
 }
 
-func (ur *ioUring) enterPending() error {
+func (ur *ioUring) wakeSQPollLocked() error {
+	flags := atomic.LoadUint32(ur.sq.kFlags)
+	if flags&IORING_SQ_NEED_WAKEUP == 0 {
+		return nil
+	}
+	_, err := ioUringEnter(ur.ringFd, uintptr(ur.params.sqEntries), 0, IORING_ENTER_SQ_WAKEUP)
+	// ErrExists/ErrInProgress means another enter is already in progress.
+	if err != nil && err != ErrExists && err != ErrInProgress {
+		return err
+	}
+	return nil
+}
+
+func (ur *ioUring) flushSubmitLocked() error {
 	// Atomic loads pair with publishSubmitSlot's stores.
 	sqHead := atomic.LoadUint32(ur.sq.kHead)
 	sqTail := atomic.LoadUint32(ur.sq.kTail)
@@ -867,6 +877,28 @@ func (ur *ioUring) enterPending() error {
 	}
 	ur.releaseConsumedKeepAlive()
 	return nil
+}
+
+func (ur *ioUring) cqReady() bool {
+	h := atomic.LoadUint32(ur.cq.kHead)
+	t := atomic.LoadUint32(ur.cq.kTail)
+	return h != t
+}
+
+// observeCQEmptyLocked performs the nonblocking IOPOLL visibility enter at the
+// empty-CQ boundary. A nil return means the CQ became visible and callers should
+// reread head/tail; a non-nil return is the terminal empty/error verdict.
+func (ur *ioUring) observeCQEmptyLocked() error {
+	if ur.params.flags&IORING_SETUP_IOPOLL == 0 {
+		return ur.cqEmptyErr()
+	}
+	if err := ur.poll(0); err != nil {
+		return err
+	}
+	if ur.cqReady() {
+		return nil
+	}
+	return ur.cqEmptyErr()
 }
 
 func (ur *ioUring) poll(n int) error {
@@ -924,9 +956,11 @@ func (ur *ioUring) wait() (*ioUringCqe, error) {
 	for {
 		h, t := atomic.LoadUint32(ur.cq.kHead), atomic.LoadUint32(ur.cq.kTail)
 		if h == t {
-			err := ur.cqEmptyErr()
-			ur.unlockSubmitState()
-			return nil, err
+			if err := ur.observeCQEmptyLocked(); err != nil {
+				ur.unlockSubmitState()
+				return nil, err
+			}
+			continue
 		}
 
 		// Acquire barrier makes CQE contents visible after reading head and tail.
@@ -959,9 +993,11 @@ func (ur *ioUring) waitBatch(cqes []CQEView) (int, error) {
 		h := atomic.LoadUint32(ur.cq.kHead)
 		t := atomic.LoadUint32(ur.cq.kTail)
 		if h == t {
-			err := ur.cqEmptyErr()
-			ur.unlockSubmitState()
-			return 0, err
+			if err := ur.observeCQEmptyLocked(); err != nil {
+				ur.unlockSubmitState()
+				return 0, err
+			}
+			continue
 		}
 
 		// Calculate batch size: min(available, requested)
