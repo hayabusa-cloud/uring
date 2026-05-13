@@ -325,7 +325,7 @@ func (ur *ioUring) acceptDirect(sqeCtx SQEContext, ioprio uint16, fileIndex uint
 	return ur.submitPacked9(sqeCtx.WithOp(IORING_OP_ACCEPT), ioprio, 0, 0, 0, SOCK_NONBLOCK, 0, int32(kernelIndex))
 }
 
-// asyncCancel cancels a pending async operation.
+// asyncCancel cancels a pending async operation matched by original SQE user_data.
 func (ur *ioUring) asyncCancel(sqeCtx SQEContext, targetUserData uint64) error {
 	return ur.submitPacked3(sqeCtx.WithOp(IORING_OP_ASYNC_CANCEL), 0, targetUserData, 0)
 }

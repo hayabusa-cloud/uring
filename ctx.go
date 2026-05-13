@@ -261,7 +261,9 @@ func (c SQEContext) IndirectSQE() *IndirectSQE {
 }
 
 // ExtSQE stores a full SQE and 64 bytes of user data.
-// Callers must stop using it after the matching pool release.
+// Callers must stop using it after the matching pool release. The GC does not
+// trace UserData; callers that place pointer-bearing values there must keep the
+// referents reachable outside UserData.
 type ExtSQE struct {
 	SQE      ioUringSqe // 64 bytes - full system context
 	UserData [64]byte   // 64 bytes - flexible user interpretation

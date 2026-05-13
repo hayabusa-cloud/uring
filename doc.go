@@ -57,8 +57,8 @@
 //	        if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
 //	            continue
 //	        }
-//	        if cqe.Res < 0 {
-//	            return fmt.Errorf("uring read failed: res=%d", cqe.Res)
+//	        if err := cqe.Err(); err != nil {
+//	            return fmt.Errorf("uring read failed: %w", err)
 //	        }
 //	        handle(buf[:int(cqe.Res)])
 //	        return nil
@@ -73,14 +73,24 @@
 //
 //	sqeCtx := uring.ForFD(listenerFD)
 //	sub, err := ring.AcceptMultishot(sqeCtx, handler)
+//	if err != nil {
+//	    return err
+//	}
 //
-//	// Process CQEs - caller-side runtime code routes decoded CQEs
+//	// Process CQEs by routing this subscription first.
 //	for i := range n {
-//	    dispatch(handler, cqes[i])
+//	    if sub.HandleCQE(cqes[i]) {
+//	        continue
+//	    }
+//	    dispatch(ring, cqes[i])
 //	}
 //
 //	// Cancel when done
-//	sub.Cancel()
+//	// On single-issuer rings, call Cancel from the ring owner or otherwise
+//	// serialize it with submit, Wait, WaitDirect, WaitExtended, Stop, and resize operations.
+//	if err := sub.Cancel(); err != nil {
+//	    return err
+//	}
 //
 // Listener setup advances with [DecodeListenerCQE], [PrepareListenerBind],
 // [PrepareListenerListen], and [SetListenerReady]. [ListenerManager] is a thin
