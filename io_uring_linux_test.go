@@ -909,3 +909,216 @@ func TestCqRingAdvanceZero(t *testing.T) {
 		t.Fatalf("cq.advance(0) changed head: %d -> %d", headBefore, headAfter)
 	}
 }
+
+func TestCQReady(t *testing.T) {
+	var head uint32
+	var tail uint32
+	ur := &ioUring{params: &ioUringParams{}, cq: ioUringCq{kHead: &head, kTail: &tail}}
+
+	if ur.cqReady() {
+		t.Fatal("empty CQ reported ready")
+	}
+
+	tail = 1
+	if !ur.cqReady() {
+		t.Fatal("visible CQE was not reported ready")
+	}
+
+	head = 1
+	if ur.cqReady() {
+		t.Fatal("reaped CQ reported ready")
+	}
+}
+
+func TestObserveCQEmptyLockedNonIOPOLL(t *testing.T) {
+	var head uint32
+	var tail uint32
+	ur := &ioUring{params: &ioUringParams{}, cq: ioUringCq{kHead: &head, kTail: &tail}}
+
+	if err := ur.observeCQEmptyLocked(); !errors.Is(err, iox.ErrWouldBlock) {
+		t.Fatalf("observeCQEmptyLocked() = %v, want %v", err, iox.ErrWouldBlock)
+	}
+}
+
+func TestRingLayoutHelpers(t *testing.T) {
+	if got, want := sqeBytesFromFlags(0), int(unsafe.Sizeof(ioUringSqe{})); got != want {
+		t.Fatalf("sqeBytesFromFlags(0) = %d, want %d", got, want)
+	}
+	if got, want := sqeBytesFromFlags(IORING_SETUP_SQE128), int(unsafe.Sizeof(ioUringSqe128{})); got != want {
+		t.Fatalf("sqeBytesFromFlags(SQE128) = %d, want %d", got, want)
+	}
+	if got, want := sqeStrideFromFlags(IORING_SETUP_SQE128), unsafe.Sizeof(ioUringSqe128{}); got != want {
+		t.Fatalf("sqeStrideFromFlags(SQE128) = %d, want %d", got, want)
+	}
+	if got, want := cqeBytesFromFlags(0), int(unsafe.Sizeof(ioUringCqe{})); got != want {
+		t.Fatalf("cqeBytesFromFlags(0) = %d, want %d", got, want)
+	}
+	if got, want := cqeBytesFromFlags(IORING_SETUP_CQE32), 2*int(unsafe.Sizeof(ioUringCqe{})); got != want {
+		t.Fatalf("cqeBytesFromFlags(CQE32) = %d, want %d", got, want)
+	}
+	if got := cqeStrideFromFlags(IORING_SETUP_CQE32); got != 2 {
+		t.Fatalf("cqeStrideFromFlags(CQE32) = %d, want 2", got)
+	}
+
+	ur := &ioUring{
+		sq:  ioUringSq{ringSz: 64},
+		cq:  ioUringCq{ringSz: 96},
+		ops: []ioUringProbeOp{{op: IORING_OP_NOP}},
+	}
+	if got := ur.ringMapSz(); got != 96 {
+		t.Fatalf("ringMapSz() = %d, want 96", got)
+	}
+	if !ur.supportsOpcode(IORING_OP_NOP) {
+		t.Fatal("supportsOpcode did not find registered NOP")
+	}
+	if ur.supportsOpcode(IORING_OP_READ) {
+		t.Fatal("supportsOpcode found unregistered READ")
+	}
+
+	var head uint32 = 1
+	var tail uint32 = 4
+	ur.sq.kHead = &head
+	ur.sq.kTail = &tail
+	if got := ur.sqCount(); got != 3 {
+		t.Fatalf("sqCount() = %d, want 3", got)
+	}
+}
+
+func TestSubmitSlotResetAndInlineCmdData(t *testing.T) {
+	sqe := ioUringSqe{opcode: IORING_OP_NOP, fd: 7, len: 3}
+	slot := submitSlot{sqe: &sqe}
+	if data := slot.inlineCmdData128(); data != nil {
+		t.Fatalf("inlineCmdData128() = %v, want nil for 64-byte SQE", data)
+	}
+	slot.reset()
+	if sqe != (ioUringSqe{}) {
+		t.Fatalf("reset 64-byte SQE = %+v, want zero", sqe)
+	}
+
+	sqe128 := ioUringSqe128{ioUringSqe: ioUringSqe{opcode: IORING_OP_URING_CMD}}
+	slot = submitSlot{sqe: &sqe, sqe128: &sqe128}
+	data := slot.inlineCmdData128()
+	if len(data) != uringCmd128DataMax {
+		t.Fatalf("inlineCmdData128 len = %d, want %d", len(data), uringCmd128DataMax)
+	}
+	data[0] = 0xaa
+	data[len(data)-1] = 0xbb
+	if sqe128.pad[0] == 0 || sqe128.extra[len(sqe128.extra)-1] != 0xbb {
+		t.Fatal("inlineCmdData128 did not expose the inline command data region")
+	}
+	slot.reset()
+	if sqe128 != (ioUringSqe128{}) {
+		t.Fatalf("reset 128-byte SQE = %+v, want zero", sqe128)
+	}
+}
+
+func newCQStrideTestRing() *ioUring {
+	head := uint32(0)
+	tail := uint32(2)
+	mask := uint32(1)
+	overflow := uint32(0)
+
+	return &ioUring{
+		cq: ioUringCq{
+			kHead:     &head,
+			kTail:     &tail,
+			kRingMask: &mask,
+			kOverflow: &overflow,
+			cqes:      make([]ioUringCqe, 4),
+			cqeStride: cqeStrideFromFlags(IORING_SETUP_CQE32),
+		},
+	}
+}
+
+func TestWaitUsesCQE32Stride(t *testing.T) {
+	ur := newCQStrideTestRing()
+	ur.cq.cqes[0] = ioUringCqe{userData: PackDirect(IORING_OP_NOP, 0, 0, 1).Raw(), res: 11}
+	ur.cq.cqes[2] = ioUringCqe{userData: PackDirect(IORING_OP_NOP, 0, 0, 2).Raw(), res: 22}
+
+	first, err := ur.wait()
+	if err != nil {
+		t.Fatalf("wait first: %v", err)
+	}
+	if got := first.res; got != 11 {
+		t.Fatalf("first.res = %d, want 11", got)
+	}
+
+	second, err := ur.wait()
+	if err != nil {
+		t.Fatalf("wait second: %v", err)
+	}
+	if got := second.res; got != 22 {
+		t.Fatalf("second.res = %d, want 22", got)
+	}
+	if got := SQEContextFromRaw(second.userData).FD(); got != 2 {
+		t.Fatalf("second.userData FD = %d, want 2", got)
+	}
+}
+
+func TestWaitBatchUsesCQE32Stride(t *testing.T) {
+	ur := newCQStrideTestRing()
+	ur.cq.cqes[0] = ioUringCqe{userData: PackDirect(IORING_OP_NOP, 0, 0, 1).Raw(), res: 11}
+	ur.cq.cqes[2] = ioUringCqe{userData: PackDirect(IORING_OP_NOP, 0, 0, 2).Raw(), res: 22}
+
+	cqes := make([]CQEView, 2)
+	n, err := ur.waitBatch(cqes)
+	if err != nil {
+		t.Fatalf("waitBatch: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("waitBatch count = %d, want 2", n)
+	}
+	if got := cqes[1].Res; got != 22 {
+		t.Fatalf("cqes[1].Res = %d, want 22", got)
+	}
+	if got := cqes[1].ctx.FD(); got != 2 {
+		t.Fatalf("cqes[1].ctx.FD = %d, want 2", got)
+	}
+}
+
+func TestWaitBatchDirectUsesCQE32Stride(t *testing.T) {
+	ur := newCQStrideTestRing()
+	ur.cq.cqes[0] = ioUringCqe{userData: PackDirect(IORING_OP_NOP, IOSQE_IO_LINK, 3, 1).Raw(), res: 11}
+	ur.cq.cqes[2] = ioUringCqe{userData: PackDirect(IORING_OP_RECV, IOSQE_BUFFER_SELECT, 7, 2).Raw(), res: 22}
+
+	cqes := make([]DirectCQE, 2)
+	n, err := ur.waitBatchDirect(cqes)
+	if err != nil {
+		t.Fatalf("waitBatchDirect: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("waitBatchDirect count = %d, want 2", n)
+	}
+	if got := cqes[1].Res; got != 22 {
+		t.Fatalf("cqes[1].Res = %d, want 22", got)
+	}
+	if got := cqes[1].FD; got != 2 {
+		t.Fatalf("cqes[1].FD = %d, want 2", got)
+	}
+	if got := cqes[1].BufGroup; got != 7 {
+		t.Fatalf("cqes[1].BufGroup = %d, want 7", got)
+	}
+}
+
+func TestWaitBatchExtendedUsesCQE32Stride(t *testing.T) {
+	ur := newCQStrideTestRing()
+	ext1 := &ExtSQE{}
+	ext2 := &ExtSQE{}
+	ur.cq.cqes[0] = ioUringCqe{userData: PackExtended(ext1).Raw(), res: 11}
+	ur.cq.cqes[2] = ioUringCqe{userData: PackExtended(ext2).Raw(), res: 22}
+
+	cqes := make([]ExtCQE, 2)
+	n, err := ur.waitBatchExtended(cqes)
+	if err != nil {
+		t.Fatalf("waitBatchExtended: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("waitBatchExtended count = %d, want 2", n)
+	}
+	if got := cqes[1].Res; got != 22 {
+		t.Fatalf("cqes[1].Res = %d, want 22", got)
+	}
+	if cqes[1].Ext != ext2 {
+		t.Fatalf("cqes[1].Ext = %p, want %p", cqes[1].Ext, ext2)
+	}
+}

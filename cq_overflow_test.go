@@ -21,6 +21,7 @@ func newCQOverflowTestRing() (*ioUring, *uint32, *uint32, *uint32) {
 	overflow := uint32(0)
 
 	return &ioUring{
+			params: &ioUringParams{},
 			sq: ioUringSq{
 				kFlags: &sqFlags,
 			},
