@@ -108,11 +108,11 @@ for {
     backoff.Reset()
     for i := range n {
         cqe := cqes[i]
-		if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
+        if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
             continue
         }
-        if cqe.Res < 0 {
-            return fmt.Errorf("uring read failed: res=%d", cqe.Res)
+        if err := cqe.Err(); err != nil {
+            return fmt.Errorf("uring read failed: %w", err)
         }
         handle(buf[:int(cqe.Res)])
         return nil
@@ -120,10 +120,7 @@ for {
 }
 ```
 
-`Wait` vacía los envíos pendientes antes de recoger completados. En rings de emisor único, también realiza la entrada al
-kernel necesaria para que el trabajo diferido avance una vez vaciada la SQ; el llamador debe serializar `Wait`/`enter`
-con las operaciones de estado de envío. Si `iox.Classify(err) == iox.OutcomeWouldBlock`, eso indica que no hay ningún
-completado observable en el límite actual.
+`Wait` vacía los envíos pendientes antes de recoger completados. En rings de emisor único, también realiza la entrada al kernel necesaria para que el trabajo diferido avance una vez vaciada la SQ; el llamador debe serializar `Wait`, `WaitDirect` y `WaitExtended` con las demás operaciones de estado de envío. Si `iox.Classify(err) == iox.OutcomeWouldBlock`, eso indica que no hay ningún completado observable en el límite actual.
 
 `Start` y `Stop` forman el par de ciclo de vida del ring. `Stop` es idempotente y deja el ring permanentemente
 inutilizable, por lo que solo debe llamarse tras drenar todas las operaciones en vuelo, recoger los CQE pendientes y
@@ -234,8 +231,8 @@ if n == 0 {
 
 for i := 0; i < n; i++ {
     cqe := cqes[i]
-    if cqe.Res < 0 {
-        return fmt.Errorf("completion failed: op=%d fd=%d res=%d", cqe.Op(), cqe.FD(), cqe.Res)
+    if err := cqe.Err(); err != nil {
+        return fmt.Errorf("completion failed: op=%d fd=%d: %w", cqe.Op(), cqe.FD(), err)
     }
 
     switch cqe.Op() {
@@ -427,8 +424,7 @@ se clasifique como `iox.OutcomeWouldBlock` o no recoja ningún CQE, y `backoff.R
 
 ### Ciclo de vida de suscripciones multishot
 
-Una operación multishot genera un flujo de CQEs hasta que el kernel envía uno final (sin `IORING_CQE_F_MORE`). El código
-de ejecución del llamador rastrea las suscripciones y gestiona la reemisión:
+Una operación multishot genera un flujo de CQEs hasta que el kernel envía uno final (sin `IORING_CQE_F_MORE`). El código de ejecución del llamador encamina cada CQE por la suscripción devuelta antes de pasar al resto del despachador:
 
 ```go
 handler := uring.NewMultishotSubscriber().
@@ -446,12 +442,20 @@ handler := uring.NewMultishotSubscriber().
         }
     })
 
-_, err := ring.AcceptMultishot(acceptCtx, handler.Handler())
+sub, err := ring.AcceptMultishot(acceptCtx, handler.Handler())
+if err != nil {
+    return err
+}
+
+for i := range n {
+    if sub.HandleCQE(cqes[i]) {
+        continue
+    }
+    dispatch(ring, cqes[i])
+}
 ```
 
-`OnMultishotStep` observa cada finalización; devuelva `MultishotContinue` para mantener el flujo o `MultishotStop` para
-solicitar la cancelación. `OnMultishotStop` se ejecuta una vez en el estado terminal. Úselo para limpieza y
-resuscripción condicional.
+`OnMultishotStep` observa cada finalización; devuelva `MultishotContinue` para mantener el flujo o `MultishotStop` para solicitar la cancelación. `OnMultishotStop` se ejecuta una vez en el estado terminal. Úselo para limpieza y resuscripción condicional. En los rings de emisor único predeterminados, llame a `Cancel` / `Unsubscribe` desde el propietario del ring o serialícelos con envío, `Wait`, `WaitDirect`, `WaitExtended`, `Stop` y operaciones de redimensionado. En rings con `MultiIssuers`, la ruta de envío compartida serializa sus SQE de cancelación.
 
 ### Estado por conexión con contextos tipados
 
@@ -651,11 +655,7 @@ A nivel de paquete, `listener_example_test.go` cubre la creación de escuchas co
 - Active `NotifySucceed` cuando necesite un CQE visible por cada operación exitosa.
 - `ring.Features` informa de las entradas reales de SQ y CQ, el ancho de la ranura SQE y el orden de bytes que usa este
   paquete al interpretar `user_data`.
-- Deje `MultiIssuers` desactivado en la configuración predeterminada de emisor único (`SINGLE_ISSUER` +
-  `DEFER_TASKRUN`), en la que una sola ruta de ejecución del llamador serializa las operaciones de estado de envío (
-  `submit`, `Wait`/`enter`, `Stop` y resize). Actívelo solo cuando varios goroutines necesiten envío concurrente o
-  entrada
-  del lado de espera; esto conmuta el ring a la configuración de envío compartido con `COOP_TASKRUN`.
+- Deje `MultiIssuers` desactivado en la configuración predeterminada de emisor único (`SINGLE_ISSUER` + `DEFER_TASKRUN`), en la que una sola ruta de ejecución del llamador serializa las operaciones de estado de envío (`submit`, `Wait`, `WaitDirect`, `WaitExtended`, `Stop` y resize). Actívelo solo cuando varios goroutines necesiten envío concurrente o llamadas concurrentes a `Wait`, `WaitDirect` o `WaitExtended`; esto conmuta el ring a la configuración de envío compartido con `COOP_TASKRUN`.
 - `EpollWait` requiere que `timeout` sea `0`; use `LinkTimeout` cuando necesite un plazo.
 - Las vistas prestadas de completado y los contextos en pool deben liberarse o descartarse con prontitud.
 - `ListenerOp.Close` cierra el FD del escucha de inmediato. Si aún hay un CQE de configuración pendiente, drene ese CQE

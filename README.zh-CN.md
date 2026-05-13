@@ -95,11 +95,11 @@ for {
     backoff.Reset()
     for i := range n {
         cqe := cqes[i]
-		if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
+        if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
             continue
         }
-        if cqe.Res < 0 {
-            return fmt.Errorf("uring read failed: res=%d", cqe.Res)
+        if err := cqe.Err(); err != nil {
+            return fmt.Errorf("uring read failed: %w", err)
         }
         handle(buf[:int(cqe.Res)])
         return nil
@@ -107,9 +107,7 @@ for {
 }
 ```
 
-`Wait` 先刷新待提交项，再回收完成事件。在单提交者 ring 上，它还会在 SQ 排空后向内核发起进入调用，以推进延迟任务执行；调用方需保证
-`Wait`/`enter` 与提交状态操作串行执行。当 `Wait` 返回的 `err` 经 `iox.Classify(err)` 分类为
-`iox.OutcomeWouldBlock` 时，表示当前边界上没有可观察到的完成事件。
+`Wait` 先刷新待提交项，再回收完成事件。在单提交者 ring 上，它还会在 SQ 排空后向内核发起进入调用，以推进延迟任务执行；调用方需保证 `Wait`、`WaitDirect` 和 `WaitExtended` 与其他提交状态操作串行执行。当 `Wait` 返回的 `err` 经 `iox.Classify(err)` 分类为 `iox.OutcomeWouldBlock` 时，表示当前边界上没有可观察到的完成事件。
 
 `Start` 与 `Stop` 是 ring 生命周期的配对操作。`Stop` 幂等但不可逆，调用后 ring 将永久不可用。调用 `Stop`
 前，需确保所有进行中的操作已完成、未处理的 CQE 已回收、活跃的 multishot 订阅已终止。
@@ -210,8 +208,8 @@ if n == 0 {
 
 for i := 0; i < n; i++ {
     cqe := cqes[i]
-    if cqe.Res < 0 {
-        return fmt.Errorf("completion failed: op=%d fd=%d res=%d", cqe.Op(), cqe.FD(), cqe.Res)
+    if err := cqe.Err(); err != nil {
+        return fmt.Errorf("completion failed: op=%d fd=%d: %w", cqe.Op(), cqe.FD(), err)
     }
 
     switch cqe.Op() {
@@ -379,7 +377,7 @@ func runLoop(ring *uring.Uring, stop <-chan struct{}) error {
 
 ### Multishot 订阅生命周期
 
-Multishot 操作产生 CQE 流，直到内核发送最终 CQE（不含 `IORING_CQE_F_MORE`）。调用方运行时代码负责追踪订阅状态并管理重新提交。
+Multishot 操作产生 CQE 流，直到内核发送最终 CQE（不含 `IORING_CQE_F_MORE`）。调用方运行时代码先把每个 CQE 交给返回的订阅，再进入其余分发器。
 
 ```go
 handler := uring.NewMultishotSubscriber().
@@ -397,11 +395,20 @@ handler := uring.NewMultishotSubscriber().
         }
     })
 
-_, err := ring.AcceptMultishot(acceptCtx, handler.Handler())
+sub, err := ring.AcceptMultishot(acceptCtx, handler.Handler())
+if err != nil {
+    return err
+}
+
+for i := range n {
+    if sub.HandleCQE(cqes[i]) {
+        continue
+    }
+    dispatch(ring, cqes[i])
+}
 ```
 
-`OnMultishotStep` 观察每次完成；返回 `MultishotContinue` 保持流，返回 `MultishotStop` 请求取消。`OnMultishotStop`
-在终态执行一次，用于清理和按条件重新订阅。
+`OnMultishotStep` 观察每次完成；返回 `MultishotContinue` 保持流，返回 `MultishotStop` 请求取消。`OnMultishotStop` 在终态执行一次，用于清理和按条件重新订阅。在默认单提交者 ring 上，应从 ring 所有者调用 `Cancel` / `Unsubscribe`，或将它们与提交、`Wait`、`WaitDirect`、`WaitExtended`、`Stop` 以及 resize 操作串行化。启用 `MultiIssuers` 的 ring 由共享提交路径串行化这些取消 SQE。
 
 ### 类型化上下文承载连接状态
 
@@ -586,9 +593,7 @@ connect/send 流程。
 
 - 若需为每个成功操作生成可见的 CQE，启用 `NotifySucceed`。
 - `ring.Features` 报告实际 SQ/CQ 条目数、SQE 槽宽以及本包解析 `user_data` 的字节序。
-- 默认不启用 `MultiIssuers`，此时采用单提交者配置（`SINGLE_ISSUER` + `DEFER_TASKRUN`），由调用方的单一执行路径串行化
-  提交状态操作（`submit`、`Wait`/`enter`、`Stop` 及 resize）。仅当多个 goroutine 需并发提交或执行等待侧进入时才启用
-  `MultiIssuers`，这会切换为共享提交的 `COOP_TASKRUN` 配置。
+- 默认不启用 `MultiIssuers`，此时采用单提交者配置（`SINGLE_ISSUER` + `DEFER_TASKRUN`），由调用方的单一执行路径串行化提交状态操作（`submit`、`Wait`、`WaitDirect`、`WaitExtended`、`Stop` 及 resize）。仅当多个 goroutine 需并发提交或并发调用 `Wait`、`WaitDirect`、`WaitExtended` 时才启用 `MultiIssuers`，这会切换为共享提交的 `COOP_TASKRUN` 配置。
 - `EpollWait` 要求 `timeout` 为 `0`；如需设置截止时间，使用 `LinkTimeout`。
 - 借用式完成视图与池化上下文应及时释放。
 - `ListenerOp.Close` 会立即关闭监听 FD。若仍有设置 CQE 待处理，需先回收该 CQE，再调用 `Close` 将借用的 `ExtSQE` 归还池中。

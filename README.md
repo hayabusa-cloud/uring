@@ -100,11 +100,11 @@ for {
     backoff.Reset()
     for i := range n {
         cqe := cqes[i]
-		if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
+        if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
             continue
         }
-        if cqe.Res < 0 {
-            return fmt.Errorf("uring read failed: res=%d", cqe.Res)
+        if err := cqe.Err(); err != nil {
+            return fmt.Errorf("uring read failed: %w", err)
         }
         handle(buf[:int(cqe.Res)])
         return nil
@@ -112,10 +112,7 @@ for {
 }
 ```
 
-`Wait` flushes pending submissions, then reaps completions. On single-issuer rings it also issues the kernel enter that
-keeps deferred task work moving once the SQ drains; the caller must serialize `Wait`/`enter` with submit-state
-operations. If `iox.Classify(err)` yields `iox.OutcomeWouldBlock`, no completion is currently observable at the
-boundary.
+`Wait` flushes pending submissions, then reaps completions. On single-issuer rings it also issues the kernel enter that keeps deferred task work moving once the SQ drains; the caller must serialize `Wait`, `WaitDirect`, and `WaitExtended` with other submit-state operations. If `iox.Classify(err)` yields `iox.OutcomeWouldBlock`, no completion is currently observable at the boundary.
 
 `Start` and `Stop` form the ring lifecycle pair. `Stop` is idempotent and renders the ring permanently unusable; call it
 only after you have drained all in-flight operations, reaped outstanding CQEs, and quiesced live multishot
@@ -223,8 +220,8 @@ if n == 0 {
 
 for i := 0; i < n; i++ {
     cqe := cqes[i]
-    if cqe.Res < 0 {
-        return fmt.Errorf("completion failed: op=%d fd=%d res=%d", cqe.Op(), cqe.FD(), cqe.Res)
+    if err := cqe.Err(); err != nil {
+        return fmt.Errorf("completion failed: op=%d fd=%d: %w", cqe.Op(), cqe.FD(), err)
     }
 
     switch cqe.Op() {
@@ -405,7 +402,7 @@ stays caller-owned: call `backoff.Wait()` on `iox.OutcomeWouldBlock` or when `Wa
 ### Multishot subscription lifecycle
 
 A multishot operation produces a stream of CQEs until the kernel sends a final one (without `IORING_CQE_F_MORE`).
-Caller-side runtime code tracks subscriptions and handles resubmission:
+Caller-side runtime code routes each CQE through the returned subscription before falling back to the rest of the dispatcher:
 
 ```go
 handler := uring.NewMultishotSubscriber().
@@ -423,11 +420,20 @@ handler := uring.NewMultishotSubscriber().
         }
     })
 
-_, err := ring.AcceptMultishot(acceptCtx, handler.Handler())
+sub, err := ring.AcceptMultishot(acceptCtx, handler.Handler())
+if err != nil {
+    return err
+}
+
+for i := range n {
+    if sub.HandleCQE(cqes[i]) {
+        continue
+    }
+    dispatch(ring, cqes[i])
+}
 ```
 
-`OnMultishotStep` observes each completion; return `MultishotContinue` to keep the stream or `MultishotStop` to request
-cancellation. `OnMultishotStop` runs once at the terminal state. Use it for cleanup and conditional resubscription.
+`OnMultishotStep` observes each completion; return `MultishotContinue` to keep the stream or `MultishotStop` to request cancellation. `OnMultishotStop` runs once at the terminal state. Use it for cleanup and conditional resubscription. On default single-issuer rings, call `Cancel` / `Unsubscribe` from the ring owner or otherwise serialize them with submit, `Wait`, `WaitDirect`, `WaitExtended`, `Stop`, and resize operations. On `MultiIssuers` rings, the shared-submit path serializes their cancel SQEs.
 
 ### Per-connection state with typed contexts
 
@@ -622,10 +628,7 @@ The package-level `listener_example_test.go` covers listener creation with multi
 
 - Enable `NotifySucceed` when you need a visible CQE for every successful operation.
 - `ring.Features` reports actual SQ/CQ entry counts, SQE slot width, and the byte order used to interpret `user_data`.
-- Leave `MultiIssuers` unset for the default single-issuer configuration (`SINGLE_ISSUER` + `DEFER_TASKRUN`) when a
-  single execution path serializes submit-state operations (`submit`, `Wait`/`enter`, `Stop`, and resize). Set it only
-  when multiple goroutines need concurrent submission or wait-side enter; this switches the ring to the shared-submit
-  `COOP_TASKRUN` configuration.
+- Leave `MultiIssuers` unset for the default single-issuer configuration (`SINGLE_ISSUER` + `DEFER_TASKRUN`) when a single execution path serializes submit-state operations (`submit`, `Wait`, `WaitDirect`, `WaitExtended`, `Stop`, and resize). Set it only when multiple goroutines need concurrent submission or concurrent calls to `Wait`, `WaitDirect`, or `WaitExtended`; this switches the ring to the shared-submit `COOP_TASKRUN` configuration.
 - `EpollWait` requires `timeout` to remain `0`; use `LinkTimeout` when you need a deadline.
 - Release or discard borrowed completion views and pooled contexts promptly.
 - `ListenerOp.Close` closes the listener FD immediately. If a setup CQE is still pending, drain it first, then call

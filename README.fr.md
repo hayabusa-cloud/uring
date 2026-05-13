@@ -104,11 +104,11 @@ for {
     backoff.Reset()
     for i := range n {
         cqe := cqes[i]
-		if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
+        if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
             continue
         }
-        if cqe.Res < 0 {
-            return fmt.Errorf("uring read failed: res=%d", cqe.Res)
+        if err := cqe.Err(); err != nil {
+            return fmt.Errorf("uring read failed: %w", err)
         }
         handle(buf[:int(cqe.Res)])
         return nil
@@ -116,10 +116,7 @@ for {
 }
 ```
 
-`Wait` purge les soumissions en attente avant de récupérer les complétions. Sur un ring mono-émetteur, il émet aussi
-l'entrée noyau nécessaire pour que le travail différé progresse une fois la SQ vidée ; l'appelant doit
-sérialiser `Wait`/`enter` avec les opérations d'état de soumission. Lorsque `iox.Classify(err)` produit
-`iox.OutcomeWouldBlock`, aucune complétion n'est observable à l'interface courante.
+`Wait` purge les soumissions en attente avant de récupérer les complétions. Sur un ring mono-émetteur, il émet aussi l'entrée noyau nécessaire pour que le travail différé progresse une fois la SQ vidée ; l'appelant doit sérialiser `Wait`, `WaitDirect` et `WaitExtended` avec les autres opérations d'état de soumission. Lorsque `iox.Classify(err)` produit `iox.OutcomeWouldBlock`, aucune complétion n'est observable à l'interface courante.
 
 `Start` et `Stop` constituent la paire de cycle de vie du ring. `Stop` est idempotent et rend le ring définitivement
 inutilisable ; on ne doit donc l'appeler qu'après avoir drainé toutes les opérations en vol, récupéré les CQE en attente
@@ -229,8 +226,8 @@ if n == 0 {
 
 for i := 0; i < n; i++ {
     cqe := cqes[i]
-    if cqe.Res < 0 {
-        return fmt.Errorf("completion failed: op=%d fd=%d res=%d", cqe.Op(), cqe.FD(), cqe.Res)
+    if err := cqe.Err(); err != nil {
+        return fmt.Errorf("completion failed: op=%d fd=%d: %w", cqe.Op(), cqe.FD(), err)
     }
 
     switch cqe.Op() {
@@ -354,14 +351,7 @@ travers de l'interface.
 
 ## Frontière d'exécution
 
-Les couches d'exécution au-dessus de `uring` doivent l'utiliser comme backend noyau, pas comme ordonnanceur. La
-frontière
-idéale est unidirectionnelle : `uring` prépare les SQE, récupère les CQE, préserve `user_data`, expose `res` et fanions
-des CQE, et rapporte les faits de propriété ; le code d'exécution côté appelant corrèle ces observations avec ses
-propres
-jetons, applique les reprises et l'attente progressive, route les gestionnaires et sessions, regroupe les soumissions et
-libère les ressources
-terminales.
+Les couches d'exécution au-dessus de `uring` doivent l'utiliser comme backend noyau, pas comme ordonnanceur. La frontière idéale est unidirectionnelle : `uring` prépare les SQE, récupère les CQE, préserve `user_data`, expose `res` et fanions des CQE, et rapporte les faits de propriété ; le code d'exécution côté appelant corrèle ces observations avec ses propres jetons, applique les reprises et l'attente progressive, achemine les gestionnaires et sessions, regroupe les soumissions et libère les ressources terminales.
 
 Un pont d'exécution peut consommer les CQE en mode Extended lorsque l'exécution abstraite a besoin des faits de
 complétion.
@@ -425,8 +415,7 @@ classe comme `iox.OutcomeWouldBlock` ou ne récupère aucun CQE, puis `backoff.R
 
 ### Cycle de vie des souscriptions multishot
 
-Une opération multishot produit un flux de CQEs jusqu'à ce que le noyau envoie un CQE final (sans `IORING_CQE_F_MORE`).
-Le code d'exécution côté appelant suit les souscriptions et gère la re-soumission :
+Une opération multishot produit un flux de CQEs jusqu'à ce que le noyau envoie un CQE final (sans `IORING_CQE_F_MORE`). Le code d'exécution côté appelant achemine chaque CQE par la souscription renvoyée avant de passer au reste du répartiteur :
 
 ```go
 handler := uring.NewMultishotSubscriber().
@@ -444,12 +433,20 @@ handler := uring.NewMultishotSubscriber().
         }
     })
 
-_, err := ring.AcceptMultishot(acceptCtx, handler.Handler())
+sub, err := ring.AcceptMultishot(acceptCtx, handler.Handler())
+if err != nil {
+    return err
+}
+
+for i := range n {
+    if sub.HandleCQE(cqes[i]) {
+        continue
+    }
+    dispatch(ring, cqes[i])
+}
 ```
 
-`OnMultishotStep` observe chaque complétion ; on renvoie `MultishotContinue` pour maintenir le flux ou `MultishotStop`
-pour demander l'annulation. `OnMultishotStop` s'exécute une seule fois à l'état terminal. On l'utilise pour le nettoyage
-et la re-souscription conditionnelle.
+`OnMultishotStep` observe chaque complétion ; on renvoie `MultishotContinue` pour maintenir le flux ou `MultishotStop` pour demander l'annulation. `OnMultishotStop` s'exécute une seule fois à l'état terminal. On l'utilise pour le nettoyage et la re-souscription conditionnelle. Sur les rings mono-émetteur par défaut, appelez `Cancel` / `Unsubscribe` depuis le propriétaire du ring ou sérialisez-les avec les opérations de soumission, `Wait`, `WaitDirect`, `WaitExtended`, `Stop` et le redimensionnement. Sur les rings `MultiIssuers`, le chemin de soumission partagé sérialise leurs SQE d'annulation.
 
 ### État par connexion via des contextes typés
 
@@ -652,12 +649,7 @@ Au niveau du package, `listener_example_test.go` couvre la création d'écouteur
 - `ring.Features` indique le nombre effectif d'entrées SQ et CQ, la largeur des emplacements SQE, ainsi que l'ordre des
   octets
   utilisé par le package pour interpréter `user_data`.
-- Laissez `MultiIssuers` désactivé pour la configuration mono-émetteur par défaut (`SINGLE_ISSUER` + `DEFER_TASKRUN`),
-  dans laquelle un seul chemin d'exécution de l'appelant sérialise les opérations d'état de soumission (`submit`,
-  `Wait`/
-  `enter`, `Stop` et resize). N'activez ce fanion que lorsque plusieurs goroutines nécessitent une soumission
-  concurrente ou une entrée côté attente ; cela bascule le ring vers la configuration de soumission partagée
-  `COOP_TASKRUN`.
+- Laissez `MultiIssuers` désactivé pour la configuration mono-émetteur par défaut (`SINGLE_ISSUER` + `DEFER_TASKRUN`), dans laquelle un seul chemin d'exécution de l'appelant sérialise les opérations d'état de soumission (`submit`, `Wait`, `WaitDirect`, `WaitExtended`, `Stop` et resize). N'activez ce fanion que lorsque plusieurs goroutines nécessitent des soumissions concurrentes ou des appels concurrents à `Wait`, `WaitDirect` ou `WaitExtended` ; cela bascule le ring vers la configuration de soumission partagée `COOP_TASKRUN`.
 - `EpollWait` exige que `timeout` vaille `0` ; utilisez `LinkTimeout` si vous avez besoin d'une échéance.
 - Les vues de complétion empruntées et les contextes issus des pools doivent être libérés ou abandonnés sans délai.
 - `ListenerOp.Close` ferme le FD de l'écouteur immédiatement. Si un CQE de mise en place est encore en attente,
