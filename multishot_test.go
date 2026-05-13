@@ -162,8 +162,8 @@ func TestSubmitAcceptMultishotCancelTerminates(t *testing.T) {
 	}
 
 	cancelCtx := uring.PackDirect(uring.IORING_OP_ASYNC_CANCEL, 0, 1, fd)
-	if err := ring.AsyncCancelFD(cancelCtx, false); err != nil {
-		t.Fatalf("AsyncCancelFD: %v", err)
+	if err := ring.AsyncCancel(cancelCtx, acceptCtx.Raw()); err != nil {
+		t.Fatalf("AsyncCancel: %v", err)
 	}
 
 	terminalAccept := false
@@ -191,7 +191,7 @@ func TestSubmitAcceptMultishotCancelTerminates(t *testing.T) {
 					terminalAccept = true
 				}
 			case uring.IORING_OP_ASYNC_CANCEL:
-				// AsyncCancelFD completion is expected alongside the terminal accept CQE.
+				// AsyncCancel completion is expected alongside the terminal accept CQE.
 			}
 		}
 		if !terminalAccept {

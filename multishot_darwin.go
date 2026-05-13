@@ -74,6 +74,11 @@ func (s *MultishotSubscription) State() SubscriptionState {
 	return SubscriptionStopped
 }
 
+// HandleCQE reports that multishot subscriptions are not supported on Darwin.
+func (s *MultishotSubscription) HandleCQE(cqe CQEView) bool {
+	return false
+}
+
 // AcceptMultishot creates a multishot accept subscription (stub on Darwin).
 func (ur *Uring) AcceptMultishot(sqeCtx SQEContext, handler MultishotHandler, options ...OpOptionFunc) (*MultishotSubscription, error) {
 	return nil, ErrNotSupported
