@@ -116,7 +116,7 @@
 //
 // [SQEContext] packs submission metadata into `user_data`.
 //
-// Direct mode layout (zero allocation, most common):
+// Direct mode layout (inline context, zero allocation):
 //
 //	┌─────────┬─────────┬──────────────┬────────────────────────────┬────┐
 //	│ Op (8b) │Flags(8b)│ BufGrp (16b) │        FD (30b)            │Mode│
@@ -178,17 +178,16 @@
 // `MultishotStop` to request cancellation after the current step. The request
 // is local until the cancel SQE is successfully enqueued.
 //
-// # Token Affinity at the Multishot Seam
+// # Multishot Subscription Lifecycle
 //
-// One live subscription names one live backend obligation. The kernel may
-// emit multiple CQEs against the same SQE before the obligation terminates;
-// each CQE carries `IORING_CQE_F_MORE` until the last. The package preserves
-// a one-to-one correspondence between a submitted [ExtSQE] (and its encoded
-// `user_data`) and the logical subscription, releasing the ExtSQE to its
-// pool only when the terminating CQE (`!HasMore()`) is observed. This is
-// the kernel-side foot of the affine-token discipline that caller runtimes
-// enforce at their own seams: an intermediate CQE discharges no obligation,
-// and the terminal CQE discharges exactly one.
+// A live subscription keeps its submitted [ExtSQE] until the terminal CQE for
+// that operation is handled. The kernel may emit multiple CQEs for the same
+// submission before that terminal CQE; each non-terminal CQE carries
+// `IORING_CQE_F_MORE`. The package keeps the submitted ExtSQE and encoded
+// `user_data` associated with the subscription, and returns the ExtSQE to its
+// pool only after handling a CQE without `HasMore()`. Caller-side runtime code
+// should treat intermediate CQEs as progress for the live subscription and the
+// final CQE as the point where the subscription can be retired.
 //
 // # Runtime Boundary
 //
