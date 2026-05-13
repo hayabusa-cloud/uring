@@ -22,7 +22,7 @@ import (
 // (PackDirect) for all submissions. This avoids the 3-way mode check
 // that the generic Wait/CQEView path requires per-CQE.
 //
-// Layout: 24 bytes (fits in 1/3 cache line, no padding needed)
+// Layout: 16 bytes (fits in 1/4 cache line, no padding needed)
 type DirectCQE struct {
 	Res      int32  // Completion result (bytes transferred or negative errno)
 	Flags    uint32 // CQE flags (IORING_CQE_F_*)

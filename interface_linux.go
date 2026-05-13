@@ -54,9 +54,10 @@ type Options struct {
 	// MultiIssuers enables the shared-submit configuration for rings that accept
 	// submissions from multiple goroutines. When false, New requests
 	// SINGLE_ISSUER + DEFER_TASKRUN and callers must serialize submit-state
-	// operations such as submit, Wait/enter, Stop, and ring resize so the
-	// default fast path can skip shared synchronization. When true, it requests
-	// COOP_TASKRUN and keeps the shared-submit synchronization path.
+	// operations such as submit, Wait, WaitDirect, WaitExtended, Stop, and ring
+	// resize so the default fast path can skip shared synchronization. When
+	// true, it requests COOP_TASKRUN and keeps the shared-submit synchronization
+	// path.
 	MultiIssuers bool
 	// NotifySucceed ensures CQEs are generated for all successful operations.
 	NotifySucceed bool
@@ -166,8 +167,8 @@ func newSetupOptions(opt Options, sqe128 bool) []func(params *ioUringParams) {
 // It wraps the kernel io_uring instance with buffer management and typed operations.
 // Default rings use the single-issuer fast path, so submit-state operations
 // are not safe for concurrent use by multiple goroutines; caller must
-// serialize submit, Wait/enter, Stop, and ResizeRings unless MultiIssuers is
-// enabled.
+// serialize submit, Wait, WaitDirect, WaitExtended, Stop, and ResizeRings
+// unless MultiIssuers is enabled.
 type Uring struct {
 	*ioUring
 	*Options
@@ -1538,7 +1539,7 @@ func (ur *Uring) CloneBuffersFromRegistered(srcRegisteredIdx int, srcOff, dstOff
 
 // ResizeRings resizes the SQ and CQ rings of this io_uring instance.
 // On single-issuer rings it is not safe for concurrent use with submit,
-// Wait/enter, or Stop; caller must serialize those operations.
+// Wait, WaitDirect, WaitExtended, or Stop; caller must serialize those operations.
 // This allows dynamic adjustment of ring sizes without recreating the ring.
 //
 // Requirements:
