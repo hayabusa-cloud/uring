@@ -1569,18 +1569,14 @@ func TestMsgRing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New (source): %v", err)
 	}
-	if err := srcRing.Start(); err != nil {
-		t.Fatalf("Start (source): %v", err)
-	}
+	mustStartRing(t, srcRing)
 
 	// Create target ring
 	dstRing, err := uring.New(testMinimalBufferOptions)
 	if err != nil {
 		t.Fatalf("New (target): %v", err)
 	}
-	if err := dstRing.Start(); err != nil {
-		t.Fatalf("Start (target): %v", err)
-	}
+	mustStartRing(t, dstRing)
 
 	// Get target ring's FD for cross-ring messaging
 	targetFD := dstRing.RingFD()
@@ -1667,18 +1663,14 @@ func TestMsgRingFD(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New (source): %v", err)
 	}
-	if err := srcRing.Start(); err != nil {
-		t.Fatalf("Start (source): %v", err)
-	}
+	mustStartRing(t, srcRing)
 
 	// Create target ring
 	dstRing, err := uring.New(testMinimalBufferOptions)
 	if err != nil {
 		t.Fatalf("New (target): %v", err)
 	}
-	if err := dstRing.Start(); err != nil {
-		t.Fatalf("Start (target): %v", err)
-	}
+	mustStartRing(t, dstRing)
 
 	// Get target ring's FD
 	targetFD := dstRing.RingFD()

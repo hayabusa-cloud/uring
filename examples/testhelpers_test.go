@@ -16,10 +16,15 @@ import (
 	"code.hybscloud.com/zcall"
 )
 
-const testLockedBufferMem = 1 << 18
+const (
+	testLockedBufferMem = 1 << 18
+	testBufferNum       = 64
+)
 
 func testMinimalBufferOptions(opt *uring.Options) {
 	opt.LockedBufferMem = testLockedBufferMem
+	opt.ReadBufferNum = testBufferNum
+	opt.WriteBufferNum = testBufferNum
 }
 
 func mustStartRing(tb testing.TB, ring *uring.Uring) {
