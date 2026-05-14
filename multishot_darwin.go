@@ -44,7 +44,8 @@ const (
 	SubscriptionStopped
 )
 
-// MultishotSubscription is a subscription to a multishot io_uring operation (stub on Darwin).
+// MultishotSubscription tracks one multishot io_uring operation.
+// On Darwin, multishot operations are not supported.
 type MultishotSubscription struct {
 	ring         *Uring
 	ext          *ExtSQE

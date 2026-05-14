@@ -126,8 +126,8 @@ const (
 // `Cancel` and `Unsubscribe` are safe for the subscription state itself, but
 // cancel submission follows the ring's submit-state serialization contract. On
 // default single-issuer rings, call them from the ring owner or otherwise
-// serialize them with submit, Wait, WaitDirect, WaitExtended, Stop, and resize
-// operations. On MultiIssuers rings, the shared-submit lock serializes the
+// serialize them with submit, Wait, WaitDirect, WaitExtended, Stop, and
+// ResizeRings. On MultiIssuers rings, the shared-submit lock serializes the
 // cancel SQE.
 // Observer callbacks run on the goroutine that dispatches the CQE, usually `Wait`.
 type MultishotSubscription struct {
@@ -144,7 +144,7 @@ type MultishotSubscription struct {
 // remains live until a terminal CQE arrives. Cancel follows the ring's
 // submit-state serialization contract: on default single-issuer rings, call it
 // from the ring owner or otherwise serialize it with submit, Wait, WaitDirect,
-// WaitExtended, Stop, and resize operations; on MultiIssuers rings, the
+// WaitExtended, Stop, and ResizeRings; on MultiIssuers rings, the
 // shared-submit lock serializes the cancel SQE.
 // It is safe to call more than once.
 //
@@ -188,8 +188,13 @@ func (s *MultishotSubscription) State() SubscriptionState {
 
 // HandleCQE processes a copied CQE observation for this subscription.
 // It returns true when the CQE belongs to this route and was handled. It returns
-// false for non-extended CQEs, foreign routes, or stale observations whose
-// pooled ExtSQE is no longer owned by this subscription.
+// false for non-extended CQEs, foreign routes, or observations whose current
+// pooled ExtSQE owner is no longer this subscription.
+//
+// HandleCQE is for immediate dispatch in the caller's serialized completion
+// loop. Caller code must call it before the observed ExtSQE can be retired and
+// reused. If caller code keeps copied CQEs beyond that loop, caller code must
+// keep its own route state and reject observations for retired subscriptions.
 //
 // HandleCQE does not wait, retry, rearm, or resubmit. Caller-side runtime code
 // owns polling cadence and any policy after the subscription reaches its
@@ -333,10 +338,11 @@ func multishotCQEHandler(ring *Uring, _ *ioUringSqe, cqe *ioUringCqe) {
 }
 
 func (s *MultishotSubscription) handleCQE(cqe *ioUringCqe) {
+	ctx := SQEContextFromRaw(cqe.userData)
 	s.handleCQEView(CQEView{
 		Res:   cqe.res,
 		Flags: cqe.flags,
-		ctx:   SQEContextFromRaw(cqe.userData),
+		ctx:   ctx,
 	})
 }
 
