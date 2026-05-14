@@ -15,13 +15,15 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Runtime probes newer than the Linux 6.12 baseline stay out of the required
+# Runtime probes newer than the Linux 6.12 baseline, plus socket zero-copy
+# probes that depend on hosted-runner network topology, stay out of the required
 # lane while ubuntu-latest is still on Ubuntu 24.04. Keep these patterns
 # anchored to whole test names so helper, encoding, and pure example coverage
 # still runs. The full suite runs below as a non-blocking signal until
 # ubuntu-latest moves to Ubuntu 26.04.
 env:
   URING_OPTIONAL_KERNEL_TESTS: '^Test(IntegrationZeroCopySend|IntegrationMultishotAcceptPrimeWaitSurfacesImmediateError|IntegrationMultishotAccept|UringEpollWait|UringPipe|ResizeRings|QueryOpcodes|NAPIRegistration|SQE128NopCycle|PollUpdate|NewZCRXReceiverNotSupported)$'
+  URING_OPTIONAL_SOCKET_ZC_TESTS: '^Test(ZCTrackerBasic|ZCTrackerPoolExhaustion|ZCTrackerHandlerOrder|ZCTrackerExactlyOnce|ZCTrackerGCSafety|SendZeroCopyFixed|ZeroCopyNotificationFlags|SendZeroCopyFixedMultiTarget|ZeroCopyBufferSafety|ZeroCopyLargeBuffer|ZeroCopyMultipleBuffers|ZeroCopyErrorHandling|ZeroCopySequentialSends|TwoCQEOverhead|ZCRXConfigValidation)$'
   URING_OPTIONAL_RUNTIME_EXAMPLES: '^Test(BufferRingBasics|SQEContextIndirect|SQEContextExtended|CQEViewAccess|TCPEchoServer|UringSocketWithSyscallAccept|SimpleTCPAccept|BroadcastServerWithFramer|UDPPingPong|FileWriteRead|BatchedFileOps|NopThroughput|FixedBufferBasics|WriteFixedOperation|ReadFixedOperation|MultishotHandlerControl|PollAddBasic|PollCancelByFD|PollMultipleFDs|SpliceBasics|TeeOperation|BasicTimeout|MultipleTimeouts|PollWithTimeout|LinkedTimeout|VectoredWrite|VectoredRead|ZCTrackerBasic|MulticastZeroCopy)$'
 
 jobs:
@@ -76,7 +78,7 @@ jobs:
       # 6.12 and earlier; newer runtime probes run in the non-blocking lane
       # below.
       - name: Test root package (Linux <=6.12 io_uring baseline)
-        run: go test -v -race -count=1 -timeout=180s -skip "$URING_OPTIONAL_KERNEL_TESTS" .
+        run: go test -v -race -count=1 -timeout=180s -skip "$URING_OPTIONAL_KERNEL_TESTS|$URING_OPTIONAL_SOCKET_ZC_TESTS" .
 
       # Required examples lane. Runs examples that are pure documentation or
       # encoding checks; runtime examples stay visible in the non-blocking full
