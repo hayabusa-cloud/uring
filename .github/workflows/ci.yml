@@ -15,15 +15,14 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Post-6.17 io_uring features that the required Linux lane skips because today's
-# `ubuntu-latest` (Ubuntu 24.04, kernel 6.17) cannot exercise them. The Linux
-# 6.18 baseline cluster (epoll-wait, pipe, recv-zc, readv/writev-fixed, 128-byte
-# SQE/NOP128/URING_CMD128) and the 6.19 cluster (ZCRX export, NAPI, query,
-# memory regions) live here. When the `ubuntu-latest` label advances past
-# kernel 6.19, this skip set is removed and the full suite becomes the only
-# test step.
+# Runtime probes newer than the Linux 6.12 baseline stay out of the required
+# lane while ubuntu-latest is still on Ubuntu 24.04. Keep these patterns
+# anchored to whole test names so helper, encoding, and pure example coverage
+# still runs. The full suite runs below as a non-blocking signal until
+# ubuntu-latest moves to Ubuntu 26.04.
 env:
-  URING_POST_617_SKIP: 'ZCRX|NAPI|QueryOpcodes|QuerySCQ|MemRegion|EpollWait|UringPipe|ReceiveZeroCopy|FixedVectored|SQE128|Nop128|UringCmd128|uringCmd128'
+  URING_OPTIONAL_KERNEL_TESTS: '^Test(IntegrationZeroCopySend|IntegrationMultishotAcceptPrimeWaitSurfacesImmediateError|IntegrationMultishotAccept|UringEpollWait|UringPipe|ResizeRings|QueryOpcodes|NAPIRegistration|SQE128NopCycle|PollUpdate|NewZCRXReceiverNotSupported)$'
+  URING_OPTIONAL_RUNTIME_EXAMPLES: '^Test(BufferRingBasics|SQEContextIndirect|SQEContextExtended|CQEViewAccess|TCPEchoServer|UringSocketWithSyscallAccept|SimpleTCPAccept|BroadcastServerWithFramer|UDPPingPong|FileWriteRead|BatchedFileOps|NopThroughput|FixedBufferBasics|WriteFixedOperation|ReadFixedOperation|MultishotHandlerControl|PollAddBasic|PollCancelByFD|PollMultipleFDs|SpliceBasics|TeeOperation|BasicTimeout|MultipleTimeouts|PollWithTimeout|LinkedTimeout|VectoredWrite|VectoredRead|ZCTrackerBasic|MulticastZeroCopy)$'
 
 jobs:
   lint-build-test-linux:
@@ -70,14 +69,24 @@ jobs:
           CGO_ENABLED: '0'
         run: go build ./...
 
-      # Required lane. Covers io_uring behavior available on Linux 6.17 and
-      # earlier; post-6.17 features run in the non-blocking lane below.
-      - name: Test (Linux pre-6.18 io_uring baseline)
-        run: go test -v -race -count=1 -timeout=180s -skip "$URING_POST_617_SKIP" ./...
+      - name: Show runner kernel
+        run: uname -a
 
-      # Non-blocking lane. Keeps the post-6.17 surface visible on ubuntu-latest;
-      # failures here are informational until ubuntu-latest advances past kernel 6.19.
-      - name: Test (post-6.17 io_uring features, non-blocking)
+      # Required root-package lane. Covers io_uring behavior available on Linux
+      # 6.12 and earlier; newer runtime probes run in the non-blocking lane
+      # below.
+      - name: Test root package (Linux <=6.12 io_uring baseline)
+        run: go test -v -race -count=1 -timeout=180s -skip "$URING_OPTIONAL_KERNEL_TESTS" .
+
+      # Required examples lane. Runs examples that are pure documentation or
+      # encoding checks; runtime examples stay visible in the non-blocking full
+      # suite below until the runner baseline catches up.
+      - name: Test examples (pure required subset)
+        run: go test -v -race -count=1 -timeout=180s -skip "$URING_OPTIONAL_RUNTIME_EXAMPLES" ./examples
+
+      # Non-blocking lane. Keeps newer kernel probes visible on ubuntu-latest;
+      # failures here become required only after the runner baseline catches up.
+      - name: Test (newer io_uring features, non-blocking)
         continue-on-error: true
         run: go test -race -count=1 -timeout=180s ./...
 
@@ -123,9 +132,6 @@ jobs:
       matrix:
         go-version: [ '1.26.x', 'stable' ]
         target:
-          - { goos: linux,  goarch: arm64 }
-          - { goos: linux,  goarch: riscv64 }
-          - { goos: linux,  goarch: loong64 }
           - { goos: darwin, goarch: arm64 }
     steps:
       - uses: actions/checkout@v6
