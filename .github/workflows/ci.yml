@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 # Cancel superseded runs on the same ref so a quick push series does not pile up
 # parallel jobs on the same matrix.
@@ -78,7 +79,18 @@ jobs:
       # 6.12 and earlier; newer runtime probes run in the non-blocking lane
       # below.
       - name: Test root package (Linux <=6.12 io_uring baseline)
-        run: go test -v -race -count=1 -timeout=180s -skip "$URING_OPTIONAL_KERNEL_TESTS|$URING_OPTIONAL_SOCKET_ZC_TESTS" .
+        run: go test -v -race -covermode=atomic -coverprofile=coverage.out -count=1 -timeout=180s -skip "$URING_OPTIONAL_KERNEL_TESTS|$URING_OPTIONAL_SOCKET_ZC_TESTS" .
+
+      - name: Upload coverage to Codecov
+        if: matrix.go-version == 'stable'
+        uses: codecov/codecov-action@v6
+        with:
+          use_oidc: true
+          files: ./coverage.out
+          disable_search: true
+          flags: linux-amd64-root
+          name: linux-amd64-root
+          fail_ci_if_error: false
 
       # Required examples lane. Runs examples that are pure documentation or
       # encoding checks; runtime examples stay visible in the non-blocking full
