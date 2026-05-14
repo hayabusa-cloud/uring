@@ -20,6 +20,21 @@ const testLockedBufferMem = 1 << 18
 
 var benchmarkMultishotHandleCQESink bool
 
+func bindMultishotTestSubscription(sub *MultishotSubscription, ext *ExtSQE) {
+	ctx := PackExtended(ext)
+	sub.userData = ctx.Raw()
+	extAnchors(ext).owner = sub
+}
+
+func multishotTestCQEView(ext *ExtSQE, res int32, flags uint32) CQEView {
+	ctx := PackExtended(ext)
+	return CQEView{
+		Res:   res,
+		Flags: flags,
+		ctx:   ctx,
+	}
+}
+
 type noopMultishotHandler struct{}
 
 type stopOnProgressHandler struct{}
@@ -351,7 +366,7 @@ func TestMultishotCancellingStillDeliversSteps(t *testing.T) {
 		handler: handler,
 	}
 	sub.ext.Store(ext)
-	sub.userData = PackExtended(ext).Raw()
+	bindMultishotTestSubscription(sub, ext)
 	sub.state.Store(uint32(SubscriptionCancelling))
 
 	sub.handleCQE(&ioUringCqe{userData: sub.userData, res: 7, flags: IORING_CQE_F_MORE})
@@ -386,7 +401,7 @@ func TestMultishotFinalSuccessSkipsCancelAndStops(t *testing.T) {
 		handler: stopOnProgressHandler{},
 	}
 	sub.ext.Store(ext)
-	sub.userData = PackExtended(ext).Raw()
+	bindMultishotTestSubscription(sub, ext)
 	sub.state.Store(uint32(SubscriptionActive))
 
 	sub.handleCQE(&ioUringCqe{userData: sub.userData, res: 1, flags: 0})
@@ -415,7 +430,7 @@ func TestMultishotCancelSubmitRetainsExtUntilSubmitReturns(t *testing.T) {
 		handler: noopMultishotHandler{},
 	}
 	sub.ext.Store(ext)
-	sub.userData = PackExtended(ext).Raw()
+	bindMultishotTestSubscription(sub, ext)
 	sub.state.Store(uint32(SubscriptionActive))
 
 	err := sub.submitCancelUsing(func(uint64) error {
@@ -456,7 +471,7 @@ func TestMultishotFinalErrorDeliversErrorThenStopped(t *testing.T) {
 		handler: handler,
 	}
 	sub.ext.Store(ext)
-	sub.userData = PackExtended(ext).Raw()
+	bindMultishotTestSubscription(sub, ext)
 	sub.state.Store(uint32(SubscriptionActive))
 
 	sub.handleCQE(&ioUringCqe{userData: sub.userData, res: -int32(EINVAL), flags: 0})
@@ -489,7 +504,7 @@ func TestMultishotUnsubscribedSuppressesCallbacks(t *testing.T) {
 		handler: handler,
 	}
 	sub.ext.Store(ext)
-	sub.userData = PackExtended(ext).Raw()
+	bindMultishotTestSubscription(sub, ext)
 	sub.state.Store(uint32(SubscriptionActive))
 	sub.unsubscribed.Store(true)
 
@@ -523,11 +538,10 @@ func TestMultishotHandleCQEClaimsRoute(t *testing.T) {
 		handler: handler,
 	}
 	sub.ext.Store(ext)
-	sub.userData = PackExtended(ext).Raw()
+	bindMultishotTestSubscription(sub, ext)
 	sub.state.Store(uint32(SubscriptionActive))
-	extAnchors(ext).owner = sub
 
-	progress := CQEView{Res: 11, Flags: IORING_CQE_F_MORE, ctx: PackExtended(ext)}
+	progress := multishotTestCQEView(ext, 11, IORING_CQE_F_MORE)
 	if !sub.HandleCQE(progress) {
 		t.Fatal("HandleCQE did not claim route progress CQE")
 	}
@@ -541,7 +555,7 @@ func TestMultishotHandleCQEClaimsRoute(t *testing.T) {
 		t.Fatalf("State after progress CQE: got %v, want %v", got, SubscriptionActive)
 	}
 
-	final := CQEView{Res: 0, Flags: 0, ctx: PackExtended(ext)}
+	final := multishotTestCQEView(ext, 0, 0)
 	if !sub.HandleCQE(final) {
 		t.Fatal("HandleCQE did not claim route final CQE")
 	}
@@ -559,6 +573,33 @@ func TestMultishotHandleCQEClaimsRoute(t *testing.T) {
 	}
 }
 
+func TestMultishotHandleCQERejectsRetiredRoute(t *testing.T) {
+	pool := NewContextPools(1)
+
+	ext := pool.Extended()
+	if ext == nil {
+		t.Fatal("pool exhausted")
+	}
+
+	handler := &recordingMultishotHandler{}
+	sub := &MultishotSubscription{
+		ring:    &Uring{ctxPools: pool},
+		handler: handler,
+	}
+	sub.ext.Store(ext)
+	bindMultishotTestSubscription(sub, ext)
+	sub.state.Store(uint32(SubscriptionActive))
+
+	cqe := multishotTestCQEView(ext, 17, IORING_CQE_F_MORE)
+	sub.retireExt()
+	if sub.HandleCQE(cqe) {
+		t.Fatal("HandleCQE claimed CQE after route retirement")
+	}
+	if got := len(handler.stepErrs); got != 0 {
+		t.Fatalf("callbacks after retired route: got %d, want 0", got)
+	}
+}
+
 func BenchmarkMultishotHandleCQE(b *testing.B) {
 	pool := NewContextPools(16)
 
@@ -572,11 +613,10 @@ func BenchmarkMultishotHandleCQE(b *testing.B) {
 		handler: noopMultishotHandler{},
 	}
 	sub.ext.Store(ext)
-	sub.userData = PackExtended(ext).Raw()
+	bindMultishotTestSubscription(sub, ext)
 	sub.state.Store(uint32(SubscriptionActive))
-	extAnchors(ext).owner = sub
 
-	cqe := CQEView{Res: 11, Flags: IORING_CQE_F_MORE, ctx: PackExtended(ext)}
+	cqe := multishotTestCQEView(ext, 11, IORING_CQE_F_MORE)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -602,14 +642,13 @@ func TestMultishotHandleCQERejectsForeignRoute(t *testing.T) {
 		handler: handler,
 	}
 	sub.ext.Store(ext)
-	sub.userData = PackExtended(ext).Raw()
+	bindMultishotTestSubscription(sub, ext)
 	sub.state.Store(uint32(SubscriptionActive))
-	extAnchors(ext).owner = sub
 
 	if sub.HandleCQE(CQEView{Res: 1, Flags: IORING_CQE_F_MORE, ctx: PackDirect(IORING_OP_ACCEPT, 0, 0, 0)}) {
 		t.Fatal("HandleCQE claimed direct CQE")
 	}
-	if sub.HandleCQE(CQEView{Res: 1, Flags: IORING_CQE_F_MORE, ctx: PackExtended(foreign)}) {
+	if sub.HandleCQE(multishotTestCQEView(foreign, 1, IORING_CQE_F_MORE)) {
 		t.Fatal("HandleCQE claimed foreign extended CQE")
 	}
 	if got := len(handler.stepErrs); got != 0 {
