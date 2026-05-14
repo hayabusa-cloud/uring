@@ -69,7 +69,10 @@
 // [Uring.SubmitReceiveBundleMultishot] submit raw multishot SQEs and keep the
 // kernel-boundary flow explicit. [Uring.AcceptMultishot] and
 // [Uring.ReceiveMultishot] use the same kernel path and return a
-// [MultishotSubscription] when caller code wants callback-driven retirement.
+// [MultishotSubscription] for caller-owned callback dispatch in the same
+// serialized completion loop. If caller code keeps copied CQEs beyond that
+// loop, it must keep its own route state and reject observations for retired
+// subscriptions.
 //
 //	sqeCtx := uring.ForFD(listenerFD)
 //	sub, err := ring.AcceptMultishot(sqeCtx, handler)
@@ -77,7 +80,7 @@
 //	    return err
 //	}
 //
-//	// Process CQEs by routing this subscription first.
+//	// Process CQEs in the same serialized completion loop.
 //	for i := range n {
 //	    if sub.HandleCQE(cqes[i]) {
 //	        continue
@@ -87,7 +90,7 @@
 //
 //	// Cancel when done
 //	// On single-issuer rings, call Cancel from the ring owner or otherwise
-//	// serialize it with submit, Wait, WaitDirect, WaitExtended, Stop, and resize operations.
+//	// serialize it with submit, Wait, WaitDirect, WaitExtended, Stop, and ResizeRings.
 //	if err := sub.Cancel(); err != nil {
 //	    return err
 //	}

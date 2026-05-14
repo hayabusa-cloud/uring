@@ -315,11 +315,12 @@ func (ur *Uring) releaseRegisteredBufRings() error {
 
 // Wait flushes pending submissions, drives deferred task work when needed, and
 // collects completion events into cqes. On single-issuer rings it is not safe
-// for concurrent use with submit, Stop, or ResizeRings; caller must serialize
-// those operations. On IOPOLL rings Wait also performs the nonblocking poll
-// enter needed to make completions visible. It returns the number of events received, ErrCQOverflow
-// when the ring enters CQ overflow and no CQEs are immediately claimable, or
-// `iox.ErrWouldBlock` if the CQ is empty.
+// for concurrent use with submit, Wait, WaitDirect, WaitExtended, Stop, or
+// ResizeRings; caller must serialize those operations. On IOPOLL rings Wait
+// also performs the nonblocking poll enter needed to make completions visible.
+// It returns the number of events received, ErrCQOverflow when the ring enters
+// CQ overflow and no CQEs are immediately claimable, or `iox.ErrWouldBlock` if
+// the CQ is empty.
 //
 // CQEView provides direct field access to Res and Flags, and methods to access
 // the submission context based on mode (Direct, Indirect, Extended).

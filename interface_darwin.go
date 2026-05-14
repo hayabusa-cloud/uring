@@ -223,9 +223,10 @@ func (ur *Uring) Stop() error {
 }
 
 // Wait flushes pending submissions and collects completion events into cqes.
-// On single-issuer rings it is not safe for concurrent use with submit or
-// Stop; caller must serialize those operations. It returns the number of
-// events received, or `iox.ErrWouldBlock` if the CQ is empty.
+// On single-issuer rings it is not safe for concurrent use with submit, Wait,
+// WaitDirect, WaitExtended, or Stop; caller must serialize those operations.
+// It returns the number of events received, or `iox.ErrWouldBlock` if the CQ
+// is empty.
 func (ur *Uring) Wait(cqes []CQEView) (n int, err error) {
 	err = ur.ioUring.enter()
 	if err != nil {

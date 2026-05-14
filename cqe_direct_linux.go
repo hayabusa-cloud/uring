@@ -74,8 +74,9 @@ func (c *DirectCQE) IsNotification() bool {
 // For applications using only Direct mode, this skips the generic mode dispatch
 // that Wait performs per CQE.
 //
-// On single-issuer rings it is not safe for concurrent use with submit, Stop,
-// or ResizeRings; caller must serialize those operations.
+// On single-issuer rings it is not safe for concurrent use with submit, Wait,
+// WaitDirect, WaitExtended, Stop, or ResizeRings; caller must serialize those
+// operations.
 // On IOPOLL rings WaitDirect also performs the nonblocking poll enter needed
 // to make completions visible.
 // Returns the number of CQEs retrieved, ErrCQOverflow when the ring enters CQ

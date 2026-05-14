@@ -44,8 +44,8 @@ func (c *ExtCQE) Op() uint8 { return c.Ext.SQE.opcode }
 func (c *ExtCQE) FD() iofd.FD { return iofd.FD(c.Ext.SQE.fd) }
 
 // WaitExtended retrieves completion events using the Extended mode fast path (darwin stub).
-// On single-issuer rings it is not safe for concurrent use with submit, Stop,
-// or ResizeRings; caller must serialize those operations.
+// On single-issuer rings it is not safe for concurrent use with submit, Wait,
+// WaitDirect, WaitExtended, or Stop; caller must serialize those operations.
 func (ur *Uring) WaitExtended(cqes []ExtCQE) (int, error) {
 	if err := ur.ioUring.enter(); err != nil {
 		return 0, err

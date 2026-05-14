@@ -12,6 +12,9 @@ import "code.hybscloud.com/iofd"
 // It exposes kernel completion facts directly and lets caller-side runtime
 // code decide how to route or interpret them. When available,
 // it also exposes the submission context that produced those facts.
+// A copied CQEView is a completion observation, not durable route state. If
+// caller code stores it beyond the current dispatch turn, caller code must keep
+// its own route state.
 //
 // # Property Patterns
 //
