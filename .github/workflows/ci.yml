@@ -9,9 +9,25 @@ on:
 permissions:
   contents: read
 
+# Cancel superseded runs on the same ref so a quick push series does not pile up
+# parallel jobs on the same matrix.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Post-6.17 io_uring features that the required Linux lane skips because today's
+# `ubuntu-latest` (Ubuntu 24.04, kernel 6.17) cannot exercise them. The Linux
+# 6.18 baseline cluster (epoll-wait, pipe, recv-zc, readv/writev-fixed, 128-byte
+# SQE/NOP128/URING_CMD128) and the 6.19 cluster (ZCRX export, NAPI, query,
+# memory regions) live here. When the `ubuntu-latest` label advances past
+# kernel 6.19, this skip set is removed and the full suite becomes the only
+# test step.
+env:
+  URING_POST_617_SKIP: 'ZCRX|NAPI|QueryOpcodes|QuerySCQ|MemRegion|EpollWait|UringPipe|ReceiveZeroCopy|FixedVectored|SQE128|Nop128|UringCmd128|uringCmd128'
+
 jobs:
-  build-and-check:
-    name: Build & Check (Go ${{ matrix.go-version }})
+  lint-build-test-linux:
+    name: Lint, Build & Test (Linux/amd64, Go ${{ matrix.go-version }})
     runs-on: ubuntu-latest
     timeout-minutes: 5
     strategy:
@@ -25,6 +41,7 @@ jobs:
         uses: actions/setup-go@v6
         with:
           go-version: ${{ matrix.go-version }}
+          check-latest: true
 
       - name: Check formatting
         run: |
@@ -39,7 +56,8 @@ jobs:
         run: |
           go vet ./... 2>&1 | tee /tmp/vet.out || true
           if [ -s /tmp/vet.out ]; then
-            # Fresh runners may print module download chatter before real vet diagnostics.
+            # Drop package headers, module-download chatter, and the intentional
+            # `unsafe.Pointer` arithmetic warning over kernel-mapped ring memory.
             grep -v -E "(^#|^go: downloading |possible misuse of unsafe.Pointer)" /tmp/vet.out > /tmp/vet.filtered || true
             if [ -s /tmp/vet.filtered ]; then
               cat /tmp/vet.filtered
@@ -52,28 +70,25 @@ jobs:
           CGO_ENABLED: '0'
         run: go build ./...
 
-      ## TODO: Enable once ubuntu-26.04 runner lands (ETA: May 2026).
-      ## Ubuntu 26.04 ships kernel 7.0; io_uring features require >= 6.18.
-      ## Change runs-on to ubuntu-26.04 and uncomment the steps below.
-      ## Tracking: https://github.com/actions/runner-images/issues/13855
-      # - name: Test
-      #   run: go test -v -race -coverprofile=coverage.out ./...
-      # - name: Upload coverage to Codecov
-      #   if: matrix.go-version == 'stable'
-      #   uses: codecov/codecov-action@v5
-      #   with:
-      #     files: coverage.out
-      #     token: ${{ secrets.CODECOV_TOKEN }}
+      # Required lane. Covers io_uring behavior available on Linux 6.17 and
+      # earlier; post-6.17 features run in the non-blocking lane below.
+      - name: Test (Linux pre-6.18 io_uring baseline)
+        run: go test -v -race -count=1 -timeout=180s -skip "$URING_POST_617_SKIP" ./...
 
-  cross-build:
-    name: Cross-Build (Go ${{ matrix.go-version }}, linux/${{ matrix.goarch }})
-    runs-on: ubuntu-latest
+      # Non-blocking lane. Keeps the post-6.17 surface visible on ubuntu-latest;
+      # failures here are informational until ubuntu-latest advances past kernel 6.19.
+      - name: Test (post-6.17 io_uring features, non-blocking)
+        continue-on-error: true
+        run: go test -race -count=1 -timeout=180s ./...
+
+  vet-build-darwin:
+    name: Vet & Build (Darwin/arm64, Go ${{ matrix.go-version }})
+    runs-on: macos-latest
     timeout-minutes: 5
     strategy:
       fail-fast: false
       matrix:
         go-version: [ '1.26.x', 'stable' ]
-        goarch: [ arm64, riscv64, loong64 ]
     steps:
       - uses: actions/checkout@v6
 
@@ -81,10 +96,49 @@ jobs:
         uses: actions/setup-go@v6
         with:
           go-version: ${{ matrix.go-version }}
+          check-latest: true
+
+      - name: Vet
+        run: |
+          go vet ./... 2>&1 | tee /tmp/vet.out || true
+          if [ -s /tmp/vet.out ]; then
+            grep -v -E "(^#|^go: downloading |possible misuse of unsafe.Pointer)" /tmp/vet.out > /tmp/vet.filtered || true
+            if [ -s /tmp/vet.filtered ]; then
+              cat /tmp/vet.filtered
+              exit 1
+            fi
+          fi
 
       - name: Build
         env:
-          GOOS: linux
-          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: go build ./...
+
+  cross-build:
+    name: Cross-Build (${{ matrix.target.goos }}/${{ matrix.target.goarch }}, Go ${{ matrix.go-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version: [ '1.26.x', 'stable' ]
+        target:
+          - { goos: linux,  goarch: arm64 }
+          - { goos: linux,  goarch: riscv64 }
+          - { goos: linux,  goarch: loong64 }
+          - { goos: darwin, goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go-version }}
+          check-latest: true
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.target.goos }}
+          GOARCH: ${{ matrix.target.goarch }}
           CGO_ENABLED: '0'
         run: go build -v ./...
