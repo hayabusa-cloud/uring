@@ -54,9 +54,10 @@ type Options struct {
 	// MultiIssuers enables the shared-submit configuration for rings that accept
 	// submissions from multiple goroutines. When false, New requests
 	// SINGLE_ISSUER + DEFER_TASKRUN and callers must serialize submit-state
-	// operations such as submit, Wait/enter, Stop, and ring resize so the
-	// default fast path can skip shared synchronization. When true, it requests
-	// COOP_TASKRUN and keeps the shared-submit synchronization path.
+	// operations such as submit, Wait, WaitDirect, WaitExtended, Stop, and ring
+	// resize so the default fast path can skip shared synchronization. When
+	// true, it requests COOP_TASKRUN and keeps the shared-submit synchronization
+	// path.
 	MultiIssuers bool
 	// NotifySucceed ensures CQEs are generated for all successful operations.
 	NotifySucceed bool
@@ -166,8 +167,8 @@ func newSetupOptions(opt Options, sqe128 bool) []func(params *ioUringParams) {
 // It wraps the kernel io_uring instance with buffer management and typed operations.
 // Default rings use the single-issuer fast path, so submit-state operations
 // are not safe for concurrent use by multiple goroutines; caller must
-// serialize submit, Wait/enter, Stop, and ResizeRings unless MultiIssuers is
-// enabled.
+// serialize submit, Wait, WaitDirect, WaitExtended, Stop, and ResizeRings
+// unless MultiIssuers is enabled.
 type Uring struct {
 	*ioUring
 	*Options
@@ -314,10 +315,12 @@ func (ur *Uring) releaseRegisteredBufRings() error {
 
 // Wait flushes pending submissions, drives deferred task work when needed, and
 // collects completion events into cqes. On single-issuer rings it is not safe
-// for concurrent use with submit, Stop, or ResizeRings; caller must serialize
-// those operations. It returns the number of events received, ErrCQOverflow
-// when the ring enters CQ overflow and no CQEs are immediately claimable, or
-// `iox.ErrWouldBlock` if the CQ is empty.
+// for concurrent use with submit, Wait, WaitDirect, WaitExtended, Stop, or
+// ResizeRings; caller must serialize those operations. On IOPOLL rings Wait
+// also performs the nonblocking poll enter needed to make completions visible.
+// It returns the number of events received, ErrCQOverflow when the ring enters
+// CQ overflow and no CQEs are immediately claimable, or `iox.ErrWouldBlock` if
+// the CQ is empty.
 //
 // CQEView provides direct field access to Res and Flags, and methods to access
 // the submission context based on mode (Direct, Indirect, Extended).
@@ -328,8 +331,8 @@ func (ur *Uring) releaseRegisteredBufRings() error {
 //	n, err := ring.Wait(cqes)
 //	for i := range n {
 //	    cqe := &cqes[i]
-//	    if cqe.Res < 0 {
-//	        handleCompletionError(cqe.Op(), cqe.Res)
+//	    if err := cqe.Err(); err != nil {
+//	        handleCompletionError(cqe.Op(), err)
 //	        continue
 //	    }
 //	    if cqe.Extended() {
@@ -736,7 +739,8 @@ type SendTargets interface {
 //
 // Zero-copy notes:
 //   - Produces two CQEs per send: completion (IORING_CQE_F_MORE) + notification
-//   - Buffer must not be modified until notification CQE is received
+//   - p must remain valid until all target sends complete
+//   - Zero-copy sends keep registered buffers immutable until notification CQE
 //   - Requires TCP sockets; returns EOPNOTSUPP on Unix sockets or loopback
 //
 // Parameters:
@@ -851,7 +855,7 @@ func (ur *Uring) Multicast(sqeCtx SQEContext, targets SendTargets, bufIndex int,
 //
 // Zero-copy notes:
 //   - Produces two CQEs per send: completion (IORING_CQE_F_MORE) + notification
-//   - Buffer must not be modified until notification CQE is received
+//   - Registered buffers must remain immutable until notification CQE
 //   - May return EOPNOTSUPP on Unix sockets or loopback
 func (ur *Uring) MulticastZeroCopy(sqeCtx SQEContext, targets SendTargets, bufIndex int, offset int64, n int, options ...OpOptionFunc) error {
 	count := targets.Count()
@@ -1133,7 +1137,8 @@ func (ur *Uring) TimeoutUpdate(sqeCtx SQEContext, userData uint64, d time.Durati
 	return ur.timeoutUpdate(ctx, userData, ts, uflags)
 }
 
-// AsyncCancel cancels a pending async operation.
+// AsyncCancel cancels a pending async operation matched by the user_data value
+// of the original SQE.
 func (ur *Uring) AsyncCancel(sqeCtx SQEContext, targetUserData uint64, options ...OpOptionFunc) error {
 	flags := ur.asyncCancelOptions(options)
 	ctx := sqeCtx.OrFlags(flags)
@@ -1535,7 +1540,7 @@ func (ur *Uring) CloneBuffersFromRegistered(srcRegisteredIdx int, srcOff, dstOff
 
 // ResizeRings resizes the SQ and CQ rings of this io_uring instance.
 // On single-issuer rings it is not safe for concurrent use with submit,
-// Wait/enter, or Stop; caller must serialize those operations.
+// Wait, WaitDirect, WaitExtended, or Stop; caller must serialize those operations.
 // This allows dynamic adjustment of ring sizes without recreating the ring.
 //
 // Requirements:
@@ -1584,26 +1589,28 @@ func (ur *Uring) ZCRXExport(zcrxID uint32) (int, error) {
 // ========================================
 
 // FSetXattr sets an extended attribute on a file descriptor.
+// Caller must keep value valid until the operation completes.
 func (ur *Uring) FSetXattr(sqeCtx SQEContext, name string, value []byte, flags int, options ...OpOptionFunc) error {
 	opFlags := ur.operationOptions(options)
 	return ur.ioUring.fsetxattr(sqeCtx.OrFlags(opFlags), name, value, flags)
 }
 
 // SetXattr sets an extended attribute on a path.
+// Caller must keep value valid until the operation completes.
 func (ur *Uring) SetXattr(sqeCtx SQEContext, path, name string, value []byte, flags int, options ...OpOptionFunc) error {
 	opFlags := ur.operationOptions(options)
 	return ur.ioUring.setxattr(sqeCtx.OrFlags(opFlags), path, name, value, flags)
 }
 
 // FGetXattr gets an extended attribute from a file descriptor.
-// The result length is returned in the CQE.
+// Caller must keep value valid until completion. The result length is returned in the CQE.
 func (ur *Uring) FGetXattr(sqeCtx SQEContext, name string, value []byte, options ...OpOptionFunc) error {
 	flags := ur.operationOptions(options)
 	return ur.ioUring.fgetxattr(sqeCtx.OrFlags(flags), name, value)
 }
 
 // GetXattr gets an extended attribute from a path.
-// The result length is returned in the CQE.
+// Caller must keep value valid until completion. The result length is returned in the CQE.
 func (ur *Uring) GetXattr(sqeCtx SQEContext, path, name string, value []byte, options ...OpOptionFunc) error {
 	flags := ur.operationOptions(options)
 	return ur.ioUring.getxattr(sqeCtx.OrFlags(flags), path, name, value)

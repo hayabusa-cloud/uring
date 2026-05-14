@@ -11,7 +11,7 @@ import (
 	"code.hybscloud.com/iox"
 )
 
-// ExtCQE is a zero-overhead CQE for Extended mode operations.
+// ExtCQE is a compact copied CQE for Extended mode operations.
 type ExtCQE struct {
 	Res   int32
 	Flags uint32
@@ -43,9 +43,9 @@ func (c *ExtCQE) Op() uint8 { return c.Ext.SQE.opcode }
 // FD returns the file descriptor from the stored SQE.
 func (c *ExtCQE) FD() iofd.FD { return iofd.FD(c.Ext.SQE.fd) }
 
-// WaitExtended retrieves completion events using Extended mode fast-path (darwin stub).
-// On single-issuer rings it is not safe for concurrent use with submit, Stop,
-// or ResizeRings; caller must serialize those operations.
+// WaitExtended retrieves completion events using the Extended mode fast path (darwin stub).
+// On single-issuer rings it is not safe for concurrent use with submit, Wait,
+// WaitDirect, WaitExtended, or Stop; caller must serialize those operations.
 func (ur *Uring) WaitExtended(cqes []ExtCQE) (int, error) {
 	if err := ur.ioUring.enter(); err != nil {
 		return 0, err

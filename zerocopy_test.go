@@ -823,8 +823,9 @@ func TestZeroCopySequentialSends(t *testing.T) {
 	const numSends = 5
 
 	for seq := 0; seq < numSends; seq++ {
-		// Write unique message
-		msg := []byte("Sequential message " + string(rune('0'+seq)))
+		// Keep the payload above MulticastZeroCopy's single-target threshold so
+		// this test observes SEND_ZC CQEs instead of the fixed-send fallback.
+		msg := bytes.Repeat([]byte{byte('0' + seq)}, 2048)
 		copy(regBuf, msg)
 
 		targets := &singleTarget{fd: fds[1]}
@@ -840,6 +841,7 @@ func TestZeroCopySequentialSends(t *testing.T) {
 		b := iox.Backoff{}
 		opDone := false
 		notifDone := false
+		unsupported := false
 
 		for time.Now().Before(deadline) && (!opDone || !notifDone) {
 			n, _ := ring.Wait(cqes)
@@ -852,14 +854,29 @@ func TestZeroCopySequentialSends(t *testing.T) {
 						opDone = true
 						if cqe.Res == -95 {
 							t.Logf("send[%d]: EOPNOTSUPP", seq)
+							unsupported = true
 							notifDone = true // Skip waiting for notification
 						} else if cqe.Res < 0 {
 							t.Errorf("send[%d] failed: res=%d", seq, cqe.Res)
+						} else if !cqe.HasMore() {
+							notifDone = true
 						}
 					}
 				}
 			}
+			if n > 0 {
+				b.Reset()
+			}
 			b.Wait()
+		}
+		if !opDone {
+			t.Fatalf("send[%d]: SEND_ZC operation CQE not observed", seq)
+		}
+		if !notifDone {
+			t.Fatalf("send[%d]: SEND_ZC notification CQE not observed", seq)
+		}
+		if unsupported {
+			t.Skip("SEND_ZC is not supported for Unix socket pairs in this environment")
 		}
 	}
 

@@ -11,6 +11,8 @@ import (
 	"net"
 	"testing"
 	"unsafe"
+
+	"code.hybscloud.com/iofd"
 )
 
 func assertZeroedSQETail(t *testing.T, sqe *ioUringSqe) {
@@ -1096,4 +1098,212 @@ func TestMsgRingFDWrapperEncodesExpectedSQEs(t *testing.T) {
 			}
 		})
 	}
+}
+
+func newRegistrationFailureTestRing() *Uring {
+	head, tail, mask := uint32(0), uint32(0), uint32(EntriesNano-1)
+	return &Uring{
+		ioUring: &ioUring{
+			ringFd: -1,
+			params: &ioUringParams{
+				sqEntries: EntriesNano,
+				cqEntries: EntriesNano * 2,
+			},
+			sq: ioUringSq{
+				kHead:     &head,
+				kTail:     &tail,
+				kRingMask: &mask,
+			},
+		},
+		Features: &Features{
+			SQEntries: EntriesNano,
+			CQEntries: EntriesNano * 2,
+		},
+	}
+}
+
+func TestAdvancedRegistrationWrappersReturnKernelErrors(t *testing.T) {
+	ring := newRegistrationFailureTestRing()
+	area := ZCRXAreaReg{}
+	region := RegionDesc{}
+
+	tests := []struct {
+		name string
+		call func() error
+	}{
+		{
+			name: "RegisterZCRXIfq",
+			call: func() error {
+				_, _, err := ring.RegisterZCRXIfq(1, 2, 4, &area, &region, 0)
+				return err
+			},
+		},
+		{
+			name: "ZCRXFlushRQ",
+			call: func() error { return ring.ZCRXFlushRQ(1) },
+		},
+		{
+			name: "QueryZCRX",
+			call: func() error {
+				_, err := ring.QueryZCRX()
+				return err
+			},
+		},
+		{
+			name: "QuerySCQ",
+			call: func() error {
+				_, err := ring.QuerySCQ()
+				return err
+			},
+		},
+		{
+			name: "RegisterMemRegion",
+			call: func() error { return ring.RegisterMemRegion(&region, 0) },
+		},
+		{
+			name: "RegisterNAPI",
+			call: func() error { return ring.RegisterNAPI(0, true, IO_URING_NAPI_TRACKING_STATIC) },
+		},
+		{
+			name: "NAPIAddStaticID",
+			call: func() error { return ring.NAPIAddStaticID(7) },
+		},
+		{
+			name: "NAPIDelStaticID",
+			call: func() error { return ring.NAPIDelStaticID(7) },
+		},
+		{
+			name: "UnregisterNAPI",
+			call: func() error { return ring.UnregisterNAPI() },
+		},
+		{
+			name: "CloneBuffers",
+			call: func() error { return ring.CloneBuffers(-1, 1, 2, 3, true) },
+		},
+		{
+			name: "CloneBuffersFromRegistered",
+			call: func() error { return ring.CloneBuffersFromRegistered(5, 1, 2, 3, true) },
+		},
+		{
+			name: "ZCRXExport",
+			call: func() error {
+				_, err := ring.ZCRXExport(1)
+				return err
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.call(); err == nil {
+				t.Fatal("error = nil, want kernel error from invalid ring fd")
+			}
+		})
+	}
+}
+
+func TestResizeRingsPropagatesRegisterFailure(t *testing.T) {
+	ring := newRegistrationFailureTestRing()
+	if err := ring.ResizeRings(EntriesNano, EntriesNano*2); err == nil {
+		t.Fatal("ResizeRings error = nil, want kernel error from invalid ring fd")
+	}
+	if ring.Features.SQEntries != EntriesNano {
+		t.Fatalf("SQEntries = %d, want %d", ring.Features.SQEntries, EntriesNano)
+	}
+	if ring.Features.CQEntries != EntriesNano*2 {
+		t.Fatalf("CQEntries = %d, want %d", ring.Features.CQEntries, EntriesNano*2)
+	}
+}
+
+func poisonNextExtendedSQE(pool *ContextPools) {
+	pool.extended[0].ext.SQE = ioUringSqe{
+		opcode:      IORING_OP_SOCKET,
+		flags:       0xff,
+		ioprio:      0xffff,
+		fd:          -99,
+		off:         99,
+		addr:        99,
+		len:         99,
+		uflags:      0xdeadbeef,
+		userData:    99,
+		bufIndex:    7,
+		personality: 3,
+		spliceFdIn:  11,
+		pad:         [2]uint64{13, 17},
+	}
+}
+
+func assertNoStaleExtendedSQEFields(t *testing.T, sqe *ioUringSqe, wantBufIndex uint16) {
+	t.Helper()
+
+	if got := sqe.off; got != 0 {
+		t.Fatalf("SQE.off = %d, want 0", got)
+	}
+	if got := sqe.uflags; got != 0 {
+		t.Fatalf("SQE.uflags = %#x, want 0", got)
+	}
+	if got := sqe.bufIndex; got != wantBufIndex {
+		t.Fatalf("SQE.bufIndex = %d, want %d", got, wantBufIndex)
+	}
+	if got := sqe.personality; got != 0 {
+		t.Fatalf("SQE.personality = %d, want 0", got)
+	}
+	if got := sqe.spliceFdIn; got != 0 {
+		t.Fatalf("SQE.spliceFdIn = %d, want 0", got)
+	}
+	if got := sqe.pad; got != [2]uint64{} {
+		t.Fatalf("SQE.pad = %#v, want zero", got)
+	}
+}
+
+func TestIncrementalRecvClearsBorrowedExtendedSQE(t *testing.T) {
+	ring := newWrapperTestRing(t)
+	pool := NewContextPools(1)
+	poisonNextExtendedSQE(pool)
+
+	receiver := NewIncrementalReceiver(ring, pool, 7, 256, make([]byte, 256), 1)
+	if err := receiver.Recv(11, nil); err != nil {
+		t.Fatalf("Recv: %v", err)
+	}
+
+	sqe := lastSubmittedSQE(t, ring)
+	if got, want := sqe.opcode, uint8(IORING_OP_RECV); got != want {
+		t.Fatalf("SQE.opcode = %d, want %d", got, want)
+	}
+	assertNoStaleExtendedSQEFields(t, sqe, 7)
+}
+
+func TestZCTrackerSendZCClearsBorrowedExtendedSQE(t *testing.T) {
+	ring := newWrapperTestRing(t)
+	pool := NewContextPools(1)
+	poisonNextExtendedSQE(pool)
+
+	tracker := NewZCTracker(ring, pool)
+	if err := tracker.SendZC(iofd.FD(11), []byte("payload"), nil); err != nil {
+		t.Fatalf("SendZC: %v", err)
+	}
+
+	sqe := lastSubmittedSQE(t, ring)
+	if got, want := sqe.opcode, uint8(IORING_OP_SEND_ZC); got != want {
+		t.Fatalf("SQE.opcode = %d, want %d", got, want)
+	}
+	assertNoStaleExtendedSQEFields(t, sqe, 0)
+}
+
+func TestZCTrackerSendZCFixedClearsBorrowedExtendedSQE(t *testing.T) {
+	ring := newWrapperTestRing(t)
+	ring.bufs = [][]byte{[]byte("registered-payload")}
+	pool := NewContextPools(1)
+	poisonNextExtendedSQE(pool)
+
+	tracker := NewZCTracker(ring, pool)
+	if err := tracker.SendZCFixed(iofd.FD(11), 0, 0, 10, nil); err != nil {
+		t.Fatalf("SendZCFixed: %v", err)
+	}
+
+	sqe := lastSubmittedSQE(t, ring)
+	if got, want := sqe.opcode, uint8(IORING_OP_SEND_ZC); got != want {
+		t.Fatalf("SQE.opcode = %d, want %d", got, want)
+	}
+	assertNoStaleExtendedSQEFields(t, sqe, 0)
 }

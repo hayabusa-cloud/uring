@@ -226,6 +226,8 @@ type IndirectSQE struct {
 var _ [64 - unsafe.Sizeof(IndirectSQE{})]struct{}
 
 // ExtSQE stub for non-Linux (must match linux ExtSQE layout for shared Ctx types).
+// The GC does not trace UserData; callers that place pointer-bearing values
+// there must keep the referents reachable outside UserData.
 type ExtSQE struct {
 	SQE      ioUringSqe // 64 bytes
 	UserData [64]byte   // 64 bytes

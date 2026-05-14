@@ -126,7 +126,7 @@ func newSetupOptions(opt Options, sqe128 bool) []func(params *ioUringParams) {
 // It wraps the kernel io_uring instance with buffer management and typed operations.
 // Default rings use the single-issuer fast path, so submit-state operations
 // are not safe for concurrent use by multiple goroutines; caller must
-// serialize submit, Wait/enter, and Stop unless MultiIssuers is enabled.
+// serialize submit, Wait, WaitDirect, WaitExtended, and Stop unless MultiIssuers is enabled.
 type Uring struct {
 	*ioUring
 	*Options
@@ -223,9 +223,10 @@ func (ur *Uring) Stop() error {
 }
 
 // Wait flushes pending submissions and collects completion events into cqes.
-// On single-issuer rings it is not safe for concurrent use with submit or
-// Stop; caller must serialize those operations. It returns the number of
-// events received, or `iox.ErrWouldBlock` if the CQ is empty.
+// On single-issuer rings it is not safe for concurrent use with submit, Wait,
+// WaitDirect, WaitExtended, or Stop; caller must serialize those operations.
+// It returns the number of events received, or `iox.ErrWouldBlock` if the CQ
+// is empty.
 func (ur *Uring) Wait(cqes []CQEView) (n int, err error) {
 	err = ur.ioUring.enter()
 	if err != nil {
@@ -856,7 +857,8 @@ func (ur *Uring) TimeoutUpdate(sqeCtx SQEContext, userData uint64, d time.Durati
 	return ErrNotSupported
 }
 
-// AsyncCancel cancels a pending async operation.
+// AsyncCancel cancels a pending async operation matched by the user_data value
+// of the original SQE.
 func (ur *Uring) AsyncCancel(sqeCtx SQEContext, targetUserData uint64, options ...OpOptionFunc) error {
 	flags := ur.operationOptions(options)
 	ctx := sqeCtx.OrFlags(flags)

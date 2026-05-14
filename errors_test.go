@@ -7,6 +7,7 @@
 package uring
 
 import (
+	"errors"
 	"testing"
 
 	"code.hybscloud.com/iox"
@@ -56,6 +57,40 @@ func TestErrFromErrno(t *testing.T) {
 				t.Errorf("errFromErrno(%d) = %v, want %v", tt.errno, got, tt.expected)
 			}
 		})
+	}
+}
+
+func TestCompletionError(t *testing.T) {
+	tests := []struct {
+		name string
+		res  int32
+		want error
+	}{
+		{"positive", 7, nil},
+		{"zero", 0, nil},
+		{"would block", -int32(EAGAIN), iox.ErrWouldBlock},
+		{"canceled", -int32(ECANCELED), ErrCanceled},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := CompletionError(tt.res)
+			if !errors.Is(got, tt.want) {
+				t.Fatalf("CompletionError(%d) = %v, want %v", tt.res, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCompletionErrMethods(t *testing.T) {
+	if err := (&CQEView{Res: 1}).Err(); err != nil {
+		t.Fatalf("CQEView.Err positive = %v", err)
+	}
+	if err := (&DirectCQE{Res: -int32(EAGAIN)}).Err(); !errors.Is(err, iox.ErrWouldBlock) {
+		t.Fatalf("DirectCQE.Err = %v, want %v", err, iox.ErrWouldBlock)
+	}
+	if err := (&ExtCQE{Res: -int32(ECANCELED)}).Err(); !errors.Is(err, ErrCanceled) {
+		t.Fatalf("ExtCQE.Err = %v, want %v", err, ErrCanceled)
 	}
 }
 

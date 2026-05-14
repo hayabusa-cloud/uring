@@ -14,14 +14,15 @@ import (
 	"code.hybscloud.com/spin"
 )
 
-// ExtCQE is a zero-overhead CQE for Extended mode operations.
-// It provides direct access to the borrowed ExtSQE pointer without mode checking.
+// ExtCQE is a compact copied CQE for Extended mode operations.
+// It stores the completion result, CQE flags, and borrowed ExtSQE pointer
+// without mode checking.
 //
-// Use WaitExtended when your application exclusively uses Extended mode
-// (PackExtended) for all submissions. This avoids the 3-way mode check
-// that the generic Wait/CQEView path requires per-CQE.
+// Use WaitExtended when every submitted operation uses Extended mode
+// (PackExtended). That path skips the generic Wait/CQEView mode dispatch per
+// CQE.
 //
-// Layout: 16 bytes (fits in 1/4 cache line)
+// Layout: 16 bytes on supported 64-bit platforms.
 type ExtCQE struct {
 	Res   int32   // Completion result (bytes transferred or negative errno)
 	Flags uint32  // CQE flags (IORING_CQE_F_*)
@@ -89,11 +90,14 @@ func (c *ExtCQE) FD() iofd.FD {
 // This method skips mode detection since all CQEs are assumed to be
 // from Extended mode submissions (PackExtended).
 //
-// For applications using only Extended mode, this skips the mode dispatch
-// that Wait([]CQEView) performs per CQE.
+// For applications using only Extended mode, this skips the generic mode
+// dispatch that Wait performs per CQE.
 //
-// On single-issuer rings it is not safe for concurrent use with submit, Stop,
-// or ResizeRings; caller must serialize those operations.
+// On single-issuer rings it is not safe for concurrent use with submit, Wait,
+// WaitDirect, WaitExtended, Stop, or ResizeRings; caller must serialize those
+// operations.
+// On IOPOLL rings WaitExtended also performs the nonblocking poll enter needed
+// to make completions visible.
 // Caller-side completion code must keep completion referents reachable until
 // CQE reap and serialize retirement.
 // For multishot CQEs, return Ext to the pool only after !HasMore().
@@ -124,9 +128,11 @@ func (ur *ioUring) waitBatchExtended(cqes []ExtCQE) (int, error) {
 		h := atomic.LoadUint32(ur.cq.kHead)
 		t := atomic.LoadUint32(ur.cq.kTail)
 		if h == t {
-			err := ur.cqEmptyErr()
-			ur.unlockSubmitState()
-			return 0, err
+			if err := ur.observeCQEmptyLocked(); err != nil {
+				ur.unlockSubmitState()
+				return 0, err
+			}
+			continue
 		}
 
 		// Calculate batch size

@@ -8,7 +8,10 @@ package uring
 
 import "code.hybscloud.com/iofd"
 
-// CQEView provides a compatibility view into a completion queue entry.
+// CQEView provides a view into a completion queue entry.
+// A copied CQEView is a completion observation, not durable route state. If
+// caller code stores it beyond the current dispatch turn, caller code must keep
+// its own route state.
 type CQEView struct {
 	Res   int32
 	Flags uint32

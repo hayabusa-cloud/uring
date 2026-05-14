@@ -14,15 +14,14 @@ import (
 	"code.hybscloud.com/spin"
 )
 
-// DirectCQE is a zero-overhead CQE for Direct mode operations.
-// It contains the completion result and unpacked context fields
-// without any mode checking or pointer indirection.
+// DirectCQE is a compact copied CQE for Direct mode operations.
+// It stores the completion result and unpacked context fields without mode
+// checking or pointer indirection.
 //
-// Use WaitDirect when your application exclusively uses Direct mode
-// (PackDirect) for all submissions. This avoids the 3-way mode check
-// that the generic Wait/CQEView path requires per-CQE.
+// Use WaitDirect when every submitted operation uses Direct mode (PackDirect).
+// That path skips the generic Wait/CQEView mode dispatch per CQE.
 //
-// Layout: 24 bytes (fits in 1/3 cache line, no padding needed)
+// Layout: 16 bytes on supported platforms.
 type DirectCQE struct {
 	Res      int32  // Completion result (bytes transferred or negative errno)
 	Flags    uint32 // CQE flags (IORING_CQE_F_*)
@@ -68,15 +67,18 @@ func (c *DirectCQE) IsNotification() bool {
 	return cqeIsNotification(c.Flags)
 }
 
-// WaitDirect retrieves completion events using Direct mode fast-path.
+// WaitDirect retrieves completion events using the Direct mode fast path.
 // This method skips mode detection since all CQEs are assumed to be
 // from Direct mode submissions (PackDirect).
 //
-// For applications using only Direct mode, this skips the mode dispatch
-// that Wait([]CQEView) performs per CQE.
+// For applications using only Direct mode, this skips the generic mode dispatch
+// that Wait performs per CQE.
 //
-// On single-issuer rings it is not safe for concurrent use with submit, Stop,
-// or ResizeRings; caller must serialize those operations.
+// On single-issuer rings it is not safe for concurrent use with submit, Wait,
+// WaitDirect, WaitExtended, Stop, or ResizeRings; caller must serialize those
+// operations.
+// On IOPOLL rings WaitDirect also performs the nonblocking poll enter needed
+// to make completions visible.
 // Returns the number of CQEs retrieved, ErrCQOverflow when the ring enters CQ
 // overflow and no CQEs are immediately claimable, or iox.ErrWouldBlock if none
 // are available.
@@ -104,9 +106,11 @@ func (ur *ioUring) waitBatchDirect(cqes []DirectCQE) (int, error) {
 		h := atomic.LoadUint32(ur.cq.kHead)
 		t := atomic.LoadUint32(ur.cq.kTail)
 		if h == t {
-			err := ur.cqEmptyErr()
-			ur.unlockSubmitState()
-			return 0, err
+			if err := ur.observeCQEmptyLocked(); err != nil {
+				ur.unlockSubmitState()
+				return 0, err
+			}
+			continue
 		}
 
 		// Calculate batch size

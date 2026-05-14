@@ -11,7 +11,7 @@ import (
 	"code.hybscloud.com/iox"
 )
 
-// DirectCQE is a zero-overhead CQE for Direct mode operations.
+// DirectCQE is a compact copied CQE for Direct mode operations.
 type DirectCQE struct {
 	Res      int32
 	Flags    uint32
@@ -37,9 +37,9 @@ func (c *DirectCQE) BufID() uint16 { return cqeBufID(c.Flags) }
 // IsNotification reports whether this is a zero-copy notification CQE.
 func (c *DirectCQE) IsNotification() bool { return cqeIsNotification(c.Flags) }
 
-// WaitDirect retrieves completion events using Direct mode fast-path (darwin stub).
-// On single-issuer rings it is not safe for concurrent use with submit, Stop,
-// or ResizeRings; caller must serialize those operations.
+// WaitDirect retrieves completion events using the Direct mode fast path (darwin stub).
+// On single-issuer rings it is not safe for concurrent use with submit, Wait,
+// WaitDirect, WaitExtended, or Stop; caller must serialize those operations.
 func (ur *Uring) WaitDirect(cqes []DirectCQE) (int, error) {
 	if err := ur.ioUring.enter(); err != nil {
 		return 0, err

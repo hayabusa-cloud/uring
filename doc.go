@@ -57,8 +57,8 @@
 //	        if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
 //	            continue
 //	        }
-//	        if cqe.Res < 0 {
-//	            return fmt.Errorf("uring read failed: res=%d", cqe.Res)
+//	        if err := cqe.Err(); err != nil {
+//	            return fmt.Errorf("uring read failed: %w", err)
 //	        }
 //	        handle(buf[:int(cqe.Res)])
 //	        return nil
@@ -69,18 +69,31 @@
 // [Uring.SubmitReceiveBundleMultishot] submit raw multishot SQEs and keep the
 // kernel-boundary flow explicit. [Uring.AcceptMultishot] and
 // [Uring.ReceiveMultishot] use the same kernel path and return a
-// [MultishotSubscription] when caller code wants callback-driven retirement.
+// [MultishotSubscription] for caller-owned callback dispatch in the same
+// serialized completion loop. If caller code keeps copied CQEs beyond that
+// loop, it must keep its own route state and reject observations for retired
+// subscriptions.
 //
 //	sqeCtx := uring.ForFD(listenerFD)
 //	sub, err := ring.AcceptMultishot(sqeCtx, handler)
+//	if err != nil {
+//	    return err
+//	}
 //
-//	// Process CQEs - caller-side runtime code routes decoded CQEs
+//	// Process CQEs in the same serialized completion loop.
 //	for i := range n {
-//	    dispatch(handler, cqes[i])
+//	    if sub.HandleCQE(cqes[i]) {
+//	        continue
+//	    }
+//	    dispatch(ring, cqes[i])
 //	}
 //
 //	// Cancel when done
-//	sub.Cancel()
+//	// On single-issuer rings, call Cancel from the ring owner or otherwise
+//	// serialize it with submit, Wait, WaitDirect, WaitExtended, Stop, and ResizeRings.
+//	if err := sub.Cancel(); err != nil {
+//	    return err
+//	}
 //
 // Listener setup advances with [DecodeListenerCQE], [PrepareListenerBind],
 // [PrepareListenerListen], and [SetListenerReady]. [ListenerManager] is a thin
@@ -106,7 +119,7 @@
 //
 // [SQEContext] packs submission metadata into `user_data`.
 //
-// Direct mode layout (zero allocation, most common):
+// Direct mode layout (inline context, zero allocation):
 //
 //	┌─────────┬─────────┬──────────────┬────────────────────────────┬────┐
 //	│ Op (8b) │Flags(8b)│ BufGrp (16b) │        FD (30b)            │Mode│
@@ -168,17 +181,16 @@
 // `MultishotStop` to request cancellation after the current step. The request
 // is local until the cancel SQE is successfully enqueued.
 //
-// # Token Affinity at the Multishot Seam
+// # Multishot Subscription Lifecycle
 //
-// One live subscription names one live backend obligation. The kernel may
-// emit multiple CQEs against the same SQE before the obligation terminates;
-// each CQE carries `IORING_CQE_F_MORE` until the last. The package preserves
-// a one-to-one correspondence between a submitted [ExtSQE] (and its encoded
-// `user_data`) and the logical subscription, releasing the ExtSQE to its
-// pool only when the terminating CQE (`!HasMore()`) is observed. This is
-// the kernel-side foot of the affine-token discipline that caller runtimes
-// enforce at their own seams: an intermediate CQE discharges no obligation,
-// and the terminal CQE discharges exactly one.
+// A live subscription keeps its submitted [ExtSQE] until the terminal CQE for
+// that operation is handled. The kernel may emit multiple CQEs for the same
+// submission before that terminal CQE; each non-terminal CQE carries
+// `IORING_CQE_F_MORE`. The package keeps the submitted ExtSQE and encoded
+// `user_data` associated with the subscription, and returns the ExtSQE to its
+// pool only after handling a CQE without `HasMore()`. Caller-side runtime code
+// should treat intermediate CQEs as progress for the live subscription and the
+// final CQE as the point where the subscription can be retired.
 //
 // # Runtime Boundary
 //

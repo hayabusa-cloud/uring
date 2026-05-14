@@ -12,6 +12,9 @@ import "code.hybscloud.com/iofd"
 // It exposes kernel completion facts directly and lets caller-side runtime
 // code decide how to route or interpret them. When available,
 // it also exposes the submission context that produced those facts.
+// A copied CQEView is a completion observation, not durable route state. If
+// caller code stores it beyond the current dispatch turn, caller code must keep
+// its own route state.
 //
 // # Property Patterns
 //
@@ -27,8 +30,8 @@ import "code.hybscloud.com/iofd"
 //	for i := range n {
 //	    cqe := cqes[i]
 //	    // Observe the kernel facts first.
-//	    if cqe.Res < 0 {
-//	        return fmt.Errorf("completion failed: op=%d fd=%d res=%d", cqe.Op(), cqe.FD(), cqe.Res)
+//	    if err := cqe.Err(); err != nil {
+//	        return fmt.Errorf("completion failed: op=%d fd=%d: %w", cqe.Op(), cqe.FD(), err)
 //	    }
 //	    fmt.Printf("completed op=%d on fd=%d with res=%d\n", cqe.Op(), cqe.FD(), cqe.Res)
 //	    if cqe.HasMore() {

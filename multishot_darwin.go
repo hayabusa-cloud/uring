@@ -44,7 +44,8 @@ const (
 	SubscriptionStopped
 )
 
-// MultishotSubscription is a subscription to a multishot io_uring operation (stub on Darwin).
+// MultishotSubscription tracks one multishot io_uring operation.
+// On Darwin, multishot operations are not supported.
 type MultishotSubscription struct {
 	ring         *Uring
 	ext          *ExtSQE
@@ -72,6 +73,11 @@ func (s *MultishotSubscription) Active() bool {
 // State returns the current subscription state.
 func (s *MultishotSubscription) State() SubscriptionState {
 	return SubscriptionStopped
+}
+
+// HandleCQE reports that multishot subscriptions are not supported on Darwin.
+func (s *MultishotSubscription) HandleCQE(cqe CQEView) bool {
+	return false
 }
 
 // AcceptMultishot creates a multishot accept subscription (stub on Darwin).

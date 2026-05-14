@@ -15,8 +15,9 @@ import (
 
 // lockSubmitState takes the shared-submit lock when submit-state operations may
 // arrive from multiple goroutines. Single-issuer rings intentionally skip this
-// lock and rely on caller serialization of submit, Wait/enter, Stop, and
-// ResizeRings so the hot path avoids shared synchronization overhead.
+// lock and rely on caller serialization of submit, Wait, WaitDirect,
+// WaitExtended, Stop, and ResizeRings so the hot path avoids shared
+// synchronization overhead.
 func (ur *ioUring) lockSubmitState() {
 	if !ur.submit.shared {
 		return

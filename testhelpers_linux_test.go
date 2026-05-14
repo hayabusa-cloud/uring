@@ -136,3 +136,20 @@ func writeTestFD(fd iofd.FD, buf []byte) (int, uintptr) {
 	n, errno := zcall.Write(uintptr(fd), buf)
 	return int(n), errno
 }
+
+// dispatchSimplifiedMultishotCQE is a test helper for direct handler exercises.
+// It intentionally skips the internal MultishotSubscription state machine and therefore
+// must not be read as the authoritative runtime lifecycle.
+func dispatchSimplifiedMultishotCQE(handler uring.MultishotHandler, cqe uring.CQEView) bool {
+	step := uring.MultishotStep{CQE: cqe}
+	if cqe.Res < 0 {
+		step.Err = zcall.Errno(uintptr(-cqe.Res))
+		step.Cancelled = cqe.Res == -int32(uring.ECANCELED)
+	}
+
+	keep := handler.OnMultishotStep(step) == uring.MultishotContinue
+	if step.Final() {
+		handler.OnMultishotStop(step.Err, step.Cancelled)
+	}
+	return keep
+}
