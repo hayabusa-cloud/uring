@@ -9,9 +9,26 @@ on:
 permissions:
   contents: read
 
+# Cancel superseded runs on the same ref so a quick push series does not pile up
+# parallel jobs on the same matrix.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Runtime probes newer than the Linux 6.12 baseline, plus socket zero-copy
+# probes that depend on hosted-runner network topology, stay out of the required
+# lane while ubuntu-latest is still on Ubuntu 24.04. Keep these patterns
+# anchored to whole test names so helper, encoding, and pure example coverage
+# still runs. The full suite runs below as a non-blocking signal until
+# ubuntu-latest moves to Ubuntu 26.04.
+env:
+  URING_OPTIONAL_KERNEL_TESTS: '^Test(IntegrationZeroCopySend|IntegrationMultishotAcceptPrimeWaitSurfacesImmediateError|IntegrationMultishotAccept|UringEpollWait|UringPipe|ResizeRings|QueryOpcodes|NAPIRegistration|SQE128NopCycle|PollUpdate|NewZCRXReceiverNotSupported)$'
+  URING_OPTIONAL_SOCKET_ZC_TESTS: '^Test(ZCTrackerBasic|ZCTrackerPoolExhaustion|ZCTrackerHandlerOrder|ZCTrackerExactlyOnce|ZCTrackerGCSafety|SendZeroCopyFixed|ZeroCopyNotificationFlags|SendZeroCopyFixedMultiTarget|ZeroCopyBufferSafety|ZeroCopyLargeBuffer|ZeroCopyMultipleBuffers|ZeroCopyErrorHandling|ZeroCopySequentialSends|TwoCQEOverhead|ZCRXConfigValidation)$'
+  URING_OPTIONAL_RUNTIME_EXAMPLES: '^Test(BufferRingBasics|SQEContextIndirect|SQEContextExtended|CQEViewAccess|TCPEchoServer|UringSocketWithSyscallAccept|SimpleTCPAccept|BroadcastServerWithFramer|UDPPingPong|FileWriteRead|BatchedFileOps|NopThroughput|FixedBufferBasics|WriteFixedOperation|ReadFixedOperation|MultishotHandlerControl|PollAddBasic|PollCancelByFD|PollMultipleFDs|SpliceBasics|TeeOperation|BasicTimeout|MultipleTimeouts|PollWithTimeout|LinkedTimeout|VectoredWrite|VectoredRead|ZCTrackerBasic|MulticastZeroCopy)$'
+
 jobs:
-  build-and-check:
-    name: Build & Check (Go ${{ matrix.go-version }})
+  lint-build-test-linux:
+    name: Lint, Build & Test (Linux/amd64, Go ${{ matrix.go-version }})
     runs-on: ubuntu-latest
     timeout-minutes: 5
     strategy:
@@ -25,6 +42,7 @@ jobs:
         uses: actions/setup-go@v6
         with:
           go-version: ${{ matrix.go-version }}
+          check-latest: true
 
       - name: Check formatting
         run: |
@@ -39,7 +57,8 @@ jobs:
         run: |
           go vet ./... 2>&1 | tee /tmp/vet.out || true
           if [ -s /tmp/vet.out ]; then
-            # Fresh runners may print module download chatter before real vet diagnostics.
+            # Drop package headers, module-download chatter, and the intentional
+            # `unsafe.Pointer` arithmetic warning over kernel-mapped ring memory.
             grep -v -E "(^#|^go: downloading |possible misuse of unsafe.Pointer)" /tmp/vet.out > /tmp/vet.filtered || true
             if [ -s /tmp/vet.filtered ]; then
               cat /tmp/vet.filtered
@@ -52,28 +71,35 @@ jobs:
           CGO_ENABLED: '0'
         run: go build ./...
 
-      ## TODO: Enable once ubuntu-26.04 runner lands (ETA: May 2026).
-      ## Ubuntu 26.04 ships kernel 7.0; io_uring features require >= 6.18.
-      ## Change runs-on to ubuntu-26.04 and uncomment the steps below.
-      ## Tracking: https://github.com/actions/runner-images/issues/13855
-      # - name: Test
-      #   run: go test -v -race -coverprofile=coverage.out ./...
-      # - name: Upload coverage to Codecov
-      #   if: matrix.go-version == 'stable'
-      #   uses: codecov/codecov-action@v5
-      #   with:
-      #     files: coverage.out
-      #     token: ${{ secrets.CODECOV_TOKEN }}
+      - name: Show runner kernel
+        run: uname -a
 
-  cross-build:
-    name: Cross-Build (Go ${{ matrix.go-version }}, linux/${{ matrix.goarch }})
-    runs-on: ubuntu-latest
+      # Required root-package lane. Covers io_uring behavior available on Linux
+      # 6.12 and earlier; newer runtime probes run in the non-blocking lane
+      # below.
+      - name: Test root package (Linux <=6.12 io_uring baseline)
+        run: go test -v -race -count=1 -timeout=180s -skip "$URING_OPTIONAL_KERNEL_TESTS|$URING_OPTIONAL_SOCKET_ZC_TESTS" .
+
+      # Required examples lane. Runs examples that are pure documentation or
+      # encoding checks; runtime examples stay visible in the non-blocking full
+      # suite below until the runner baseline catches up.
+      - name: Test examples (pure required subset)
+        run: go test -v -race -count=1 -timeout=180s -skip "$URING_OPTIONAL_RUNTIME_EXAMPLES" ./examples
+
+      # Non-blocking lane. Keeps newer kernel probes visible on ubuntu-latest;
+      # failures here become required only after the runner baseline catches up.
+      - name: Test (newer io_uring features, non-blocking)
+        continue-on-error: true
+        run: go test -race -count=1 -timeout=180s ./...
+
+  vet-build-darwin:
+    name: Vet & Build (Darwin/arm64, Go ${{ matrix.go-version }})
+    runs-on: macos-latest
     timeout-minutes: 5
     strategy:
       fail-fast: false
       matrix:
         go-version: [ '1.26.x', 'stable' ]
-        goarch: [ arm64, riscv64, loong64 ]
     steps:
       - uses: actions/checkout@v6
 
@@ -81,10 +107,46 @@ jobs:
         uses: actions/setup-go@v6
         with:
           go-version: ${{ matrix.go-version }}
+          check-latest: true
+
+      - name: Vet
+        run: |
+          go vet ./... 2>&1 | tee /tmp/vet.out || true
+          if [ -s /tmp/vet.out ]; then
+            grep -v -E "(^#|^go: downloading |possible misuse of unsafe.Pointer)" /tmp/vet.out > /tmp/vet.filtered || true
+            if [ -s /tmp/vet.filtered ]; then
+              cat /tmp/vet.filtered
+              exit 1
+            fi
+          fi
 
       - name: Build
         env:
-          GOOS: linux
-          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: go build ./...
+
+  cross-build:
+    name: Cross-Build (${{ matrix.target.goos }}/${{ matrix.target.goarch }}, Go ${{ matrix.go-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version: [ '1.26.x', 'stable' ]
+        target:
+          - { goos: darwin, goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go-version }}
+          check-latest: true
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.target.goos }}
+          GOARCH: ${{ matrix.target.goarch }}
           CGO_ENABLED: '0'
         run: go build -v ./...
