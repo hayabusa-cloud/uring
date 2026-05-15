@@ -16,7 +16,7 @@ import (
 const (
 	testInternalLockedBufferMem         = registerBufferSize
 	testInternalTwoRegisteredBuffersMem = 2 * registerBufferSize
-	testInternalProvidedBufferNum       = 64
+	testInternalProvidedBufferNum       = 4
 )
 
 func testMinimalBufferOptions(opt *Options) {

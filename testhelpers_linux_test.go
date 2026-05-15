@@ -22,7 +22,7 @@ import (
 const (
 	testLockedBufferMem         = uring.BufferSizeLarge
 	testTwoRegisteredBuffersMem = 2 * uring.BufferSizeLarge
-	testProvidedBufferNum       = 64
+	testProvidedBufferNum       = 4
 )
 
 func testMinimalBufferOptions(opt *uring.Options) {
