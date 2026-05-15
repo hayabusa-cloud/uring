@@ -228,6 +228,8 @@ func newPublicPerformanceIORing(b *testing.B) *uring.Uring {
 
 	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
 		opt.NotifySucceed = true
+		opt.Entries = uring.EntriesSmall
+		opt.MultiIssuers = true
 	})
 	if err != nil {
 		b.Skipf("New: %v", err)
