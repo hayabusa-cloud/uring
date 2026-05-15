@@ -16,13 +16,13 @@ concurrency:
   cancel-in-progress: true
 
 # Runtime probes newer than the Linux 6.12 baseline stay out of the required
-# lane while ubuntu-latest is still on Ubuntu 24.04. Zero-copy runtime probes
-# require network or NIC support the hosted runner does not provide, so CI does
-# not run them. Keep these patterns anchored to whole test names so helper,
-# encoding, and pure example coverage still runs.
+# lane until GitHub-hosted ubuntu-latest reliably exposes a newer io_uring
+# baseline. Zero-copy runtime probes require network or NIC support the hosted
+# runner does not provide, so CI does not run them. Keep these patterns anchored
+# to whole test names so helper, encoding, and pure example coverage still runs.
 env:
   URING_OPTIONAL_KERNEL_TESTS: '^Test(IntegrationMultishotAcceptPrimeWaitSurfacesImmediateError|IntegrationMultishotAccept|UringEpollWait|UringPipe|ResizeRings|QueryOpcodes|NAPIRegistration|SQE128NopCycle|PollUpdate|NewZCRXReceiverNotSupported)$'
-  URING_CI_UNSUPPORTED_ZC_TESTS: '^Test(IntegrationZeroCopySend|ZCTrackerBasic|ZCTrackerPoolExhaustion|ZCTrackerHandlerOrder|ZCTrackerExactlyOnce|ZCTrackerGCSafety|SendZeroCopyFixed|ZeroCopyNotificationFlags|SendZeroCopyFixedMultiTarget|ZeroCopyBufferSafety|ZeroCopyLargeBuffer|ZeroCopyMultipleBuffers|ZeroCopyErrorHandling|ZeroCopySequentialSends|TwoCQEOverhead|ZCRXConfigValidation)$'
+  URING_CI_UNSUPPORTED_ZC_TESTS: '^Test(IntegrationZeroCopySend|ZCTrackerBasic|ZCTrackerPoolExhaustion|ZCTrackerHandlerOrder|ZCTrackerExactlyOnce|ZCTrackerGCSafety|SendZeroCopyFixed|ZeroCopyNotificationFlags|SendZeroCopyFixedMultiTarget|ZeroCopyBufferSafety|ZeroCopyLargeBuffer|ZeroCopyMultipleBuffers|ZeroCopyErrorHandling|ZeroCopySequentialSends|TwoCQEOverhead)$'
   URING_OPTIONAL_RUNTIME_EXAMPLES: '^Test(BufferRingBasics|SQEContextIndirect|SQEContextExtended|CQEViewAccess|TCPEchoServer|UringSocketWithSyscallAccept|SimpleTCPAccept|BroadcastServerWithFramer|UDPPingPong|FileWriteRead|BatchedFileOps|NopThroughput|FixedBufferBasics|WriteFixedOperation|ReadFixedOperation|MultishotHandlerControl|PollAddBasic|PollCancelByFD|PollMultipleFDs|SpliceBasics|TeeOperation|BasicTimeout|MultipleTimeouts|PollWithTimeout|LinkedTimeout|VectoredWrite|VectoredRead)$'
   URING_CI_UNSUPPORTED_ZC_EXAMPLES: '^Test(ZCTrackerBasic|MulticastZeroCopy)$'
 
@@ -80,9 +80,26 @@ jobs:
       # Required root-package lane. Covers io_uring behavior available on Linux
       # 6.12 and earlier; newer runtime probes run in the non-blocking lane
       # below. Coverage collection runs separately so instrumentation does not
-      # change the required race-test verdict.
+      # change the required race-test verdict. The summary keeps the failing
+      # test name visible when the full verbose log is too long for quick review.
       - name: Test root package (Linux <=6.12 io_uring baseline)
-        run: go test -v -race -count=1 -timeout=180s -skip "$URING_OPTIONAL_KERNEL_TESTS|$URING_CI_UNSUPPORTED_ZC_TESTS" .
+        run: |
+          set -o pipefail
+          log=/tmp/uring-root-test.out
+          set +e
+          go test -v -race -count=1 -timeout=180s -skip "$URING_OPTIONAL_KERNEL_TESTS|$URING_CI_UNSUPPORTED_ZC_TESTS" . 2>&1 | tee "$log"
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ]; then
+            {
+              echo "### Root package test failures"
+              echo
+              echo '```text'
+              grep -E '^(--- FAIL:|    [^[:space:]]+_test\.go:[0-9]+:|WARNING: DATA RACE|panic:|fatal error:|FAIL[[:space:]]|FAIL$)' "$log" | tail -n 120 || true
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit "$status"
+          fi
 
       - name: Collect root package coverage
         if: matrix.go-version == 'stable'
