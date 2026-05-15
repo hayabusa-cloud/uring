@@ -331,7 +331,9 @@ func benchmarkPublicPerformanceZeroCopyIO(b *testing.B, payloadSize, destination
 		if err := ring.MulticastZeroCopy(ctx, targets, 0, 0, payloadSize); err != nil {
 			b.Fatalf("MulticastZeroCopy: %v", err)
 		}
-		benchmarkPublicPerformanceInt32Sink ^= waitPublicPerformanceZeroCopyCQEs(b, ring, cqes, destinationCount)
+		benchmarkPublicPerformanceInt32Sink ^= waitPublicPerformanceZeroCopyCQEs(
+			b, ring, cqes, destinationCount, int32(payloadSize),
+		)
 	}
 }
 
@@ -430,16 +432,17 @@ func waitPublicPerformanceDirectCQEs(b *testing.B, ring *uring.Uring, cqes []uri
 	return res
 }
 
-func waitPublicPerformanceZeroCopyCQEs(b *testing.B, ring *uring.Uring, cqes []uring.DirectCQE, want int) int32 {
+func waitPublicPerformanceZeroCopyCQEs(b *testing.B, ring *uring.Uring, cqes []uring.DirectCQE, want int, wantRes int32) int32 {
 	b.Helper()
 
 	var (
-		backoff  iox.Backoff
-		deadline time.Time
-		seen     int
-		res      int32
+		backoff           iox.Backoff
+		deadline          time.Time
+		seenOps           int
+		seenNotifications int
+		res               int32
 	)
-	for seen < want {
+	for seenOps < want || seenNotifications < want {
 		n, err := ring.WaitDirect(cqes)
 		switch {
 		case err == nil:
@@ -459,24 +462,28 @@ func waitPublicPerformanceZeroCopyCQEs(b *testing.B, ring *uring.Uring, cqes []u
 		}
 
 		backoff.Reset()
-		for i := 0; i < n && seen < want; i++ {
+		for i := 0; i < n && (seenOps < want || seenNotifications < want); i++ {
 			cqe := &cqes[i]
 			switch cqe.Op {
 			case uring.IORING_OP_SEND_ZC:
 				if cqe.IsNotification() {
+					seenNotifications++
+					res ^= cqe.Res
 					continue
 				}
-				if cqe.Res < 0 && cqe.Res != -int32(uring.EOPNOTSUPP) {
+				if cqe.Res == -int32(uring.EOPNOTSUPP) {
+					b.Skip("zero-copy send not supported for this benchmark target")
+				}
+				if cqe.Res < 0 {
 					b.Fatalf("zero-copy completion failed: %v", uring.CompletionError(cqe.Res))
 				}
-				res ^= cqe.Res
-				seen++
-			case uring.IORING_OP_SEND:
-				if cqe.Res < 0 {
-					b.Fatalf("send completion failed: %v", uring.CompletionError(cqe.Res))
+				if cqe.Res != wantRes {
+					b.Fatalf("zero-copy completion result = %d, want %d", cqe.Res, wantRes)
 				}
 				res ^= cqe.Res
-				seen++
+				seenOps++
+			case uring.IORING_OP_SEND:
+				b.Skip("zero-copy benchmark used non-zero-copy send fallback")
 			}
 		}
 	}

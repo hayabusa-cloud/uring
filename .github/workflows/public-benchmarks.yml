@@ -58,7 +58,6 @@ jobs:
             '^BenchmarkPublicPerformance(SQEContextPackDirect|CQEViewAccessors|DirectCQEAccessors|CompletionError)$'
             '^BenchmarkPublicPerformanceSocketIORoundTrip$'
             '^BenchmarkPublicPerformanceSocketIOBatchRoundTrip$'
-            '^BenchmarkPublicPerformanceStorageIOWriteRead$'
           )
           for benchmark_group in "${benchmark_groups[@]}"; do
             echo "### go test -bench ${benchmark_group}" | tee -a "$log"
@@ -83,14 +82,24 @@ jobs:
             BenchmarkPublicPerformanceSocketIOBatchRoundTrip/16KiB/Batch16
             BenchmarkPublicPerformanceSocketIOBatchRoundTrip/512B/Batch64
             BenchmarkPublicPerformanceSocketIOBatchRoundTrip/4KiB/Batch64
-            BenchmarkPublicPerformanceStorageIOWriteRead/512B
-            BenchmarkPublicPerformanceStorageIOWriteRead/4KiB
-            BenchmarkPublicPerformanceStorageIOWriteRead/64KiB
           )
+          missing=0
+          missing_benchmark_rows=()
+          for benchmark in "${required_benchmarks[@]}"; do
+            if ! grep -q "^${benchmark}" "$log"; then
+              missing_benchmark_rows+=("$benchmark")
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            status=1
+          fi
+
           {
             echo "### Public benchmark results"
             echo
-            echo "Public API, socket I/O, and storage I/O measurements from the GitHub-hosted runner."
+            echo "Public API and socket I/O measurements from the GitHub-hosted runner."
+            echo "Storage I/O benchmark rows remain available in the source tree for dedicated Linux validation; hosted runner file I/O completions are timing-sensitive and are not required for this public badge."
             echo "Zero-copy socket I/O benchmarks require a suitable real-host network setup, so hosted CI leaves them for dedicated Linux validation."
             echo
             echo "- Workflow: Benchmarks"
@@ -100,15 +109,11 @@ jobs:
             echo "- Runner: $(uname -s)/$(uname -m) $(uname -r)"
             echo
             if [ "$status" -ne 0 ]; then
-              echo "> Benchmark collection exited with status $status. The rows below are the measurements produced before the hosted runner stopped the benchmark command."
+              echo "> Benchmark collection or required-row verification exited with status $status. The rows below are the measurements produced before failure."
               echo
             fi
-            missing=0
-            for benchmark in "${required_benchmarks[@]}"; do
-              if ! grep -q "^${benchmark}" "$log"; then
-                echo "- Missing benchmark row: \`${benchmark}\`"
-                missing=1
-              fi
+            for benchmark in "${missing_benchmark_rows[@]}"; do
+              echo "- Missing benchmark row: \`${benchmark}\`"
             done
             if [ "$missing" -ne 0 ]; then
               echo

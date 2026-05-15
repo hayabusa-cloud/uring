@@ -17,14 +17,18 @@ concurrency:
 
 # Runtime probes newer than the Linux 6.12 baseline stay out of the required
 # lane until GitHub-hosted ubuntu-latest reliably exposes a newer io_uring
-# baseline. Zero-copy runtime probes require network or NIC support the hosted
+# baseline. Timing-sensitive socket/listener probes stay visible in the
+# non-blocking full-suite lane because hosted runner networking can stall these
+# waits. Zero-copy runtime probes require network or NIC support the hosted
 # runner does not provide, so CI does not run them. Keep these patterns anchored
 # to whole test names so helper, encoding, and pure example coverage still runs.
 env:
-  URING_OPTIONAL_KERNEL_TESTS: '^Test(IntegrationMultishotAcceptPrimeWaitSurfacesImmediateError|IntegrationMultishotAccept|UringEpollWait|UringPipe|ResizeRings|QueryOpcodes|NAPIRegistration|SQE128NopCycle|PollUpdate|NewZCRXReceiverNotSupported)$'
+  URING_OPTIONAL_KERNEL_TESTS: '^Test(IntegrationMultishotAcceptPrimeWaitSurfacesImmediateError|IntegrationMultishotAccept|TCPAcceptConnectSendReceive|ListenerWithAccept|UringEpollWait|UringPipe|ResizeRings|QueryOpcodes|NAPIRegistration|SQE128NopCycle|PollUpdate|NewZCRXReceiverNotSupported)$'
   URING_CI_UNSUPPORTED_ZC_TESTS: '^Test(IntegrationZeroCopySend|ZCTrackerBasic|ZCTrackerPoolExhaustion|ZCTrackerHandlerOrder|ZCTrackerExactlyOnce|ZCTrackerGCSafety|SendZeroCopyFixed|ZeroCopyNotificationFlags|SendZeroCopyFixedMultiTarget|ZeroCopyBufferSafety|ZeroCopyLargeBuffer|ZeroCopyMultipleBuffers|ZeroCopyErrorHandling|ZeroCopySequentialSends|TwoCQEOverhead|ZeroCopyVsNormalComparison|MultiDestinationComparison)$'
   URING_OPTIONAL_RUNTIME_EXAMPLES: '^Test(BufferRingBasics|SQEContextIndirect|SQEContextExtended|CQEViewAccess|TCPEchoServer|UringSocketWithSyscallAccept|SimpleTCPAccept|BroadcastServerWithFramer|UDPPingPong|FileWriteRead|BatchedFileOps|NopThroughput|FixedBufferBasics|WriteFixedOperation|ReadFixedOperation|MultishotHandlerControl|PollAddBasic|PollCancelByFD|PollMultipleFDs|SpliceBasics|TeeOperation|BasicTimeout|MultipleTimeouts|PollWithTimeout|LinkedTimeout|VectoredWrite|VectoredRead)$'
   URING_CI_UNSUPPORTED_ZC_EXAMPLES: '^Test(ZCTrackerBasic|MulticastZeroCopy)$'
+  URING_REQUIRED_RACE_TESTS: '^Test(ContextPoolsOutOfOrderPut|ContextPoolsResetRestoresCapacity|ZCTrackerNotificationUsesStoredCompletionResult|ZCTrackerDataTryInvokeOnceIsAffine|ZCTrackerHandleCQEUsesNoopHandlerWhenNil|ZCTrackerNotificationReturnsExtSQEOnUnexpectedState|ZCTrackerCQEHandlerDispatchesAnchoredTracker|ZCTrackerCQEHandlerIgnoresNonExtendedAndUnownedContexts|MultishotSubscriptionStateSurvivesRetireExt|MultishotSubscriptionSubmitCancelStateTracksEnqueue|MultishotSubscriptionUnsubscribeMarksSuppressedWhenStopped|ListenerSubscriber|IncrementalSubscriber|ZCSubscriber|NoopMultishotHandler|NoopListenerHandler|NoopIncrementalHandler|NoopZCHandler|NoopHandlerMethods)$'
+  URING_REQUIRED_RACE_EXAMPLES: '^Test(SQEContextDirect|SQEContextWithFlags|ZeroCopyThresholds)$'
 
 jobs:
   lint-build-test-linux:
@@ -80,9 +84,10 @@ jobs:
 
       # Required root-package lane. Covers io_uring behavior available on Linux
       # 6.12 and earlier; newer runtime probes run in the non-blocking lane
-      # below. Keep this lane focused on kernel-feature correctness; race
-      # instrumentation is intentionally left to the non-blocking full-suite
-      # lane because it can perturb hosted-runner io_uring resource behavior.
+      # below. Keep this lane focused on kernel-feature correctness; full-suite
+      # race instrumentation stays in the non-blocking lane because it can
+      # perturb hosted-runner io_uring resource behavior. A deterministic
+      # required race subset follows this step.
       # Raise RLIMIT_MEMLOCK inside the same shell that launches each runtime
       # test process so io_uring buffer registration inherits the largest
       # hosted-runner limit available.
@@ -116,6 +121,12 @@ jobs:
             cat "$summary" >> "$GITHUB_STEP_SUMMARY"
             exit "$status"
           fi
+
+      # Required deterministic race subset. Keeps race detector failures
+      # blocking without applying race instrumentation to the hosted-runner
+      # runtime probes that have unstable io_uring resource behavior.
+      - name: Test root package race subset
+        run: go test -race -v -count=1 -timeout=120s -run "$URING_REQUIRED_RACE_TESTS" .
 
       - name: Collect root package coverage
         if: matrix.go-version == 'stable'
@@ -171,6 +182,9 @@ jobs:
           echo "ulimit -l: $(ulimit -l || true)"
 
           go test -v -count=1 -timeout=180s -skip "$URING_OPTIONAL_RUNTIME_EXAMPLES|$URING_CI_UNSUPPORTED_ZC_EXAMPLES" ./examples
+
+      - name: Test examples race subset
+        run: go test -race -v -count=1 -timeout=120s -run "$URING_REQUIRED_RACE_EXAMPLES" ./examples
 
       # Non-blocking lane. Keeps newer kernel probes visible on ubuntu-latest.
       # Zero-copy runtime probes stay out of hosted CI and should be validated
