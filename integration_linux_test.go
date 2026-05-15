@@ -64,9 +64,7 @@ func skipIfXattrUnsupported(t *testing.T, op string, res int32) {
 // =============================================================================
 
 func TestUringNopCycle(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
-	})
+	ring, err := uring.New(testMinimalBufferOptions)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -88,9 +86,7 @@ func TestUringNopCycle(t *testing.T) {
 }
 
 func TestUringIntrospection(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall // 512 entries
-	})
+	ring, err := uring.New(testMinimalBufferOptions)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -98,8 +94,8 @@ func TestUringIntrospection(t *testing.T) {
 
 	// Initially, SQ should be fully available
 	initial := ring.SQAvailable()
-	if initial != uring.EntriesSmall {
-		t.Errorf("SQAvailable: got %d, want %d", initial, uring.EntriesSmall)
+	if initial != ring.Features.SQEntries {
+		t.Errorf("SQAvailable: got %d, want %d", initial, ring.Features.SQEntries)
 	}
 
 	// CQ should be empty
@@ -153,7 +149,6 @@ func TestUringTimeoutCycle(t *testing.T) {
 	}
 
 	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
 		opt.NotifySucceed = true // Request a CQE for every successful operation.
 		opt.MultiIssuers = true  // Exercise the shared-submit configuration.
 	})
@@ -182,9 +177,7 @@ func TestUringTimeoutCycle(t *testing.T) {
 // TestTimeoutUpdate validates the IORING_TIMEOUT_UPDATE flag.
 // Timeout update allows modifying an existing timeout's expiration in-place.
 func TestTimeoutUpdate(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
-	})
+	ring, err := uring.New(testMinimalBufferOptions)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -253,7 +246,6 @@ func TestTimeoutUpdate(t *testing.T) {
 
 func TestTimeoutRemove(t *testing.T) {
 	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
 		opt.NotifySucceed = true
 		opt.MultiIssuers = true
 	})
@@ -309,7 +301,6 @@ func TestTimeoutRemove(t *testing.T) {
 
 func TestUringLinkTimeoutCycle(t *testing.T) {
 	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
 		opt.NotifySucceed = true
 		opt.MultiIssuers = true
 	})
@@ -365,7 +356,6 @@ func TestUringLinkTimeoutCycle(t *testing.T) {
 
 func TestUringFileReadWriteCycle(t *testing.T) {
 	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
 		opt.NotifySucceed = true // Request a CQE for every successful operation.
 		opt.MultiIssuers = true  // Exercise the shared-submit configuration.
 	})
@@ -426,9 +416,7 @@ func TestUringFileReadWriteCycle(t *testing.T) {
 // =============================================================================
 
 func TestUringTCPSocketCycle(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
-	})
+	ring, err := uring.New(testMinimalBufferOptions)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -455,9 +443,7 @@ func TestUringTCPSocketCycle(t *testing.T) {
 }
 
 func TestUringTCPBindListenAccept(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
-	})
+	ring, err := uring.New(testMinimalBufferOptions)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -510,9 +496,7 @@ func TestUringTCPBindListenAccept(t *testing.T) {
 }
 
 func TestUringUDPSocketCycle(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
-	})
+	ring, err := uring.New(testMinimalBufferOptions)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -533,9 +517,7 @@ func TestUringUDPSocketCycle(t *testing.T) {
 }
 
 func TestUringUnixSocketCycle(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
-	})
+	ring, err := uring.New(testMinimalBufferOptions)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -561,7 +543,6 @@ func TestUringUnixSocketCycle(t *testing.T) {
 
 func TestUringPollAddCycle(t *testing.T) {
 	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
 		opt.NotifySucceed = true // Request a CQE for every successful operation.
 		opt.MultiIssuers = true  // Exercise the shared-submit configuration.
 	})

@@ -24,7 +24,20 @@ func newStartedSharedTestRing(t *testing.T) *Uring {
 	t.Helper()
 
 	ring, err := New(testMinimalBufferOptions, func(opt *Options) {
-		opt.Entries = EntriesNano
+		opt.MultiIssuers = true
+		opt.NotifySucceed = true
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	mustStartRing(t, ring)
+	return ring
+}
+
+func newStartedTwoRegisteredBuffersSharedTestRing(t *testing.T) *Uring {
+	t.Helper()
+
+	ring, err := New(testMinimalBufferOptions, testTwoRegisteredBuffersOptions, func(opt *Options) {
 		opt.MultiIssuers = true
 		opt.NotifySucceed = true
 	})
@@ -368,7 +381,6 @@ func TestSubmitKeepAliveRetainsBindAndXattrRoots(t *testing.T) {
 
 	t.Run("uringCmd128 stages inline command bytes", func(t *testing.T) {
 		ring, err := New(testMinimalBufferOptions, func(opt *Options) {
-			opt.Entries = EntriesNano
 			opt.MultiIssuers = true
 			opt.NotifySucceed = true
 			opt.SQE128 = true
@@ -502,7 +514,7 @@ func TestSubmitKeepAliveRetainsOpenHowAndStatxRoots(t *testing.T) {
 
 func TestSubmitStagesFixedVectoredBuffers(t *testing.T) {
 	t.Run("readvFixed stages registered buffer iovecs", func(t *testing.T) {
-		ring := newStartedSharedTestRing(t)
+		ring := newStartedTwoRegisteredBuffersSharedTestRing(t)
 		if got := ring.RegisteredBufferCount(); got < 2 {
 			t.Fatalf("RegisteredBufferCount = %d, want at least 2", got)
 		}
@@ -559,7 +571,7 @@ func TestSubmitStagesFixedVectoredBuffers(t *testing.T) {
 	})
 
 	t.Run("writevFixed stages registered buffer iovecs", func(t *testing.T) {
-		ring := newStartedSharedTestRing(t)
+		ring := newStartedTwoRegisteredBuffersSharedTestRing(t)
 		if got := ring.RegisteredBufferCount(); got < 2 {
 			t.Fatalf("RegisteredBufferCount = %d, want at least 2", got)
 		}
@@ -819,9 +831,7 @@ func TestSubmitKeepAliveClearReturnsExtAndClearsRoots(t *testing.T) {
 }
 
 func TestUringStopClosesUnstartedRing(t *testing.T) {
-	ring, err := New(testMinimalBufferOptions, func(opt *Options) {
-		opt.Entries = EntriesNano
-	})
+	ring, err := New(testMinimalBufferOptions)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -845,7 +855,6 @@ func TestUringStopClosesUnstartedRing(t *testing.T) {
 
 func TestUringStopReleasesTrackedResources(t *testing.T) {
 	ring, err := New(testMinimalBufferOptions, func(opt *Options) {
-		opt.Entries = EntriesNano
 		opt.NotifySucceed = true
 	})
 	if err != nil {
@@ -910,7 +919,7 @@ func TestUringStopReleasesTrackedResources(t *testing.T) {
 }
 
 func TestSendZeroCopyFixedStagesBufIndexAndOffset(t *testing.T) {
-	ring := newStartedSharedTestRing(t)
+	ring := newStartedTwoRegisteredBuffersSharedTestRing(t)
 	if ring.RegisteredBufferCount() < 2 {
 		t.Skip("need at least two registered buffers")
 	}

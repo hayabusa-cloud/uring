@@ -8,7 +8,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 # Cancel superseded runs on the same ref so a quick push series does not pile up
 # parallel jobs on the same matrix.
@@ -16,21 +15,24 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Runtime probes newer than the Linux 6.12 baseline, plus socket zero-copy
-# probes that depend on hosted-runner network topology, stay out of the required
-# lane while ubuntu-latest is still on Ubuntu 24.04. Keep these patterns
-# anchored to whole test names so helper, encoding, and pure example coverage
-# still runs. The full suite runs below as a non-blocking signal until
-# ubuntu-latest moves to Ubuntu 26.04.
+# Runtime probes newer than the Linux 6.12 baseline stay out of the required
+# lane while ubuntu-latest is still on Ubuntu 24.04. Zero-copy runtime probes
+# require network or NIC support the hosted runner does not provide, so CI does
+# not run them. Keep these patterns anchored to whole test names so helper,
+# encoding, and pure example coverage still runs.
 env:
-  URING_OPTIONAL_KERNEL_TESTS: '^Test(IntegrationZeroCopySend|IntegrationMultishotAcceptPrimeWaitSurfacesImmediateError|IntegrationMultishotAccept|UringEpollWait|UringPipe|ResizeRings|QueryOpcodes|NAPIRegistration|SQE128NopCycle|PollUpdate|NewZCRXReceiverNotSupported)$'
-  URING_OPTIONAL_SOCKET_ZC_TESTS: '^Test(ZCTrackerBasic|ZCTrackerPoolExhaustion|ZCTrackerHandlerOrder|ZCTrackerExactlyOnce|ZCTrackerGCSafety|SendZeroCopyFixed|ZeroCopyNotificationFlags|SendZeroCopyFixedMultiTarget|ZeroCopyBufferSafety|ZeroCopyLargeBuffer|ZeroCopyMultipleBuffers|ZeroCopyErrorHandling|ZeroCopySequentialSends|TwoCQEOverhead|ZCRXConfigValidation)$'
-  URING_OPTIONAL_RUNTIME_EXAMPLES: '^Test(BufferRingBasics|SQEContextIndirect|SQEContextExtended|CQEViewAccess|TCPEchoServer|UringSocketWithSyscallAccept|SimpleTCPAccept|BroadcastServerWithFramer|UDPPingPong|FileWriteRead|BatchedFileOps|NopThroughput|FixedBufferBasics|WriteFixedOperation|ReadFixedOperation|MultishotHandlerControl|PollAddBasic|PollCancelByFD|PollMultipleFDs|SpliceBasics|TeeOperation|BasicTimeout|MultipleTimeouts|PollWithTimeout|LinkedTimeout|VectoredWrite|VectoredRead|ZCTrackerBasic|MulticastZeroCopy)$'
+  URING_OPTIONAL_KERNEL_TESTS: '^Test(IntegrationMultishotAcceptPrimeWaitSurfacesImmediateError|IntegrationMultishotAccept|UringEpollWait|UringPipe|ResizeRings|QueryOpcodes|NAPIRegistration|SQE128NopCycle|PollUpdate|NewZCRXReceiverNotSupported)$'
+  URING_CI_UNSUPPORTED_ZC_TESTS: '^Test(IntegrationZeroCopySend|ZCTrackerBasic|ZCTrackerPoolExhaustion|ZCTrackerHandlerOrder|ZCTrackerExactlyOnce|ZCTrackerGCSafety|SendZeroCopyFixed|ZeroCopyNotificationFlags|SendZeroCopyFixedMultiTarget|ZeroCopyBufferSafety|ZeroCopyLargeBuffer|ZeroCopyMultipleBuffers|ZeroCopyErrorHandling|ZeroCopySequentialSends|TwoCQEOverhead|ZCRXConfigValidation)$'
+  URING_OPTIONAL_RUNTIME_EXAMPLES: '^Test(BufferRingBasics|SQEContextIndirect|SQEContextExtended|CQEViewAccess|TCPEchoServer|UringSocketWithSyscallAccept|SimpleTCPAccept|BroadcastServerWithFramer|UDPPingPong|FileWriteRead|BatchedFileOps|NopThroughput|FixedBufferBasics|WriteFixedOperation|ReadFixedOperation|MultishotHandlerControl|PollAddBasic|PollCancelByFD|PollMultipleFDs|SpliceBasics|TeeOperation|BasicTimeout|MultipleTimeouts|PollWithTimeout|LinkedTimeout|VectoredWrite|VectoredRead)$'
+  URING_CI_UNSUPPORTED_ZC_EXAMPLES: '^Test(ZCTrackerBasic|MulticastZeroCopy)$'
 
 jobs:
   lint-build-test-linux:
     name: Lint, Build & Test (Linux/amd64, Go ${{ matrix.go-version }})
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     timeout-minutes: 5
     strategy:
       fail-fast: false
@@ -77,9 +79,14 @@ jobs:
 
       # Required root-package lane. Covers io_uring behavior available on Linux
       # 6.12 and earlier; newer runtime probes run in the non-blocking lane
-      # below.
+      # below. Coverage collection runs separately so instrumentation does not
+      # change the required race-test verdict.
       - name: Test root package (Linux <=6.12 io_uring baseline)
-        run: go test -v -race -covermode=atomic -coverprofile=coverage.out -count=1 -timeout=180s -skip "$URING_OPTIONAL_KERNEL_TESTS|$URING_OPTIONAL_SOCKET_ZC_TESTS" .
+        run: go test -v -race -count=1 -timeout=180s -skip "$URING_OPTIONAL_KERNEL_TESTS|$URING_CI_UNSUPPORTED_ZC_TESTS" .
+
+      - name: Collect root package coverage
+        if: matrix.go-version == 'stable'
+        run: go test -v -covermode=count -coverprofile=coverage.out -count=1 -timeout=180s -skip "$URING_OPTIONAL_KERNEL_TESTS|$URING_CI_UNSUPPORTED_ZC_TESTS" .
 
       - name: Upload coverage to Codecov
         if: matrix.go-version == 'stable'
@@ -92,17 +99,96 @@ jobs:
           name: linux-amd64-root
           fail_ci_if_error: false
 
-      # Required examples lane. Runs examples that are pure documentation or
-      # encoding checks; runtime examples stay visible in the non-blocking full
-      # suite below until the runner baseline catches up.
-      - name: Test examples (pure required subset)
-        run: go test -v -race -count=1 -timeout=180s -skip "$URING_OPTIONAL_RUNTIME_EXAMPLES" ./examples
+      - name: Report public API performance metrics
+        if: matrix.go-version == 'stable'
+        run: |
+          set -o pipefail
+          benchmark_pattern='^BenchmarkPublicPerformance(SQEContextPackDirect|CQEViewAccessors|DirectCQEAccessors|CompletionError|SocketIORoundTrip|StorageIOWriteRead)$'
+          go test -run '^$' -bench "$benchmark_pattern" -benchmem -benchtime=100ms -count=10 -timeout=120s . | tee /tmp/uring-public-performance.txt
+          if ! grep -q '^BenchmarkPublicPerformance' /tmp/uring-public-performance.txt; then
+            echo "No public performance benchmark rows were produced." >&2
+            exit 1
+          fi
+          required_benchmarks=(
+            BenchmarkPublicPerformanceSQEContextPackDirect
+            BenchmarkPublicPerformanceCQEViewAccessors
+            BenchmarkPublicPerformanceDirectCQEAccessors
+            BenchmarkPublicPerformanceCompletionError
+            BenchmarkPublicPerformanceSocketIORoundTrip/512B
+            BenchmarkPublicPerformanceSocketIORoundTrip/4KiB
+            BenchmarkPublicPerformanceSocketIORoundTrip/16KiB
+            BenchmarkPublicPerformanceStorageIOWriteRead/512B
+            BenchmarkPublicPerformanceStorageIOWriteRead/4KiB
+            BenchmarkPublicPerformanceStorageIOWriteRead/64KiB
+          )
+          for benchmark in "${required_benchmarks[@]}"; do
+            if ! grep -q "^${benchmark}" /tmp/uring-public-performance.txt; then
+              echo "${benchmark} did not produce a benchmark row." >&2
+              exit 1
+            fi
+          done
+          {
+            echo "### Public API performance metrics"
+            echo
+            echo "Public API, socket I/O, and storage I/O measurements from the GitHub-hosted runner."
+            echo "Zero-copy socket I/O benchmarks require a suitable real-host network setup, so hosted CI leaves them for dedicated Linux validation."
+            echo
+            echo "- Go: $(go version)"
+            echo "- Runner: $(uname -s)/$(uname -m) $(uname -r)"
+            echo
+            echo "| Benchmark | samples | avg ns/op | avg B/op | avg allocs/op |"
+            echo "|---|---:|---:|---:|---:|"
+            awk '
+              /^BenchmarkPublicPerformance/ {
+                name=$1
+                sub(/-[0-9]+$/, "", name)
+                if (!(name in seen)) {
+                  order[++orderLen] = name
+                  seen[name] = 1
+                }
+                ns = bytes = allocs = ""
+                for (i = 2; i <= NF; i++) {
+                  if ($(i + 1) == "ns/op") ns = $i
+                  if ($(i + 1) == "B/op") bytes = $i
+                  if ($(i + 1) == "allocs/op") allocs = $i
+                }
+                samples[name]++
+                nsTotal[name] += ns
+                bytesTotal[name] += bytes
+                allocsTotal[name] += allocs
+              }
+              END {
+                for (i = 1; i <= orderLen; i++) {
+                  name = order[i]
+                  printf "| `%s` | %d | %.2f | %.2f | %.2f |\n",
+                    name, samples[name],
+                    nsTotal[name] / samples[name],
+                    bytesTotal[name] / samples[name],
+                    allocsTotal[name] / samples[name]
+                }
+              }
+            ' /tmp/uring-public-performance.txt
+            echo
+            echo "<details><summary>Raw benchmark output</summary>"
+            echo
+            printf '%s\n' '```text'
+            cat /tmp/uring-public-performance.txt
+            printf '%s\n' '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      # Non-blocking lane. Keeps newer kernel probes visible on ubuntu-latest;
-      # failures here become required only after the runner baseline catches up.
+      # Required examples lane. Runs examples that are pure documentation or
+      # encoding checks; runtime examples stay visible in the non-blocking lane
+      # below until the runner baseline catches up.
+      - name: Test examples (pure required subset)
+        run: go test -v -race -count=1 -timeout=180s -skip "$URING_OPTIONAL_RUNTIME_EXAMPLES|$URING_CI_UNSUPPORTED_ZC_EXAMPLES" ./examples
+
+      # Non-blocking lane. Keeps newer kernel probes visible on ubuntu-latest.
+      # Zero-copy runtime probes stay out of hosted CI and should be validated
+      # on a dedicated Linux setup instead.
       - name: Test (newer io_uring features, non-blocking)
         continue-on-error: true
-        run: go test -race -count=1 -timeout=180s ./...
+        run: go test -race -count=1 -timeout=180s -skip "$URING_CI_UNSUPPORTED_ZC_TESTS|$URING_CI_UNSUPPORTED_ZC_EXAMPLES" ./...
 
   vet-build-darwin:
     name: Vet & Build (Darwin/arm64, Go ${{ matrix.go-version }})

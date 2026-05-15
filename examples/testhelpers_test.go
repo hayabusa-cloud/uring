@@ -17,14 +17,14 @@ import (
 )
 
 const (
-	testLockedBufferMem = 1 << 18
-	testBufferNum       = 64
+	testLockedBufferMem   = uring.BufferSizeLarge
+	testProvidedBufferNum = 64
 )
 
 func testMinimalBufferOptions(opt *uring.Options) {
 	opt.LockedBufferMem = testLockedBufferMem
-	opt.ReadBufferNum = testBufferNum
-	opt.WriteBufferNum = testBufferNum
+	opt.ReadBufferNum = testProvidedBufferNum
+	opt.Entries = uring.EntriesNano
 }
 
 func mustStartRing(tb testing.TB, ring *uring.Uring) {

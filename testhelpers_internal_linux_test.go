@@ -14,14 +14,19 @@ import (
 )
 
 const (
-	testInternalLockedBufferMem = 1 << 18
-	testInternalBufferNum       = 64
+	testInternalLockedBufferMem         = registerBufferSize
+	testInternalTwoRegisteredBuffersMem = 2 * registerBufferSize
+	testInternalProvidedBufferNum       = 64
 )
 
 func testMinimalBufferOptions(opt *Options) {
 	opt.LockedBufferMem = testInternalLockedBufferMem
-	opt.ReadBufferNum = testInternalBufferNum
-	opt.WriteBufferNum = testInternalBufferNum
+	opt.ReadBufferNum = testInternalProvidedBufferNum
+	opt.Entries = EntriesNano
+}
+
+func testTwoRegisteredBuffersOptions(opt *Options) {
+	opt.LockedBufferMem = testInternalTwoRegisteredBuffersMem
 }
 
 func mustStartRing(tb testing.TB, ring *Uring) {
@@ -41,7 +46,6 @@ func newWrapperTestRing(t *testing.T) *Uring {
 	t.Helper()
 
 	ring, err := New(testMinimalBufferOptions, func(opt *Options) {
-		opt.Entries = EntriesNano
 		opt.MultiIssuers = true
 		opt.NotifySucceed = true
 	})

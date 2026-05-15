@@ -23,10 +23,7 @@ func (listenerOwnerTestHandler) OnListening()                 {}
 func (listenerOwnerTestHandler) OnError(uint8, error)         {}
 
 func TestListenerManagerRootsListenerOwner(t *testing.T) {
-	ring, err := New(func(opt *Options) {
-		opt.LockedBufferMem = testInternalLockedBufferMem
-		opt.Entries = EntriesSmall
-	})
+	ring, err := New(testMinimalBufferOptions)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

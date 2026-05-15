@@ -16,8 +16,6 @@ import (
 	"code.hybscloud.com/iox"
 )
 
-const testLockedBufferMem = 1 << 18
-
 var benchmarkMultishotHandleCQESink bool
 
 func bindMultishotTestSubscription(sub *MultishotSubscription, ext *ExtSQE) {
@@ -101,10 +99,7 @@ func (h *raceMultishotHandler) OnMultishotStop(err error, cancelled bool) {
 }
 
 func TestAcceptMultishotPreservesFlagsAndResetsSQE(t *testing.T) {
-	ring, err := New(func(opt *Options) {
-		opt.LockedBufferMem = testLockedBufferMem
-		opt.Entries = EntriesSmall
-	})
+	ring, err := New(testMinimalBufferOptions)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -180,10 +175,7 @@ func TestAcceptMultishotPreservesFlagsAndResetsSQE(t *testing.T) {
 }
 
 func TestReceiveMultishotPreservesFlagsAndResetsSQE(t *testing.T) {
-	ring, err := New(func(opt *Options) {
-		opt.LockedBufferMem = testLockedBufferMem
-		opt.Entries = EntriesSmall
-	})
+	ring, err := New(testMinimalBufferOptions)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -660,9 +652,7 @@ func TestMultishotHandleCQERejectsForeignRoute(t *testing.T) {
 }
 
 func TestMultishotCancelRaceTerminalCQE(t *testing.T) {
-	ring, err := New(func(opt *Options) {
-		opt.LockedBufferMem = testLockedBufferMem
-		opt.Entries = EntriesSmall
+	ring, err := New(testMinimalBufferOptions, func(opt *Options) {
 		opt.NotifySucceed = true
 		opt.MultiIssuers = true
 	})
