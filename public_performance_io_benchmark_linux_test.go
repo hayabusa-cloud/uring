@@ -26,6 +26,18 @@ var publicPerformanceSocketIOSizes = [...]struct {
 	{name: "16KiB", size: 16 * 1024},
 }
 
+var publicPerformanceSocketIOBatchCases = [...]struct {
+	name      string
+	size      int
+	batchSize int
+}{
+	{name: "512B/Batch16", size: 512, batchSize: 16},
+	{name: "512B/Batch64", size: 512, batchSize: 64},
+	{name: "4KiB/Batch16", size: 4 * 1024, batchSize: 16},
+	{name: "4KiB/Batch64", size: 4 * 1024, batchSize: 64},
+	{name: "16KiB/Batch16", size: 16 * 1024, batchSize: 16},
+}
+
 var publicPerformanceStorageIOSizes = [...]struct {
 	name string
 	size int
@@ -55,7 +67,7 @@ func BenchmarkPublicPerformanceSocketIORoundTrip(b *testing.B) {
 }
 
 func benchmarkPublicPerformanceSocketIORoundTrip(b *testing.B, payloadSize int) {
-	ring := newPublicPerformanceIORing(b)
+	ring := newPublicPerformanceSingleIssuerIORing(b)
 
 	fds, err := newUnixSocketPairForTest()
 	if err != nil {
@@ -72,8 +84,18 @@ func benchmarkPublicPerformanceSocketIORoundTrip(b *testing.B, payloadSize int) 
 		payload[i] = byte(i)
 	}
 	recvBuf := make([]byte, len(payload))
-	cqes := make([]uring.CQEView, 4)
+	cqes := make([]uring.DirectCQE, 2)
 	expected := int32(len(payload))
+
+	warmSendCtx := uring.PackDirect(uring.IORING_OP_SEND, 0, 0, int32(fds[0]))
+	warmRecvCtx := uring.PackDirect(uring.IORING_OP_RECV, 0, 0, int32(fds[1]))
+	if err := ring.Receive(warmRecvCtx, recvFD, recvBuf); err != nil {
+		b.Fatalf("warmup Receive: %v", err)
+	}
+	if err := ring.Send(warmSendCtx, sendFD, payload); err != nil {
+		b.Fatalf("warmup Send: %v", err)
+	}
+	benchmarkPublicPerformanceInt32Sink ^= waitPublicPerformanceDirectCQEs(b, ring, cqes, 2, expected)
 
 	b.SetBytes(int64(len(payload) * 2))
 	b.ReportAllocs()
@@ -90,7 +112,83 @@ func benchmarkPublicPerformanceSocketIORoundTrip(b *testing.B, payloadSize int) 
 			b.Fatalf("Send: %v", err)
 		}
 
-		benchmarkPublicPerformanceInt32Sink ^= waitPublicPerformanceCQEs(b, ring, cqes, 2, expected)
+		benchmarkPublicPerformanceInt32Sink ^= waitPublicPerformanceDirectCQEs(b, ring, cqes, 2, expected)
+	}
+}
+
+func BenchmarkPublicPerformanceSocketIOBatchRoundTrip(b *testing.B) {
+	for _, tc := range publicPerformanceSocketIOBatchCases {
+		b.Run(tc.name, func(b *testing.B) {
+			benchmarkPublicPerformanceSocketIOBatchRoundTrip(b, tc.size, tc.batchSize)
+		})
+	}
+}
+
+func benchmarkPublicPerformanceSocketIOBatchRoundTrip(b *testing.B, payloadSize, batchSize int) {
+	ring := newPublicPerformanceSingleIssuerIORing(b)
+
+	fds, err := newUnixSocketPairForTest()
+	if err != nil {
+		b.Skipf("socketpair: %v", err)
+	}
+	b.Cleanup(func() {
+		closeTestFds(fds)
+	})
+
+	sendFD := &publicPerformancePollFD{fd: fds[0]}
+	recvFD := &publicPerformancePollFD{fd: fds[1]}
+	payload := make([]byte, payloadSize)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	recvBufs := make([][]byte, batchSize)
+	for i := range recvBufs {
+		recvBufs[i] = make([]byte, len(payload))
+	}
+	cqes := make([]uring.DirectCQE, batchSize*2)
+	expected := int32(len(payload))
+
+	for j := 0; j < batchSize; j++ {
+		recvCtx := uring.PackDirect(uring.IORING_OP_RECV, 0, uint16(j), int32(fds[1]))
+		if err := ring.Receive(recvCtx, recvFD, recvBufs[j]); err != nil {
+			b.Fatalf("warmup Receive: %v", err)
+		}
+	}
+	for j := 0; j < batchSize; j++ {
+		sendCtx := uring.PackDirect(uring.IORING_OP_SEND, 0, uint16(j), int32(fds[0]))
+		if err := ring.Send(sendCtx, sendFD, payload); err != nil {
+			b.Fatalf("warmup Send: %v", err)
+		}
+	}
+	benchmarkPublicPerformanceInt32Sink ^= waitPublicPerformanceDirectCQEs(
+		b, ring, cqes, batchSize*2, expected,
+	)
+
+	b.SetBytes(int64(len(payload) * 2))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; {
+		n := batchSize
+		if remaining := b.N - i; remaining < n {
+			n = remaining
+		}
+		for j := 0; j < n; j++ {
+			seq := uint16(i + j)
+			recvCtx := uring.PackDirect(uring.IORING_OP_RECV, 0, seq, int32(fds[1]))
+			if err := ring.Receive(recvCtx, recvFD, recvBufs[j]); err != nil {
+				b.Fatalf("Receive: %v", err)
+			}
+		}
+		for j := 0; j < n; j++ {
+			seq := uint16(i + j)
+			sendCtx := uring.PackDirect(uring.IORING_OP_SEND, 0, seq, int32(fds[0]))
+			if err := ring.Send(sendCtx, sendFD, payload); err != nil {
+				b.Fatalf("Send: %v", err)
+			}
+		}
+		benchmarkPublicPerformanceInt32Sink ^= waitPublicPerformanceDirectCQEs(b, ring, cqes, n*2, expected)
+		i += n
 	}
 }
 
@@ -103,7 +201,7 @@ func BenchmarkPublicPerformanceStorageIOWriteRead(b *testing.B) {
 }
 
 func benchmarkPublicPerformanceStorageIOWriteRead(b *testing.B, payloadSize int) {
-	ring := newPublicPerformanceIORing(b)
+	ring := newPublicPerformanceSingleIssuerIORing(b)
 
 	f, err := os.CreateTemp("", "uring-public-performance-storage-*")
 	if err != nil {
@@ -125,8 +223,22 @@ func benchmarkPublicPerformanceStorageIOWriteRead(b *testing.B, payloadSize int)
 		payload[i] = byte(i)
 	}
 	readBuf := make([]byte, len(payload))
-	cqes := make([]uring.CQEView, 4)
+	cqes := make([]uring.DirectCQE, 4)
 	expected := int32(len(payload))
+	if err := f.Truncate(int64(payloadSize)); err != nil {
+		b.Fatalf("Truncate: %v", err)
+	}
+
+	warmWriteCtx := uring.PackDirect(uring.IORING_OP_WRITE, 0, 0, fd)
+	warmReadCtx := uring.PackDirect(uring.IORING_OP_READ, 0, 0, fd)
+	if err := ring.Write(warmWriteCtx, payload); err != nil {
+		b.Fatalf("warmup Write: %v", err)
+	}
+	benchmarkPublicPerformanceInt32Sink ^= waitPublicPerformanceDirectCQEs(b, ring, cqes, 1, expected)
+	if err := ring.Read(warmReadCtx, readBuf); err != nil {
+		b.Fatalf("warmup Read: %v", err)
+	}
+	benchmarkPublicPerformanceInt32Sink ^= waitPublicPerformanceDirectCQEs(b, ring, cqes, 1, expected)
 
 	b.SetBytes(int64(len(payload) * 2))
 	b.ReportAllocs()
@@ -139,12 +251,12 @@ func benchmarkPublicPerformanceStorageIOWriteRead(b *testing.B, payloadSize int)
 		if err := ring.Write(writeCtx, payload); err != nil {
 			b.Fatalf("Write: %v", err)
 		}
-		benchmarkPublicPerformanceInt32Sink ^= waitPublicPerformanceCQEs(b, ring, cqes, 1, expected)
+		benchmarkPublicPerformanceInt32Sink ^= waitPublicPerformanceDirectCQEs(b, ring, cqes, 1, expected)
 
 		if err := ring.Read(readCtx, readBuf); err != nil {
 			b.Fatalf("Read: %v", err)
 		}
-		benchmarkPublicPerformanceInt32Sink ^= waitPublicPerformanceCQEs(b, ring, cqes, 1, expected)
+		benchmarkPublicPerformanceInt32Sink ^= waitPublicPerformanceDirectCQEs(b, ring, cqes, 1, expected)
 	}
 }
 
@@ -163,7 +275,7 @@ func BenchmarkPublicPerformanceZeroCopyIO(b *testing.B) {
 }
 
 func benchmarkPublicPerformanceZeroCopyIO(b *testing.B, payloadSize, destinationCount int) {
-	ring := newPublicPerformanceIORing(b)
+	ring := newPublicPerformanceSharedIORing(b)
 
 	if ring.RegisteredBufferCount() == 0 {
 		b.Skip("no registered buffers")
@@ -207,7 +319,7 @@ func benchmarkPublicPerformanceZeroCopyIO(b *testing.B, payloadSize, destination
 	if n := destinationCount * 4; n > cqeCap {
 		cqeCap = n
 	}
-	cqes := make([]uring.CQEView, cqeCap)
+	cqes := make([]uring.DirectCQE, cqeCap)
 	targets := publicPerformanceTargets{fds: writers}
 
 	b.SetBytes(int64(payloadSize * destinationCount))
@@ -223,13 +335,25 @@ func benchmarkPublicPerformanceZeroCopyIO(b *testing.B, payloadSize, destination
 	}
 }
 
-func newPublicPerformanceIORing(b *testing.B) *uring.Uring {
+func newPublicPerformanceSingleIssuerIORing(b *testing.B) *uring.Uring {
+	b.Helper()
+
+	return newPublicPerformanceIORing(b, false)
+}
+
+func newPublicPerformanceSharedIORing(b *testing.B) *uring.Uring {
+	b.Helper()
+
+	return newPublicPerformanceIORing(b, true)
+}
+
+func newPublicPerformanceIORing(b *testing.B, multiIssuers bool) *uring.Uring {
 	b.Helper()
 
 	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
 		opt.NotifySucceed = true
 		opt.Entries = uring.EntriesSmall
-		opt.MultiIssuers = true
+		opt.MultiIssuers = multiIssuers
 	})
 	if err != nil {
 		b.Skipf("New: %v", err)
@@ -263,7 +387,7 @@ func (t publicPerformanceTargets) FD(i int) iofd.FD {
 	return t.fds[i]
 }
 
-func waitPublicPerformanceCQEs(b *testing.B, ring *uring.Uring, cqes []uring.CQEView, want int, wantRes int32) int32 {
+func waitPublicPerformanceDirectCQEs(b *testing.B, ring *uring.Uring, cqes []uring.DirectCQE, want int, wantRes int32) int32 {
 	b.Helper()
 
 	var (
@@ -273,7 +397,7 @@ func waitPublicPerformanceCQEs(b *testing.B, ring *uring.Uring, cqes []uring.CQE
 		res      int32
 	)
 	for seen < want {
-		n, err := ring.Wait(cqes)
+		n, err := ring.WaitDirect(cqes)
 		switch {
 		case err == nil:
 		case err == iox.ErrWouldBlock, err == uring.ErrExists:
@@ -306,7 +430,7 @@ func waitPublicPerformanceCQEs(b *testing.B, ring *uring.Uring, cqes []uring.CQE
 	return res
 }
 
-func waitPublicPerformanceZeroCopyCQEs(b *testing.B, ring *uring.Uring, cqes []uring.CQEView, want int) int32 {
+func waitPublicPerformanceZeroCopyCQEs(b *testing.B, ring *uring.Uring, cqes []uring.DirectCQE, want int) int32 {
 	b.Helper()
 
 	var (
@@ -316,7 +440,7 @@ func waitPublicPerformanceZeroCopyCQEs(b *testing.B, ring *uring.Uring, cqes []u
 		res      int32
 	)
 	for seen < want {
-		n, err := ring.Wait(cqes)
+		n, err := ring.WaitDirect(cqes)
 		switch {
 		case err == nil:
 		case err == iox.ErrWouldBlock, err == uring.ErrExists:
@@ -336,8 +460,8 @@ func waitPublicPerformanceZeroCopyCQEs(b *testing.B, ring *uring.Uring, cqes []u
 
 		backoff.Reset()
 		for i := 0; i < n && seen < want; i++ {
-			cqe := cqes[i]
-			switch cqe.Op() {
+			cqe := &cqes[i]
+			switch cqe.Op {
 			case uring.IORING_OP_SEND_ZC:
 				if cqe.IsNotification() {
 					continue

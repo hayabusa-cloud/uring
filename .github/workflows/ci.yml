@@ -32,7 +32,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write
     timeout-minutes: 5
     strategy:
       fail-fast: false
@@ -40,6 +39,8 @@ jobs:
         go-version: [ '1.26.x', 'stable' ]
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -146,109 +147,14 @@ jobs:
             exit "$status"
           fi
 
-      - name: Upload coverage to Codecov
+      - name: Upload coverage artifact
         if: matrix.go-version == 'stable'
-        uses: codecov/codecov-action@v6
+        uses: actions/upload-artifact@v7
         with:
-          use_oidc: true
-          files: ./coverage.out
-          disable_search: true
-          flags: linux-amd64-root
-          name: linux-amd64-root
-          fail_ci_if_error: false
-
-      - name: Report public API performance metrics
-        if: matrix.go-version == 'stable'
-        run: |
-          set -o pipefail
-          echo "Memlock before:"
-          grep "Max locked memory" "/proc/$$/limits" || true
-          sudo prlimit --pid "$$" --memlock=unlimited:unlimited || true
-          ulimit -l unlimited || true
-          echo "Memlock after:"
-          grep "Max locked memory" "/proc/$$/limits" || true
-          echo "ulimit -l: $(ulimit -l || true)"
-
-          benchmark_pattern='^BenchmarkPublicPerformance(SQEContextPackDirect|CQEViewAccessors|DirectCQEAccessors|CompletionError|SocketIORoundTrip|StorageIOWriteRead)$'
-          set +e
-          go test -run '^$' -bench "$benchmark_pattern" -benchmem -benchtime=100ms -count=3 -timeout=120s . | tee /tmp/uring-public-performance.txt
-          status=${PIPESTATUS[0]}
-          set -e
-          required_benchmarks=(
-            BenchmarkPublicPerformanceSQEContextPackDirect
-            BenchmarkPublicPerformanceCQEViewAccessors
-            BenchmarkPublicPerformanceDirectCQEAccessors
-            BenchmarkPublicPerformanceCompletionError
-            BenchmarkPublicPerformanceSocketIORoundTrip/512B
-            BenchmarkPublicPerformanceSocketIORoundTrip/4KiB
-            BenchmarkPublicPerformanceSocketIORoundTrip/16KiB
-            BenchmarkPublicPerformanceStorageIOWriteRead/512B
-            BenchmarkPublicPerformanceStorageIOWriteRead/4KiB
-            BenchmarkPublicPerformanceStorageIOWriteRead/64KiB
-          )
-          {
-            echo "### Public API performance metrics"
-            echo
-            echo "Public API, socket I/O, and storage I/O measurements from the GitHub-hosted runner."
-            echo "Zero-copy socket I/O benchmarks require a suitable real-host network setup, so hosted CI leaves them for dedicated Linux validation."
-            echo
-            echo "- Go: $(go version)"
-            echo "- Runner: $(uname -s)/$(uname -m) $(uname -r)"
-            echo
-            if [ "$status" -ne 0 ]; then
-              echo "> Benchmark collection exited with status $status. The rows below are the measurements produced before the hosted runner stopped the benchmark command."
-              echo
-            fi
-            missing=0
-            for benchmark in "${required_benchmarks[@]}"; do
-              if ! grep -q "^${benchmark}" /tmp/uring-public-performance.txt; then
-                echo "- Missing benchmark row: \`${benchmark}\`"
-                missing=1
-              fi
-            done
-            if [ "$missing" -ne 0 ]; then
-              echo
-            fi
-            echo "| Benchmark | samples | avg ns/op | avg B/op | avg allocs/op |"
-            echo "|---|---:|---:|---:|---:|"
-            awk '
-              /^BenchmarkPublicPerformance/ {
-                name=$1
-                sub(/-[0-9]+$/, "", name)
-                if (!(name in seen)) {
-                  order[++orderLen] = name
-                  seen[name] = 1
-                }
-                ns = bytes = allocs = ""
-                for (i = 2; i <= NF; i++) {
-                  if ($(i + 1) == "ns/op") ns = $i
-                  if ($(i + 1) == "B/op") bytes = $i
-                  if ($(i + 1) == "allocs/op") allocs = $i
-                }
-                samples[name]++
-                nsTotal[name] += ns
-                bytesTotal[name] += bytes
-                allocsTotal[name] += allocs
-              }
-              END {
-                for (i = 1; i <= orderLen; i++) {
-                  name = order[i]
-                  printf "| `%s` | %d | %.2f | %.2f | %.2f |\n",
-                    name, samples[name],
-                    nsTotal[name] / samples[name],
-                    bytesTotal[name] / samples[name],
-                    allocsTotal[name] / samples[name]
-                }
-              }
-            ' /tmp/uring-public-performance.txt
-            echo
-            echo "<details><summary>Raw benchmark output</summary>"
-            echo
-            printf '%s\n' '```text'
-            cat /tmp/uring-public-performance.txt
-            printf '%s\n' '```'
-            echo "</details>"
-          } >> "$GITHUB_STEP_SUMMARY"
+          name: uring-root-coverage
+          path: coverage.out
+          if-no-files-found: error
+          retention-days: 7
 
       # Required examples lane. Runs examples that are pure documentation or
       # encoding checks; runtime examples stay visible in the non-blocking lane
@@ -293,6 +199,8 @@ jobs:
         go-version: [ '1.26.x', 'stable' ]
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -316,6 +224,35 @@ jobs:
           CGO_ENABLED: '0'
         run: go build ./...
 
+  upload-coverage:
+    name: Upload Coverage
+    runs-on: ubuntu-latest
+    needs: lint-build-test-linux
+    permissions:
+      contents: read
+      id-token: write
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Download coverage artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: uring-root-coverage
+          path: .
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v6
+        with:
+          use_oidc: true
+          files: ./coverage.out
+          disable_search: true
+          flags: linux-amd64-root
+          name: linux-amd64-root
+          fail_ci_if_error: false
+
   cross-build:
     name: Cross-Build (${{ matrix.target.goos }}/${{ matrix.target.goarch }}, Go ${{ matrix.go-version }})
     runs-on: ubuntu-latest
@@ -328,6 +265,8 @@ jobs:
           - { goos: darwin, goarch: arm64 }
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@v6

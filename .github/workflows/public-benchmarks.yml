@@ -1,0 +1,182 @@
+name: Benchmarks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-benchmarks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOTOOLCHAIN: local
+  GOMAXPROCS: '1'
+
+jobs:
+  public-benchmarks:
+    name: Benchmarks (Linux/amd64, Go 1.26.x)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+
+      - name: Run public benchmarks
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          set -o pipefail
+          report_dir="${RUNNER_TEMP}/uring-public-performance"
+          mkdir -p "$report_dir"
+          log="$report_dir/raw.txt"
+          summary="$report_dir/summary.md"
+
+          echo "Memlock before:"
+          grep "Max locked memory" "/proc/$$/limits" || true
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited || true
+          ulimit -l unlimited || true
+          echo "Memlock after:"
+          grep "Max locked memory" "/proc/$$/limits" || true
+          echo "ulimit -l: $(ulimit -l || true)"
+
+          : > "$log"
+          status=0
+          benchmark_groups=(
+            '^BenchmarkPublicPerformance(SQEContextPackDirect|CQEViewAccessors|DirectCQEAccessors|CompletionError)$'
+            '^BenchmarkPublicPerformanceSocketIORoundTrip$'
+            '^BenchmarkPublicPerformanceSocketIOBatchRoundTrip$'
+            '^BenchmarkPublicPerformanceStorageIOWriteRead$'
+          )
+          for benchmark_group in "${benchmark_groups[@]}"; do
+            echo "### go test -bench ${benchmark_group}" | tee -a "$log"
+            set +e
+            go test -run '^$' -bench "$benchmark_group" -benchmem -benchtime=100ms -count=10 -cpu=1 -timeout=120s . 2>&1 | tee -a "$log"
+            group_status=${PIPESTATUS[0]}
+            set -e
+            if [ "$group_status" -ne 0 ]; then
+              status="$group_status"
+            fi
+          done
+          required_benchmarks=(
+            BenchmarkPublicPerformanceSQEContextPackDirect
+            BenchmarkPublicPerformanceCQEViewAccessors
+            BenchmarkPublicPerformanceDirectCQEAccessors
+            BenchmarkPublicPerformanceCompletionError
+            BenchmarkPublicPerformanceSocketIORoundTrip/512B
+            BenchmarkPublicPerformanceSocketIORoundTrip/4KiB
+            BenchmarkPublicPerformanceSocketIORoundTrip/16KiB
+            BenchmarkPublicPerformanceSocketIOBatchRoundTrip/512B/Batch16
+            BenchmarkPublicPerformanceSocketIOBatchRoundTrip/4KiB/Batch16
+            BenchmarkPublicPerformanceSocketIOBatchRoundTrip/16KiB/Batch16
+            BenchmarkPublicPerformanceSocketIOBatchRoundTrip/512B/Batch64
+            BenchmarkPublicPerformanceSocketIOBatchRoundTrip/4KiB/Batch64
+            BenchmarkPublicPerformanceStorageIOWriteRead/512B
+            BenchmarkPublicPerformanceStorageIOWriteRead/4KiB
+            BenchmarkPublicPerformanceStorageIOWriteRead/64KiB
+          )
+          {
+            echo "### Public benchmark results"
+            echo
+            echo "Public API, socket I/O, and storage I/O measurements from the GitHub-hosted runner."
+            echo "Zero-copy socket I/O benchmarks require a suitable real-host network setup, so hosted CI leaves them for dedicated Linux validation."
+            echo
+            echo "- Workflow: Benchmarks"
+            echo "- Artifact: \`uring-public-benchmark-results\` contains \`summary.md\` and \`raw.txt\`."
+            echo "- Parameters: \`-benchmem -benchtime=100ms -count=10 -cpu=1\`, \`GOMAXPROCS=1\`."
+            echo "- Go: $(go version)"
+            echo "- Runner: $(uname -s)/$(uname -m) $(uname -r)"
+            echo
+            if [ "$status" -ne 0 ]; then
+              echo "> Benchmark collection exited with status $status. The rows below are the measurements produced before the hosted runner stopped the benchmark command."
+              echo
+            fi
+            missing=0
+            for benchmark in "${required_benchmarks[@]}"; do
+              if ! grep -q "^${benchmark}" "$log"; then
+                echo "- Missing benchmark row: \`${benchmark}\`"
+                missing=1
+              fi
+            done
+            if [ "$missing" -ne 0 ]; then
+              echo
+            fi
+            echo "| Benchmark | samples | avg ns/op | best ns/op | avg MB/s | best MB/s | avg B/op | avg allocs/op |"
+            echo "|---|---:|---:|---:|---:|---:|---:|---:|"
+            awk '
+              /^BenchmarkPublicPerformance/ {
+                name=$1
+                sub(/-[0-9]+$/, "", name)
+                if (!(name in seen)) {
+                  order[++orderLen] = name
+                  seen[name] = 1
+                }
+                ns = mbps = bytes = allocs = ""
+                for (i = 2; i <= NF; i++) {
+                  if ($(i + 1) == "ns/op") ns = $i
+                  if ($(i + 1) == "MB/s") mbps = $i
+                  if ($(i + 1) == "B/op") bytes = $i
+                  if ($(i + 1) == "allocs/op") allocs = $i
+                }
+                samples[name]++
+                nsTotal[name] += ns
+                bytesTotal[name] += bytes
+                allocsTotal[name] += allocs
+                if (!(name in bestNs) || ns + 0 < bestNs[name]) bestNs[name] = ns + 0
+                if (mbps != "") {
+                  mbpsSamples[name]++
+                  mbpsTotal[name] += mbps
+                  if (!(name in bestMbps) || mbps + 0 > bestMbps[name]) bestMbps[name] = mbps + 0
+                }
+              }
+              END {
+                for (i = 1; i <= orderLen; i++) {
+                  name = order[i]
+                  avgMbps = "-"
+                  bestMbpsText = "-"
+                  if (mbpsSamples[name] > 0) {
+                    avgMbps = sprintf("%.2f", mbpsTotal[name] / mbpsSamples[name])
+                    bestMbpsText = sprintf("%.2f", bestMbps[name])
+                  }
+                  printf "| `%s` | %d | %.2f | %.2f | %s | %s | %.2f | %.2f |\n",
+                    name, samples[name],
+                    nsTotal[name] / samples[name],
+                    bestNs[name],
+                    avgMbps,
+                    bestMbpsText,
+                    bytesTotal[name] / samples[name],
+                    allocsTotal[name] / samples[name]
+                }
+              }
+            ' "$log"
+            echo
+            echo "<details><summary>Raw benchmark output</summary>"
+            echo
+            printf '%s\n' '```text'
+            cat "$log"
+            printf '%s\n' '```'
+            echo "</details>"
+          } | tee "$summary" >> "$GITHUB_STEP_SUMMARY"
+
+          exit "$status"
+
+      - name: Upload public benchmark results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: uring-public-benchmark-results
+          path: ${{ runner.temp }}/uring-public-performance
+          if-no-files-found: warn
+          retention-days: 30
