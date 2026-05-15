@@ -630,8 +630,7 @@ func TestZeroCopyLargeBuffer(t *testing.T) {
 
 // TestZeroCopyMultipleBuffers tests using different registered buffers.
 func TestZeroCopyMultipleBuffers(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
+	ring, err := uring.New(testMinimalBufferOptions, testTwoRegisteredBuffersOptions, func(opt *uring.Options) {
 		opt.NotifySucceed = true
 	})
 	if err != nil {

@@ -13,10 +13,20 @@ import (
 	"code.hybscloud.com/zcall"
 )
 
-const testInternalLockedBufferMem = 1 << 18
+const (
+	testInternalLockedBufferMem         = registerBufferSize
+	testInternalTwoRegisteredBuffersMem = 2 * registerBufferSize
+	testInternalProvidedBufferNum       = 4
+)
 
 func testMinimalBufferOptions(opt *Options) {
 	opt.LockedBufferMem = testInternalLockedBufferMem
+	opt.ReadBufferNum = testInternalProvidedBufferNum
+	opt.Entries = EntriesNano
+}
+
+func testTwoRegisteredBuffersOptions(opt *Options) {
+	opt.LockedBufferMem = testInternalTwoRegisteredBuffersMem
 }
 
 func mustStartRing(tb testing.TB, ring *Uring) {
@@ -36,7 +46,6 @@ func newWrapperTestRing(t *testing.T) *Uring {
 	t.Helper()
 
 	ring, err := New(testMinimalBufferOptions, func(opt *Options) {
-		opt.Entries = EntriesNano
 		opt.MultiIssuers = true
 		opt.NotifySucceed = true
 	})

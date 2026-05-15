@@ -15,21 +15,27 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Runtime probes newer than the Linux 6.12 baseline, plus socket zero-copy
-# probes that depend on hosted-runner network topology, stay out of the required
-# lane while ubuntu-latest is still on Ubuntu 24.04. Keep these patterns
-# anchored to whole test names so helper, encoding, and pure example coverage
-# still runs. The full suite runs below as a non-blocking signal until
-# ubuntu-latest moves to Ubuntu 26.04.
+# Runtime probes newer than the Linux 6.12 baseline stay out of the required
+# lane until GitHub-hosted ubuntu-latest reliably exposes a newer io_uring
+# baseline. Timing-sensitive socket/listener probes stay visible in the
+# non-blocking full-suite lane because hosted runner networking can stall these
+# waits. Zero-copy runtime probes require network or NIC support the hosted
+# runner does not provide, so CI does not run them. Keep these patterns anchored
+# to whole test names so helper, encoding, and pure example coverage still runs.
 env:
-  URING_OPTIONAL_KERNEL_TESTS: '^Test(IntegrationZeroCopySend|IntegrationMultishotAcceptPrimeWaitSurfacesImmediateError|IntegrationMultishotAccept|UringEpollWait|UringPipe|ResizeRings|QueryOpcodes|NAPIRegistration|SQE128NopCycle|PollUpdate|NewZCRXReceiverNotSupported)$'
-  URING_OPTIONAL_SOCKET_ZC_TESTS: '^Test(ZCTrackerBasic|ZCTrackerPoolExhaustion|ZCTrackerHandlerOrder|ZCTrackerExactlyOnce|ZCTrackerGCSafety|SendZeroCopyFixed|ZeroCopyNotificationFlags|SendZeroCopyFixedMultiTarget|ZeroCopyBufferSafety|ZeroCopyLargeBuffer|ZeroCopyMultipleBuffers|ZeroCopyErrorHandling|ZeroCopySequentialSends|TwoCQEOverhead|ZCRXConfigValidation)$'
-  URING_OPTIONAL_RUNTIME_EXAMPLES: '^Test(BufferRingBasics|SQEContextIndirect|SQEContextExtended|CQEViewAccess|TCPEchoServer|UringSocketWithSyscallAccept|SimpleTCPAccept|BroadcastServerWithFramer|UDPPingPong|FileWriteRead|BatchedFileOps|NopThroughput|FixedBufferBasics|WriteFixedOperation|ReadFixedOperation|MultishotHandlerControl|PollAddBasic|PollCancelByFD|PollMultipleFDs|SpliceBasics|TeeOperation|BasicTimeout|MultipleTimeouts|PollWithTimeout|LinkedTimeout|VectoredWrite|VectoredRead|ZCTrackerBasic|MulticastZeroCopy)$'
+  URING_OPTIONAL_KERNEL_TESTS: '^Test(IntegrationMultishotAcceptPrimeWaitSurfacesImmediateError|IntegrationMultishotAccept|TCPAcceptConnectSendReceive|ListenerWithAccept|UringEpollWait|UringPipe|ResizeRings|QueryOpcodes|NAPIRegistration|SQE128NopCycle|PollUpdate|NewZCRXReceiverNotSupported)$'
+  URING_CI_UNSUPPORTED_ZC_TESTS: '^Test(IntegrationZeroCopySend|ZCTrackerBasic|ZCTrackerPoolExhaustion|ZCTrackerHandlerOrder|ZCTrackerExactlyOnce|ZCTrackerGCSafety|SendZeroCopyFixed|ZeroCopyNotificationFlags|SendZeroCopyFixedMultiTarget|ZeroCopyBufferSafety|ZeroCopyLargeBuffer|ZeroCopyMultipleBuffers|ZeroCopyErrorHandling|ZeroCopySequentialSends|TwoCQEOverhead|ZeroCopyVsNormalComparison|MultiDestinationComparison)$'
+  URING_OPTIONAL_RUNTIME_EXAMPLES: '^Test(BufferRingBasics|SQEContextIndirect|SQEContextExtended|CQEViewAccess|TCPEchoServer|UringSocketWithSyscallAccept|SimpleTCPAccept|BroadcastServerWithFramer|UDPPingPong|FileWriteRead|BatchedFileOps|NopThroughput|FixedBufferBasics|WriteFixedOperation|ReadFixedOperation|MultishotHandlerControl|PollAddBasic|PollCancelByFD|PollMultipleFDs|SpliceBasics|TeeOperation|BasicTimeout|MultipleTimeouts|PollWithTimeout|LinkedTimeout|VectoredWrite|VectoredRead)$'
+  URING_CI_UNSUPPORTED_ZC_EXAMPLES: '^Test(ZCTrackerBasic|MulticastZeroCopy)$'
+  URING_REQUIRED_RACE_TESTS: '^Test(ContextPoolsOutOfOrderPut|ContextPoolsResetRestoresCapacity|ZCTrackerNotificationUsesStoredCompletionResult|ZCTrackerDataTryInvokeOnceIsAffine|ZCTrackerHandleCQEUsesNoopHandlerWhenNil|ZCTrackerNotificationReturnsExtSQEOnUnexpectedState|ZCTrackerCQEHandlerDispatchesAnchoredTracker|ZCTrackerCQEHandlerIgnoresNonExtendedAndUnownedContexts|MultishotSubscriptionStateSurvivesRetireExt|MultishotSubscriptionSubmitCancelStateTracksEnqueue|MultishotSubscriptionUnsubscribeMarksSuppressedWhenStopped|ListenerSubscriber|IncrementalSubscriber|ZCSubscriber|NoopMultishotHandler|NoopListenerHandler|NoopIncrementalHandler|NoopZCHandler|NoopHandlerMethods)$'
+  URING_REQUIRED_RACE_EXAMPLES: '^Test(SQEContextDirect|SQEContextWithFlags|ZeroCopyThresholds)$'
 
 jobs:
   lint-build-test-linux:
     name: Lint, Build & Test (Linux/amd64, Go ${{ matrix.go-version }})
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     timeout-minutes: 5
     strategy:
       fail-fast: false
@@ -37,6 +43,8 @@ jobs:
         go-version: [ '1.26.x', 'stable' ]
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -76,21 +84,124 @@ jobs:
 
       # Required root-package lane. Covers io_uring behavior available on Linux
       # 6.12 and earlier; newer runtime probes run in the non-blocking lane
-      # below.
+      # below. Keep this lane focused on kernel-feature correctness; full-suite
+      # race instrumentation stays in the non-blocking lane because it can
+      # perturb hosted-runner io_uring resource behavior. A deterministic
+      # required race subset follows this step.
+      # Raise RLIMIT_MEMLOCK inside the same shell that launches each runtime
+      # test process so io_uring buffer registration inherits the largest
+      # hosted-runner limit available.
+      # Print the failure digest to both the job log and the summary so the
+      # failing test remains visible when the verbose log is too long.
       - name: Test root package (Linux <=6.12 io_uring baseline)
-        run: go test -v -race -count=1 -timeout=180s -skip "$URING_OPTIONAL_KERNEL_TESTS|$URING_OPTIONAL_SOCKET_ZC_TESTS" .
+        run: |
+          set -o pipefail
+          echo "Memlock before:"
+          grep "Max locked memory" "/proc/$$/limits" || true
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited || true
+          ulimit -l unlimited || true
+          echo "Memlock after:"
+          grep "Max locked memory" "/proc/$$/limits" || true
+          echo "ulimit -l: $(ulimit -l || true)"
+
+          log=/tmp/uring-root-test.out
+          set +e
+          go test -v -count=1 -timeout=180s -skip "$URING_OPTIONAL_KERNEL_TESTS|$URING_CI_UNSUPPORTED_ZC_TESTS" . 2>&1 | tee "$log"
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ]; then
+            summary=/tmp/uring-root-test-summary.md
+            {
+              echo "### Root package test failures"
+              echo
+              echo '```text'
+              grep -E '^(--- FAIL:|    [^[:space:]]+_test\.go:[0-9]+:|    testing\.go:[0-9]+:|WARNING: DATA RACE|Found [0-9]+ data race|ThreadSanitizer|panic:|fatal error:|FAIL[[:space:]]|FAIL$)' "$log" | tail -n 120 || true
+              echo '```'
+            } | tee "$summary"
+            cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+            exit "$status"
+          fi
+
+      # Required deterministic race subset. Keeps race detector failures
+      # blocking without applying race instrumentation to the hosted-runner
+      # runtime probes that have unstable io_uring resource behavior.
+      - name: Test root package race subset
+        run: go test -race -v -count=1 -timeout=120s -run "$URING_REQUIRED_RACE_TESTS" .
+
+      - name: Collect root package coverage
+        if: matrix.go-version == 'stable'
+        run: |
+          set -o pipefail
+          echo "Memlock before:"
+          grep "Max locked memory" "/proc/$$/limits" || true
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited || true
+          ulimit -l unlimited || true
+          echo "Memlock after:"
+          grep "Max locked memory" "/proc/$$/limits" || true
+          echo "ulimit -l: $(ulimit -l || true)"
+
+          log=/tmp/uring-coverage-test.out
+          set +e
+          go test -v -covermode=count -coverprofile=coverage.out -count=1 -timeout=180s -skip "$URING_OPTIONAL_KERNEL_TESTS|$URING_CI_UNSUPPORTED_ZC_TESTS" . 2>&1 | tee "$log"
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ]; then
+            summary=/tmp/uring-coverage-test-summary.md
+            {
+              echo "### Coverage test failures"
+              echo
+              echo '```text'
+              grep -E '^(--- FAIL:|    [^[:space:]]+_test\.go:[0-9]+:|    testing\.go:[0-9]+:|WARNING: DATA RACE|Found [0-9]+ data race|ThreadSanitizer|panic:|fatal error:|FAIL[[:space:]]|FAIL$)' "$log" | tail -n 120 || true
+              echo '```'
+            } | tee "$summary"
+            cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+            exit "$status"
+          fi
+
+      - name: Upload coverage artifact
+        if: matrix.go-version == 'stable'
+        uses: actions/upload-artifact@v7
+        with:
+          name: uring-root-coverage
+          path: coverage.out
+          if-no-files-found: error
+          retention-days: 7
 
       # Required examples lane. Runs examples that are pure documentation or
-      # encoding checks; runtime examples stay visible in the non-blocking full
-      # suite below until the runner baseline catches up.
+      # encoding checks; runtime examples stay visible in the non-blocking lane
+      # below until the runner baseline catches up.
       - name: Test examples (pure required subset)
-        run: go test -v -race -count=1 -timeout=180s -skip "$URING_OPTIONAL_RUNTIME_EXAMPLES" ./examples
+        run: |
+          set -o pipefail
+          echo "Memlock before:"
+          grep "Max locked memory" "/proc/$$/limits" || true
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited || true
+          ulimit -l unlimited || true
+          echo "Memlock after:"
+          grep "Max locked memory" "/proc/$$/limits" || true
+          echo "ulimit -l: $(ulimit -l || true)"
 
-      # Non-blocking lane. Keeps newer kernel probes visible on ubuntu-latest;
-      # failures here become required only after the runner baseline catches up.
+          go test -v -count=1 -timeout=180s -skip "$URING_OPTIONAL_RUNTIME_EXAMPLES|$URING_CI_UNSUPPORTED_ZC_EXAMPLES" ./examples
+
+      - name: Test examples race subset
+        run: go test -race -v -count=1 -timeout=120s -run "$URING_REQUIRED_RACE_EXAMPLES" ./examples
+
+      # Non-blocking lane. Keeps newer kernel probes visible on ubuntu-latest.
+      # Zero-copy runtime probes stay out of hosted CI and should be validated
+      # on a dedicated Linux setup instead.
       - name: Test (newer io_uring features, non-blocking)
         continue-on-error: true
-        run: go test -race -count=1 -timeout=180s ./...
+        run: |
+          set -o pipefail
+          echo "Memlock before:"
+          grep "Max locked memory" "/proc/$$/limits" || true
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited || true
+          ulimit -l unlimited || true
+          echo "Memlock after:"
+          grep "Max locked memory" "/proc/$$/limits" || true
+          echo "ulimit -l: $(ulimit -l || true)"
+
+          go test -race -count=1 -timeout=180s -skip "$URING_CI_UNSUPPORTED_ZC_TESTS|$URING_CI_UNSUPPORTED_ZC_EXAMPLES" ./...
 
   vet-build-darwin:
     name: Vet & Build (Darwin/arm64, Go ${{ matrix.go-version }})
@@ -102,6 +213,8 @@ jobs:
         go-version: [ '1.26.x', 'stable' ]
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -125,6 +238,35 @@ jobs:
           CGO_ENABLED: '0'
         run: go build ./...
 
+  upload-coverage:
+    name: Upload Coverage
+    runs-on: ubuntu-latest
+    needs: lint-build-test-linux
+    permissions:
+      contents: read
+      id-token: write
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Download coverage artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: uring-root-coverage
+          path: .
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v6
+        with:
+          use_oidc: true
+          files: ./coverage.out
+          disable_search: true
+          flags: linux-amd64-root
+          name: linux-amd64-root
+          fail_ci_if_error: false
+
   cross-build:
     name: Cross-Build (${{ matrix.target.goos }}/${{ matrix.target.goarch }}, Go ${{ matrix.go-version }})
     runs-on: ubuntu-latest
@@ -137,6 +279,8 @@ jobs:
           - { goos: darwin, goarch: arm64 }
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@v6

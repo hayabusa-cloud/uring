@@ -359,7 +359,11 @@ func TestOptionsForBudget_Integration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New failed: %v", err)
 	}
-	// Ring cleanup handled by finalizer - no explicit Close needed for this test
+	t.Cleanup(func() {
+		if err := ring.Stop(); err != nil {
+			t.Fatalf("Stop failed: %v", err)
+		}
+	})
 
 	// Verify the ring was created with correct entries
 	if ring.SQAvailable() != opts.Entries {
