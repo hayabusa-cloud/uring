@@ -2,6 +2,7 @@
 
 [![Go Reference](https://pkg.go.dev/badge/code.hybscloud.com/uring.svg)](https://pkg.go.dev/code.hybscloud.com/uring)
 [![Go Report Card](https://goreportcard.com/badge/github.com/hayabusa-cloud/uring)](https://goreportcard.com/report/github.com/hayabusa-cloud/uring)
+[![Benchmarks](https://github.com/hayabusa-cloud/uring/actions/workflows/public-benchmarks.yml/badge.svg)](https://github.com/hayabusa-cloud/uring/actions/workflows/public-benchmarks.yml)
 [![Codecov](https://codecov.io/gh/hayabusa-cloud/uring/graph/badge.svg)](https://codecov.io/gh/hayabusa-cloud/uring)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -393,7 +394,7 @@ for i := range n {
 }
 ```
 
-`OnMultishotStep` observa cada finalización; devuelva `MultishotContinue` para mantener el flujo o `MultishotStop` para solicitar la cancelación. `OnMultishotStop` se ejecuta una vez en el estado terminal. Úselo para limpieza y resuscripción condicional. `HandleCQE` sirve para el despacho inmediato en el bucle de finalización serializado del llamador. Si el código llamador conserva CQE copiadas más allá de ese bucle, debe mantener su propio estado de ruta y rechazar observaciones de suscripciones ya retiradas. En los rings de emisor único predeterminados, llame a `Cancel` / `Unsubscribe` desde el propietario del ring o serialícelos con envío, `Wait`, `WaitDirect`, `WaitExtended`, `Stop` y `ResizeRings`. En rings con `MultiIssuers`, la ruta de envío compartida serializa sus SQE de cancelación.
+Cada llamada a `OnStep` observa un `MultishotStep`: devuelva `MultishotContinue` para mantener el flujo activo o `MultishotStop` para solicitar la cancelación. Si las devoluciones de llamada permanecen habilitadas hasta la observación terminal, `OnStop` se ejecuta como máximo una vez con el error final y la bandera `cancelled`; en el propio paso, `step.Cancelled` distingue en el límite el veredicto específico `-ECANCELED` del kernel del resto de fallos. Ambas devoluciones son la proyección del lado del constructor sobre la interfaz `MultishotHandler` (`OnMultishotStep` / `OnMultishotStop`); implemente la interfaz directamente cuando necesite un manejador explícito. `HandleCQE` sirve para el despacho inmediato en el bucle de finalización serializado del llamador; si el código llamador conserva CQE copiadas más allá de ese bucle, debe mantener su propio estado de ruta y rechazar observaciones de suscripciones ya retiradas. En los rings de emisor único predeterminados, llame a `Cancel` / `Unsubscribe` desde el propietario del ring o serialícelos con envío, `Wait`, `WaitDirect`, `WaitExtended`, `Stop` y `ResizeRings`. En rings con `MultiIssuers`, la ruta de envío compartida serializa sus SQE de cancelación.
 
 ### Estado por conexión con contextos tipados
 

@@ -2,6 +2,7 @@
 
 [![Go Reference](https://pkg.go.dev/badge/code.hybscloud.com/uring.svg)](https://pkg.go.dev/code.hybscloud.com/uring)
 [![Go Report Card](https://goreportcard.com/badge/github.com/hayabusa-cloud/uring)](https://goreportcard.com/report/github.com/hayabusa-cloud/uring)
+[![Benchmarks](https://github.com/hayabusa-cloud/uring/actions/workflows/public-benchmarks.yml/badge.svg)](https://github.com/hayabusa-cloud/uring/actions/workflows/public-benchmarks.yml)
 [![Codecov](https://codecov.io/gh/hayabusa-cloud/uring/graph/badge.svg)](https://codecov.io/gh/hayabusa-cloud/uring)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -393,7 +394,7 @@ for i := range n {
 }
 ```
 
-`OnMultishotStep` 观察每次完成；返回 `MultishotContinue` 保持流，返回 `MultishotStop` 请求取消。`OnMultishotStop` 在终态执行一次，用于清理和按条件重新订阅。`HandleCQE` 用于调用方串行化完成循环内的立即 dispatch；若调用方在该循环之后保留复制 CQE，调用方必须维护自己的 route state，并拒绝已退役订阅的观察。在默认单提交者 ring 上，应从 ring 所有者调用 `Cancel` / `Unsubscribe`，或将它们与提交、`Wait`、`WaitDirect`、`WaitExtended`、`Stop` 以及 `ResizeRings` 串行化。启用 `MultiIssuers` 的 ring 由共享提交路径串行化这些取消 SQE。
+每一次 `OnStep` 回调观察一个 `MultishotStep`：返回 `MultishotContinue` 保持流活跃，或返回 `MultishotStop` 请求取消。如果回调一直保持启用直到终态观察，`OnStop` 至多以最终错误及 `cancelled` 标志触发一次；在步骤自身上，`step.Cancelled` 在边界处把内核的 `-ECANCELED` 判定与其他失败明确区分开。两个回调都是 `MultishotHandler` 接口（`OnMultishotStep` / `OnMultishotStop`）在构建器侧的投影；需要显式处理器时，可直接实现该接口。`HandleCQE` 用于调用方串行化完成循环内的立即 dispatch；若调用方在该循环之后保留复制 CQE，则需维护自己的 route state，并拒绝已退役订阅的观察。在默认单提交者 ring 上，应从 ring 所有者调用 `Cancel` / `Unsubscribe`，或将它们与提交、`Wait`、`WaitDirect`、`WaitExtended`、`Stop` 以及 `ResizeRings` 串行化。启用 `MultiIssuers` 的 ring 由共享提交路径串行化这些取消 SQE。
 
 ### 类型化上下文承载连接状态
 

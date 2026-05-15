@@ -2,6 +2,7 @@
 
 [![Go Reference](https://pkg.go.dev/badge/code.hybscloud.com/uring.svg)](https://pkg.go.dev/code.hybscloud.com/uring)
 [![Go Report Card](https://goreportcard.com/badge/github.com/hayabusa-cloud/uring)](https://goreportcard.com/report/github.com/hayabusa-cloud/uring)
+[![Benchmarks](https://github.com/hayabusa-cloud/uring/actions/workflows/public-benchmarks.yml/badge.svg)](https://github.com/hayabusa-cloud/uring/actions/workflows/public-benchmarks.yml)
 [![Codecov](https://codecov.io/gh/hayabusa-cloud/uring/graph/badge.svg)](https://codecov.io/gh/hayabusa-cloud/uring)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -393,7 +394,7 @@ for i := range n {
 }
 ```
 
-`OnMultishotStep` observe chaque complétion ; on renvoie `MultishotContinue` pour maintenir le flux ou `MultishotStop` pour demander l'annulation. `OnMultishotStop` s'exécute une seule fois à l'état terminal. On l'utilise pour le nettoyage et la re-souscription conditionnelle. `HandleCQE` sert au dispatch immédiat dans la boucle de complétion sérialisée de l'appelant. Si le code appelant conserve des CQE copiées après cette boucle, il doit garder son propre état de routage et rejeter les observations de souscriptions déjà retirées. Sur les rings mono-émetteur par défaut, appelez `Cancel` / `Unsubscribe` depuis le propriétaire du ring ou sérialisez-les avec les opérations de soumission, `Wait`, `WaitDirect`, `WaitExtended`, `Stop` et `ResizeRings`. Sur les rings `MultiIssuers`, le chemin de soumission partagé sérialise leurs SQE d'annulation.
+Chaque rappel `OnStep` observe un `MultishotStep` : renvoyez `MultishotContinue` pour maintenir le flux actif ou `MultishotStop` pour demander l'annulation. Si les rappels restent activés jusqu'à l'observation terminale, `OnStop` s'exécute au plus une fois avec l'erreur finale et l'indicateur `cancelled` ; sur le pas lui-même, `step.Cancelled` distingue à la frontière le verdict spécifique `-ECANCELED` du noyau des autres échecs. Les deux rappels sont la projection côté constructeur de l'interface `MultishotHandler` (`OnMultishotStep` / `OnMultishotStop`) ; implémentez directement cette interface lorsque vous écrivez un gestionnaire explicite. `HandleCQE` sert au dispatch immédiat dans la boucle de complétion sérialisée de l'appelant ; si le code appelant conserve des CQE copiées après cette boucle, il doit garder son propre état de routage et rejeter les observations de souscriptions déjà retirées. Sur les rings mono-émetteur par défaut, appelez `Cancel` / `Unsubscribe` depuis le propriétaire du ring ou sérialisez-les avec les opérations de soumission, `Wait`, `WaitDirect`, `WaitExtended`, `Stop` et `ResizeRings`. Sur les rings `MultiIssuers`, le chemin de soumission partagé sérialise leurs SQE d'annulation.
 
 ### État par connexion via des contextes typés
 

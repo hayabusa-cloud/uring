@@ -2,6 +2,7 @@
 
 [![Go Reference](https://pkg.go.dev/badge/code.hybscloud.com/uring.svg)](https://pkg.go.dev/code.hybscloud.com/uring)
 [![Go Report Card](https://goreportcard.com/badge/github.com/hayabusa-cloud/uring)](https://goreportcard.com/report/github.com/hayabusa-cloud/uring)
+[![Benchmarks](https://github.com/hayabusa-cloud/uring/actions/workflows/public-benchmarks.yml/badge.svg)](https://github.com/hayabusa-cloud/uring/actions/workflows/public-benchmarks.yml)
 [![Codecov](https://codecov.io/gh/hayabusa-cloud/uring/graph/badge.svg)](https://codecov.io/gh/hayabusa-cloud/uring)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -393,7 +394,7 @@ for i := range n {
 }
 ```
 
-`OnMultishotStep` observes each completion; return `MultishotContinue` to keep the stream or `MultishotStop` to request cancellation. `OnMultishotStop` runs once at the terminal state. Use it for cleanup and conditional resubscription. `HandleCQE` is for immediate dispatch in the caller's serialized completion loop. If caller code stores copied CQEs beyond that loop, it must keep its own route state and reject observations for retired subscriptions. On default single-issuer rings, call `Cancel` / `Unsubscribe` from the ring owner or otherwise serialize them with submit, `Wait`, `WaitDirect`, `WaitExtended`, `Stop`, and `ResizeRings`. On `MultiIssuers` rings, the shared-submit path serializes their cancel SQEs.
+Each `OnStep` callback observes one `MultishotStep`: return `MultishotContinue` to keep the stream live, or `MultishotStop` to request cancellation. If callbacks remain enabled until the terminal observation, `OnStop` runs at most once with the final error and a `cancelled` flag; on the step itself, `step.Cancelled` distinguishes the specific `-ECANCELED` kernel verdict from other failures at the boundary. Both callbacks are the builder-side projection of the `MultishotHandler` interface (`OnMultishotStep` / `OnMultishotStop`); implement that interface directly when you want an explicit handler. `HandleCQE` is for immediate dispatch in the caller's serialized completion loop; if caller code stores copied CQEs beyond that loop, it must keep its own route state and reject observations for retired subscriptions. On default single-issuer rings, call `Cancel` / `Unsubscribe` from the ring owner or otherwise serialize them with submit, `Wait`, `WaitDirect`, `WaitExtended`, `Stop`, and `ResizeRings`. On `MultiIssuers` rings, the shared-submit path serializes their cancel SQEs.
 
 ### Per-connection state with typed contexts
 

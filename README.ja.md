@@ -2,6 +2,7 @@
 
 [![Go Reference](https://pkg.go.dev/badge/code.hybscloud.com/uring.svg)](https://pkg.go.dev/code.hybscloud.com/uring)
 [![Go Report Card](https://goreportcard.com/badge/github.com/hayabusa-cloud/uring)](https://goreportcard.com/report/github.com/hayabusa-cloud/uring)
+[![Benchmarks](https://github.com/hayabusa-cloud/uring/actions/workflows/public-benchmarks.yml/badge.svg)](https://github.com/hayabusa-cloud/uring/actions/workflows/public-benchmarks.yml)
 [![Codecov](https://codecov.io/gh/hayabusa-cloud/uring/graph/badge.svg)](https://codecov.io/gh/hayabusa-cloud/uring)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -394,7 +395,7 @@ for i := range n {
 }
 ```
 
-`OnMultishotStep` は各完了を観察します。ストリームを維持するなら `MultishotContinue` を、キャンセルを要求するなら `MultishotStop` を返します。`OnMultishotStop` は終端状態で一度だけ実行されます。クリーンアップと条件付き再サブスクリプションに使用します。`HandleCQE` は呼び出し側の直列化された完了ループ内で即時 dispatch するための補助です。コピー済み CQE をそのループの後も保持する場合、呼び出し側が独自の route state を保持し、すでに解放されたサブスクリプションの観察を拒否してください。既定の単一発行者リングでは、`Cancel` / `Unsubscribe` はリング所有者から呼び出すか、発行、`Wait`、`WaitDirect`、`WaitExtended`、`Stop`、`ResizeRings` と直列化してください。`MultiIssuers` リングでは、共有発行パスがこれらのキャンセル SQE を直列化します。
+`OnStep` コールバックは 1 件の `MultishotStep` を観察します。ストリームを維持するなら `MultishotContinue` を、キャンセルを要求するなら `MultishotStop` を返します。コールバックが終端観察まで有効なままなら、`OnStop` は最終エラーと `cancelled` フラグを伴って高々一度だけ実行されます。ステップ自身の `step.Cancelled` は、境界上でカーネルが `-ECANCELED` を返した判定をその他の失敗と明示的に区別します。両コールバックは `MultishotHandler` インタフェース（`OnMultishotStep` / `OnMultishotStop`）のビルダー側射影です。明示的なハンドラを書く場合はこのインタフェースを直接実装してください。`HandleCQE` は呼び出し側の直列化された完了ループ内で即時 dispatch するための補助です。コピー済み CQE をそのループの後も保持する場合、呼び出し側が独自の route state を保持し、すでに解放されたサブスクリプションの観察を拒否してください。既定の単一発行者リングでは、`Cancel` / `Unsubscribe` はリング所有者から呼び出すか、発行、`Wait`、`WaitDirect`、`WaitExtended`、`Stop`、`ResizeRings` と直列化してください。`MultiIssuers` リングでは、共有発行パスがこれらのキャンセル SQE を直列化します。
 
 ### 型付きコンテキストによるコネクション状態
 
