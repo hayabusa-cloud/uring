@@ -50,7 +50,8 @@ func (s MultishotStep) Final() bool {
 }
 
 // MultishotHandler handles multishot step observations and the terminal stop.
-// Retry or resubmission policy stays in caller-side runtime code above `uring`.
+// Retry and resubmission policy stay in caller-side runtime code outside
+// `uring`.
 type MultishotHandler interface {
 	// OnMultishotStep handles one observed CQE.
 	// Return `MultishotStop` to request async cancellation after a non-final step.
@@ -193,8 +194,8 @@ func (s *MultishotSubscription) State() SubscriptionState {
 //
 // HandleCQE is for immediate dispatch in the caller's serialized completion
 // loop. Caller code must call it before the observed ExtSQE can be retired and
-// reused. If caller code keeps copied CQEs beyond that loop, caller code must
-// keep its own route state and reject observations for retired subscriptions.
+// reused. If copied CQEs outlive that loop, caller code must pair them with its
+// own route state and reject observations for retired subscriptions.
 //
 // HandleCQE does not wait, retry, rearm, or resubmit. Caller-side runtime code
 // owns polling cadence and any policy after the subscription reaches its

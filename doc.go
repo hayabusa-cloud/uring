@@ -7,9 +7,9 @@
 // kernels. Its core Linux `io_uring` implementation was refactored from
 // `code.hybscloud.com/sox` into this dedicated package. It prepares SQEs,
 // decodes CQEs, transports submission context through `user_data`, and exposes
-// kernel-boundary facts. Dispatch, retry, completion correlation, and
-// connection/session orchestration stay in caller-side runtime code above this
-// boundary.
+// kernel-boundary facts. Dispatch, retry, completion routing, route retirement,
+// and connection/session orchestration stay in caller-side runtime code outside
+// this boundary.
 //
 // A typical caller starts the ring, submits an operation, and then treats the
 // completion queue as the source of truth for kernel results. Semantic
@@ -70,8 +70,8 @@
 // kernel-boundary flow explicit. [Uring.AcceptMultishot] and
 // [Uring.ReceiveMultishot] use the same kernel path and return a
 // [MultishotSubscription] for caller-owned callback dispatch in the same
-// serialized completion loop. If caller code keeps copied CQEs beyond that
-// loop, it must keep its own route state and reject observations for retired
+// serialized completion loop. If copied CQEs outlive that loop, caller code
+// must pair them with its own route state and reject observations for retired
 // subscriptions.
 //
 //	sqeCtx := uring.ForFD(listenerFD)
@@ -196,8 +196,9 @@
 //
 // uring is a kernel boundary, not a scheduler. It owns SQE encoding, CQE
 // observation, `user_data` identity, capability exposure, and kernel-facing
-// lifetimes. Runtime policy, connection routing, batching, retries, parking,
-// and terminal resource release belong above this package.
+// lifetimes. Runtime policy, completion routing, route retirement, batching,
+// retries, parking, protocol parsing, safety checks, and terminal resource
+// release belong outside this package.
 //
 // # Buffer Groups
 //

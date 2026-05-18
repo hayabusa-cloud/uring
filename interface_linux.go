@@ -738,9 +738,10 @@ type SendTargets interface {
 // For aggressive zero-copy usage, use MulticastZeroCopy instead.
 //
 // Zero-copy notes:
-//   - Produces two CQEs per send: completion (IORING_CQE_F_MORE) + notification
+//   - Normally produces completion (IORING_CQE_F_MORE) + notification CQEs
+//   - Terminal completion without IORING_CQE_F_MORE is the no-notification fallback
 //   - p must remain valid until all target sends complete
-//   - Zero-copy sends keep registered buffers immutable until notification CQE
+//   - Zero-copy sends keep registered buffers immutable until notification or fallback
 //   - Requires TCP sockets; returns EOPNOTSUPP on Unix sockets or loopback
 //
 // Parameters:
@@ -854,8 +855,9 @@ func (ur *Uring) Multicast(sqeCtx SQEContext, targets SendTargets, bufIndex int,
 //   - Any scenario with O(1) payload and O(N) targets
 //
 // Zero-copy notes:
-//   - Produces two CQEs per send: completion (IORING_CQE_F_MORE) + notification
-//   - Registered buffers must remain immutable until notification CQE
+//   - Normally produces completion (IORING_CQE_F_MORE) + notification CQEs
+//   - Terminal completion without IORING_CQE_F_MORE is the no-notification fallback
+//   - Registered buffers must remain immutable until notification or fallback
 //   - May return EOPNOTSUPP on Unix sockets or loopback
 func (ur *Uring) MulticastZeroCopy(sqeCtx SQEContext, targets SendTargets, bufIndex int, offset int64, n int, options ...OpOptionFunc) error {
 	count := targets.Count()

@@ -14,7 +14,7 @@ import (
 	"code.hybscloud.com/iox"
 )
 
-// Zero-copy send states for the two-CQE model.
+// Zero-copy send states for the normal notification path.
 const (
 	zcStateSubmitted uint32 = iota // SQE submitted, waiting for first CQE
 	zcStateCompleted               // First CQE received (IORING_CQE_F_MORE set)
@@ -71,20 +71,25 @@ type ZCHandler interface {
 	OnCompleted(result int32)
 
 	// OnNotification is called when the buffer can be safely reused.
-	// This is the second CQE in the zero-copy two-CQE model and it carries
-	// the original send result observed at completion time.
+	// In the normal path this is the second CQE in the zero-copy two-CQE model.
+	// If the data CQE is terminal without MORE, the tracker calls this from the
+	// terminal no-notification fallback. The result is the original send result.
 	OnNotification(result int32)
 }
 
-// ZCTracker manages zero-copy send operations through the two-CQE model.
-// Zero-copy sends produce two CQEs:
+// ZCTracker manages zero-copy send operations through the notification path and
+// the terminal no-notification fallback. Zero-copy sends normally produce two
+// CQEs:
 //  1. Operation CQE (IORING_CQE_F_MORE) - send completed, buffer still in use
 //  2. Notification CQE (IORING_CQE_F_NOTIF) - buffer can be reused
+//
+// A terminal operation CQE without IORING_CQE_F_MORE means no notification CQE is
+// expected; the tracker completes callbacks and returns ExtSQE immediately.
 //
 // The tracker ensures:
 //   - Handlers are invoked in the correct order
 //   - Each handler is invoked exactly once
-//   - ExtSQE is returned to pool only after notification
+//   - ExtSQE is returned to pool only after notification or terminal fallback
 type ZCTracker struct {
 	ring *Uring
 	pool *ContextPools
@@ -203,7 +208,7 @@ func (t *ZCTracker) HandleCQE(cqe CQEView) bool {
 	return t.dispatchCQE(cqe, ext, ctx, handler)
 }
 
-// dispatchCQE handles the two-CQE zero-copy state machine.
+// dispatchCQE handles the zero-copy notification state machine and terminal fallback.
 func (t *ZCTracker) dispatchCQE(cqe CQEView, ext *ExtSQE, ctx *zcCtx, handler ZCHandler) bool {
 	tracker := zcGetTrackerData(ctx)
 

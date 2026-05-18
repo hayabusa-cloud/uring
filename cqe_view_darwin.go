@@ -9,9 +9,9 @@ package uring
 import "code.hybscloud.com/iofd"
 
 // CQEView provides a view into a completion queue entry.
-// A copied CQEView is a completion observation, not durable route state. If
-// caller code stores it beyond the current dispatch turn, caller code must keep
-// its own route state.
+// A copied CQEView is a completion observation, not durable route state. If it
+// is stored beyond the current dispatch turn, caller code must pair it with
+// caller-owned route state.
 type CQEView struct {
 	Res   int32
 	Flags uint32
