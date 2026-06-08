@@ -83,9 +83,9 @@ func TestCQEProcessingOverhead(t *testing.T) {
 	t.Logf("CQE flag processing: %d ns/%d checks", flagsDuration.Nanoseconds()/iterations, 4)
 }
 
-// TestTwoCQEOverhead measures the overhead of the two-CQE notification model.
-// Compares single CQE (normal send) vs two CQEs (zero-copy send).
-func TestTwoCQEOverhead(t *testing.T) {
+// TestZeroCopyNotificationOverhead measures zero-copy notification overhead.
+// It compares a normal send CQE with the zero-copy notification path.
+func TestZeroCopyNotificationOverhead(t *testing.T) {
 	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
 		opt.Entries = uring.EntriesSmall
 		opt.NotifySucceed = true
@@ -137,7 +137,7 @@ func TestTwoCQEOverhead(t *testing.T) {
 				} else {
 					opTime = time.Now()
 					opReceived = true
-					if cqe.Res == -95 {
+					if cqe.Res == -int32(uring.EOPNOTSUPP) {
 						eopnotsupp = true
 					}
 				}
@@ -153,7 +153,7 @@ func TestTwoCQEOverhead(t *testing.T) {
 	t.Logf("Submit → Operation CQE: %v", opTime.Sub(submitTime))
 	if notifReceived {
 		t.Logf("Operation CQE → Notification CQE: %v", notifTime.Sub(opTime))
-		t.Logf("Total (two-CQE model): %v", notifTime.Sub(submitTime))
+		t.Logf("Total notification-path time: %v", notifTime.Sub(submitTime))
 	} else if eopnotsupp {
 		t.Log("EOPNOTSUPP - notification timing not available on Unix sockets")
 	}
@@ -202,7 +202,7 @@ func TestCrossoverAnalysis(t *testing.T) {
 
 		// Zero-copy additional overhead
 		pinnedLookupNs = 100 // io_import_fixed() lookup
-		notifCQENs     = 50  // Second CQE processing
+		notifCQENs     = 50  // Notification CQE processing
 
 		// Page pinning (amortized with registered buffers)
 		registeredPinNs = 0 // Pre-registered, no per-send cost
@@ -226,7 +226,7 @@ func TestCrossoverAnalysis(t *testing.T) {
 		// Normal send: submit + copy + completion
 		normalCost := float64(sqeSubmitNs) + float64(size)*memcpyPerByteNs + float64(cqeProcessNs)
 
-		// Zero-copy send: submit + lookup + completion + notification
+		// Notification-path zero-copy: submit + lookup + completion + notification
 		zcCost := float64(sqeSubmitNs) + float64(pinnedLookupNs) + float64(cqeProcessNs) + float64(notifCQENs)
 
 		var winner string

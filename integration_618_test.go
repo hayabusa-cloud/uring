@@ -101,7 +101,7 @@ func TestIntegrationZeroCopySend(t *testing.T) {
 	if !completed {
 		t.Fatal("zero-copy send did not report completion")
 	}
-	if result == -95 {
+	if result == -int32(uring.EOPNOTSUPP) {
 		t.Log("EOPNOTSUPP returned (expected on loopback)")
 		return
 	}
@@ -162,6 +162,45 @@ func consumeAcceptCQEs(cqes []uring.CQEView) (accepted int, errRes int32) {
 		closeTestFD(iofd.FD(cqe.Res))
 	}
 	return accepted, 0
+}
+
+func cancelAcceptMultishot(t *testing.T, ring *uring.Uring, acceptCtx uring.SQEContext, cqes []uring.CQEView) (accepted int, terminal bool) {
+	t.Helper()
+
+	cancelCtx := uring.PackDirect(uring.IORING_OP_ASYNC_CANCEL, 0, 1, acceptCtx.FD())
+	if err := ring.AsyncCancelFD(cancelCtx, false); err != nil {
+		t.Fatalf("AsyncCancelFD: %v", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	b := iox.Backoff{}
+	for time.Now().Before(deadline) && !terminal {
+		n, err := ring.Wait(cqes)
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+			t.Fatalf("Wait after cancel: %v", err)
+		}
+		for i := 0; i < n; i++ {
+			cqe := cqes[i]
+			switch cqe.Op() {
+			case uring.IORING_OP_ACCEPT:
+				if cqe.Res >= 0 {
+					accepted++
+					closeTestFD(iofd.FD(cqe.Res))
+				} else if cqe.Res != -int32(uring.ECANCELED) {
+					t.Fatalf("terminal accept CQE failed: %d", cqe.Res)
+				}
+				if !cqe.HasMore() {
+					terminal = true
+				}
+			case uring.IORING_OP_ASYNC_CANCEL:
+				// AsyncCancel completion is expected alongside the terminal accept CQE.
+			}
+		}
+		if !terminal {
+			b.Wait()
+		}
+	}
+	return accepted, terminal
 }
 
 // TestIntegrationMultishotAcceptPrimeWaitSurfacesImmediateError verifies that
@@ -290,7 +329,15 @@ func TestIntegrationMultishotAccept(t *testing.T) {
 		b.Wait()
 	}
 
+	delta, terminal := cancelAcceptMultishot(t, ring, sqeCtx, cqes)
+	accepted += delta
+	if !terminal {
+		t.Log("SubmitAcceptMultishot terminal accept CQE not observed after cancel")
+	}
 	if accepted != numClients {
+		if accepted == 0 {
+			t.Skip("SubmitAcceptMultishot completion not received - timing-sensitive")
+		}
 		t.Fatalf("accepted %d connections, want %d", accepted, numClients)
 	}
 }

@@ -180,8 +180,9 @@ func (c *CQEView) SocketNonEmpty() bool {
 }
 
 // IsNotification reports whether this is a zero-copy notification CQE.
-// Zero-copy sends generate two CQEs: one for completion, one for notification
-// when the buffer can be reused.
+// Notification CQEs mark the buffer-reuse frontier. A terminal data CQE without
+// MORE closes the data side; if no notification was observed, it is the
+// no-notification fallback.
 //
 //go:nosplit
 func (c *CQEView) IsNotification() bool {

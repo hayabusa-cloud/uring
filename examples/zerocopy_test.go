@@ -21,13 +21,14 @@ import (
 	"code.hybscloud.com/zcall"
 )
 
-// TestZCTrackerBasic demonstrates the ZCTracker for managing
-// zero-copy sends through the two-CQE model.
+// TestZCTrackerBasic demonstrates the ZCTracker for managing zero-copy sends
+// through the notification path and terminal no-notification fallback.
 //
 // Architecture:
-//   - Zero-copy sends produce TWO CQEs:
-//     1. Operation CQE (IORING_CQE_F_MORE) - send completed, buffer in use
-//     2. Notification CQE (IORING_CQE_F_NOTIF) - buffer can be reused
+//   - The notification path pairs an operation CQE with MORE and a notification
+//     CQE; the tracker releases only after the pair is complete
+//   - A terminal operation CQE without MORE is release-ready; it is the
+//     no-notification fallback only when no notification CQE was observed first
 //   - ZCTracker manages this lifecycle automatically
 //   - ZCHandler interface receives both callbacks in order
 //
@@ -177,7 +178,8 @@ func (h *testZCHandler) OnNotification(result int32) {
 //   - Registered buffers are pre-pinned in kernel memory (no per-call pinning)
 //   - MulticastZeroCopy sends to N targets efficiently
 //   - Adaptive threshold decides ZC vs regular send based on payload size
-//   - Two-CQE model applies: N*2 CQEs for N targets with zero-copy
+//   - Notification-path zero-copy can emit one data CQE plus one notification
+//     CQE per target; terminal data CQEs without MORE use the fallback path
 //
 // Use cases: chat servers, pub/sub systems, real-time data distribution.
 func TestMulticastZeroCopy(t *testing.T) {

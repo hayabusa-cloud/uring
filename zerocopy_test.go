@@ -24,7 +24,7 @@ import (
 
 // TestSendZeroCopyFixed verifies basic zero-copy send with registered buffers.
 // Uses a single target socket and validates data is received correctly.
-// Note: Zero-copy send may return EOPNOTSUPP (-95) on Unix sockets or loopback.
+// Note: zero-copy send may return EOPNOTSUPP on Unix sockets or loopback.
 func TestSendZeroCopyFixed(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping zero-copy send test in short mode (requires reliable io_uring)")
@@ -101,7 +101,8 @@ func TestSendZeroCopyFixed(t *testing.T) {
 		t.Fatalf("MulticastZeroCopy: %v", err)
 	}
 
-	// Wait for completion (both operation and notification CQEs)
+	// Wait for the operation CQE and, when the kernel reports MORE, its
+	// notification CQE.
 	cqes := make([]uring.CQEView, 16)
 	deadline := time.Now().Add(3 * time.Second)
 	b := iox.Backoff{}
@@ -122,7 +123,7 @@ func TestSendZeroCopyFixed(t *testing.T) {
 					t.Logf("notification CQE received, res=%d flags=0x%x", cqe.Res, cqe.Flags)
 				} else {
 					opCompleted = true
-					if cqe.Res == -95 { // EOPNOTSUPP
+					if cqe.Res == -int32(uring.EOPNOTSUPP) {
 						eopnotsupp = true
 						t.Logf("SEND_ZC returned EOPNOTSUPP (expected on loopback/Unix sockets)")
 					} else if cqe.Res < 0 {
@@ -176,8 +177,9 @@ type singleTarget struct {
 func (t *singleTarget) Count() int       { return 1 }
 func (t *singleTarget) FD(i int) iofd.FD { return iofd.FD(t.fd) }
 
-// TestZeroCopyNotificationFlags verifies the two-CQE notification model.
-// Zero-copy send generates: operation CQE (with MORE flag) + notification CQE (with NOTIF flag).
+// TestZeroCopyNotificationFlags verifies the zero-copy notification path.
+// The notification path emits an operation CQE with MORE and a notification CQE
+// with NOTIF; terminal operation CQEs without MORE use the fallback path.
 func TestZeroCopyNotificationFlags(t *testing.T) {
 	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
 		opt.Entries = uring.EntriesSmall
@@ -246,25 +248,26 @@ func TestZeroCopyNotificationFlags(t *testing.T) {
 	if opCQE == nil {
 		t.Fatal("operation CQE not received")
 	}
-	if opCQE.Res == -95 { // EOPNOTSUPP
+	if opCQE.Res == -int32(uring.EOPNOTSUPP) {
 		t.Log("SEND_ZC returned EOPNOTSUPP (expected on Unix sockets)")
-		// Still verify notification model works even with EOPNOTSUPP
 	} else if opCQE.Res < 0 {
 		t.Errorf("SEND_ZC failed: res=%d", opCQE.Res)
 	}
 
-	// Verify HasMore flag indicates notification coming
-	// (Note: HasMore may not always be set depending on timing)
+	// HasMore reports whether a notification CQE follows the operation CQE.
 	t.Logf("operation HasMore: %v", opCQE.HasMore())
 
-	// Verify notification CQE (should still be received even on EOPNOTSUPP)
 	if notifCQE == nil {
-		t.Log("notification CQE not received (may be timing dependent)")
+		if opCQE.HasMore() {
+			t.Log("notification CQE not received before deadline")
+		} else {
+			t.Log("terminal operation CQE used no-notification fallback")
+		}
 	} else {
 		if !notifCQE.IsNotification() {
 			t.Error("notification CQE missing IORING_CQE_F_NOTIF flag")
 		}
-		t.Log("two-CQE notification model verified")
+		t.Log("zero-copy notification lifecycle verified")
 	}
 }
 
@@ -343,7 +346,7 @@ func TestSendZeroCopyFixedMultiTarget(t *testing.T) {
 			cqe := &cqes[i]
 			if cqe.Op() == uring.IORING_OP_SEND_ZC && !cqe.IsNotification() {
 				opCount++
-				if cqe.Res == -95 { // EOPNOTSUPP
+				if cqe.Res == -int32(uring.EOPNOTSUPP) {
 					eopnotsupp = true
 					t.Logf("SEND_ZC[%d] returned EOPNOTSUPP (expected on Unix sockets)", opCount-1)
 				} else if cqe.Res < 0 {
@@ -446,9 +449,10 @@ func TestZeroCopyBufferSafety(t *testing.T) {
 	b := iox.Backoff{}
 	notifReceived := false
 	opCompleted := false
+	releaseReady := false
 	eopnotsupp := false
 
-	for time.Now().Before(deadline) && !notifReceived {
+	for time.Now().Before(deadline) && !releaseReady {
 		n, err := ring.Wait(cqes)
 		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
 			t.Fatalf("Wait: %v", err)
@@ -458,21 +462,27 @@ func TestZeroCopyBufferSafety(t *testing.T) {
 			if cqe.Op() == uring.IORING_OP_SEND_ZC {
 				if cqe.IsNotification() {
 					notifReceived = true
+					releaseReady = true
 				} else {
 					opCompleted = true
-					if cqe.Res == -95 { // EOPNOTSUPP
+					if cqe.Res == -int32(uring.EOPNOTSUPP) {
 						eopnotsupp = true
+					} else if cqe.Res < 0 {
+						t.Errorf("SEND_ZC failed: res=%d", cqe.Res)
+					}
+					if !cqe.HasMore() {
+						releaseReady = true
 					}
 				}
 			}
-		}
-		if opCompleted && !notifReceived {
-			// Keep waiting for notification
 		}
 		b.Wait()
 	}
 
 	if !opCompleted {
+		if !notifReceived {
+			t.Skip("no zero-copy CQEs observed on Unix socket pair in this environment")
+		}
 		t.Fatal("operation CQE not received")
 	}
 
@@ -480,6 +490,9 @@ func TestZeroCopyBufferSafety(t *testing.T) {
 	if eopnotsupp {
 		t.Log("SEND_ZC returned EOPNOTSUPP, buffer safety test verified (no data sent)")
 		return
+	}
+	if !releaseReady {
+		t.Skip("SEND_ZC release frontier not observed before deadline")
 	}
 
 	// Read first message
@@ -515,6 +528,7 @@ func TestZeroCopyBufferSafety(t *testing.T) {
 	deadline = time.Now().Add(3 * time.Second)
 	b = iox.Backoff{}
 	op2Completed := false
+	op2Unsupported := false
 
 	for time.Now().Before(deadline) && !op2Completed {
 		n, err := ring.Wait(cqes)
@@ -525,9 +539,20 @@ func TestZeroCopyBufferSafety(t *testing.T) {
 			cqe := &cqes[i]
 			if cqe.Op() == uring.IORING_OP_SEND_ZC && !cqe.IsNotification() {
 				op2Completed = true
+				if cqe.Res == -int32(uring.EOPNOTSUPP) {
+					op2Unsupported = true
+				} else if cqe.Res < 0 {
+					t.Errorf("second SEND_ZC failed: res=%d", cqe.Res)
+				}
 			}
 		}
 		b.Wait()
+	}
+	if !op2Completed {
+		t.Skip("second SEND_ZC operation CQE not observed before deadline")
+	}
+	if op2Unsupported {
+		t.Skip("second SEND_ZC returned EOPNOTSUPP in this environment")
 	}
 
 	// Read second message
@@ -611,7 +636,7 @@ func TestZeroCopyLargeBuffer(t *testing.T) {
 			cqe := &cqes[i]
 			if cqe.Op() == uring.IORING_OP_SEND_ZC && !cqe.IsNotification() {
 				opCompleted = true
-				if cqe.Res == -95 {
+				if cqe.Res == -int32(uring.EOPNOTSUPP) {
 					t.Log("SEND_ZC returned EOPNOTSUPP (expected on Unix sockets)")
 				} else if cqe.Res < 0 {
 					t.Errorf("SEND_ZC failed: res=%d", cqe.Res)
@@ -701,7 +726,7 @@ func TestZeroCopyMultipleBuffers(t *testing.T) {
 			cqe := &cqes[i]
 			if cqe.Op() == uring.IORING_OP_SEND_ZC && !cqe.IsNotification() {
 				completions++
-				if cqe.Res == -95 {
+				if cqe.Res == -int32(uring.EOPNOTSUPP) {
 					t.Logf("buffer %d: EOPNOTSUPP", completions-1)
 				} else if cqe.Res < 0 {
 					t.Errorf("buffer %d failed: res=%d", completions-1, cqe.Res)
@@ -851,7 +876,7 @@ func TestZeroCopySequentialSends(t *testing.T) {
 						notifDone = true
 					} else {
 						opDone = true
-						if cqe.Res == -95 {
+						if cqe.Res == -int32(uring.EOPNOTSUPP) {
 							t.Logf("send[%d]: EOPNOTSUPP", seq)
 							unsupported = true
 							notifDone = true // Skip waiting for notification

@@ -8,6 +8,7 @@ package uring_test
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -97,22 +98,25 @@ func TestListenerWithAccept(t *testing.T) {
 
 	// Phase 3: Connect clients
 	const numClients = 3
+	clientErrs := make(chan error, numClients)
 	for i := 0; i < numClients; i++ {
 		go func(idx int) {
-			conn, err := net.Dial("tcp", addr.String())
+			conn, err := net.DialTimeout("tcp", addr.String(), 2*time.Second)
 			if err != nil {
+				clientErrs <- fmt.Errorf("client %d dial: %w", idx, err)
 				return
 			}
-			conn.Write([]byte("hello"))
+			_, _ = conn.Write([]byte("hello"))
 			time.Sleep(50 * time.Millisecond)
 			conn.Close()
+			clientErrs <- nil
 		}(i)
 	}
 
 	// Process accepts
 	acceptCount := 0
 	cqes := make([]uring.CQEView, 32)
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	b := iox.Backoff{}
 
 	for acceptCount < numClients && time.Now().Before(deadline) {
@@ -121,7 +125,7 @@ func TestListenerWithAccept(t *testing.T) {
 			t.Fatalf("Wait: %v", err)
 		}
 		for i := range n {
-			if dispatchSimplifiedMultishotCQE(acceptHandler, cqes[i]) {
+			if acceptSub.HandleCQE(cqes[i]) {
 				select {
 				case fd := <-acceptHandler.accepted:
 					acceptCount++
@@ -135,7 +139,29 @@ func TestListenerWithAccept(t *testing.T) {
 	}
 
 	acceptSub.Cancel()
-	t.Logf("Accepted %d connections via multishot", acceptCount)
+	clientFailed := false
+	for i := 0; i < numClients; i++ {
+		select {
+		case err := <-clientErrs:
+			if err != nil {
+				t.Error(err)
+				clientFailed = true
+			}
+		case <-time.After(2 * time.Second):
+			t.Errorf("client %d did not finish", i)
+			clientFailed = true
+		}
+	}
+	if clientFailed {
+		t.FailNow()
+	}
+	if acceptCount == 0 {
+		t.Skip("AcceptMultishot completion not received - timing-sensitive")
+	}
+	if acceptCount != numClients {
+		t.Fatalf("accepted %d/%d connections via multishot", acceptCount, numClients)
+	}
+	t.Logf("Accepted %d/%d connections via multishot", acceptCount, numClients)
 }
 
 // exampleListenerHandler implements ListenerHandler for examples.

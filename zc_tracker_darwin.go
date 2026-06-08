@@ -8,9 +8,10 @@ package uring
 
 import "code.hybscloud.com/iofd"
 
-// Zero-copy send states for the normal notification path (darwin stub).
+// Zero-copy send states for the notification path (darwin stub).
 const (
 	zcStateSubmitted uint32 = iota
+	zcStateEarlyNotified
 	zcStateCompleted
 	zcStateNotified
 )
