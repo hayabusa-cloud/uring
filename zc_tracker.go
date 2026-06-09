@@ -14,53 +14,110 @@ import (
 	"code.hybscloud.com/iox"
 )
 
-// Zero-copy send states for the two-CQE model.
+// Zero-copy send states for notification and no-notification release paths.
 const (
-	zcStateSubmitted uint32 = iota // SQE submitted, waiting for first CQE
-	zcStateCompleted               // First CQE received (IORING_CQE_F_MORE set)
-	zcStateNotified                // The second CQE received (IORING_CQE_F_NOTIF set)
+	zcStateSubmitted     uint32 = iota // SQE submitted, waiting for data CQE
+	zcStateEarlyNotified               // Notification CQE arrived before data CQE
+	zcStateCompleted                   // Data CQE received (IORING_CQE_F_MORE set)
+	zcStateNotified                    // Terminal state; buffer and ExtSQE may be released
 )
 
 // zcTrackerData tracks zero-copy send state in ExtSQE UserData.
 // Layout: 16 bytes, fits in Ctx0V5.Data[16].
 type zcTrackerData struct {
-	used     atomic.Bool   // 4 bytes - one-shot handler invocation
-	state    atomic.Uint32 // 4 bytes - state machine
-	opResult atomic.Int32  // 4 bytes - operation result from first CQE
-	_        [4]byte       // padding to 16 bytes
+	meta atomic.Uint64 // state in high 32 bits, result in low 32 bits
+	_    [8]byte       // padding to 16 bytes
 }
 
 var _ [16 - unsafe.Sizeof(zcTrackerData{})]struct{}
 
-// tryInvokeOnce ensures the handler is invoked exactly once.
-// Returns true on the first call, false on subsequent calls.
-//
 //go:nosplit
-func (d *zcTrackerData) tryInvokeOnce() bool {
-	return d.used.CompareAndSwap(false, true)
+func zcPackMeta(state uint32, result int32) uint64 {
+	return uint64(state)<<32 | uint64(uint32(result))
+}
+
+//go:nosplit
+func zcMetaState(meta uint64) uint32 {
+	return uint32(meta >> 32)
+}
+
+//go:nosplit
+func zcMetaResult(meta uint64) int32 {
+	return int32(uint32(meta))
 }
 
 // markCompleted atomically transitions from Submitted to Completed.
-// Stores the operation result before transitioning.
+// If a notification arrived early, it closes the lifecycle after the data CQE.
 //
 //go:nosplit
-func (d *zcTrackerData) markCompleted(result int32) bool {
-	d.opResult.Store(result)
-	return d.state.CompareAndSwap(zcStateSubmitted, zcStateCompleted)
+func (d *zcTrackerData) markCompleted(result int32) (complete bool, release bool) {
+	for {
+		meta := d.meta.Load()
+		switch zcMetaState(meta) {
+		case zcStateSubmitted:
+			if d.meta.CompareAndSwap(meta, zcPackMeta(zcStateCompleted, result)) {
+				return true, false
+			}
+		case zcStateEarlyNotified:
+			if d.meta.CompareAndSwap(meta, zcPackMeta(zcStateNotified, result)) {
+				return true, true
+			}
+		default:
+			return false, false
+		}
+	}
 }
 
-// markNotified atomically transitions from Completed to Notified.
+// markNotification atomically processes a notification CQE.
+// It returns true when the notification closes the lifecycle—OnNotification
+// should run and the ExtSQE should be released.
 //
 //go:nosplit
-func (d *zcTrackerData) markNotified() bool {
-	return d.state.CompareAndSwap(zcStateCompleted, zcStateNotified)
+func (d *zcTrackerData) markNotification() (ready bool) {
+	for {
+		meta := d.meta.Load()
+		result := zcMetaResult(meta)
+		switch zcMetaState(meta) {
+		case zcStateCompleted:
+			if d.meta.CompareAndSwap(meta, zcPackMeta(zcStateNotified, result)) {
+				return true
+			}
+		case zcStateSubmitted:
+			if d.meta.CompareAndSwap(meta, zcPackMeta(zcStateEarlyNotified, result)) {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+}
+
+// markTerminalData atomically completes a terminal data CQE without MORE.
+// If no notification arrived, this is the no-notification fallback. If a
+// notification arrived early, this pairs with it and closes the lifecycle.
+// Returns true when the lifecycle closes—OnCompleted, OnNotification, and
+// pool release should all run.
+//
+//go:nosplit
+func (d *zcTrackerData) markTerminalData(result int32) (ready bool) {
+	for {
+		meta := d.meta.Load()
+		switch zcMetaState(meta) {
+		case zcStateSubmitted, zcStateEarlyNotified:
+			if d.meta.CompareAndSwap(meta, zcPackMeta(zcStateNotified, result)) {
+				return true
+			}
+		default:
+			return false
+		}
+	}
 }
 
 // result returns the operation result stored during completion.
 //
 //go:nosplit
 func (d *zcTrackerData) result() int32 {
-	return d.opResult.Load()
+	return zcMetaResult(d.meta.Load())
 }
 
 // ZCHandler handles zero-copy send completion events.
@@ -71,20 +128,27 @@ type ZCHandler interface {
 	OnCompleted(result int32)
 
 	// OnNotification is called when the buffer can be safely reused.
-	// This is the second CQE in the zero-copy two-CQE model and it carries
-	// the original send result observed at completion time.
+	// In the notification path this callback runs after the data CQE is known,
+	// even if the notification CQE arrived first. If the data CQE is terminal
+	// without MORE, the tracker calls this from the terminal no-notification
+	// fallback. The result is the original send result.
 	OnNotification(result int32)
 }
 
-// ZCTracker manages zero-copy send operations through the two-CQE model.
-// Zero-copy sends produce two CQEs:
-//  1. Operation CQE (IORING_CQE_F_MORE) - send completed, buffer still in use
-//  2. Notification CQE (IORING_CQE_F_NOTIF) - buffer can be reused
+// ZCTracker manages zero-copy send operations through the notification path and
+// the terminal no-notification fallback. The notification path pairs an
+// operation CQE with MORE and a notification CQE; the tracker tolerates either
+// CQE arrival order and releases only after the pair is complete. The fallback
+// produces a terminal operation CQE without MORE.
+//
+// A terminal operation CQE without IORING_CQE_F_MORE is release-ready for this
+// tracker. If no notification was observed, it is the no-notification fallback;
+// if a notification arrived early, it closes the already paired lifecycle.
 //
 // The tracker ensures:
 //   - Handlers are invoked in the correct order
 //   - Each handler is invoked exactly once
-//   - ExtSQE is returned to pool only after notification
+//   - ExtSQE is returned to pool only after data plus notification, or terminal fallback
 type ZCTracker struct {
 	ring *Uring
 	pool *ContextPools
@@ -101,9 +165,39 @@ func NewZCTracker(ring *Uring, pool *ContextPools) *ZCTracker {
 // SendZC submits a zero-copy send operation.
 // The handler receives OnCompleted for the send CQE and OnNotification when the
 // buffer can be safely reused.
+// Caller must keep buf valid and unmodified until OnNotification runs.
 // Returns iox.ErrWouldBlock if the context pool is exhausted.
 func (t *ZCTracker) SendZC(fd iofd.FD, buf []byte, handler ZCHandler, options ...OpOptionFunc) error {
-	flags, ioprio, offset, n := t.ring.sendOptions(buf, options)
+	if len(buf) < 1 {
+		return ErrInvalidParam
+	}
+
+	var flags uint8 = uringOpFlagsNone
+	var ioprio uint16 = uringOpIOPrioNone
+	dataOffset := 0
+	n := len(buf)
+	if len(options) > 0 {
+		opt := defaultUringOpOption
+		opt.Apply(options...)
+		if opt.Offset < 0 || opt.Offset > int64(len(buf)) {
+			return ErrInvalidParam
+		}
+		dataOffset = int(opt.Offset)
+		remaining := len(buf) - dataOffset
+		if opt.N != nil {
+			if *opt.N < 1 || *opt.N > remaining {
+				return ErrInvalidParam
+			}
+			n = *opt.N
+		} else {
+			n = remaining
+			if n < 1 {
+				return ErrInvalidParam
+			}
+		}
+		flags = opt.Flags
+		ioprio = opt.IOPrio
+	}
 
 	ext := t.pool.Extended()
 	if ext == nil {
@@ -119,7 +213,7 @@ func (t *ZCTracker) SendZC(fd iofd.FD, buf []byte, handler ZCHandler, options ..
 	ext.SQE.flags = flags | t.ring.writeLikeOpFlags
 	ext.SQE.ioprio = ioprio
 	ext.SQE.fd = int32(fd)
-	ext.SQE.addr = uint64(uintptr(unsafe.Pointer(unsafe.SliceData(buf)))) + uint64(offset)
+	ext.SQE.addr = uint64(uintptr(unsafe.Pointer(unsafe.SliceData(buf)))) + uint64(dataOffset)
 	ext.SQE.len = uint32(n)
 	ext.SQE.off = 0
 	ext.SQE.uflags = 0
@@ -135,17 +229,45 @@ func (t *ZCTracker) SendZC(fd iofd.FD, buf []byte, handler ZCHandler, options ..
 }
 
 // SendZCFixed submits a zero-copy send using a registered buffer.
+// Caller must keep the registered buffer range valid and unmodified until
+// OnNotification runs.
 // Returns iox.ErrWouldBlock if the context pool is exhausted.
 func (t *ZCTracker) SendZCFixed(fd iofd.FD, bufIndex int, offset int, length int, handler ZCHandler, options ...OpOptionFunc) error {
 	buf := t.ring.RegisteredBuffer(bufIndex)
 	if buf == nil {
 		return ErrInvalidParam
 	}
-	if offset < 0 || length < 0 || offset+length > len(buf) {
+	if offset < 0 || length < 1 || offset > len(buf) || length > len(buf)-offset {
 		return ErrInvalidParam
 	}
 
-	flags, ioprio, off, n := t.ring.sendOptions(buf[offset:offset+length], options)
+	var flags uint8 = uringOpFlagsNone
+	var ioprio uint16 = uringOpIOPrioNone
+	dataOffset := 0
+	n := length
+	if len(options) > 0 {
+		opt := defaultUringOpOption
+		opt.Apply(options...)
+		if opt.Offset < 0 || opt.Offset > int64(length) {
+			return ErrInvalidParam
+		}
+		dataOffset = int(opt.Offset)
+		remaining := length - dataOffset
+		if opt.N != nil {
+			if *opt.N < 1 || *opt.N > remaining {
+				return ErrInvalidParam
+			}
+			n = *opt.N
+		} else {
+			n = remaining
+			if n < 1 {
+				return ErrInvalidParam
+			}
+		}
+		flags = opt.Flags
+		ioprio = opt.IOPrio
+	}
+	effectiveOffset := offset + dataOffset
 
 	ext := t.pool.Extended()
 	if ext == nil {
@@ -162,7 +284,7 @@ func (t *ZCTracker) SendZCFixed(fd iofd.FD, bufIndex int, offset int, length int
 	ext.SQE.flags = flags | t.ring.writeLikeOpFlags
 	ext.SQE.ioprio = ioprio | IORING_RECVSEND_FIXED_BUF
 	ext.SQE.fd = int32(fd)
-	ext.SQE.addr = uint64(uintptr(unsafe.Pointer(unsafe.SliceData(buf)))) + uint64(offset+int(off))
+	ext.SQE.addr = uint64(uintptr(unsafe.Pointer(unsafe.SliceData(buf)))) + uint64(effectiveOffset)
 	ext.SQE.len = uint32(n)
 	ext.SQE.off = 0
 	ext.SQE.uflags = 0
@@ -180,57 +302,56 @@ func (t *ZCTracker) SendZCFixed(fd iofd.FD, bufIndex int, offset int, length int
 
 // HandleCQE processes a CQE that may be a zero-copy completion or notification.
 // Returns true if the CQE was handled, false if it's not a ZC tracker CQE.
+//
+// HandleCQE is for immediate dispatch in the caller's serialized completion
+// loop. Caller-side completion code must keep completion referents reachable
+// until CQE reap and serialize retirement.
 func (t *ZCTracker) HandleCQE(cqe CQEView) bool {
 	if !cqe.Extended() {
 		return false
 	}
 
 	ext := cqe.ExtSQE()
-	ctx := asZCCtx(ext)
-	if ctx == nil {
-		return false
-	}
 	owner, _ := extAnchors(ext).owner.(*ZCTracker)
 	if owner != t {
 		return false
 	}
 
+	ctx := asZCCtx(ext)
 	handler := zcGetHandler(ext)
-	if handler == nil {
-		return false
-	}
 
 	return t.dispatchCQE(cqe, ext, ctx, handler)
 }
 
-// dispatchCQE handles the two-CQE zero-copy state machine.
+// dispatchCQE handles the zero-copy notification and release state machine.
 func (t *ZCTracker) dispatchCQE(cqe CQEView, ext *ExtSQE, ctx *zcCtx, handler ZCHandler) bool {
 	tracker := zcGetTrackerData(ctx)
 
 	if cqe.IsNotification() {
-		// Second CQE: notification - buffer can be reused
-		if tracker.markNotified() {
+		if tracker.markNotification() {
 			handler.OnNotification(tracker.result())
+			t.pool.PutExtended(ext)
 		}
-		// Notification CQEs are terminal for this operation, even if the state
-		// machine has already advanced or the caller replays the CQE.
-		t.pool.PutExtended(ext)
 		return true
 	}
 
 	if cqe.HasMore() {
-		// First CQE: operation completed, more CQEs coming
-		if tracker.markCompleted(cqe.Res) {
+		// Data CQE with MORE: operation completed, notification may follow.
+		complete, release := tracker.markCompleted(cqe.Res)
+		if complete {
 			handler.OnCompleted(cqe.Res)
+		}
+		if release {
+			handler.OnNotification(cqe.Res)
+			t.pool.PutExtended(ext)
 		}
 		return true
 	}
 
-	// Single CQE without MORE flag - possibly EOPNOTSUPP
-	// Complete immediately and return to pool
-	if tracker.tryInvokeOnce() {
+	// Terminal data CQE without MORE: either terminal no-notification
+	// fallback, or the data half of an early-notification pair.
+	if tracker.markTerminalData(cqe.Res) {
 		handler.OnCompleted(cqe.Res)
-		// No notification expected, complete now
 		handler.OnNotification(cqe.Res)
 		t.pool.PutExtended(ext)
 	}
@@ -252,7 +373,9 @@ func zcTrackerCQEHandler(_ *Uring, _ *ioUringSqe, cqe *ioUringCqe) {
 	if tracker == nil {
 		return
 	}
-	tracker.HandleCQE(view)
+	ctx := asZCCtx(ext)
+	handler := zcGetHandler(ext)
+	tracker.dispatchCQE(view, ext, ctx, handler)
 }
 
 // zcCtx is the raw scalar context layout for zero-copy tracking.
@@ -271,9 +394,7 @@ func zcInitCtx(ext *ExtSQE, tracker *ZCTracker, handler ZCHandler) *zcCtx {
 	anchors.owner = tracker
 	anchors.handler = zcHandlerOrDefault(handler)
 	// Initialize tracker state
-	ctx.Tracker.used.Store(false)
-	ctx.Tracker.state.Store(zcStateSubmitted)
-	ctx.Tracker.opResult.Store(0)
+	ctx.Tracker.meta.Store(zcPackMeta(zcStateSubmitted, 0))
 	return ctx
 }
 

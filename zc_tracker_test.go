@@ -40,7 +40,8 @@ func (h *testZCHandler) OnNotification(result int32) {
 	h.notifyCalls.Add(1)
 }
 
-// TestZCTrackerBasic verifies the ZCTracker handles the two-CQE model.
+// TestZCTrackerBasic verifies the ZCTracker handles the notification and
+// terminal no-notification fallback lifecycle.
 func TestZCTrackerBasic(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping zero-copy tracker test in short mode (requires reliable io_uring)")
@@ -129,8 +130,8 @@ func TestZCTrackerBasic(t *testing.T) {
 		t.Skip("no zero-copy callbacks observed on loopback in this environment")
 	}
 
-	// Handle EOPNOTSUPP (-95) gracefully
-	if completedRes == -95 {
+	// Handle EOPNOTSUPP gracefully.
+	if completedRes == -int32(uring.EOPNOTSUPP) {
 		t.Log("EOPNOTSUPP returned (expected on loopback)")
 		if completedCalls != 1 {
 			t.Errorf("expected 1 completed call for EOPNOTSUPP, got %d", completedCalls)
@@ -399,7 +400,7 @@ func TestZCTrackerExactlyOnce(t *testing.T) {
 	notifyCalls := handler.notifyCalls.Load()
 
 	// EOPNOTSUPP case: both called together
-	if handler.completedRes.Load() == -95 {
+	if handler.completedRes.Load() == -int32(uring.EOPNOTSUPP) {
 		if completedCalls != 1 || notifyCalls != 1 {
 			t.Errorf("EOPNOTSUPP: expected 1/1 calls, got %d/%d", completedCalls, notifyCalls)
 		}

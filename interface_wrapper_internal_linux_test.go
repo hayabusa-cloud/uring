@@ -9,6 +9,7 @@ package uring
 import (
 	"errors"
 	"net"
+	"runtime"
 	"testing"
 	"unsafe"
 
@@ -1274,7 +1275,7 @@ func TestIncrementalRecvClearsBorrowedExtendedSQE(t *testing.T) {
 }
 
 func TestZCTrackerSendZCClearsBorrowedExtendedSQE(t *testing.T) {
-	ring := newWrapperTestRing(t)
+	ring := newWrapperSyntheticSubmitRing(t, 8)
 	pool := NewContextPools(1)
 	poisonNextExtendedSQE(pool)
 
@@ -1291,7 +1292,7 @@ func TestZCTrackerSendZCClearsBorrowedExtendedSQE(t *testing.T) {
 }
 
 func TestZCTrackerSendZCFixedClearsBorrowedExtendedSQE(t *testing.T) {
-	ring := newWrapperTestRing(t)
+	ring := newWrapperSyntheticSubmitRing(t, 8)
 	ring.bufs = [][]byte{[]byte("registered-payload")}
 	pool := NewContextPools(1)
 	poisonNextExtendedSQE(pool)
@@ -1306,4 +1307,214 @@ func TestZCTrackerSendZCFixedClearsBorrowedExtendedSQE(t *testing.T) {
 		t.Fatalf("SQE.opcode = %d, want %d", got, want)
 	}
 	assertNoStaleExtendedSQEFields(t, sqe, 0)
+}
+
+func newWrapperSyntheticSubmitRing(t *testing.T, entries uint32) *Uring {
+	t.Helper()
+
+	head := new(uint32)
+	tail := new(uint32)
+	mask := new(uint32)
+	ringEntries := new(uint32)
+	flags := new(uint32)
+	*mask = entries - 1
+	*ringEntries = entries
+	sqes := make([]ioUringSqe, entries)
+	t.Cleanup(func() {
+		runtime.KeepAlive(sqes)
+	})
+
+	return &Uring{
+		ioUring: &ioUring{
+			params: &ioUringParams{},
+			sq: ioUringSq{
+				kHead:        head,
+				kTail:        tail,
+				kRingMask:    mask,
+				kRingEntries: ringEntries,
+				kFlags:       flags,
+				array:        make([]uint32, entries),
+				sqesPtr:      unsafe.Pointer(unsafe.SliceData(sqes)),
+				sqeStride:    unsafe.Sizeof(ioUringSqe{}),
+			},
+			submit: submitState{
+				keepAlive: make([]submitKeepAlive, entries),
+				shared:    true,
+			},
+			ringFd:   -1,
+			pollerFd: -1,
+		},
+	}
+}
+
+func TestZCTrackerSendZCFixedRejectsOverflowingRange(t *testing.T) {
+	ring := newWrapperSyntheticSubmitRing(t, 8)
+	ring.bufs = [][]byte{[]byte("registered-payload")}
+	pool := NewContextPools(1)
+
+	tracker := NewZCTracker(ring, pool)
+	maxInt := int(^uint(0) >> 1)
+	if err := tracker.SendZCFixed(iofd.FD(11), 0, 1, maxInt, nil); !errors.Is(err, ErrInvalidParam) {
+		t.Fatalf("SendZCFixed overflow range error = %v, want %v", err, ErrInvalidParam)
+	}
+	if got := pool.ExtendedAvailable(); got != 1 {
+		t.Fatalf("available ExtSQE after invalid range = %d, want 1", got)
+	}
+	if got := ring.ioUring.sqCount(); got != 0 {
+		t.Fatalf("submitted SQEs after invalid range = %d, want 0", got)
+	}
+}
+
+func TestZCTrackerSendZCRejectsInvalidOptionRange(t *testing.T) {
+	ring := newWrapperSyntheticSubmitRing(t, 8)
+	pool := NewContextPools(1)
+
+	tracker := NewZCTracker(ring, pool)
+	err := tracker.SendZC(iofd.FD(11), nil, nil)
+	if !errors.Is(err, ErrInvalidParam) {
+		t.Fatalf("SendZC nil buffer error = %v, want %v", err, ErrInvalidParam)
+	}
+	if got := pool.ExtendedAvailable(); got != 1 {
+		t.Fatalf("available ExtSQE after nil buffer = %d, want 1", got)
+	}
+	if got := ring.ioUring.sqCount(); got != 0 {
+		t.Fatalf("submitted SQEs after nil buffer = %d, want 0", got)
+	}
+
+	err = tracker.SendZC(iofd.FD(11), []byte("payload"), nil, WithOffset(-1))
+	if !errors.Is(err, ErrInvalidParam) {
+		t.Fatalf("SendZC negative option offset error = %v, want %v", err, ErrInvalidParam)
+	}
+	if got := pool.ExtendedAvailable(); got != 1 {
+		t.Fatalf("available ExtSQE after invalid option range = %d, want 1", got)
+	}
+	if got := ring.ioUring.sqCount(); got != 0 {
+		t.Fatalf("submitted SQEs after invalid option range = %d, want 0", got)
+	}
+
+	err = tracker.SendZC(iofd.FD(11), []byte("payload"), nil, WithOffset(4), WithN(4))
+	if !errors.Is(err, ErrInvalidParam) {
+		t.Fatalf("SendZC overflowing option range error = %v, want %v", err, ErrInvalidParam)
+	}
+	if got := pool.ExtendedAvailable(); got != 1 {
+		t.Fatalf("available ExtSQE after overflowing option range = %d, want 1", got)
+	}
+	if got := ring.ioUring.sqCount(); got != 0 {
+		t.Fatalf("submitted SQEs after overflowing option range = %d, want 0", got)
+	}
+
+	err = tracker.SendZC(iofd.FD(11), []byte("payload"), nil, WithN(0))
+	if !errors.Is(err, ErrInvalidParam) {
+		t.Fatalf("SendZC zero option length error = %v, want %v", err, ErrInvalidParam)
+	}
+	if got := pool.ExtendedAvailable(); got != 1 {
+		t.Fatalf("available ExtSQE after zero option length = %d, want 1", got)
+	}
+	if got := ring.ioUring.sqCount(); got != 0 {
+		t.Fatalf("submitted SQEs after zero option length = %d, want 0", got)
+	}
+
+	err = tracker.SendZC(iofd.FD(11), []byte("payload"), nil, WithOffset(7))
+	if !errors.Is(err, ErrInvalidParam) {
+		t.Fatalf("SendZC empty option subrange error = %v, want %v", err, ErrInvalidParam)
+	}
+	if got := pool.ExtendedAvailable(); got != 1 {
+		t.Fatalf("available ExtSQE after empty option subrange = %d, want 1", got)
+	}
+	if got := ring.ioUring.sqCount(); got != 0 {
+		t.Fatalf("submitted SQEs after empty option subrange = %d, want 0", got)
+	}
+}
+
+func TestZCTrackerSendZCEncodesOptionRange(t *testing.T) {
+	ring := newWrapperSyntheticSubmitRing(t, 8)
+	pool := NewContextPools(1)
+	payload := []byte("payload")
+
+	tracker := NewZCTracker(ring, pool)
+	if err := tracker.SendZC(iofd.FD(11), payload, nil, WithOffset(2)); err != nil {
+		t.Fatalf("SendZC offset-only range: %v", err)
+	}
+
+	sqe := lastSubmittedSQE(t, ring)
+	base := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(payload))))
+	if sqe.addr != base+2 {
+		t.Fatalf("SendZC offset-only addr = %#x, want %#x", sqe.addr, base+2)
+	}
+	if sqe.len != uint32(len(payload)-2) {
+		t.Fatalf("SendZC offset-only len = %d, want %d", sqe.len, len(payload)-2)
+	}
+}
+
+func TestZCTrackerSendZCFixedRejectsInvalidOptionRange(t *testing.T) {
+	ring := newWrapperSyntheticSubmitRing(t, 8)
+	ring.bufs = [][]byte{[]byte("registered-payload")}
+	pool := NewContextPools(1)
+
+	tracker := NewZCTracker(ring, pool)
+	err := tracker.SendZCFixed(iofd.FD(11), 0, 2, 5, nil, WithOffset(-1))
+	if !errors.Is(err, ErrInvalidParam) {
+		t.Fatalf("SendZCFixed negative option offset error = %v, want %v", err, ErrInvalidParam)
+	}
+	if got := pool.ExtendedAvailable(); got != 1 {
+		t.Fatalf("available ExtSQE after invalid option range = %d, want 1", got)
+	}
+	if got := ring.ioUring.sqCount(); got != 0 {
+		t.Fatalf("submitted SQEs after invalid option range = %d, want 0", got)
+	}
+
+	err = tracker.SendZCFixed(iofd.FD(11), 0, 2, 5, nil, WithOffset(3), WithN(3))
+	if !errors.Is(err, ErrInvalidParam) {
+		t.Fatalf("SendZCFixed overflowing option range error = %v, want %v", err, ErrInvalidParam)
+	}
+	if got := pool.ExtendedAvailable(); got != 1 {
+		t.Fatalf("available ExtSQE after overflowing option range = %d, want 1", got)
+	}
+	if got := ring.ioUring.sqCount(); got != 0 {
+		t.Fatalf("submitted SQEs after overflowing option range = %d, want 0", got)
+	}
+
+	err = tracker.SendZCFixed(iofd.FD(11), 0, 2, 5, nil, WithN(0))
+	if !errors.Is(err, ErrInvalidParam) {
+		t.Fatalf("SendZCFixed zero option length error = %v, want %v", err, ErrInvalidParam)
+	}
+	if got := pool.ExtendedAvailable(); got != 1 {
+		t.Fatalf("available ExtSQE after zero option length = %d, want 1", got)
+	}
+	if got := ring.ioUring.sqCount(); got != 0 {
+		t.Fatalf("submitted SQEs after zero option length = %d, want 0", got)
+	}
+
+	err = tracker.SendZCFixed(iofd.FD(11), 0, 2, 5, nil, WithOffset(5))
+	if !errors.Is(err, ErrInvalidParam) {
+		t.Fatalf("SendZCFixed empty option subrange error = %v, want %v", err, ErrInvalidParam)
+	}
+	if got := pool.ExtendedAvailable(); got != 1 {
+		t.Fatalf("available ExtSQE after empty option subrange = %d, want 1", got)
+	}
+	if got := ring.ioUring.sqCount(); got != 0 {
+		t.Fatalf("submitted SQEs after empty option subrange = %d, want 0", got)
+	}
+}
+
+func TestZCTrackerSendZCFixedEncodesOptionRange(t *testing.T) {
+	ring := newWrapperSyntheticSubmitRing(t, 8)
+	ring.bufs = [][]byte{[]byte("registered-payload")}
+	pool := NewContextPools(1)
+
+	tracker := NewZCTracker(ring, pool)
+	if err := tracker.SendZCFixed(iofd.FD(11), 0, 2, 10, nil, WithOffset(3)); err != nil {
+		t.Fatalf("SendZCFixed offset-only range: %v", err)
+	}
+
+	sqe := lastSubmittedSQE(t, ring)
+	buf := ring.bufs[0]
+	base := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(buf))))
+	wantOffset := uint64(2 + 3)
+	if sqe.addr != base+wantOffset {
+		t.Fatalf("SendZCFixed offset-only addr = %#x, want %#x", sqe.addr, base+wantOffset)
+	}
+	if sqe.len != uint32(10-3) {
+		t.Fatalf("SendZCFixed offset-only len = %d, want %d", sqe.len, 10-3)
+	}
 }

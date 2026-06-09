@@ -727,7 +727,7 @@ type SendTargets interface {
 // Multicast sends data to multiple sockets, selecting copy vs zero-copy per message size.
 //
 // Strategy selection (conservative thresholds, based on Linux 6.18 measurements):
-// io_uring cycle ~523ns, ZC needs 2 cycles (~1046ns overhead).
+// io_uring cycle ~523ns; notification-path ZC can require an extra cycle.
 // Uses zero-copy only when memcpy savings clearly exceed overhead:
 //   - N < 8:    >= 8 KiB uses zero-copy (high bar, overhead not amortized)
 //   - N < 64:   >= 4 KiB uses zero-copy
@@ -738,9 +738,11 @@ type SendTargets interface {
 // For aggressive zero-copy usage, use MulticastZeroCopy instead.
 //
 // Zero-copy notes:
-//   - Produces two CQEs per send: completion (IORING_CQE_F_MORE) + notification
+//   - The notification path produces completion (IORING_CQE_F_MORE) + notification CQEs
+//   - Terminal completion without IORING_CQE_F_MORE closes the data-CQE side
+//   - If no notification was observed, that terminal completion is the fallback
 //   - p must remain valid until all target sends complete
-//   - Zero-copy sends keep registered buffers immutable until notification CQE
+//   - Zero-copy sends keep registered buffers immutable until notification or fallback
 //   - Requires TCP sockets; returns EOPNOTSUPP on Unix sockets or loopback
 //
 // Parameters:
@@ -787,10 +789,11 @@ func (ur *Uring) Multicast(sqeCtx SQEContext, targets SendTargets, bufIndex int,
 	}
 
 	// Strategy: use zero-copy with registered buffers based on payload size and
-	// destination count. More destinations amortize ZC overhead (pinning, two-CQE).
+	// destination count. More destinations amortize ZC overhead such as pinning
+	// and notification handling.
 	//
 	// Conservative thresholds (based on Linux 6.18 measurements):
-	// io_uring cycle ~523ns, ZC needs 2 cycles (~1046ns overhead).
+	// io_uring cycle ~523ns; notification-path ZC can require an extra cycle.
 	// Use ZC only when memcpy savings clearly exceed overhead.
 	//
 	//   N < 8:    8 KiB  (high bar - ZC overhead not amortized)
@@ -854,8 +857,10 @@ func (ur *Uring) Multicast(sqeCtx SQEContext, targets SendTargets, bufIndex int,
 //   - Any scenario with O(1) payload and O(N) targets
 //
 // Zero-copy notes:
-//   - Produces two CQEs per send: completion (IORING_CQE_F_MORE) + notification
-//   - Registered buffers must remain immutable until notification CQE
+//   - The notification path produces completion (IORING_CQE_F_MORE) + notification CQEs
+//   - Terminal completion without IORING_CQE_F_MORE closes the data-CQE side
+//   - If no notification was observed, that terminal completion is the fallback
+//   - Registered buffers must remain immutable until notification or fallback
 //   - May return EOPNOTSUPP on Unix sockets or loopback
 func (ur *Uring) MulticastZeroCopy(sqeCtx SQEContext, targets SendTargets, bufIndex int, offset int64, n int, options ...OpOptionFunc) error {
 	count := targets.Count()

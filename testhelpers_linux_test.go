@@ -8,6 +8,7 @@ package uring_test
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -24,6 +25,29 @@ const (
 	testTwoRegisteredBuffersMem = 2 * uring.BufferSizeLarge
 	testProvidedBufferNum       = 4
 )
+
+func TestMain(m *testing.M) {
+	ring, err := uring.New(testMinimalBufferOptions)
+	if err != nil {
+		if testRingUnavailable(err) {
+			fmt.Fprintf(os.Stderr, "skipping uring tests: io_uring unavailable: %v\n", err)
+			os.Exit(0)
+		}
+		fmt.Fprintf(os.Stderr, "uring test probe failed: %v\n", err)
+		os.Exit(1)
+	}
+	if err := ring.Stop(); err != nil {
+		fmt.Fprintf(os.Stderr, "uring test probe cleanup failed: %v\n", err)
+		os.Exit(1)
+	}
+	os.Exit(m.Run())
+}
+
+func testRingUnavailable(err error) bool {
+	return errors.Is(err, uring.ErrPermission) ||
+		errors.Is(err, uring.ErrNotSupported) ||
+		errors.Is(err, uring.ErrNoMemory)
+}
 
 func testMinimalBufferOptions(opt *uring.Options) {
 	opt.LockedBufferMem = testLockedBufferMem

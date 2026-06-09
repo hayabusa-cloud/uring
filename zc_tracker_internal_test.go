@@ -21,6 +21,16 @@ func (h *zcContractHandler) OnNotification(result int32) {
 	h.notified = append(h.notified, result)
 }
 
+func assertNoPanic(t *testing.T, f func()) {
+	t.Helper()
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("unexpected panic: %v", r)
+		}
+	}()
+	f()
+}
+
 func TestZCTrackerNotificationUsesStoredCompletionResult(t *testing.T) {
 	pool := NewContextPools(4)
 	ext := pool.Extended()
@@ -53,13 +63,112 @@ func TestZCTrackerNotificationUsesStoredCompletionResult(t *testing.T) {
 	}
 }
 
-func TestZCTrackerDataTryInvokeOnceIsAffine(t *testing.T) {
+func TestZCTrackerDataNotificationTerminalIsAffine(t *testing.T) {
 	var data zcTrackerData
-	if !data.tryInvokeOnce() {
-		t.Fatal("first invocation was rejected")
+	data.meta.Store(zcPackMeta(zcStateCompleted, 23))
+
+	if !data.markNotification() {
+		t.Fatal("first notification transition: got false, want true")
 	}
-	if data.tryInvokeOnce() {
-		t.Fatal("second invocation was accepted")
+	if got := data.result(); got != 23 {
+		t.Fatalf("notification result: got %d, want 23", got)
+	}
+
+	if data.markNotification() {
+		t.Fatal("second notification transition: got true, want false")
+	}
+}
+
+func TestZCTrackerDataCompletionReplayKeepsFirstResult(t *testing.T) {
+	var data zcTrackerData
+
+	complete, release := data.markCompleted(23)
+	if !complete || release {
+		t.Fatalf("first completion transition: got complete=%v release=%v, want true false", complete, release)
+	}
+	complete, release = data.markCompleted(24)
+	if complete || release {
+		t.Fatalf("replayed completion transition: got complete=%v release=%v, want false false", complete, release)
+	}
+
+	if !data.markNotification() {
+		t.Fatal("notification transition: got false, want true")
+	}
+	if got := data.result(); got != 23 {
+		t.Fatalf("notification result after replayed completion: got %d, want 23", got)
+	}
+}
+
+func TestZCTrackerDataEarlyNotificationWaitsForData(t *testing.T) {
+	var data zcTrackerData
+
+	if data.markNotification() {
+		t.Fatal("early notification transition: got true, want false")
+	}
+	if got := zcMetaState(data.meta.Load()); got != zcStateEarlyNotified {
+		t.Fatalf("state after early notification: got %d, want %d", got, zcStateEarlyNotified)
+	}
+
+	complete, release := data.markCompleted(23)
+	if !complete || !release {
+		t.Fatalf("data after early notification: got complete=%v release=%v, want true true", complete, release)
+	}
+	if got := data.result(); got != 23 {
+		t.Fatalf("completion result after early notification: got %d, want 23", got)
+	}
+
+	complete, release = data.markCompleted(24)
+	if complete || release {
+		t.Fatalf("replayed completion transition: got complete=%v release=%v, want false false", complete, release)
+	}
+}
+
+func TestZCTrackerDataEarlyNotificationTerminalData(t *testing.T) {
+	var data zcTrackerData
+
+	if data.markNotification() {
+		t.Fatal("early notification transition: got true, want false")
+	}
+
+	if !data.markTerminalData(23) {
+		t.Fatal("terminal after early notification: got false, want true")
+	}
+	if got := data.result(); got != 23 {
+		t.Fatalf("terminal data result after early notification: got %d, want 23", got)
+	}
+}
+
+func TestZCTrackerDataTerminalFallbackIsAffine(t *testing.T) {
+	var data zcTrackerData
+
+	if !data.markTerminalData(23) {
+		t.Fatal("terminal fallback transition: got false, want true")
+	}
+	if got := data.result(); got != 23 {
+		t.Fatalf("terminal fallback result: got %d, want 23", got)
+	}
+	if data.markTerminalData(24) {
+		t.Fatal("replayed terminal fallback: got true, want false")
+	}
+	if data.markNotification() {
+		t.Fatal("late notification after fallback: got true, want false")
+	}
+}
+
+func TestZCTrackerDataCompletionAfterNotificationReplayIsRejected(t *testing.T) {
+	var data zcTrackerData
+
+	complete, release := data.markCompleted(23)
+	if !complete || release {
+		t.Fatal("first completion transition was rejected")
+	}
+
+	if !data.markNotification() {
+		t.Fatal("notification transition: got false, want true")
+	}
+	complete, release = data.markCompleted(24)
+	if complete || release {
+		t.Fatalf("completion after notification: got complete=%v release=%v, want false false", complete, release)
 	}
 }
 
@@ -89,7 +198,7 @@ func TestZCTrackerHandleCQEUsesNoopHandlerWhenNil(t *testing.T) {
 	}
 }
 
-func TestZCTrackerNotificationReturnsExtSQEOnUnexpectedState(t *testing.T) {
+func TestZCTrackerEarlyNotificationDoesNotReturnExtSQE(t *testing.T) {
 	pool := NewContextPools(1)
 	ext := pool.Extended()
 	if ext == nil {
@@ -99,7 +208,7 @@ func TestZCTrackerNotificationReturnsExtSQEOnUnexpectedState(t *testing.T) {
 	tracker := &ZCTracker{pool: pool}
 	ctx := zcInitCtx(ext, tracker, h)
 
-	ctx.Tracker.state.Store(zcStateSubmitted)
+	ctx.Tracker.meta.Store(zcPackMeta(zcStateSubmitted, 0))
 	notified := CQEView{Res: 0, Flags: IORING_CQE_F_NOTIF}
 	if !tracker.dispatchCQE(notified, ext, ctx, h) {
 		t.Fatal("notification CQE was not handled")
@@ -107,8 +216,79 @@ func TestZCTrackerNotificationReturnsExtSQEOnUnexpectedState(t *testing.T) {
 	if len(h.notified) != 0 {
 		t.Fatalf("unexpected notifications: got %v, want none", h.notified)
 	}
-	if got := pool.Extended(); got == nil {
-		t.Fatal("expected notification CQE to return ExtSQE to pool")
+	if got := pool.ExtendedAvailable(); got != 0 {
+		t.Fatalf("available ExtSQE after early notification: got %d, want 0", got)
+	}
+}
+
+func TestZCTrackerDataAfterEarlyNotificationCompletesAndReleases(t *testing.T) {
+	pool := NewContextPools(1)
+	ext := pool.Extended()
+	if ext == nil {
+		t.Fatal("pool exhausted")
+	}
+	h := &zcContractHandler{}
+	tracker := &ZCTracker{pool: pool}
+	ctx := zcInitCtx(ext, tracker, h)
+
+	notified := CQEView{Res: 0, Flags: IORING_CQE_F_NOTIF}
+	if !tracker.dispatchCQE(notified, ext, ctx, h) {
+		t.Fatal("notification CQE was not handled")
+	}
+	if got := pool.Extended(); got != nil {
+		t.Fatalf("ExtSQE reused after early notification: got %p, want nil", got)
+	}
+
+	completed := CQEView{Res: 23, Flags: IORING_CQE_F_MORE, ctx: PackExtended(ext)}
+	if !tracker.HandleCQE(completed) {
+		t.Fatal("data CQE after early notification was not handled")
+	}
+	if len(h.completed) != 1 || h.completed[0] != 23 {
+		t.Fatalf("completed callbacks after early notification: got %v, want [23]", h.completed)
+	}
+	if len(h.notified) != 1 || h.notified[0] != 23 {
+		t.Fatalf("notification callbacks after early notification: got %v, want [23]", h.notified)
+	}
+	if got := pool.ExtendedAvailable(); got != 1 {
+		t.Fatalf("available ExtSQE after data CQE: got %d, want 1", got)
+	}
+}
+
+func TestZCTrackerLateNotificationAfterTerminalFallbackDoesNotReleaseAgain(t *testing.T) {
+	pool := NewContextPools(1)
+	ext := pool.Extended()
+	if ext == nil {
+		t.Fatal("pool exhausted")
+	}
+	h := &zcContractHandler{}
+	tracker := &ZCTracker{pool: pool}
+	ctx := zcInitCtx(ext, tracker, h)
+
+	terminal := CQEView{Res: 23}
+	if !tracker.dispatchCQE(terminal, ext, ctx, h) {
+		t.Fatal("terminal CQE was not handled")
+	}
+	if len(h.completed) != 1 || h.completed[0] != 23 {
+		t.Fatalf("terminal completed callbacks: got %v, want [23]", h.completed)
+	}
+	if len(h.notified) != 1 || h.notified[0] != 23 {
+		t.Fatalf("terminal notification callbacks: got %v, want [23]", h.notified)
+	}
+	if got := pool.ExtendedAvailable(); got != 1 {
+		t.Fatalf("available ExtSQE after terminal fallback: got %d, want 1", got)
+	}
+
+	notified := CQEView{Res: 0, Flags: IORING_CQE_F_NOTIF, ctx: PackExtended(ext)}
+	assertNoPanic(t, func() {
+		if tracker.HandleCQE(notified) {
+			t.Fatal("late notification CQE was handled after ExtSQE release")
+		}
+	})
+	if len(h.completed) != 1 || len(h.notified) != 1 {
+		t.Fatalf("late notification callbacks: got completed=%v notified=%v, want one each", h.completed, h.notified)
+	}
+	if got := pool.ExtendedAvailable(); got != 1 {
+		t.Fatalf("available ExtSQE after late notification: got %d, want 1", got)
 	}
 }
 

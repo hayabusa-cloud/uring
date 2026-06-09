@@ -9,9 +9,9 @@ package uring
 import "code.hybscloud.com/iofd"
 
 // CQEView provides a view into a completion queue entry.
-// A copied CQEView is a completion observation, not durable route state. If
-// caller code stores it beyond the current dispatch turn, caller code must keep
-// its own route state.
+// A copied CQEView is a completion observation, not durable route state. If it
+// is stored beyond the current dispatch turn, caller code must pair it with
+// caller-owned route state.
 type CQEView struct {
 	Res   int32
 	Flags uint32
@@ -126,8 +126,9 @@ func (c *CQEView) SocketNonEmpty() bool {
 }
 
 // IsNotification reports whether this is a zero-copy notification CQE.
-// Zero-copy sends generate two CQEs: one for completion, one for notification
-// when the buffer can be reused.
+// Notification CQEs mark the buffer-reuse frontier. A terminal data CQE without
+// MORE closes the data side; if no notification was observed, it is the
+// no-notification fallback.
 func (c *CQEView) IsNotification() bool {
 	return c.Flags&IORING_CQE_F_NOTIF != 0
 }

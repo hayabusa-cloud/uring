@@ -12,9 +12,9 @@ import "code.hybscloud.com/iofd"
 // It exposes kernel completion facts directly and lets caller-side runtime
 // code decide how to route or interpret them. When available,
 // it also exposes the submission context that produced those facts.
-// A copied CQEView is a completion observation, not durable route state. If
-// caller code stores it beyond the current dispatch turn, caller code must keep
-// its own route state.
+// A copied CQEView is a completion observation, not durable route state. If it
+// is stored beyond the current dispatch turn, caller code must pair it with
+// caller-owned route state.
 //
 // # Property Patterns
 //
@@ -180,8 +180,9 @@ func (c *CQEView) SocketNonEmpty() bool {
 }
 
 // IsNotification reports whether this is a zero-copy notification CQE.
-// Zero-copy sends generate two CQEs: one for completion, one for notification
-// when the buffer can be reused.
+// Notification CQEs mark the buffer-reuse frontier. A terminal data CQE without
+// MORE closes the data side; if no notification was observed, it is the
+// no-notification fallback.
 //
 //go:nosplit
 func (c *CQEView) IsNotification() bool {

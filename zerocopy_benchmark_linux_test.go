@@ -227,7 +227,7 @@ func benchmarkZeroCopySend(b *testing.B, payloadSize int) {
 						notifDone = true
 					} else {
 						opDone = true
-						if cqe.Res == -95 && !eopnotsupp {
+						if cqe.Res == -int32(uring.EOPNOTSUPP) && !eopnotsupp {
 							eopnotsupp = true
 							b.Log("EOPNOTSUPP - zero-copy not supported on loopback")
 						}
@@ -435,7 +435,7 @@ func measureZeroCopySend(t *testing.T, payloadSize, iterations int) int64 {
 						notifDone = true
 					} else {
 						opDone = true
-						if cqe.Res == -95 {
+						if cqe.Res == -int32(uring.EOPNOTSUPP) {
 							eopnotsupp = true
 							notifDone = true // Skip notification wait
 						}
@@ -641,7 +641,7 @@ func measureZeroCopyMultiSend(t *testing.T, payloadSize, numDest, iterations int
 				// Handle both SEND_ZC (zero-copy path) and WRITE_FIXED (fallback path)
 				if op == uring.IORING_OP_SEND_ZC && !cqe.IsNotification() {
 					completed++
-					if cqe.Res == -95 {
+					if cqe.Res == -int32(uring.EOPNOTSUPP) {
 						eopnotsupp = true
 					}
 				} else if op == uring.IORING_OP_WRITE_FIXED {
