@@ -67,35 +67,32 @@ func TestZCTrackerDataNotificationTerminalIsAffine(t *testing.T) {
 	var data zcTrackerData
 	data.meta.Store(zcPackMeta(zcStateCompleted, 23))
 
-	notify, release := data.markNotification()
-	if !notify || !release {
-		t.Fatalf("first notification transition: got notify=%v release=%v, want true true", notify, release)
+	if !data.markNotification() {
+		t.Fatal("first notification transition: got false, want true")
 	}
 	if got := data.result(); got != 23 {
 		t.Fatalf("notification result: got %d, want 23", got)
 	}
 
-	notify, release = data.markNotification()
-	if notify || release {
-		t.Fatalf("second notification transition: got notify=%v release=%v, want false false", notify, release)
+	if data.markNotification() {
+		t.Fatal("second notification transition: got true, want false")
 	}
 }
 
 func TestZCTrackerDataCompletionReplayKeepsFirstResult(t *testing.T) {
 	var data zcTrackerData
 
-	complete, notify, release := data.markCompleted(23)
-	if !complete || notify || release {
-		t.Fatalf("first completion transition: got complete=%v notify=%v release=%v, want true false false", complete, notify, release)
+	complete, release := data.markCompleted(23)
+	if !complete || release {
+		t.Fatalf("first completion transition: got complete=%v release=%v, want true false", complete, release)
 	}
-	complete, notify, release = data.markCompleted(24)
-	if complete || notify || release {
-		t.Fatalf("replayed completion transition: got complete=%v notify=%v release=%v, want false false false", complete, notify, release)
+	complete, release = data.markCompleted(24)
+	if complete || release {
+		t.Fatalf("replayed completion transition: got complete=%v release=%v, want false false", complete, release)
 	}
 
-	notify, release = data.markNotification()
-	if !notify || !release {
-		t.Fatalf("notification transition: got notify=%v release=%v, want true true", notify, release)
+	if !data.markNotification() {
+		t.Fatal("notification transition: got false, want true")
 	}
 	if got := data.result(); got != 23 {
 		t.Fatalf("notification result after replayed completion: got %d, want 23", got)
@@ -105,39 +102,36 @@ func TestZCTrackerDataCompletionReplayKeepsFirstResult(t *testing.T) {
 func TestZCTrackerDataEarlyNotificationWaitsForData(t *testing.T) {
 	var data zcTrackerData
 
-	notify, release := data.markNotification()
-	if notify || release {
-		t.Fatalf("early notification transition: got notify=%v release=%v, want false false", notify, release)
+	if data.markNotification() {
+		t.Fatal("early notification transition: got true, want false")
 	}
 	if got := zcMetaState(data.meta.Load()); got != zcStateEarlyNotified {
 		t.Fatalf("state after early notification: got %d, want %d", got, zcStateEarlyNotified)
 	}
 
-	complete, notify, release := data.markCompleted(23)
-	if !complete || !notify || !release {
-		t.Fatalf("data after early notification: got complete=%v notify=%v release=%v, want true true true", complete, notify, release)
+	complete, release := data.markCompleted(23)
+	if !complete || !release {
+		t.Fatalf("data after early notification: got complete=%v release=%v, want true true", complete, release)
 	}
 	if got := data.result(); got != 23 {
 		t.Fatalf("completion result after early notification: got %d, want 23", got)
 	}
 
-	complete, notify, release = data.markCompleted(24)
-	if complete || notify || release {
-		t.Fatalf("replayed completion transition: got complete=%v notify=%v release=%v, want false false false", complete, notify, release)
+	complete, release = data.markCompleted(24)
+	if complete || release {
+		t.Fatalf("replayed completion transition: got complete=%v release=%v, want false false", complete, release)
 	}
 }
 
 func TestZCTrackerDataEarlyNotificationTerminalData(t *testing.T) {
 	var data zcTrackerData
 
-	notify, release := data.markNotification()
-	if notify || release {
-		t.Fatalf("early notification transition: got notify=%v release=%v, want false false", notify, release)
+	if data.markNotification() {
+		t.Fatal("early notification transition: got true, want false")
 	}
 
-	complete, notify, release := data.markTerminalData(23)
-	if !complete || !notify || !release {
-		t.Fatalf("terminal after early notification: got complete=%v notify=%v release=%v, want true true true", complete, notify, release)
+	if !data.markTerminalData(23) {
+		t.Fatal("terminal after early notification: got false, want true")
 	}
 	if got := data.result(); got != 23 {
 		t.Fatalf("terminal data result after early notification: got %d, want 23", got)
@@ -147,38 +141,34 @@ func TestZCTrackerDataEarlyNotificationTerminalData(t *testing.T) {
 func TestZCTrackerDataTerminalFallbackIsAffine(t *testing.T) {
 	var data zcTrackerData
 
-	complete, notify, release := data.markTerminalData(23)
-	if !complete || !notify || !release {
-		t.Fatalf("terminal fallback transition: got complete=%v notify=%v release=%v, want true true true", complete, notify, release)
+	if !data.markTerminalData(23) {
+		t.Fatal("terminal fallback transition: got false, want true")
 	}
 	if got := data.result(); got != 23 {
 		t.Fatalf("terminal fallback result: got %d, want 23", got)
 	}
-	complete, notify, release = data.markTerminalData(24)
-	if complete || notify || release {
-		t.Fatalf("replayed terminal fallback: got complete=%v notify=%v release=%v, want false false false", complete, notify, release)
+	if data.markTerminalData(24) {
+		t.Fatal("replayed terminal fallback: got true, want false")
 	}
-	notify, release = data.markNotification()
-	if notify || release {
-		t.Fatalf("late notification after fallback: got notify=%v release=%v, want false false", notify, release)
+	if data.markNotification() {
+		t.Fatal("late notification after fallback: got true, want false")
 	}
 }
 
 func TestZCTrackerDataCompletionAfterNotificationReplayIsRejected(t *testing.T) {
 	var data zcTrackerData
 
-	complete, notify, release := data.markCompleted(23)
-	if !complete || notify || release {
+	complete, release := data.markCompleted(23)
+	if !complete || release {
 		t.Fatal("first completion transition was rejected")
 	}
 
-	notify, release = data.markNotification()
-	if !notify || !release {
-		t.Fatalf("notification transition: got notify=%v release=%v, want true true", notify, release)
+	if !data.markNotification() {
+		t.Fatal("notification transition: got false, want true")
 	}
-	complete, notify, release = data.markCompleted(24)
-	if complete || notify || release {
-		t.Fatalf("completion after notification: got complete=%v notify=%v release=%v, want false false false", complete, notify, release)
+	complete, release = data.markCompleted(24)
+	if complete || release {
+		t.Fatalf("completion after notification: got complete=%v release=%v, want false false", complete, release)
 	}
 }
 

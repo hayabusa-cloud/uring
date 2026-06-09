@@ -50,40 +50,17 @@ func zcMetaResult(meta uint64) int32 {
 // If a notification arrived early, it closes the lifecycle after the data CQE.
 //
 //go:nosplit
-func (d *zcTrackerData) markCompleted(result int32) (complete bool, notify bool, release bool) {
+func (d *zcTrackerData) markCompleted(result int32) (complete bool, release bool) {
 	for {
 		meta := d.meta.Load()
 		switch zcMetaState(meta) {
 		case zcStateSubmitted:
 			if d.meta.CompareAndSwap(meta, zcPackMeta(zcStateCompleted, result)) {
-				return true, false, false
+				return true, false
 			}
 		case zcStateEarlyNotified:
 			if d.meta.CompareAndSwap(meta, zcPackMeta(zcStateNotified, result)) {
-				return true, true, true
-			}
-		default:
-			return false, false, false
-		}
-	}
-}
-
-// markNotification atomically processes a notification CQE.
-// It returns whether OnNotification should run and whether ExtSQE should be released.
-//
-//go:nosplit
-func (d *zcTrackerData) markNotification() (notify bool, release bool) {
-	for {
-		meta := d.meta.Load()
-		result := zcMetaResult(meta)
-		switch zcMetaState(meta) {
-		case zcStateCompleted:
-			if d.meta.CompareAndSwap(meta, zcPackMeta(zcStateNotified, result)) {
 				return true, true
-			}
-		case zcStateSubmitted:
-			if d.meta.CompareAndSwap(meta, zcPackMeta(zcStateEarlyNotified, result)) {
-				return false, false
 			}
 		default:
 			return false, false
@@ -91,21 +68,47 @@ func (d *zcTrackerData) markNotification() (notify bool, release bool) {
 	}
 }
 
+// markNotification atomically processes a notification CQE.
+// It returns true when the notification closes the lifecycle—OnNotification
+// should run and the ExtSQE should be released.
+//
+//go:nosplit
+func (d *zcTrackerData) markNotification() (ready bool) {
+	for {
+		meta := d.meta.Load()
+		result := zcMetaResult(meta)
+		switch zcMetaState(meta) {
+		case zcStateCompleted:
+			if d.meta.CompareAndSwap(meta, zcPackMeta(zcStateNotified, result)) {
+				return true
+			}
+		case zcStateSubmitted:
+			if d.meta.CompareAndSwap(meta, zcPackMeta(zcStateEarlyNotified, result)) {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+}
+
 // markTerminalData atomically completes a terminal data CQE without MORE.
 // If no notification arrived, this is the no-notification fallback. If a
 // notification arrived early, this pairs with it and closes the lifecycle.
+// Returns true when the lifecycle closes—OnCompleted, OnNotification, and
+// pool release should all run.
 //
 //go:nosplit
-func (d *zcTrackerData) markTerminalData(result int32) (complete bool, notify bool, release bool) {
+func (d *zcTrackerData) markTerminalData(result int32) (ready bool) {
 	for {
 		meta := d.meta.Load()
 		switch zcMetaState(meta) {
 		case zcStateSubmitted, zcStateEarlyNotified:
 			if d.meta.CompareAndSwap(meta, zcPackMeta(zcStateNotified, result)) {
-				return true, true, true
+				return true
 			}
 		default:
-			return false, false, false
+			return false
 		}
 	}
 }
@@ -309,19 +312,13 @@ func (t *ZCTracker) HandleCQE(cqe CQEView) bool {
 	}
 
 	ext := cqe.ExtSQE()
-	ctx := asZCCtx(ext)
-	if ctx == nil {
-		return false
-	}
 	owner, _ := extAnchors(ext).owner.(*ZCTracker)
 	if owner != t {
 		return false
 	}
 
+	ctx := asZCCtx(ext)
 	handler := zcGetHandler(ext)
-	if handler == nil {
-		return false
-	}
 
 	return t.dispatchCQE(cqe, ext, ctx, handler)
 }
@@ -331,13 +328,8 @@ func (t *ZCTracker) dispatchCQE(cqe CQEView, ext *ExtSQE, ctx *zcCtx, handler ZC
 	tracker := zcGetTrackerData(ctx)
 
 	if cqe.IsNotification() {
-		// Notification CQE: buffer can be reused after the data CQE is known.
-		notify, release := tracker.markNotification()
-		if notify {
+		if tracker.markNotification() {
 			handler.OnNotification(tracker.result())
-		}
-		// Release the ExtSQE only on the first terminal notification transition.
-		if release {
 			t.pool.PutExtended(ext)
 		}
 		return true
@@ -345,14 +337,12 @@ func (t *ZCTracker) dispatchCQE(cqe CQEView, ext *ExtSQE, ctx *zcCtx, handler ZC
 
 	if cqe.HasMore() {
 		// Data CQE with MORE: operation completed, notification may follow.
-		complete, notify, release := tracker.markCompleted(cqe.Res)
+		complete, release := tracker.markCompleted(cqe.Res)
 		if complete {
 			handler.OnCompleted(cqe.Res)
 		}
-		if notify {
-			handler.OnNotification(cqe.Res)
-		}
 		if release {
+			handler.OnNotification(cqe.Res)
 			t.pool.PutExtended(ext)
 		}
 		return true
@@ -360,14 +350,9 @@ func (t *ZCTracker) dispatchCQE(cqe CQEView, ext *ExtSQE, ctx *zcCtx, handler ZC
 
 	// Terminal data CQE without MORE: either terminal no-notification
 	// fallback, or the data half of an early-notification pair.
-	complete, notify, release := tracker.markTerminalData(cqe.Res)
-	if complete {
+	if tracker.markTerminalData(cqe.Res) {
 		handler.OnCompleted(cqe.Res)
-	}
-	if notify {
 		handler.OnNotification(cqe.Res)
-	}
-	if release {
 		t.pool.PutExtended(ext)
 	}
 	return true
@@ -388,7 +373,9 @@ func zcTrackerCQEHandler(_ *Uring, _ *ioUringSqe, cqe *ioUringCqe) {
 	if tracker == nil {
 		return
 	}
-	tracker.HandleCQE(view)
+	ctx := asZCCtx(ext)
+	handler := zcGetHandler(ext)
+	tracker.dispatchCQE(view, ext, ctx, handler)
 }
 
 // zcCtx is the raw scalar context layout for zero-copy tracking.

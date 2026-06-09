@@ -462,7 +462,9 @@ func TestZeroCopyBufferSafety(t *testing.T) {
 			if cqe.Op() == uring.IORING_OP_SEND_ZC {
 				if cqe.IsNotification() {
 					notifReceived = true
-					releaseReady = true
+					if opCompleted {
+						releaseReady = true
+					}
 				} else {
 					opCompleted = true
 					if cqe.Res == -int32(uring.EOPNOTSUPP) {
@@ -471,6 +473,8 @@ func TestZeroCopyBufferSafety(t *testing.T) {
 						t.Errorf("SEND_ZC failed: res=%d", cqe.Res)
 					}
 					if !cqe.HasMore() {
+						releaseReady = true
+					} else if notifReceived {
 						releaseReady = true
 					}
 				}
