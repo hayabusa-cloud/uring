@@ -14,7 +14,7 @@ Langue: [English](./README.md) | [简体中文](./README.zh-CN.md) | [Español](
 
 `uring` est le package Go qui expose l'interface noyau Linux `io_uring`. Il crée et démarre les rings, prépare les SQE, décode les CQE, achemine l'identité de soumission via `user_data` et fournit l'enregistrement de tampons, les opérations multishot ainsi que les primitives de mise en place des écouteurs, sans pour autant devenir un ordonnanceur.
 
-`uring` repose sur une conception à interface explicite : la mécanique côté noyau et les faits de complétion observables se situent au bord de l'API, tandis que la politique et la composition relèvent des couches supérieures. Le code d'exécution côté appelant possède la corrélation des complétions, les tentatives de reprise et l'attente progressive, le routage des gestionnaires et des sessions, le cycle de vie des connexions et la libération terminale des ressources.
+`uring` repose sur une conception à interface explicite : la mécanique côté noyau et les faits de complétion observables se situent au bord de l'API, tandis que la politique et la composition relèvent des couches appelantes. Le code d'exécution côté appelant possède le routage des complétions, le retrait des routes, les reprises et l'attente progressive, le routage des gestionnaires et des sessions, les contrôles de sécurité, le cycle de vie des connexions et la libération terminale des ressources.
 
 Les surfaces principales sont :
 
@@ -46,6 +46,12 @@ La branche stable de Debian 13 fournit le noyau 6.12. La suite `trixie-backports
 ### Dépannage
 
 La création du ring peut renvoyer `ENOMEM`, `EPERM` ou `ENOSYS` selon les limites memlock, la configuration sysctl ou le support noyau. Les environnements d'exécution de conteneurs bloquent par défaut les appels système `io_uring`. Consultez [SETUP.md](./SETUP.md) pour le diagnostic et la résolution.
+
+## Codage agentique au-dessus ou au-delà de `code.hybscloud.com/uring`
+
+Utilisez le jeu de guides autonome dans [`agents/`](./agents/) lorsque vous générez ou relisez du code appelant au-dessus ou au-delà de `code.hybscloud.com/uring`. Commencez par [`agents/INDEX.md`](./agents/INDEX.md) afin de préserver la frontière noyau : mécanique SQE/CQE, identité `user_data`, propriété des tampons, résultats de complétion, règles de cycle de vie, limites d'intégration, contrôles de référence et le flux depuis l'analyse et la formalisation jusqu'au raisonnement, à la compilation vers Go et à la vérification.
+
+La règle est simple : `code.hybscloud.com/uring` expose les faits noyau ; les couches appelantes choisissent la politique. Laissez les reprises/backoff, la cadence de polling, l'ordonnancement, le routage, le retrait des routes, l'état de protocole, l'analyse syntaxique, le routage des complétions, les politiques d'annulation et de délai, les contrôles de sécurité et le cycle de vie du service hors de la frontière de `code.hybscloud.com/uring`, et gardez visibles `ErrWouldBlock`, `ErrMore`, `IORING_CQE_F_MORE`, le transfert de propriété et les échecs de capacité.
 
 ## Cycle de vie du ring
 
@@ -118,7 +124,7 @@ for {
 | `ListenerOp`          | Gestionnaire d'une opération de création d'écouteur avec FD et auxiliaires accept                            |
 | `BundleIterator`      | Itère sur les tampons consommés lors d'une réception groupée                                                 |
 | `IncrementalReceiver` | Gère les réceptions incrémentales de buffer-ring (`IOU_PBUF_RING_INC`)                                       |
-| `ZCTracker`           | Suit le cycle de vie à deux CQE de l'envoi sans copie                                                        |
+| `ZCTracker`           | Suit le cycle de vie des notifications et du repli de l'envoi sans copie                                     |
 | `ContextPools`        | Pools pour contextes de soumission indirects et étendus                                                      |
 | `ZCRXReceiver`        | Cycle de vie de réception sans copie sur une file RX de NIC                                                  |
 | `ZCRXConfig`          | Configuration d'une instance de réception ZCRX                                                               |
@@ -305,21 +311,21 @@ L'implémentation se structure autour des couches suivantes :
 2. `Start` enregistre les tampons et active le ring conformément à la base fixe Linux 6.18+.
 3. Les méthodes d'opération publient l'intention en écrivant des SQE.
 4. `Wait` purge les soumissions et renvoie des vues CQE empruntées.
-5. Le code d'exécution côté appelant décide de l'ordonnancement, des reprises, de l'attente, du routage connexion/session et de la politique terminale des ressources.
+5. Le code d'exécution côté appelant décide de l'ordonnancement, des reprises, de l'attente, du routage connexion/session, du retrait des routes, des contrôles de sécurité et de la politique terminale des ressources.
 
-De cette manière, `uring` reste focalisé sur la mécanique côté noyau tout en préservant la sémantique des complétions au travers de l'interface.
+De cette manière, `code.hybscloud.com/uring` reste focalisé sur la mécanique côté noyau tout en préservant la sémantique des complétions au travers de l'interface.
 
 ## Frontière d'exécution
 
-Les couches d'exécution au-dessus de `uring` doivent l'utiliser comme backend noyau, pas comme ordonnanceur. La frontière idéale est unidirectionnelle : `uring` prépare les SQE, récupère les CQE, préserve `user_data`, expose `res` et fanions des CQE, et rapporte les faits de propriété ; le code d'exécution côté appelant corrèle ces observations avec ses propres jetons, applique les reprises et l'attente progressive, achemine les gestionnaires et sessions, regroupe les soumissions et libère les ressources terminales.
+Les couches d'exécution au-dessus de `code.hybscloud.com/uring` doivent l'utiliser comme backend noyau, pas comme ordonnanceur. La frontière est unidirectionnelle : `code.hybscloud.com/uring` prépare les SQE, récupère les CQE, préserve `user_data`, expose `res` et fanions des CQE, et rapporte les faits de propriété ; le code d'exécution côté appelant corrèle ces observations avec ses propres jetons, applique les reprises et l'attente progressive, achemine les gestionnaires et sessions, regroupe les soumissions, retire les routes et libère les ressources terminales.
 
 Un pont d'exécution peut consommer les CQE en mode Extended lorsque l'exécution abstraite a besoin des faits de complétion. Un environnement d'exécution par connexion peut aussi sonder directement les CQE Extended bruts lorsqu'il a besoin du résultat CQE, des fanions, de l'ID de tampon et du jeton encodé avant de réduire l'événement en rappels de gestionnaire.
 
-Les couches de contexte et d'exécution abstraite au-dessus de cette frontière ne modifient pas le rôle de frontière noyau de `uring`.
+Les couches de contexte et d'exécution abstraite au-dessus de cette frontière ne modifient pas le rôle de frontière noyau de `code.hybscloud.com/uring`.
 
 ## Patrons pour la couche applicative
 
-`uring` expose les mécanismes tournés vers le noyau ; l'ordonnancement, les tentatives de reprise, le suivi de connexions et l'interprétation du protocole relèvent des couches supérieures. Les patrons ci-dessous décrivent la frontière qu'un environnement d'exécution côté appelant doit préserver.
+`code.hybscloud.com/uring` expose les mécanismes tournés vers le noyau ; l'ordonnancement, les tentatives de reprise, le suivi de connexions et l'interprétation du protocole relèvent des couches appelantes situées au-dessus de lui. Les patrons ci-dessous décrivent la frontière qu'un environnement d'exécution côté appelant doit préserver.
 
 ### Boucle d'événements propriétaire du ring
 
@@ -357,7 +363,7 @@ func runLoop(ring *uring.Uring, stop <-chan struct{}) error {
 }
 ```
 
-Les méthodes du ring, dont `Send`, `Receive`, `AcceptMultishot` et `Wait`, s'exécutent sur cette goroutine. Le travail provenant d'autres goroutines entre dans la boucle via un canal ou une file sans verrou ; on n'appelle pas directement les méthodes du ring depuis l'extérieur. `iox.Backoff` reste côté appelant : on appelle `backoff.Wait()` quand `Wait` est classé comme `iox.OutcomeWouldBlock` ou ne récupère aucun CQE, puis `backoff.Reset()` après tout lot avec `n > 0`.
+Les méthodes du ring, dont `Send`, `Receive`, `AcceptMultishot` et `Wait`, s'exécutent sur cette goroutine. Le travail provenant d'autres goroutines doit entrer dans la boucle par une boîte aux lettres de travail détenue par l'appelant, comme `code.hybscloud.com/lfq`, et non en appelant directement les méthodes du ring. `iox.Backoff` reste côté appelant : on appelle `backoff.Wait()` quand `Wait` est classé comme `iox.OutcomeWouldBlock` ou ne récupère aucun CQE, puis `backoff.Reset()` après tout lot avec `n > 0`.
 
 ### Cycle de vie des souscriptions multishot
 
@@ -462,7 +468,7 @@ Les parcours les plus concis, à lire en regard des tests :
 
 ### Serveur echo TCP
 
-On utilise `ListenerManager` pour que le package prépare la chaîne socket → bind → listen, puis on démarre le multishot accept et le multishot receive sur les FD de connexion actifs.
+On utilise `ListenerManager` pour que le package prépare la chaîne socket → bind → listen. Les rappels booléens du gestionnaire d'écouteur servent de points de contrôle de flux : `true` fait passer à l'étape de configuration suivante, `false` interrompt avant celle-ci. Une fois l'écouteur actif, on démarre le multishot accept et le multishot receive sur les FD de connexion.
 
 ```go
 pool := uring.NewContextPools(32)
@@ -523,7 +529,7 @@ On réutilise la boucle `Wait` décrite dans la section cycle de vie du ring apr
 
 `ZCRXReceiver` gère la réception sans copie depuis une file RX matérielle de NIC via `io_uring`.
 
-`NewZCRXReceiver` est prévu pour les rings créés avec des CQE de 32 octets (`IORING_SETUP_CQE32`). La surface `Options` actuelle n'expose pas ce fanion de configuration ; par conséquent, les rings créés via le chemin standard de `New` conduisent ce constructeur à renvoyer `ErrNotSupported`. Tant qu'un chemin de configuration CQE32 n'est pas exposé, cette section documente le contrat de frontière du récepteur plutôt qu'une recette publique exécutable.
+`NewZCRXReceiver` est prévu pour les rings créés avec des CQE de 32 octets (`IORING_SETUP_CQE32`). La surface `Options` actuelle n'expose pas ce fanion de configuration ; par conséquent, ce constructeur renvoie `ErrNotSupported` pour les rings créés via le chemin standard de `New`. Tant qu'un chemin de configuration CQE32 n'est pas exposé, cette section documente le contrat de frontière du récepteur plutôt qu'une recette publique exécutable.
 
 ### Cycle de vie
 

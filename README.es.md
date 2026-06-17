@@ -14,7 +14,7 @@ Idioma: [English](./README.md) | [简体中文](./README.zh-CN.md) | **Español*
 
 `uring` es el paquete Go que expone la interfaz de `io_uring` frente al kernel de Linux. Crea y arranca rings, prepara SQE, decodifica CQE, transporta la identidad de envío a través de `user_data` y ofrece registro de búferes, operaciones multishot y primitivas de configuración de escuchas, sin convertirse en un planificador.
 
-El diseño sigue un principio de frontera explícita: la mecánica orientada al kernel y los hechos observables de completado permanecen en el borde de la API, mientras que la política y la composición quedan por encima de esa frontera. El código de ejecución del llamador posee la correlación de completados, los reintentos y la espera progresiva, el enrutamiento de manejadores y sesiones, el ciclo de vida de conexiones y la liberación terminal de recursos.
+El diseño sigue un principio de frontera explícita: la mecánica orientada al kernel y los hechos observables de completado permanecen en el borde de la API, mientras que la política y la composición quedan en las capas del llamador. El código de ejecución del llamador posee el enrutamiento de finalizaciones, la retirada de rutas, los reintentos y la espera progresiva, el enrutamiento de manejadores y sesiones, las comprobaciones de seguridad, el ciclo de vida de conexiones y la liberación terminal de recursos.
 
 Las superficies principales son:
 
@@ -46,6 +46,12 @@ La rama estable de Debian 13 incluye el kernel 6.12. La suite `trixie-backports`
 ### Resolución de problemas
 
 La creación del ring puede devolver `ENOMEM`, `EPERM` o `ENOSYS` según los límites de memlock, la configuración de sysctl o el soporte del kernel. Los entornos de ejecución de contenedores bloquean las llamadas al sistema de `io_uring` por defecto. Consulte [SETUP.md](./SETUP.md) para el diagnóstico y la resolución.
+
+## Codificación orientada a agentes sobre o más allá de `code.hybscloud.com/uring`
+
+Utilice el conjunto de guías independiente en [`agents/`](./agents/) al generar o revisar código del llamador sobre o más allá de `code.hybscloud.com/uring`. Comience por [`agents/INDEX.md`](./agents/INDEX.md) para conservar la frontera del núcleo: mecánica SQE/CQE, identidad en `user_data`, propiedad de búferes, resultados de finalización, reglas de ciclo de vida, límites de integración, comprobaciones de referencia y el flujo desde análisis y formalización hasta razonamiento, compilación a Go y verificación.
+
+La regla es simple: `code.hybscloud.com/uring` expone hechos del núcleo; las capas del llamador eligen la política. Mantenga reintentos/backoff, cadencia de sondeo, planificación, enrutamiento, retirada de rutas, estado de protocolo, análisis sintáctico, enrutamiento de finalizaciones, política de cancelación y tiempo de espera, comprobaciones de seguridad y ciclo de vida del servicio fuera de la frontera de `code.hybscloud.com/uring`, y conserve visibles `ErrWouldBlock`, `ErrMore`, `IORING_CQE_F_MORE`, la transferencia de propiedad y los fallos de capacidad.
 
 ## Ciclo de vida del ring
 
@@ -118,7 +124,7 @@ for {
 | `ListenerOp`          | Manejador de una operación de creación de escucha con FD y auxiliares de accept                                   |
 | `BundleIterator`      | Itera sobre búferes consumidos en una recepción agrupada                                                          |
 | `IncrementalReceiver` | Gestiona recepciones incrementales de buffer-ring (`IOU_PBUF_RING_INC`)                                           |
-| `ZCTracker`           | Rastrea el ciclo de vida de dos CQEs del envío de copia cero                                                      |
+| `ZCTracker`           | Rastrea el ciclo de vida de notificación y fallback del envío de copia cero                                      |
 | `ContextPools`        | Pools para contextos de envío indirectos y extendidos                                                             |
 | `ZCRXReceiver`        | Ciclo de vida de recepción de copia cero sobre una cola RX de NIC                                                 |
 | `ZCRXConfig`          | Configuración de una instancia de recepción ZCRX                                                                  |
@@ -239,7 +245,7 @@ ring, err := uring.New(func(o *uring.Options) {
 })
 ```
 
-Use `OptionsForBudget` para partir de un presupuesto de memoria explícito, y `BufferConfigForBudget` para inspeccionar la distribución por niveles elegida para dicho presupuesto:
+Utilice `OptionsForBudget` para partir de un presupuesto de memoria explícito, y `BufferConfigForBudget` para inspeccionar la distribución por niveles elegida para dicho presupuesto:
 
 ```go
 cfg, scale := uring.BufferConfigForBudget(256 * uring.MiB)
@@ -305,21 +311,21 @@ La frontera de implementación se define así:
 2. `Start` registra los búferes y habilita el ring para la línea base fija de Linux 6.18+.
 3. Los métodos de operación declaran intención escribiendo SQE.
 4. `Wait` vacía los envíos y devuelve observaciones prestadas de CQE.
-5. El código de ejecución del llamador decide planificación, reintentos, espera, enrutamiento de conexión/sesión y política terminal de recursos.
+5. El código de ejecución del llamador decide planificación, reintentos, espera, enrutamiento de conexión/sesión, retirada de rutas, comprobaciones de seguridad y política terminal de recursos.
 
-De este modo, `uring` se mantiene centrado en la mecánica frente al kernel y preserva el significado de los completados a través de la frontera.
+De este modo, `code.hybscloud.com/uring` se mantiene centrado en la mecánica frente al kernel y preserva el significado de los completados a través de la frontera.
 
 ## Frontera de ejecución
 
-Las capas de ejecución por encima de `uring` deben usarlo como backend del kernel, no como planificador. La frontera ideal es unidireccional: `uring` prepara SQEs, recoge CQEs, preserva `user_data`, expone `res` y marcas de CQE, e informa hechos de propiedad; el código de ejecución del llamador correlaciona esas observaciones con sus propios tokens, aplica reintentos y espera progresiva, enruta manejadores y sesiones, agrupa envíos y libera recursos terminales.
+Las capas de ejecución por encima de `code.hybscloud.com/uring` deben usarlo como backend del kernel, no como planificador. La frontera es unidireccional: `code.hybscloud.com/uring` prepara SQEs, recoge CQEs, preserva `user_data`, expone `res` y marcas de CQE, e informa hechos de propiedad; el código de ejecución del llamador correlaciona esas observaciones con sus propios tokens, aplica reintentos y espera progresiva, enruta manejadores y sesiones, agrupa envíos, retira rutas y libera recursos terminales.
 
 Un puente de ejecución puede consumir CQEs en modo Extended cuando la ejecución abstracta necesita hechos de completado. Un entorno de ejecución por conexión también puede sondear CQEs Extended sin procesar directamente cuando necesita el resultado de CQE, las marcas, el ID de búfer y el token codificado antes de reducir el evento a devoluciones de llamada de manejador.
 
-Las capas de contexto y ejecución abstracta por encima de esta frontera no cambian el rol de `uring` como frontera del kernel.
+Las capas de contexto y ejecución abstracta por encima de esta frontera no cambian el rol de `code.hybscloud.com/uring` como frontera del kernel.
 
 ## Patrones para la capa de aplicación
 
-`uring` expone los mecanismos orientados al kernel; la planificación, los reintentos, el seguimiento de conexiones y la interpretación del protocolo corresponden a las capas superiores. Los patrones siguientes describen la frontera que debe preservar un entorno de ejecución del llamador.
+`code.hybscloud.com/uring` expone los mecanismos orientados al kernel; la planificación, los reintentos, el seguimiento de conexiones y la interpretación del protocolo corresponden a las capas del llamador por encima de él. Los patrones siguientes describen la frontera que debe preservar un entorno de ejecución del llamador.
 
 ### Bucle de eventos propietario del ring
 
@@ -357,7 +363,7 @@ func runLoop(ring *uring.Uring, stop <-chan struct{}) error {
 }
 ```
 
-Todos los métodos del ring, incluidos `Send`, `Receive`, `AcceptMultishot` y `Wait`, se ejecutan en esta goroutine. El trabajo procedente de otras goroutines entra en el bucle a través de un canal o una cola sin bloqueos; no se deben invocar los métodos del ring directamente. `iox.Backoff` sigue siendo propiedad del llamador: use `backoff.Wait()` cuando `Wait` se clasifique como `iox.OutcomeWouldBlock` o no recoja ningún CQE, y `backoff.Reset()` tras cualquier lote con `n > 0`.
+Todos los métodos del ring, incluidos `Send`, `Receive`, `AcceptMultishot` y `Wait`, se ejecutan en esta goroutine. El trabajo procedente de otras goroutines debe entrar en el bucle por un buzón de trabajo propiedad del llamador, como `code.hybscloud.com/lfq`, no mediante llamadas directas a los métodos del ring. `iox.Backoff` sigue siendo propiedad del llamador: use `backoff.Wait()` cuando `Wait` se clasifique como `iox.OutcomeWouldBlock` o no recoja ningún CQE, y `backoff.Reset()` tras cualquier lote con `n > 0`.
 
 ### Ciclo de vida de suscripciones multishot
 
@@ -462,7 +468,7 @@ Los siguientes son los flujos más cortos, pensados para leerse junto con las pr
 
 ### Servidor echo TCP
 
-Use `ListenerManager` para que el paquete prepare la cadena socket → bind → listen; a continuación, inicie multishot accept y multishot receive sobre los FD de conexión activos.
+Utilice `ListenerManager` para que el paquete prepare la cadena socket → bind → listen. Las devoluciones de llamada booleanas del manejador de escucha son ganchos de control de flujo: `true` avanza a la siguiente fase de configuración y `false` aborta antes de ella. Una vez que el escucha está activo, inicie multishot accept y multishot receive sobre los FD de conexión.
 
 ```go
 pool := uring.NewContextPools(32)
@@ -523,7 +529,7 @@ Reutilice el bucle `Wait` de la sección de ciclo de vida del ring tras cada env
 
 `ZCRXReceiver` gestiona la recepción de copia cero desde una cola RX de hardware de NIC mediante `io_uring`.
 
-`NewZCRXReceiver` está preparado para rings con CQE de 32 bytes (`IORING_SETUP_CQE32`). La superficie actual de `Options` no expone esa marca de configuración, de modo que los rings creados por la ruta estándar de `New` provocan que este constructor devuelva `ErrNotSupported`. Hasta que se exponga una ruta de configuración CQE32, esta sección documenta el contrato de frontera del receptor y no una receta pública ejecutable.
+`NewZCRXReceiver` está preparado para rings con CQE de 32 bytes (`IORING_SETUP_CQE32`). La superficie actual de `Options` no expone esa marca de configuración, de modo que este constructor devuelve `ErrNotSupported` para los rings creados por la ruta estándar de `New`. Hasta que se exponga una ruta de configuración CQE32, esta sección documenta el contrato de frontera del receptor y no una receta pública ejecutable.
 
 ### Ciclo de vida
 
