@@ -12,9 +12,9 @@ Language: **English** | [简体中文](./README.zh-CN.md) | [Español](./README.
 
 ## Overview
 
-`uring` is the kernel-facing boundary for Linux `io_uring`. It creates and starts rings, prepares SQEs, decodes CQEs, carries submission identity through `user_data`, and exposes buffer registration, multishot operations, and listener-setup primitives without turning them into a scheduler.
+`uring` is the kernel-facing boundary for Linux `io_uring`. It creates and starts rings, prepares SQEs, decodes CQEs, carries submission identity through `user_data`, and exposes buffer registration, multishot operations, and listener-setup primitives without becoming a scheduler.
 
-The package keeps the boundary explicit: kernel mechanics and observable completion facts live here; policy and composition live above it. Caller-side runtime code owns completion correlation, retry/backoff, handler and session routing, connection lifecycle, and terminal resource release.
+The package keeps the boundary explicit: kernel mechanics and observable completion facts live here; policy and composition live in caller-side layers. Caller-side runtime code owns completion routing, route retirement, retry/backoff, handler and session routing, connection lifecycle, safety checks, and terminal resource release.
 
 The primary surfaces are:
 
@@ -46,6 +46,12 @@ Debian 13 ships kernel 6.12 in its stable track. The `trixie-backports` suite pr
 ### Troubleshooting
 
 Ring creation may return `ENOMEM`, `EPERM`, or `ENOSYS` depending on memlock limits, sysctl settings, or kernel support. Container runtimes block `io_uring` syscalls by default. See [SETUP.md](./SETUP.md) for diagnosis and resolution.
+
+## Agentic coding above or beyond `code.hybscloud.com/uring`
+
+Use the standalone guide entrypoint [`AGENTS.md`](./AGENTS.md) when generating or reviewing caller-side code above or beyond `code.hybscloud.com/uring`. Use [`agents/INDEX.md`](./agents/INDEX.md) as the topic index to preserve the kernel boundary: SQE/CQE mechanics, `user_data` identity, buffer ownership, completion outcomes, lifecycle rules, integration points, reference checks, and the workflow from analysis through formalization, reasoning, compilation into Go, and verification.
+
+The rule is simple: `code.hybscloud.com/uring` exposes kernel facts; caller-side layers choose policy. Keep retry/backoff, poll cadence, scheduling, routing, route retirement, protocol state, parsing, completion routing, cancellation and timeout policy, safety checks, and service lifecycle outside the `code.hybscloud.com/uring` boundary, and keep `ErrWouldBlock`, `ErrMore`, `IORING_CQE_F_MORE`, ownership transfer, and capability failures visible.
 
 ## Ring lifecycle
 
@@ -118,7 +124,7 @@ for {
 | `ListenerOp` | Handle to a listener creation operation with FD and accept helpers |
 | `BundleIterator` | Iterates over buffers consumed in a bundle receive |
 | `IncrementalReceiver` | Manages incremental buffer-ring receives (`IOU_PBUF_RING_INC`) |
-| `ZCTracker` | Tracks the two-CQE zero-copy send lifecycle |
+| `ZCTracker` | Tracks zero-copy send notification and fallback lifecycle |
 | `ContextPools` | Pools for indirect and extended submission contexts |
 | `ZCRXReceiver` | Zero-copy receive lifecycle over a NIC RX queue |
 | `ZCRXConfig` | Configuration for a ZCRX receive instance |
@@ -179,7 +185,7 @@ sqeCtx := uring.PackExtended(ext)
 fmt.Printf("sqe context mode=%d seq=%d\n", sqeCtx.Mode(), meta.Val1)
 ```
 
-`NewContextPools` returns pools that are ready to use. Call `Reset` only once all borrowed contexts have been returned and you want to reuse the pool set.
+`NewContextPools` returns pools that are ready to use. Call `Reset` only after all borrowed contexts have been returned and you want to reuse the pool set.
 
 ### Completion dispatch with `CQEView`
 
@@ -305,21 +311,21 @@ The implementation sits at this boundary:
 2. `Start` registers buffers and enables the ring for the 6.18+ baseline.
 3. Operation methods express intent by writing SQEs.
 4. `Wait` flushes submissions and returns borrowed CQE views.
-5. Caller-side runtime code decides scheduling, retries, parking, connection/session routing, and terminal resource policy.
+5. Caller-side runtime code decides scheduling, retries, parking, connection/session routing, route retirement, safety checks, and terminal resource policy.
 
-This keeps `uring` focused on kernel-facing mechanics and preserves completion meaning across the boundary.
+This keeps `code.hybscloud.com/uring` focused on kernel-facing mechanics and preserves completion meaning across the boundary.
 
 ## Runtime boundary
 
-Runtime layers above `uring` should use it as the kernel backend, not as a scheduler. The ideal seam is one-way: `uring` prepares SQEs, reaps CQEs, preserves `user_data`, exposes CQE `res` and flags, and reports ownership facts; caller-side runtime code correlates those observations with its own tokens, applies retry/backoff, routes handlers and sessions, batches submissions, and releases terminal resources.
+Runtime layers above `code.hybscloud.com/uring` should use it as the kernel backend, not as a scheduler. The boundary is one-way: `code.hybscloud.com/uring` prepares SQEs, reaps CQEs, preserves `user_data`, exposes CQE `res` and flags, and reports ownership facts; caller-side runtime code correlates those observations with its own tokens, applies retry/backoff, routes handlers and sessions, batches submissions, retires routes, and releases terminal resources.
 
 A runtime bridge can consume Extended-mode CQEs when abstract execution needs completion facts. A connection-scoped runtime can also poll raw Extended CQEs directly when it needs the CQE result, flags, buffer ID, and encoded token before reducing the event to handler callbacks.
 
-Context and abstract-execution layers above this boundary do not change `uring`'s kernel-boundary role.
+Context and abstract-execution layers above this boundary do not change `code.hybscloud.com/uring`'s kernel-boundary role.
 
 ## Application-layer patterns
 
-`uring` exposes kernel mechanics; scheduling, retry, connection tracking, and protocol interpretation belong in the layers above it. The patterns below describe the boundary a caller-side runtime must preserve.
+`code.hybscloud.com/uring` exposes kernel mechanics; scheduling, retry, connection tracking, and protocol interpretation belong in caller-side layers above it. The patterns below describe the boundary a caller-side runtime must preserve.
 
 ### Ring-owning event loop
 
@@ -357,7 +363,7 @@ func runLoop(ring *uring.Uring, stop <-chan struct{}) error {
 }
 ```
 
-All ring methods, including `Send`, `Receive`, `AcceptMultishot`, and `Wait`, run on this goroutine. Work from other goroutines enters the loop through a channel or a lock-free queue, not by calling ring methods directly. `iox.Backoff` stays caller-owned: call `backoff.Wait()` on `iox.OutcomeWouldBlock` or when `Wait` returns no CQEs, and `backoff.Reset()` after any batch with `n > 0`.
+All ring methods, including `Send`, `Receive`, `AcceptMultishot`, and `Wait`, run on this goroutine. Work from other goroutines should enter the loop through a caller-owned mailbox such as `code.hybscloud.com/lfq`, not by calling ring methods directly. `iox.Backoff` stays caller-owned: call `backoff.Wait()` on `iox.OutcomeWouldBlock` or when `Wait` returns no CQEs, and `backoff.Reset()` after any batch with `n > 0`.
 
 ### Multishot subscription lifecycle
 
@@ -523,7 +529,7 @@ After each submit, reuse the `Wait` loop from the ring lifecycle section to obse
 
 `ZCRXReceiver` drives zero-copy receive from a NIC hardware RX queue through `io_uring`.
 
-`NewZCRXReceiver` is wired for rings with 32-byte CQEs (`IORING_SETUP_CQE32`). The current `Options` surface does not expose that setup flag, so rings created through the standard `New` path cause this constructor to return `ErrNotSupported`. Until a CQE32 setup path is exposed, this section documents the receiver boundary contract rather than a runnable public setup recipe.
+`NewZCRXReceiver` is wired for rings with 32-byte CQEs (`IORING_SETUP_CQE32`). The current `Options` surface does not expose that setup flag, so this constructor returns `ErrNotSupported` for rings created through the standard `New` path. Until a CQE32 setup path is exposed, this section documents the receiver boundary contract rather than a runnable public setup recipe.
 
 ### Lifecycle
 
