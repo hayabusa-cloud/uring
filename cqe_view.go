@@ -18,11 +18,12 @@ import "code.hybscloud.com/iofd"
 //
 // # Property Patterns
 //
-// | FullSQE() | Extended() | Mode     | Available Data                                |
-// |-----------|------------|----------|-----------------------------------------------|
-// | false     | false      | Direct   | Op, SQE flags, BufGroup, FD, Res, CQE flags   |
-// | true      | false      | Indirect | + full ioUringSqe copy                        |
-// | true      | true       | Extended | + borrowed `ExtSQE` escape hatch              |
+//   - Direct: FullSQE reports false and Extended reports false. Available
+//     data: Op, SQE flags, BufGroup, FD, Res, and CQE flags.
+//   - Indirect: FullSQE reports true and Extended reports false. Available
+//     data: Direct facts plus a full ioUringSqe copy.
+//   - Extended: FullSQE reports true and Extended reports true. Available
+//     data: Indirect facts plus the borrowed ExtSQE escape hatch.
 //
 // # Usage
 //
