@@ -49,7 +49,7 @@ Ring creation may return `ENOMEM`, `EPERM`, or `ENOSYS` depending on memlock lim
 
 ## Agentic coding above or beyond `code.hybscloud.com/uring`
 
-Use the standalone guide set in [`agents/`](./agents/) when generating or reviewing caller-side code above or beyond `code.hybscloud.com/uring`. Start from [`agents/INDEX.md`](./agents/INDEX.md) to preserve the kernel boundary: SQE/CQE mechanics, `user_data` identity, buffer ownership, completion outcomes, lifecycle rules, integration points, reference checks, and the workflow from analysis through formalization, reasoning, compilation into Go, and verification.
+Use the standalone guide entrypoint [`AGENTS.md`](./AGENTS.md) when generating or reviewing caller-side code above or beyond `code.hybscloud.com/uring`. Use [`agents/INDEX.md`](./agents/INDEX.md) as the topic index to preserve the kernel boundary: SQE/CQE mechanics, `user_data` identity, buffer ownership, completion outcomes, lifecycle rules, integration points, reference checks, and the workflow from analysis through formalization, reasoning, compilation into Go, and verification.
 
 The rule is simple: `code.hybscloud.com/uring` exposes kernel facts; caller-side layers choose policy. Keep retry/backoff, poll cadence, scheduling, routing, route retirement, protocol state, parsing, completion routing, cancellation and timeout policy, safety checks, and service lifecycle outside the `code.hybscloud.com/uring` boundary, and keep `ErrWouldBlock`, `ErrMore`, `IORING_CQE_F_MORE`, ownership transfer, and capability failures visible.
 
