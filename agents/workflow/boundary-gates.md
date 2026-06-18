@@ -4,7 +4,7 @@ Before a change counts as correct, it must pass the gates in this file — the m
 
 Each gate checks one thing, and a gate that fails means the change is wrong:
 
-- `G_read` — read-completeness: you have read the complete `iox` package and the owner package of every package-owned fact the change uses.
+- `G_read` — read-completeness: you have read the complete `code.hybscloud.com/iox` package and the owner package of every package-owned fact the change uses.
 - `G_place` — correct placement: the caller frontier and caller policy both sit in the caller layer, owned by the caller, and neither overlaps the boundary.
 - `G_owner` — single owner: the resource frontiers are affine, every boundary fact has a single-stratum owner, and every resource has a named owner epoch.
 - `G_outcome` — outcome separation: the outcome and release planes are kept apart, the control symbol is one of `ok`/`wouldBlock`/`errMore`/`fail(e)`, and the CQE evidence (`Res`, `Flags`, `user_data`, frontier) is preserved.

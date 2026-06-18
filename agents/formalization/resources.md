@@ -1,6 +1,6 @@
 # Resources
 
-Every ring context, submission entry, file descriptor, buffer, and zero-copy tracker the kernel touches is a *resource* with one owner and a definite lifetime. Using `uring` correctly means never consuming one twice, never releasing one early, and never letting a borrowed view escape the observation that produced it. This file is the inventory and the discipline.
+Every ring context, submission entry, file descriptor, buffer, and zero-copy tracker the kernel touches is a *resource* with one owner and a definite lifetime. Using `code.hybscloud.com/uring` correctly means never consuming one twice, never releasing one early, and never letting a borrowed view escape the observation that produced it. This file is the inventory and the discipline.
 
 It enumerates every resource kind the boundary can produce, the result resources handed back to the caller (FDs, buffers), and the evidence, frontier, and lifecycle kinds that track their state — together with `OwnerPkg`, which fixes exactly which package owns each kind (`dom(OwnerPkg) = DenotedKind`). The affine frontiers `Θ`/`Θ'` make linear consumption checkable, and the epoch order turns "no early release" into a property you can verify rather than hope for.
 

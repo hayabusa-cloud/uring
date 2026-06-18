@@ -1,15 +1,15 @@
 # Suspension Utilization
 
-When you suspend on a pending ring operation, `code.hybscloud.com/kont` is how you do it correctly: one suspension, one resume, matched to one operation identity. This file is the rule for wiring `kont` onto a `code.hybscloud.com/uring` boundary action. A one-shot operation maps to an affine `Suspension` resumed at most once with *copied* completion facts (never a borrowed CQE view); a multishot operation is rejected here and routed through `code.hybscloud.com/takt` instead; and `kont` itself stays entirely in the caller layer, its carriers never projected into the boundary. This is the package-level instance of the shallow handler: resume on one observation, hand control back.
+When you suspend on a pending ring operation, `code.hybscloud.com/kont` is how you do it correctly: one suspension, one resume, matched to one operation identity. This file is the rule for wiring `code.hybscloud.com/kont` onto a `code.hybscloud.com/uring` boundary action. A one-shot operation maps to an affine `Suspension` resumed at most once with *copied* completion facts (never a borrowed CQE view); a multishot operation is rejected here and routed through `code.hybscloud.com/takt` instead; and `code.hybscloud.com/kont` itself stays entirely in the caller layer, its carriers never projected into the boundary. This is the package-level instance of the shallow handler: resume on one observation, hand control back.
 
 In plain terms, the rules an agent follows here are:
 
 - One suspension, one resume, one identity. A one-shot operation maps to an affine `Suspension` resumed at most once; resume consumes both the suspension and the operation identity, and a second resume is rejected.
 - Resume on copied facts, never a borrowed view. The resume value copies `Res`, `Flags`, `user_data`, and selected-buffer metadata; a borrowed CQE view is never stored, and a continuation closure captures only copied facts or caller-owned state.
-- Multishot does not belong here. A multishot operation is rejected from a `Suspension` and routed through `takt`'s `SubscriptionLoop` instead.
+- Multishot does not belong here. A multishot operation is rejected from a `Suspension` and routed through `SubscriptionLoop` from `code.hybscloud.com/takt` instead.
 - Discarding is not cancelling. Discarding a suspension consumes it but does not cancel the pending operation; cancellation is a separate visible boundary action, and the discard decision is the caller's.
 - Step index is proof fuel only. It bounds reasoning, and never changes runtime affinity or creates progress evidence.
-- Keep all `kont` carriers in the caller layer. Effect, computation, suspension, and step carriers are caller-owned and never projected into the boundary.
+- Keep all carriers from `code.hybscloud.com/kont` in the caller layer. Effect, computation, suspension, and step carriers are caller-owned and never projected into the boundary.
 
 The block below states these rules formally.
 

@@ -1,6 +1,6 @@
 # Notation
 
-This is the notation an agent reasons in when changing or reviewing `code.hybscloud.com/uring`. To use `uring` correctly you must read three things precisely: the *judgment* `J` that records what a boundary action does, the *syntactic categories* that name every carrier the kernel and the caller can touch, and the *typing discipline* that decides which carriers are linear (used once) and which evidence must be copied rather than borrowed. None of this is ceremony — every later guarantee (outcomes, ownership, sessions, the shallow handler) is stated against these symbols, so an edit that breaks the notation silently breaks the obligations that depend on it.
+This is the notation an agent reasons in when changing or reviewing `code.hybscloud.com/uring`. To use `code.hybscloud.com/uring` correctly you must read three things precisely: the *judgment* `J` that records what a boundary action does, the *syntactic categories* that name every carrier the kernel and the caller can touch, and the *typing discipline* that decides which carriers are linear (used once) and which evidence must be copied rather than borrowed. None of this is ceremony — every later guarantee (outcomes, ownership, sessions, the shallow handler) is stated against these symbols, so an edit that breaks the notation silently breaks the obligations that depend on it.
 
 Keep the judgment shape in view as you read; every other topic file projects onto one of its slots:
 

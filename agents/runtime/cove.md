@@ -1,13 +1,13 @@
 # Context Evidence Utilization
 
-Because handling a completion is shallow, the world can advance between the moment you submit an operation and the moment you resume on its CQE — so the requirement evidence you relied on must still hold at the point of use. `code.hybscloud.com/cove` is how you carry and re-check that evidence across a suspension boundary. This file is the rule for using `cove` with `code.hybscloud.com/uring`: requirement and safety evidence is caller-owned, epoch-monotone where it may be cached and re-checked at the use epoch where it may not, and never projected into the boundary.
+Because handling a completion is shallow, the world can advance between the moment you submit an operation and the moment you resume on its CQE — so the requirement evidence you relied on must still hold at the point of use. `code.hybscloud.com/cove` is how you carry and re-check that evidence across a suspension boundary. This file is the rule for using `code.hybscloud.com/cove` with `code.hybscloud.com/uring`: requirement and safety evidence is caller-owned, epoch-monotone where it may be cached and re-checked at the use epoch where it may not, and never projected into the boundary.
 
 In plain terms, the rules an agent follows here are:
 
 - Carry context across the shallow gap, and re-check at use. Between observe and resume the world may advance, so cache only monotone facts (capability present, registration done, terminal observed) and re-check non-monotone facts (frontier live, buffer owned, fd open, ring not closed, token live) at the resume or dispatch epoch.
 - Resume does not validate for you. Resuming a suspension view performs no requirement check; guard it explicitly with a requirement (`Need`/`NeedExpr`), and if a requirement fails, the wait, reroute, or abandon decision is the caller's.
 - Copy completion facts into the context, never a borrowed pointer. A context extension carries copied `Res`/`Flags`/`user_data`, metadata, capability, and ownership facts; a borrowed CQE pointer is never in the world or the context.
-- Keep all `cove` carriers in the caller layer. Context, requirement, rule, suspension-view, and Kripke carriers are caller-owned, never projected into the boundary, and never used to mutate the boundary frontiers `Θ`/`Σ`/`Μ`.
+- Keep all carriers from `code.hybscloud.com/cove` in the caller layer. Context, requirement, rule, suspension-view, and Kripke carriers are caller-owned, never projected into the boundary, and never used to mutate the boundary frontiers `Θ`/`Σ`/`Μ`.
 
 The block below states these rules formally.
 

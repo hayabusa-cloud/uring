@@ -41,6 +41,8 @@ When a task uses a fact owned by another package, read that package before using
 - `code.hybscloud.com/sess` for protocol frontiers, branching, endpoint transitions, and session close semantics.
 - `code.hybscloud.com/takt` for runner movement, polling, resumption, completion memory, completion routing, and route-indexed stream carriers.
 
+For broad guide edits, runtime-utilization edits, or review work that changes the cross-package model, read the complete current source of every package whose facts the edited guide relies on. In practice, this usually means `code.hybscloud.com/iox`, `code.hybscloud.com/iofd`, `code.hybscloud.com/sock`, `code.hybscloud.com/kont`, `code.hybscloud.com/cove`, `code.hybscloud.com/takt`, and `code.hybscloud.com/sess` before changing `uring/AGENTS.md` or any file under `uring/agents/`. Extend that set with `code.hybscloud.com/zcall`, `code.hybscloud.com/iobuf`, `code.hybscloud.com/spin`, `code.hybscloud.com/lfq`, or `code.hybscloud.com/framer` whenever the edited guide cites syscall, buffer, spin/yield, mailbox, or framing facts.
+
 Before generating or reviewing code, read every guide file needed by the task. A file is needed when its topic names a fact, action, resource, outcome, frontier, policy, or obligation used by that task.
 
 Read in this order:

@@ -1,6 +1,6 @@
 # Go Mapping
 
-The model in the other topic files only matters because it maps faithfully to real Go. This file is that bridge, in both directions. *Abstraction* lifts a Go surface up into a judgment so you can reason about it; *compilation* sends a judgment back down to Go and demands that the round trip preserve denotation and never smuggle caller frontier or policy into the boundary. When you change `uring` code, this is the file that says your change still *means* what the model says it means: same outcomes, same release evidence, ownership and epochs intact, nothing hidden in the boundary.
+The model in the other topic files only matters because it maps faithfully to real Go. This file is that bridge, in both directions. *Abstraction* lifts a Go surface up into a judgment so you can reason about it; *compilation* sends a judgment back down to Go and demands that the round trip preserve denotation and never smuggle caller frontier or policy into the boundary. When you change `code.hybscloud.com/uring` code, this is the file that says your change still *means* what the model says it means: same outcomes, same release evidence, ownership and epochs intact, nothing hidden in the boundary.
 
 ## Abstraction: Go To Guide
 

@@ -208,7 +208,7 @@ Completeness_relative(surface) ⇔
 ```
 ## The Properties A Change Must Satisfy
 
-The theorems above are about the system; the properties below are about *your* judgment and *your* Go. Each is a predicate you can check directly: owner unique, resources affine, outcomes separated, policy kept out of the boundary, denotation defined, round trip closed. `Accept(J, go_surface)` bundles them into the bar a change must clear — it is the formal restatement of "this change uses `uring` correctly".
+The theorems above are about the system; the properties below are about *your* judgment and *your* Go. Each is a predicate you can check directly: owner unique, resources affine, outcomes separated, policy kept out of the boundary, denotation defined, round trip closed. `Accept(J, go_surface)` bundles them into the bar a change must clear — it is the formal restatement of "this change uses `code.hybscloud.com/uring` correctly".
 
 ```text
 module = pkg("code.hybscloud.com/uring")
