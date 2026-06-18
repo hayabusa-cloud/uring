@@ -1,8 +1,8 @@
 # Sessions
 
-A protocol is a caller-side state machine driven by boundary observations, and `uring` correctly refuses to own any of it. This file gives the frontier model: how a session frontier `Σ` steps when a completion arrives, and which steps exist at all. Every observation drives exactly one of six transitions — success (live or terminal), `errMore`, failure (live or terminal), `wouldBlock` (which returns control unchanged), suspension, or runner movement — and the whole stepping relation `ObsStepRel` lives outside the boundary (`ObsStepRel ∉ support(B)`). Parser state, branch policy, and the frontier itself are caller-owned; if a change lets any of them hide inside `B`, the protocol is no longer the caller's.
+A protocol is a caller-side state machine driven by boundary observations, and `code.hybscloud.com/uring` correctly refuses to own any of it. This file gives the frontier model: how a session frontier `Σ` steps when a completion arrives, and which steps exist at all. Every observation drives exactly one of six transitions — success (live or terminal), `errMore`, failure (live or terminal), `wouldBlock` (which returns control unchanged), suspension, or runner movement — and the whole stepping relation `ObsStepRel` lives outside the boundary (`ObsStepRel ∉ support(B)`). Parser state, branch policy, and the frontier itself are caller-owned; if a change lets any of them hide inside `B`, the protocol is no longer the caller's.
 
-Two asymmetries matter for using `uring` correctly: a failure on a live frontier is not terminal and must not carry a terminal frontier fact, and a multishot frontier is advanced by the caller's loop, never by the boundary re-entering itself.
+Two asymmetries matter for using `code.hybscloud.com/uring` correctly: a failure on a live frontier is not terminal and must not carry a terminal frontier fact, and a multishot frontier is advanced by the caller's loop, never by the boundary re-entering itself.
 
 In plain terms, the rules an agent follows here are:
 

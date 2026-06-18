@@ -8,7 +8,7 @@ When the user does not specify another location, save new or updated lift record
 
 - [uring/agents/lift/boundary-core.md](boundary-core.md): saved lift for the core boundary facts plus SQE encoding, CQE observation, outcome decode, release decode, and zero-copy notification handling.
 - [uring/agents/lift/resources-lifecycle.md](resources-lifecycle.md): saved lift for ownership epochs, pending kernel references, release, recycle, close, stop, and cancellation-adjacent lifecycle checks, together with fixed, provided, and selected buffers and zero-copy buffer carriers.
-- [uring/agents/lift/protocols-runtime.md](protocols-runtime.md): saved lift for multishot frontiers, subscription-style observations, protocol boundaries, stream-route liveness, and the caller-owned `code.hybscloud.com/kont`, `code.hybscloud.com/cove`, `code.hybscloud.com/takt`, and `code.hybscloud.com/sess` carriers around boundary observations.
+- [uring/agents/lift/protocols-runtime.md](protocols-runtime.md): saved lift for multishot frontiers, subscription-style observations, protocol boundaries, stream-route liveness, and the caller-owned carriers from `code.hybscloud.com/kont`, `code.hybscloud.com/cove`, `code.hybscloud.com/takt`, and `code.hybscloud.com/sess` around boundary observations.
 - [uring/agents/lift/policy-separation.md](policy-separation.md): saved lift for separating caller-owned retry, backoff, route, parser, scheduler, cancellation, timeout, and service policy from `code.hybscloud.com/uring` boundary mechanics.
 
 ## Save Rule

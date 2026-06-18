@@ -161,7 +161,7 @@ Buffers are resources with a lifecycle of their own — `allocate → own → pu
 
 In plain terms, the rules an agent follows here are:
 
-- A buffer has its own lifecycle, owned by `iobuf`. It moves `allocate → own → publish → select → consume → recycle → release`, and the buffer-shaping facts (pool index, aligned region, iovec view, array copy, typed slice view, reset-without-zero) belong to `iobuf`.
+- A buffer has its own lifecycle, owned by `code.hybscloud.com/iobuf`. It moves `allocate → own → publish → select → consume → recycle → release`, and the buffer-shaping facts (pool index, aligned region, iovec view, array copy, typed slice view, reset-without-zero) belong to `code.hybscloud.com/iobuf`.
 - While the kernel may own a buffer, you may not touch it. Reuse, return, mutate, unregister, and recycle are all disabled for a buffer the kernel may still be reading or writing.
 - Register, provide, select, and consume under explicit preconditions. Registration needs an owned, aligned, stable-address buffer and a valid slot; a provided buffer is published to a valid group and id; a selected buffer comes from a CQE carrying the buffer-select flag and a selected-buffer frontier; after consuming the first `n` bytes the buffer is recycled, copied-then-recycled, or released.
 - Release a zero-copy window exactly once, and only when it is safe. The release fires after both the data and notification frontiers are observed, or through an explicit terminal no-notification fallback, and never more than once; while pending it stays kernel-owned.

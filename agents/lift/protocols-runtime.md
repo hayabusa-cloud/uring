@@ -268,7 +268,7 @@ PO_multishot_protocols =
 ```
 ## Runtime Carriers Lift
 
-This second lift records the runtime carriers — the checked shape that caller-side Go must preserve when it drives operations through `kont`, `cove`, `takt`, and `sess`.
+This second lift records the runtime carriers — the checked shape that caller-side Go must preserve when it drives operations through `code.hybscloud.com/kont`, `code.hybscloud.com/cove`, `code.hybscloud.com/takt`, and `code.hybscloud.com/sess`.
 
 ```text
 topic = runtime_carriers
@@ -301,14 +301,16 @@ J_runtime_carriers =
 complete(lift,J_runtime_carriers)
   → saved(SaveLift(lift,task,J_runtime_carriers))
 
-RuntimeOwner =
+RuntimeOwnerPkg =
   { pkg("code.hybscloud.com/kont")
   , pkg("code.hybscloud.com/cove")
   , pkg("code.hybscloud.com/takt")
   , pkg("code.hybscloud.com/sess")
   }
-support(RuntimeOwner) ⊆ C
-RuntimeOwner ∩ support(B) = ∅
+RuntimeOwnerFact_rc =
+  {runtime_owner_pkg(p) | p ∈ RuntimeOwnerPkg}
+support(RuntimeOwnerFact_rc) ⊆ C
+RuntimeOwnerFact_rc ∩ support(B) = ∅
 
 RuntimeTheoryRoute_rc =
   { pkg("code.hybscloud.com/kont")
@@ -320,14 +322,14 @@ RuntimeTheoryRoute_rc =
   , pkg("code.hybscloud.com/sess")
       ↦ {session_frontier}
 }
-∀ p ∈ RuntimeOwner. RuntimeTheoryRoute_rc[p] ⊆ TheoryConcept
+∀ p ∈ RuntimeOwnerPkg. RuntimeTheoryRoute_rc[p] ⊆ TheoryConcept
 RuntimeTheoryUse_rc =
   {runtime_concept_use(p,c) |
-     p ∈ RuntimeOwner ∧ c ∈ RuntimeTheoryRoute_rc[p]}
+     p ∈ RuntimeOwnerPkg ∧ c ∈ RuntimeTheoryRoute_rc[p]}
 RuntimeTheoryUse_rc ⊆ RuntimeConceptUse
 support(RuntimeTheoryUse_rc) ⊆ C
 project(RuntimeTheoryUse_rc,B) = ∅
-∀ c ∈ ⋃ {RuntimeTheoryRoute_rc[p] | p ∈ RuntimeOwner}.
+∀ c ∈ ⋃ {RuntimeTheoryRoute_rc[p] | p ∈ RuntimeOwnerPkg}.
   concept_utilized_U(J_runtime_carriers,c)
 
 KontCarrier =
@@ -448,6 +450,18 @@ BoundarySuspension(s,op) ⇔
   s ∈ OneShotSuspension ∧ op ∈ boundary_action(B) ∧ pending_op(s)=op
 ∀ s ∈ OneShotSuspension.
   ∀ op. BoundarySuspension(s,op) → identity(s)=user_data(op)
+live_token_rc(token) ⇔ token ∈ dom(PendingTable_rc)
+submit_token_rc(token,op) ⇔
+  one_shot(op)
+  ∧ carrier(op) = Loop(pkg("code.hybscloud.com/takt"))
+  ∧ token_indexes(token,user_data(op))
+submit_token_rc(token,op) ∧ live_token_rc(token)
+  → fail(ErrLiveTokenReuse_rc)
+    ∧ fatal(Loop(pkg("code.hybscloud.com/takt")),
+             ErrLiveTokenReuse_rc)
+    ∧ drain(PendingTable_rc)
+retire_token_rc(token) ⇔
+  token ∈ dom_pre(PendingTable_rc) ∧ token ∉ dom_post(PendingTable_rc)
 ∀ op.
   multishot(op) → reject(carrier(op) = OneShotSuspension)
 ∀ op.
@@ -500,6 +514,18 @@ poll_err(Loop(pkg("code.hybscloud.com/takt")))
   = ErrWouldBlock_rc
   → idle(Loop(pkg("code.hybscloud.com/takt")))
     ∧ no_mutation(PendingTable_rc)
+fatal(Loop(pkg("code.hybscloud.com/takt")),e) ∧ submit_token_rc(token,op)
+  → fail(e)
+fatal(Loop(pkg("code.hybscloud.com/takt")),e)
+  → poll(Loop(pkg("code.hybscloud.com/takt"))) = fail(e)
+drain(Loop(pkg("code.hybscloud.com/takt"))) ∧
+  fatal_pre(Loop(pkg("code.hybscloud.com/takt")))=nil
+  → fatal_post(Loop(pkg("code.hybscloud.com/takt"))) =
+      ErrDisposed_rc
+drain(Loop(pkg("code.hybscloud.com/takt"))) ∧
+  fatal_pre(Loop(pkg("code.hybscloud.com/takt")))≠nil
+  → fatal_post(Loop(pkg("code.hybscloud.com/takt"))) =
+      fatal_pre(Loop(pkg("code.hybscloud.com/takt")))
 stream_completion(SubscriptionLoop(pkg("code.hybscloud.com/takt")), c) ∧ More_rc(c)
   → emit(stream_event(c))
     ∧ live_route_rc(route_rc(c))
@@ -522,10 +548,14 @@ cancel_route_rc(route) ∧
   (route=zero_route_rc ∨ route ∉ dom_pre(RouteTable_rc))
   → fail(ErrUnknownSubscription_rc)
     ∧ no_mutation(RouteTable_rc)
-fatal(SubscriptionLoop(pkg("code.hybscloud.com/takt")),e) →
-  subscribe_route_rc(_,_) = fail(e)
-  ∧ poll(SubscriptionLoop(pkg("code.hybscloud.com/takt"))) = fail(e)
-  ∧ cancel_route_rc(_) = fail(e)
+fatal(SubscriptionLoop(pkg("code.hybscloud.com/takt")),e) ∧
+  subscribe_route_rc(route,op)
+  → fail(e)
+fatal(SubscriptionLoop(pkg("code.hybscloud.com/takt")),e) ∧
+  cancel_route_rc(route)
+  → fail(e)
+fatal(SubscriptionLoop(pkg("code.hybscloud.com/takt")),e)
+  → poll(SubscriptionLoop(pkg("code.hybscloud.com/takt"))) = fail(e)
 drain(SubscriptionLoop(pkg("code.hybscloud.com/takt"))) ∧
   fatal_pre(SubscriptionLoop(pkg("code.hybscloud.com/takt")))=nil
   → fatal_post(SubscriptionLoop(pkg("code.hybscloud.com/takt"))) =
@@ -577,6 +607,12 @@ Preservation_rc =
        → (More_rc(c) ⇔ boundary_more_rc(cqe)))
   ∧ (payload_failure_rc(c) ∧ More_rc(c)
        → live_route_rc(route_rc(c)) ∧ ¬retire_route_rc(route_rc(c)))
+  ∧ (submit_token_rc(token,op) ∧ live_token_rc(token)
+       → fail(ErrLiveTokenReuse_rc))
+  ∧ (drain(Loop(pkg("code.hybscloud.com/takt"))) ∧
+       fatal_pre(Loop(pkg("code.hybscloud.com/takt")))=nil
+       → fatal_post(Loop(pkg("code.hybscloud.com/takt"))) =
+          ErrDisposed_rc)
   ∧ (subscribe_route_rc(zero_route_rc,op)
        → fail(ErrInvalidRouteID_rc))
   ∧ (cancel_route_rc(route) ∧ route ∉ dom_pre(RouteTable_rc)

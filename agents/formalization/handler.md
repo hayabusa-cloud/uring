@@ -1,6 +1,6 @@
 # Handler
 
-`uring` is a *shallow* effect handler: it observes one boundary action and hands control straight back to the caller. It never owns the loop, never reinstalls itself to interpret the next completion, and never captures caller policy. This file is the operational heart of that claim. Read it to know exactly how a boundary action steps, what counts as a normal form, and how a suspension is resumed at most once per observation — because the moment a change makes the handler *deep* (a hidden runner loop, a retained continuation, policy baked into the step), every separation the guide promises collapses.
+`code.hybscloud.com/uring` is a *shallow* effect handler: it observes one boundary action and hands control straight back to the caller. It never owns the loop, never reinstalls itself to interpret the next completion, and never captures caller policy. This file is the operational heart of that claim. Read it to know exactly how a boundary action steps, what counts as a normal form, and how a suspension is resumed at most once per observation — because the moment a change makes the handler *deep* (a hidden runner loop, a retained continuation, policy baked into the step), every separation the guide promises collapses.
 
 The three sections move from the small-step calculus, to the reduction that says when stepping is done, to the suspend/resume boundary where a kernel observation is delivered to the caller's continuation.
 
@@ -180,7 +180,7 @@ ReductionSound(J,J_nf) ⇔
 
 ## Suspend, Resume, And The Observation Boundary
 
-This is where one kernel observation crosses into the caller's continuation. A suspension is resumed at most once per observation, the continuation is owned by the caller layer (not the boundary), and the runner loop is the caller's, not the package's. The two rejections at the end — no hidden runner loop, no boundary-owned caller frontier — are what keep `uring` shallow rather than silently deep.
+This is where one kernel observation crosses into the caller's continuation. A suspension is resumed at most once per observation, the continuation is owned by the caller layer (not the boundary), and the runner loop is the caller's, not the package's. The two rejections at the end — no hidden runner loop, no boundary-owned caller frontier — are what keep `code.hybscloud.com/uring` shallow rather than silently deep.
 
 ```text
 module = pkg("code.hybscloud.com/uring")

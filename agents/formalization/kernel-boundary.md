@@ -1,10 +1,10 @@
 # Kernel Boundary
 
-This is the half of the world an agent does not control: what the kernel does, and which stratum owns which fact. To use `uring` correctly you must keep *kernel facts* (an SQE was submitted; a CQE arrived with these `Res` / `Flags` / `user_data`) strictly apart from *caller policy* (whether to retry, back off, or route). The two sections below give you (1) the boundary / below / caller stratum model and the per-package ownership of each carrier, and (2) the exact correspondence between an SQE action you encode and the CQE observation you later decode. If a change lets a kernel fact carry policy, or lets a borrowed CQE outlive its observation, it is wrong here before it is wrong anywhere else.
+This is the half of the world an agent does not control: what the kernel does, and which stratum owns which fact. To use `code.hybscloud.com/uring` correctly you must keep *kernel facts* (an SQE was submitted; a CQE arrived with these `Res` / `Flags` / `user_data`) strictly apart from *caller policy* (whether to retry, back off, or route). The two sections below give you (1) the boundary / below / caller stratum model and the per-package ownership of each carrier, and (2) the exact correspondence between an SQE action you encode and the CQE observation you later decode. If a change lets a kernel fact carry policy, or lets a borrowed CQE outlive its observation, it is wrong here before it is wrong anywhere else.
 
 ## Kernel Facts And Stratum Ownership
 
-The block fixes the kernel boundary `K = below(module)`, the disjoint strata, and `CarrierOwnerPackages` — the packages allowed to own carriers used by the guide. Read it as the authority on *who owns what*: nothing the kernel reports is caller policy, nothing the caller decides is a kernel fact, and `cove` context or requirement evidence guards caller decisions rather than becoming a boundary projection.
+The block fixes the kernel boundary `K = below(module)`, the disjoint strata, and `CarrierOwnerPackages` — the packages allowed to own carriers used by the guide. Read it as the authority on *who owns what*: nothing the kernel reports is caller policy, nothing the caller decides is a kernel fact, and `code.hybscloud.com/cove` context or requirement evidence guards caller decisions rather than becoming a boundary projection.
 
 ```text
 module = pkg("code.hybscloud.com/uring")

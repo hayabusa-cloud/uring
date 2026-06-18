@@ -1,10 +1,10 @@
 # Runner Utilization
 
-The loop that drives operations against the ring is the caller's, not the package's, and `code.hybscloud.com/takt` is how you build that loop correctly. This file is the rule for using `takt` with `code.hybscloud.com/uring`: a token *is* the `user_data` operation identity, a one-shot completion routes through `Loop` while a multishot stream routes through `SubscriptionLoop` keyed by a `RouteID` of token and generation, drain corresponds to the stop and drain epoch, and runner movement, completion routing, and completion memory all stay caller-owned and out of the boundary. A reused live token or route is rejected.
+The loop that drives operations against the ring is the caller's, not the package's, and `code.hybscloud.com/takt` is how you build that loop correctly. This file is the rule for using `code.hybscloud.com/takt` with `code.hybscloud.com/uring`: a token *is* the `user_data` operation identity, a one-shot completion routes through `Loop` while a multishot stream routes through `SubscriptionLoop` keyed by a `RouteID` of token and generation, drain corresponds to the stop and drain epoch, and runner movement, completion routing, and completion memory all stay caller-owned and out of the boundary. A reused live token or route is rejected.
 
 In plain terms, the rules an agent follows here are:
 
-- A token is the operation identity. A `takt` token *is* the `user_data` of a boundary operation; reusing a still-live token is rejected (`ErrLiveTokenReuse`), and a completion value must be copied facts, never a borrowed CQE view.
+- A token is the operation identity. A token from `code.hybscloud.com/takt` *is* the `user_data` of a boundary operation; reusing a still-live token is rejected (`ErrLiveTokenReuse`), and a completion value must be copied facts, never a borrowed CQE view.
 - Route one-shot and multishot differently. A one-shot operation runs through `Loop`; a multishot operation runs through `SubscriptionLoop` keyed by a `RouteID = (Token, Generation)`. A multishot completion arriving in a one-shot `Loop` fails as `ErrUnsupportedMultishot`, and reusing a live route is rejected (`ErrLiveRouteReuse`).
 - Distinguish dispatcher-level from completion-level `ErrMore`. `Advance`/`AdvanceSuspension` resume on dispatcher `ErrMore` and return a live frontier; the generic `Loop` rejects completion-level `ErrMore` as unsupported multishot; a stream completion's `More` flag means the route stays live, and its absence means the route may retire.
 - Back off and wait in the caller. On `ErrWouldBlock` or no completion, the park, spin-wait, or backoff decision and its state are caller-owned; the loop never hides them.
@@ -92,7 +92,8 @@ meaning(more_flag_takt(c) = true, SubscriptionLoop(pkg("code.hybscloud.com/takt"
 meaning(more_flag_takt(c) = false, SubscriptionLoop(pkg("code.hybscloud.com/takt"))) =
   route_may_retire_after_event(route(c))
 PendingTable = finite_map(Token, Suspension[A])
-CompletionMemory = loop_slab_storage([]Completion)
+CompletionMemoryStore_takt = loop_slab_storage([]Completion)
+storage_realizer(CompletionMemory, CompletionMemoryStore_takt)
 RouteTable = finite_map(RouteID, RouteState)
 RouteState = {active, canceling}
 current_suspension_takt(token) =
@@ -115,6 +116,9 @@ backend_submit(token,op) =
 live(token) ⇔ ∃cqe op. may_arrive(cqe,op) ∧ boundary_token_correlates(token,op)
 submit(token',op') ∧ live(token')
   → fail(ErrLiveTokenReuse_takt)
+    ∧ fatal(Loop(pkg("code.hybscloud.com/takt")),
+             ErrLiveTokenReuse_takt)
+    ∧ drain(PendingTable)
 completion(token,v) ∧ ∃op. boundary_token_correlates(token,op)
   → BoundaryCompletionValue(v)
 terminal(Completion(token)) → retire(token)
@@ -126,6 +130,18 @@ poll(Loop(pkg("code.hybscloud.com/takt"))) = idle →
 poll_err = ErrWouldBlock_takt
   → poll(Loop(pkg("code.hybscloud.com/takt"))) = idle
     ∧ no_mutation(PendingTable)
+fatal(Loop(pkg("code.hybscloud.com/takt")),e) ∧ submit(token,op)
+  → fail(e)
+fatal(Loop(pkg("code.hybscloud.com/takt")),e)
+  → poll(Loop(pkg("code.hybscloud.com/takt"))) = fail(e)
+drain(Loop(pkg("code.hybscloud.com/takt"))) ∧
+  fatal_pre(Loop(pkg("code.hybscloud.com/takt")))=nil
+  → fatal_post(Loop(pkg("code.hybscloud.com/takt"))) =
+      ErrDisposed_takt
+drain(Loop(pkg("code.hybscloud.com/takt"))) ∧
+  fatal_pre(Loop(pkg("code.hybscloud.com/takt")))≠nil
+  → fatal_post(Loop(pkg("code.hybscloud.com/takt"))) =
+      fatal_pre(Loop(pkg("code.hybscloud.com/takt")))
 
 ⟦Reify(Eff[A])⟧ = Expr[A]
 ⟦Reflect(Expr[A])⟧ = Eff[A]
@@ -229,10 +245,14 @@ cancel_success(route) ⇔ cancel(route) ∧ route ∈ dom_pre(RouteTable)
 cancel_success(route) →
   route ∈ dom_pre(RouteTable)
   ∧ route_remains_live_until_terminal_or_drain(route)
-fatal(SubscriptionLoop(pkg("code.hybscloud.com/takt")),e) →
-  subscribe(_,_) = fail(e)
-  ∧ poll(SubscriptionLoop(pkg("code.hybscloud.com/takt"))) = fail(e)
-  ∧ cancel(_) = fail(e)
+fatal(SubscriptionLoop(pkg("code.hybscloud.com/takt")),e) ∧
+  subscribe(route,op)
+  → fail(e)
+fatal(SubscriptionLoop(pkg("code.hybscloud.com/takt")),e) ∧
+  cancel(route)
+  → fail(e)
+fatal(SubscriptionLoop(pkg("code.hybscloud.com/takt")),e)
+  → poll(SubscriptionLoop(pkg("code.hybscloud.com/takt"))) = fail(e)
 drain(SubscriptionLoop(pkg("code.hybscloud.com/takt"))) →
   ∀ route ∈ dom_pre(RouteTable).
     retire(route)
@@ -304,6 +324,7 @@ reject(hidden_runner_loop(B))
 successor_observation_possible(ctx) → decision_owner(next_observation) = C
 
 support(RunnerCarrier ∪ EffectCarrier ∪ {PendingTable, RouteTable,
+                         CompletionMemoryStore_takt,
                          backoff_policy(Backoff_takt), spin_wait_policy(SpinWait_takt),
                          poll_cadence}) ⊆ C
 support(kernel_boundary_facts) ⊆ B

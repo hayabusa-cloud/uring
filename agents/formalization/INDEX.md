@@ -2,9 +2,9 @@
 
 Use these files when the task needs the formal notation behind the public `code.hybscloud.com/uring` agent guide. They cover caller code that directly invokes the package and broader systems built above that caller layer. They also describe abstraction from Go into the guide notation and compilation from checked notation back into Go. The files are ordered from notation basics to verification closure.
 
-The formalization guide family is checked as a composed guide: each topic file states an internal well property, and the topic judgments must remain provably composable under the closure conditions in [uring/agents/formalization/overview.md](overview.md), [uring/agents/formalization/guarantees.md](guarantees.md), and [uring/agents/formalization/verification.md](verification.md).
+The formalization guide family is checked as a composed guide: each topic file is checked by `GuideInternalWell_U(f)`, defined in [uring/agents/formalization/guarantees.md](guarantees.md), and the topic judgments must remain provably composable under the closure conditions in [uring/agents/formalization/overview.md](overview.md), [uring/agents/formalization/guarantees.md](guarantees.md), and [uring/agents/formalization/verification.md](verification.md).
 
-The formal vocabulary stays explicit in `uring` terms. Preserve every group when editing any topic file:
+The formal vocabulary stays explicit in `code.hybscloud.com/uring` boundary terms. Preserve every group when editing any topic file:
 
 ```text
 kernel           := {core, judgment, Ctrl, noHidden, canonicalLevel}
@@ -15,8 +15,8 @@ reify_runner     := {Reify, Reflect, trampoline, runner, Suspension, coalgebra}
 compilation      := {compile_to_go, outcome_compilation, handler_compilation, contextual_compilation}
 sessions_outcomes := {duality, projection, Outcome, Π, Backoff, ErrWouldBlock, ErrMore}
 metatheory       := {soundness, completeness, consistency, preservation, progress}
-abstraction      := {LIFT, SAVE, ANALYZE, FIX, REPORT, UPDATE, formalize, typecheck, reduce, prove, verify}
-middleware       := {middleware, shallow_handler, iox, kont, cove, takt}
+abstraction      := {LIFT, SAVE, ANALYZE, FIX, REPORT, UPDATE, analyze, lift, formalize, typecheck, reduce, prove, verify}
+middleware       := {middleware, shallow_handler, pkg("code.hybscloud.com/iox"), pkg("code.hybscloud.com/kont"), pkg("code.hybscloud.com/cove"), pkg("code.hybscloud.com/takt")}
 properties       := {Structural_Soundness, Conservativity, Composability, Parametricity, extension_admissibility}
 ```
 
