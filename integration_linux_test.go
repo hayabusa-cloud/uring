@@ -928,6 +928,7 @@ func TestQueryOpcodes(t *testing.T) {
 func TestRegisterFiles(t *testing.T) {
 	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
 		opt.Entries = uring.EntriesSmall
+		opt.MultiIssuers = true // Avoid SINGLE_ISSUER io_uring_register task affinity in CI.
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -979,6 +980,7 @@ func TestRegisterFiles(t *testing.T) {
 func TestRegisterFilesSparse(t *testing.T) {
 	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
 		opt.Entries = uring.EntriesSmall
+		opt.MultiIssuers = true // Avoid SINGLE_ISSUER io_uring_register task affinity in CI.
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

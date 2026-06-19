@@ -47,9 +47,9 @@ Debian 13 の安定版トラックが提供するカーネルは 6.12 です。`
 
 リング生成時に `ENOMEM`・`EPERM`・`ENOSYS` が返る場合、memlock 上限、sysctl 設定、またはカーネルのサポート状況が原因です。コンテナランタイムはデフォルトで `io_uring` システムコールをブロックします。診断と解決手順は [SETUP.md](./SETUP.md) を参照してください。
 
-## `code.hybscloud.com/uring` の上位およびその先のエージェント向けコーディング
+## `code.hybscloud.com/uring` 境界周辺のエージェント向けコーディング
 
-`code.hybscloud.com/uring` の上位またはその先にある呼び出し側コードを生成またはレビューするときは、独立したガイドの入口 [`AGENTS.md`](./AGENTS.md) を使用します。[`agents/INDEX.md`](./agents/INDEX.md) はトピック索引として使い、SQE/CQE の機構、`user_data` による識別、バッファ所有権、完了結果、ライフサイクル規則、統合境界、参照確認、そして要求分析から形式化、推論、Go へのコンパイル、検証までの流れを保ってください。
+`code.hybscloud.com/uring` 境界周辺の呼び出し側コード、つまりランタイム、プロトコルスタック、サービス、および正確な Linux `io_uring` 境界を必要とするレビュー作業を生成またはレビューするときは、独立したガイドの入口 [`AGENTS.md`](./AGENTS.md) を使用します。[`agents/INDEX.md`](./agents/INDEX.md) はトピック索引として使い、SQE/CQE の機構、`user_data` による識別、バッファ所有権、完了結果、ライフサイクル規則、統合境界、参照確認、そして要求分析から形式化、推論、Go へのコンパイル、検証までの流れを保ってください。
 
 規則は単純です。`code.hybscloud.com/uring` はカーネルの事実を公開し、ポリシーは呼び出し側レイヤーが選びます。再試行/backoff、ポーリング周期、スケジューリング、ルーティング、ルートの終了処理、プロトコル状態、パース、完了ルーティング、キャンセルおよびタイムアウトポリシー、安全性チェック、サービスライフサイクルは `code.hybscloud.com/uring` の境界外に置き、`ErrWouldBlock`、`ErrMore`、`IORING_CQE_F_MORE`、所有権の移動、機能不足による失敗を可視のまま保ってください。
 
