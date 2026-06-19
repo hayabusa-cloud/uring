@@ -238,6 +238,15 @@ field access                : cqe ↦ {cqe.Res, cqe.Flags, cqe.user_data}
 InstanceCase =
   { cqe, sqe, ctx, r }
 
+CompletionInstanceCase =
+  { cqe, ctx, r }
+
+SubmissionInstanceCase =
+  { sqe, ctx, r }
+
+bound_completion_instance(x) ⇔ x ∈ CompletionInstanceCase
+bound_submission_instance(x) ⇔ x ∈ SubmissionInstanceCase
+
 SortOrKind =
   { CQE, SQE, Ctx, Ring, R[κ], CQEView, CQECopy,
     CQEFact, CQEResultResource, CQEEvent }
@@ -275,7 +284,10 @@ GuideCaseInvariant ⇔
   ∧ holds(path("uring/agents/workflow"))
   ∧ holds(path("uring/agents/runtime"))
   ∧ holds(path("uring/agents/lift"))
-  ∧ ∀x. bound_completion_instance(x) → x ∈ {cqe,ctx,r}
+  ∧ InstanceCase = CompletionInstanceCase ∪ SubmissionInstanceCase
+  ∧ ∀x. bound_completion_instance(x) → x ∈ CompletionInstanceCase
+  ∧ ∀x. bound_submission_instance(x) → x ∈ SubmissionInstanceCase
+  ∧ ∀x. bound_instance(x) → x ∈ InstanceCase
   ∧ ∀cqe. field_access(cqe) ⊆ {cqe.Res,cqe.Flags,cqe.user_data}
 ```
 

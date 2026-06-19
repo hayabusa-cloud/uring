@@ -1,6 +1,6 @@
 # code.hybscloud.com/uring Agent Guide
 
-This is the entry point to the guide set for using `code.hybscloud.com/uring` correctly. Use it when generating or reviewing caller-side code above or beyond the package boundary: runtimes, protocol stacks, services, and review work that needs a precise Linux `io_uring` boundary.
+This is the entry point to the guide set for using `code.hybscloud.com/uring` correctly. Use it when generating or reviewing caller-side code around the package boundary: runtimes, protocol stacks, services, and review work that needs a precise Linux `io_uring` boundary.
 
 Read [`uring/README.md`](README.md) first for the package overview and API examples. Then use this guide to decide which facts belong at the boundary, which policy belongs in the caller layer, and which lifecycle transitions must remain visible.
 
@@ -10,7 +10,7 @@ Treat `code.hybscloud.com/uring` as a narrow Linux `io_uring` boundary. It sets 
 
 Keep caller policy in the layer that invokes `code.hybscloud.com/uring`: retry/backoff, poll cadence, scheduling, parking, routing, route retirement, parser state, protocol branching, completion routing, cancellation and timeout policy, safety checks, and service lifecycle. Use this guide for caller-side design and review, not as a package-maintenance manual.
 
-The `INDEX.md` files under [`agents/`](agents/) are readable navigation: use them to choose the guide files required by a task. [`agents/references.md`](agents/references.md) is a natural-language research guide, and the [`agents/workflow/`](agents/workflow/) files are readable procedure — the gates, obligations, checklists, and staged loop you apply to a task. The remaining topic files under `boundary/`, `formalization/`, `lift/`, and `runtime/` carry the formal notation for tasks that need it, including abstraction from caller-side Go into the guide notation and compilation from checked notation back into Go, for both the layer directly above the package and the broader systems beyond it. Theory terms in those files are useful only when they classify a concrete guide obligation: effect and resumption, context and coeffect, session frontier, runner observation, denotation, compilation, or verification evidence. This file is the readable entrypoint.
+The `INDEX.md` files under [`agents/`](agents/) are readable navigation: use them to choose the guide files required by a task. [`agents/references.md`](agents/references.md) is a natural-language research guide, and the [`agents/workflow/`](agents/workflow/) files are readable procedure: the gates, obligations, checklists, and staged loop you apply to a task. The remaining topic files under `boundary/`, `formalization/`, `lift/`, and `runtime/` carry the formal notation for tasks that need it, including abstraction from caller-side Go into the guide notation and compilation from checked notation back into Go. Theory terms in those files are useful only when they classify a concrete guide obligation: effect and resumption, context and coeffect, session frontier, runner observation, denotation, compilation, or verification evidence. This file is the readable entrypoint.
 
 ```text
 beyond code.hybscloud.com/uring = broader systems built on the layer above: protocol stacks, services, applications

@@ -47,9 +47,9 @@ La branche stable de Debian 13 fournit le noyau 6.12. La suite `trixie-backports
 
 La création du ring peut renvoyer `ENOMEM`, `EPERM` ou `ENOSYS` selon les limites memlock, la configuration sysctl ou le support noyau. Les environnements d'exécution de conteneurs bloquent par défaut les appels système `io_uring`. Consultez [SETUP.md](./SETUP.md) pour le diagnostic et la résolution.
 
-## Codage agentique au-dessus ou au-delà de `code.hybscloud.com/uring`
+## Codage agentique autour de la frontière `code.hybscloud.com/uring`
 
-Utilisez le point d'entrée du guide autonome [`AGENTS.md`](./AGENTS.md) lorsque vous générez ou relisez du code appelant au-dessus ou au-delà de `code.hybscloud.com/uring`. Utilisez [`agents/INDEX.md`](./agents/INDEX.md) comme index thématique afin de préserver la frontière noyau : mécanique SQE/CQE, identité `user_data`, propriété des tampons, résultats de complétion, règles de cycle de vie, limites d'intégration, contrôles de référence et le flux depuis l'analyse et la formalisation jusqu'au raisonnement, à la compilation vers Go et à la vérification.
+Utilisez le point d'entrée du guide autonome [`AGENTS.md`](./AGENTS.md) lorsque vous générez ou relisez du code appelant autour de la frontière `code.hybscloud.com/uring` : runtimes, piles de protocoles, services et travaux de revue qui exigent une frontière Linux `io_uring` précise. Utilisez [`agents/INDEX.md`](./agents/INDEX.md) comme index thématique afin de préserver la frontière noyau : mécanique SQE/CQE, identité `user_data`, propriété des tampons, résultats de complétion, règles de cycle de vie, limites d'intégration, contrôles de référence et le flux depuis l'analyse et la formalisation jusqu'au raisonnement, à la compilation vers Go et à la vérification.
 
 La règle est simple : `code.hybscloud.com/uring` expose les faits noyau ; les couches appelantes choisissent la politique. Laissez les reprises/backoff, la cadence de polling, l'ordonnancement, le routage, le retrait des routes, l'état de protocole, l'analyse syntaxique, le routage des complétions, les politiques d'annulation et de délai, les contrôles de sécurité et le cycle de vie du service hors de la frontière de `code.hybscloud.com/uring`, et gardez visibles `ErrWouldBlock`, `ErrMore`, `IORING_CQE_F_MORE`, le transfert de propriété et les échecs de capacité.
 
