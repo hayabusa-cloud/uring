@@ -8,6 +8,7 @@ The block lifts a `GoSurface` into a `JudgmentSurface` (`lift = ⟦·⟧⁻¹_U`
 
 ```text
 module = pkg("code.hybscloud.com/uring")
+B = boundary(module)
 A = above(module)
 D = beyond(module)
 C = caller(module) = A ∪ D
@@ -177,24 +178,32 @@ compile_denotation_preserved(J,w) ⇔
 CompileSubmit(J) ⇔
   defined(⟦J⟧_U)
   ∧ action(J)=submit
-  ∧ ⟦J⟧_U = helper(submit)
-  ∧ emits(Encode(req,ctx))
-  ∧ no_loop(helper)
-  ∧ no_retry(helper)
+  ∧ ∃ req,ctx,h.
+      h = ⟦J⟧_U
+      ∧ h = helper(submit)
+      ∧ emits(h,Encode(req,ctx))
+      ∧ no_loop(h)
+      ∧ no_retry(h)
 
 CompileObserve(J) ⇔
   defined(⟦J⟧_U)
   ∧ action(J)∈{wait,observe,decode}
-  ∧ ⟦J⟧_U = helper(action(J))
-  ∧ reads(cqe)
-  ∧ (operation_cqe(cqe) → projects(CQEToObs(cqe,ctx,r,χ(J))))
-  ∧ (release_ready_carrier(cqe,ctx,r) → projects(ReleaseProjection(cqe,ctx,r,χ(J))))
-  ∧ preserves(cqe.Res,cqe.Flags,cqe.user_data)
+  ∧ ∃ cqe,ctx,r,h.
+      h = ⟦J⟧_U
+      ∧ h = helper(action(J))
+      ∧ reads(h,cqe)
+      ∧ (operation_cqe(cqe) → projects(h,CQEToObs(cqe,ctx,r,χ(J))))
+      ∧ (release_ready_carrier(cqe,ctx,r) →
+          projects(h,ReleaseProjection(cqe,ctx,r,χ(J))))
+      ∧ preserves(h,{cqe.Res,cqe.Flags,cqe.user_data})
 
 CompileResource(J) ⇔
-  preserves(Θ(J),Θ'(J))
-  ∧ no_hidden_pool_policy(helper)
-  ∧ no_hidden_gc_root(helper)
+  defined(⟦J⟧_U)
+  ∧ ∃ h.
+      h = ⟦J⟧_U
+      ∧ preserves(h,{Θ(J),Θ'(J)})
+      ∧ no_hidden_pool_policy(h)
+      ∧ no_hidden_gc_root(h)
 
 CompilePolicy(J) ⇔
   defined(⟦J⟧_U)
@@ -212,6 +221,9 @@ compilation_sound(J) ⇔
   ∧ DesignDirection(J)
   ∧ Roundtrip1(J)
   ∧ ∃ w ∈ World_U. compile_denotation_preserved(J,w)
+  ∧ (action(J)=submit → CompileSubmit(J))
+  ∧ (action(J)∈{wait,observe,decode} → CompileObserve(J))
+  ∧ CompileResource(J)
   ∧ CompilePolicy(J)
 
 reject(defined(⟦J⟧_U) ∧ hidden(CallerFrontier ∪ CallerPolicy, support(⟦J⟧_U)))

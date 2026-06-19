@@ -47,8 +47,28 @@ SuspCarrier = {Suspension[A], Affine[R,A], EffectFrame[A]}
 BoundaryObservation =
   {cqe_res, cqe_flags, user_data, selected_buffer, capability_fact,
    ownership_fact}
+Source_kont =
+  {path("kont/effect.go"), path("kont/cont.go"), path("kont/frame.go"),
+   path("kont/bridge.go"), path("kont/step.go"), path("kont/trampoline.go"),
+   path("kont/index.go"), path("kont/affine.go"), path("kont/marker_pool.go"),
+   path("kont/pool.go"), path("kont/dispatch.go")}
+source_checked(Source_kont) ⇔ ∀ f ∈ Source_kont. read_current_source(f)
 BoundaryWrapped(s) ⇔
   s ∈ Suspension[A] ∧ pending_op(s) ∈ boundary_action(B)
+CodingObligation_kont(op,s,cqe) ⇔
+  source_checked(Source_kont)
+  ∧ BoundaryWrapped(s)
+  ∧ pending_op(s)=op
+  ∧ one_shot(op)
+  ∧ affine(s)
+  ∧ resume_value(cqe) =
+      copy({cqe.Res, cqe.Flags, cqe.user_data, selected_buffer_metadata(cqe)})
+  ∧ resume_value(cqe) ∩ borrowed_cqe_view = ∅
+  ∧ closure_capture(continuation_of(s))
+      ⊆ copied_completion_facts ∪ caller_owned_state
+  ∧ project({s,resume,try_resume,discard},B) = ∅
+multishot(op) → ¬CodingObligation_kont(op,s,cqe)
+multishot(op) → route_via(SubscriptionLoop(pkg("code.hybscloud.com/takt")))
 
 ⟦Perform(op)⟧ = suspended(effect_operation_shape(op))
 ⟦ExprPerform(op)⟧ = suspended(effect_operation_shape(op))

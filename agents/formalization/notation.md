@@ -16,9 +16,11 @@ The block below fixes the module strata (boundary `B`, caller `C = A ∪ D`, bel
 
 ```text
 module = pkg("code.hybscloud.com/uring")
+B = boundary(module)
 A = above(module)
 D = beyond(module)
 C = caller(module) = A ∪ D
+K = below(module)
 
 ASCIIAlpha = { c | "A" ≤ c ≤ "Z" ∨ "a" ≤ c ≤ "z" }
 ASCIIDigit = { c | "0" ≤ c ≤ "9" }
@@ -251,6 +253,13 @@ capital_sort_or_identifier(x) ⇔ x ∈ SortOrKind ∪ IdentifierCapital
 ∀x. bound_instance(x) → lowercase_bound_instance(x)
 ∀x. bound_instance(x) → x ∉ SortOrKind ∧ x ∉ IdentifierCapital
 ∀cqe. field_access(cqe) ⊆ {cqe.Res, cqe.Flags, cqe.user_data}
+
+PathName = {p | finite_string(p)}
+Path = {path(p) | p ∈ PathName}
+SourceFile = {f ∈ Path | checked_out_source_file(f)}
+read_current_source : SourceFile → Bool
+read_current_source(f) ⇔
+  f ∈ SourceFile ∧ file_exists(f) ∧ read_at_current_revision(f)
 
 capital_allowed(Ctx) ⇔ kind_position(Ctx) ∨ sort_annotation(Ctx)
 capital_allowed(CQE) ⇔ sort_position(CQE) ∨ type_annotation(CQE)

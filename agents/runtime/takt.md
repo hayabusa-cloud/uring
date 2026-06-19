@@ -53,6 +53,13 @@ EffectCarrier = {Eff[A], Expr[A], Either[E,A], Suspension[A]}
 
 Completion = {Token, Value, Err}
 StreamCompletion = {RouteID, Value, HasValue, EventErr, More}
+Source_takt =
+  {path("takt/backend.go"), path("takt/takt.go"), path("takt/bridge.go"),
+   path("takt/step.go"), path("takt/error.go"), path("takt/loop.go"),
+   path("takt/option.go"), path("takt/subscription_backend.go"),
+   path("takt/subscription.go"), path("takt/subscription_option.go"),
+   path("takt/completion_memory.go")}
+source_checked(Source_takt) ⇔ ∀ f ∈ Source_takt. read_current_source(f)
 ErrMore_takt = err_symbol(pkg("code.hybscloud.com/iox"),"ErrMore")
 ErrWouldBlock_takt = err_symbol(pkg("code.hybscloud.com/iox"),"ErrWouldBlock")
 ErrUnsupportedMultishot_takt =
@@ -106,6 +113,21 @@ current_suspension_takt(op) =
 BoundaryDispatch(op) ⇔ op ∈ boundary_action(B)
 BoundaryCompletionValue(v) ⇔
   copied_facts(v) ∧ borrowed_cqe_view ∉ v
+completion_value_takt(cqe) =
+  copy({cqe.Res, cqe.Flags, cqe.user_data, selected_buffer_metadata(cqe)})
+CodingObligation_takt(op,token,cqe) ⇔
+  source_checked(Source_takt)
+  ∧ BoundaryDispatch(op)
+  ∧ token_indexes(token,user_data(op))
+  ∧ BoundaryCompletionValue(completion_value_takt(cqe))
+  ∧ ((one_shot(op) ∧ route_via(Loop(pkg("code.hybscloud.com/takt"))))
+     ∨ (multishot(op)
+        ∧ route_via(SubscriptionLoop(pkg("code.hybscloud.com/takt")))))
+  ∧ DispatchErrMore_takt ≠ CompletionErrMore_takt
+  ∧ (multishot(op)
+       → ¬route_via(Loop(pkg("code.hybscloud.com/takt"))))
+  ∧ project(RunnerCarrier ∪ {PendingTable, RouteTable,
+             CompletionMemoryStore_takt},B) = ∅
 
 boundary_token_correlates(token,op) ⇔
   BoundaryDispatch(op)

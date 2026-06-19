@@ -14,10 +14,10 @@ The block below states these rules formally.
 
 ```text
 module = pkg("code.hybscloud.com/uring")
+B = boundary(module)
 A = above(module)
 D = beyond(module)
 C = caller(module) = A ∪ D
-B = boundary(module)
 World_U = { w | world_for(module,w) }
 Denotation_U(w) = { d | denotation_at(module,w,d) }
 
