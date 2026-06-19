@@ -51,6 +51,12 @@ ProtocolCarrier = {Eff[A], Expr[A], Either[E,A], Suspension[A]}
 Endpoint = SessionState × Transport × Serial
 Transport = bounded_spsc_queues(capacity=4)
 Op = Send(v) ⊎ Recv ⊎ Close ⊎ SelectL ⊎ SelectR ⊎ Offer
+Source_sess =
+  {path("sess/op.go"), path("sess/session.go"), path("sess/step.go"),
+   path("sess/error.go"), path("sess/run.go"), path("sess/bridge.go"),
+   path("sess/fused.go"), path("sess/fused_expr.go"),
+   path("sess/rec.go"), path("sess/exec.go"), path("sess/serial.go")}
+source_checked(Source_sess) ⇔ ∀ f ∈ Source_sess. read_current_source(f)
 current_suspension_sess(op) =
   ιs. s ∈ type_symbol(pkg("code.hybscloud.com/kont"),"Suspension[A]")
       ∧ pending_op(s)=op
@@ -62,15 +68,29 @@ E_sess ∩ {err_symbol(pkg("code.hybscloud.com/iox"),"ErrWouldBlock"),
 Unexpected_sess = {err_symbol(pkg("code.hybscloud.com/iox"),"ErrMore")} ∪ E_sess
 Unexpected_sess_outcome = { unexpected(e) | e ∈ Unexpected_sess }
 SessTransportCtrl = {ok, wouldBlock}
+SessTransportDomain =
+  {nil, err_symbol(pkg("code.hybscloud.com/iox"),"ErrWouldBlock")}
+q_sess_transport : SessTransportDomain → SessTransportCtrl
 q_sess_transport(nil) = ok
 q_sess_transport(err_symbol(pkg("code.hybscloud.com/iox"),"ErrWouldBlock")) =
   wouldBlock
-q_sess_transport(err_symbol(pkg("code.hybscloud.com/iox"),"ErrMore")) =
-  undefined
-dom(q_sess_transport) =
-  {nil, err_symbol(pkg("code.hybscloud.com/iox"),"ErrWouldBlock")}
+dom(q_sess_transport) = SessTransportDomain
 err_symbol(pkg("code.hybscloud.com/iox"),"ErrMore")
-  ∉ dom(q_sess_transport)
+  ∉ SessTransportDomain
+CodingObligation_sess(ep,op,err) ⇔
+  source_checked(Source_sess)
+  ∧ single_owner(ep)
+  ∧ op ∈ Op
+  ∧ ∃ protocol_io_step.
+      BoundaryProtocolStep(protocol_io_step)
+      ∧ bind(protocol_io_step) = op
+  ∧ err ∈ dom(q_sess_transport)
+  ∧ q_sess_transport(err) ∈ SessTransportCtrl
+  ∧ err_symbol(pkg("code.hybscloud.com/iox"),"ErrMore")
+      ∉ dom(q_sess_transport)
+  ∧ protocol_frontier(session(ep)) ∈ CallerFrontier
+  ∧ support(protocol_frontier(session(ep))) ⊆ C
+  ∧ project(SessCarrier ∪ ProtocolCarrier ∪ CallerCheck,B) = ∅
 
 protocol_frontier(session) ∈ CallerFrontier
 ⟦Reify(Eff[A])⟧ = Expr[A]
@@ -80,7 +100,8 @@ support({Reify, Reflect}) ⊆ C
 project({Reify, Reflect}, B) = ∅
 BoundaryProtocolStep(step) ⇔
   defined(bind(step)) ∧ bind(step) ∈ boundary_action(B)
-BoundaryProtocolStep(protocol_io_step) → one_boundary_action(bind(protocol_io_step))
+∀ protocol_io_step.
+  BoundaryProtocolStep(protocol_io_step) → one_boundary_action(bind(protocol_io_step))
 single_owner(Endpoint)
 single_producer_single_consumer(Transport)
 concurrent_use(Endpoint) → reject

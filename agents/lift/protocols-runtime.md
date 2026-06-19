@@ -311,6 +311,26 @@ RuntimeOwnerFact_rc =
   {runtime_owner_pkg(p) | p ∈ RuntimeOwnerPkg}
 support(RuntimeOwnerFact_rc) ⊆ C
 RuntimeOwnerFact_rc ∩ support(B) = ∅
+RuntimeSource_rc =
+  { path("kont/effect.go"), path("kont/cont.go"), path("kont/frame.go"),
+    path("kont/bridge.go"), path("kont/step.go"), path("kont/trampoline.go"),
+    path("kont/index.go"), path("kont/affine.go"), path("kont/marker_pool.go"),
+    path("kont/pool.go"), path("kont/dispatch.go"),
+    path("cove/constraint.go"), path("cove/view.go"), path("cove/cmd.go"),
+    path("cove/req.go"), path("cove/req_expr.go"), path("cove/rule.go"),
+    path("cove/rule_expr.go"), path("cove/checked.go"),
+    path("cove/checked_expr.go"), path("cove/step.go"),
+    path("cove/kripke.go"), path("cove/bridge.go"),
+    path("takt/backend.go"), path("takt/takt.go"), path("takt/bridge.go"),
+    path("takt/step.go"), path("takt/error.go"), path("takt/loop.go"),
+    path("takt/option.go"), path("takt/subscription_backend.go"),
+    path("takt/subscription.go"), path("takt/subscription_option.go"),
+    path("takt/completion_memory.go"),
+    path("sess/op.go"), path("sess/session.go"), path("sess/step.go"),
+    path("sess/error.go"), path("sess/run.go"), path("sess/bridge.go"),
+    path("sess/fused.go"), path("sess/fused_expr.go"),
+    path("sess/rec.go"), path("sess/exec.go"), path("sess/serial.go") }
+source_checked(RuntimeSource_rc) ⇔ ∀ f ∈ RuntimeSource_rc. read_current_source(f)
 
 RuntimeTheoryRoute_rc =
   { pkg("code.hybscloud.com/kont")
@@ -358,6 +378,16 @@ current_suspension_rc(c) =
 current_suspension_rc(op) =
   ιs. s ∈ OneShotSuspension ∧ pending_op(s)=op
   if ∃!s. s ∈ OneShotSuspension ∧ pending_op(s)=op
+runtime_resume_value_rc(cqe) =
+  copy({cqe.Res, cqe.Flags, cqe.user_data, selected_buffer_metadata(cqe)})
+BoundaryContextFact_rc(cqe) =
+  copy({cqe.Res, cqe.Flags, cqe.user_data, selected_buffer_metadata(cqe),
+        capability_fact(cqe), ownership_fact(cqe)})
+ContextExtension_rc(ctx,cqe) =
+  extend(ctx,BoundaryContextFact_rc(cqe))
+support(ContextExtension_rc(ctx,cqe)) ⊆ C
+project(ContextExtension_rc(ctx,cqe),B) = ∅
+borrowed_cqe_pointer ∉ BoundaryContextFact_rc(cqe)
 more_flag_rc(c) = c.More
 more_flag_rc(c) ∈ Bool
 More_rc(c) ⇔ more_flag_rc(c) = true
@@ -392,6 +422,8 @@ ErrDisposed_rc =
   err_symbol(pkg("code.hybscloud.com/takt"),"ErrDisposed")
 ErrMore_rc ∈ ErrorSymbol
 ErrWouldBlock_rc ∈ ErrorSymbol
+SessTransportDomain_rc = {nil, ErrWouldBlock_rc}
+ErrMore_rc ∉ SessTransportDomain_rc
 TaktFatalSymbol_rc =
   {ErrUnsupportedMultishot_rc, ErrLiveTokenReuse_rc,
    ErrLiveRouteReuse_rc, ErrInvalidRouteID_rc, ErrDisposed_rc}
@@ -413,12 +445,65 @@ SessCarrier =
    Reify, Reflect, Step, Advance, StepError, AdvanceError,
    Run, RunExpr, RunError, RunErrorExpr,
    Exec, ExecExpr, ExecError, ExecErrorExpr, Loop, ExprLoop}
+SessOp_rc = {Send[T], Recv[T], Close, SelectL, SelectR, Offer}
+BoundaryProtocolStep_rc(step) ⇔
+  defined(bind(step)) ∧ bind(step) ∈ boundary_action(B)
+∀ protocol_io_step_rc.
+  BoundaryProtocolStep_rc(protocol_io_step_rc) →
+    one_boundary_action(bind(protocol_io_step_rc))
 
 Carrier_rc = KontCarrier ∪ CoveCarrier ∪ TaktCarrier ∪ SessCarrier
 support(Carrier_rc) ⊆ C
 project(Carrier_rc,B) = ∅
 support({PendingTable_rc,RouteTable_rc}) ⊆ C
 project({PendingTable_rc,RouteTable_rc},B) = ∅
+CodingObligation_kont_rc(op,s,cqe) ⇔
+  source_checked(RuntimeSource_rc)
+  ∧ BoundarySuspension(s,op)
+  ∧ one_shot(op)
+  ∧ copied_facts(runtime_resume_value_rc(cqe))
+  ∧ borrowed_cqe_view ∉ runtime_resume_value_rc(cqe)
+  ∧ project({s,resume,try_resume,discard},B) = ∅
+CodingObligation_cove_rc(ctx,s,guard,cqe) ⇔
+  source_checked(RuntimeSource_rc)
+  ∧ CoveRequirementGate(ctx,s,guard)
+  ∧ support(ContextExtension_rc(ctx,cqe)) ⊆ C
+  ∧ borrowed_cqe_pointer ∉ ContextExtension_rc(ctx,cqe)
+  ∧ project(CoveCarrier,B) = ∅
+CodingObligation_takt_rc(op,token,cqe) ⇔
+  source_checked(RuntimeSource_rc)
+  ∧ submit_token_rc(token,op)
+  ∧ token_indexes(token,user_data(op))
+  ∧ copied_facts(runtime_resume_value_rc(cqe))
+  ∧ classify_takt_dispatch(ErrMore_rc) ≠ classify_takt_completion_loop(ErrMore_rc)
+  ∧ project(TaktCarrier ∪ {PendingTable_rc,RouteTable_rc},B) = ∅
+CodingObligation_takt_stream_rc(op,route,c,cqe) ⇔
+  source_checked(RuntimeSource_rc)
+  ∧ multishot(op)
+  ∧ carrier(op) = SubscriptionLoop(pkg("code.hybscloud.com/takt"))
+  ∧ route ∈ RouteID
+  ∧ route = route_rc(c)
+  ∧ boundary_stream_completion_rc(c,cqe)
+  ∧ project(TaktCarrier ∪ {RouteTable_rc},B) = ∅
+CodingObligation_sess_rc(ep,op,err) ⇔
+  source_checked(RuntimeSource_rc)
+  ∧ single_owner(ep)
+  ∧ op ∈ SessOp_rc
+  ∧ ∃ protocol_io_step_rc.
+      BoundaryProtocolStep_rc(protocol_io_step_rc)
+      ∧ bind(protocol_io_step_rc) = op
+  ∧ err ∈ SessTransportDomain_rc
+  ∧ classify_sess_transport(err) ∈ {ok,wouldBlock}
+  ∧ classify_sess_transport(ErrMore_rc) = unexpected(ErrMore_rc)
+  ∧ protocol_frontier(session(ep)) ∈ CallerFrontier
+  ∧ support(protocol_frontier(session(ep))) ⊆ C
+  ∧ project(SessCarrier,B) = ∅
+RuntimeCodingObligation_rc =
+  {CodingObligation_kont_rc, CodingObligation_cove_rc,
+   CodingObligation_takt_rc, CodingObligation_takt_stream_rc,
+   CodingObligation_sess_rc}
+support(RuntimeCodingObligation_rc) ⊆ C
+project(RuntimeCodingObligation_rc,B) = ∅
 
 CoveRequirementGate(ctx,s,guard) ⇔
   owner(ctx) = pkg("code.hybscloud.com/cove")
@@ -597,6 +682,8 @@ Preservation_rc =
   ∧ support(BoundaryFacts) ⊆ B
   ∧ project(Carrier_rc ∪ RuntimePolicy,B)=∅
   ∧ project(RuntimeTheoryUse_rc,B)=∅
+  ∧ support(RuntimeCodingObligation_rc) ⊆ C
+  ∧ project(RuntimeCodingObligation_rc,B)=∅
   ∧ classify_takt_dispatch(ErrMore_rc)
        ≠ classify_takt_completion_loop(ErrMore_rc)
   ∧ classify_takt_dispatch(ErrMore_rc)

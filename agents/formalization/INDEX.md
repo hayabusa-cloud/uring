@@ -4,21 +4,19 @@ Use these files when the task needs the formal notation behind the public `code.
 
 The formalization guide family is checked as a composed guide: each topic file is checked by `GuideInternalWell_U(f)`, defined in [uring/agents/formalization/guarantees.md](guarantees.md), and the topic judgments must remain provably composable under the closure conditions in [uring/agents/formalization/overview.md](overview.md), [uring/agents/formalization/guarantees.md](guarantees.md), and [uring/agents/formalization/verification.md](verification.md).
 
-The formal vocabulary stays explicit in `code.hybscloud.com/uring` boundary terms. Preserve every group when editing any topic file:
+The formal vocabulary stays explicit in `code.hybscloud.com/uring` boundary terms, but this index remains a navigation file. When editing a topic file, preserve the vocabulary group it owns:
 
-```text
-kernel           := {core, judgment, Ctrl, noHidden, canonicalLevel}
-syntax           := {NameAtoms, facts, Γ, Δ, Θ, χ, Σ, Μ, Φ, Obs, Rel, Π}
-typing           := {typing, resource, session, effect, coeffect}
-reduction        := {reduction, wouldBlock, errMore, shallow_handler, coeffect}
-reify_runner     := {Reify, Reflect, trampoline, runner, Suspension, coalgebra}
-compilation      := {compile_to_go, outcome_compilation, handler_compilation, contextual_compilation}
-sessions_outcomes := {duality, projection, Outcome, Π, Backoff, ErrWouldBlock, ErrMore}
-metatheory       := {soundness, completeness, consistency, preservation, progress}
-abstraction      := {LIFT, SAVE, ANALYZE, FIX, REPORT, UPDATE, analyze, lift, formalize, typecheck, reduce, prove, verify}
-middleware       := {middleware, shallow_handler, pkg("code.hybscloud.com/iox"), pkg("code.hybscloud.com/kont"), pkg("code.hybscloud.com/cove"), pkg("code.hybscloud.com/takt")}
-properties       := {Structural_Soundness, Conservativity, Composability, Parametricity, extension_admissibility}
-```
+- Kernel and judgment vocabulary: core boundary facts, `Ctrl`, `noHidden`, and `canonicalLevel`.
+- Syntax vocabulary: `NameAtoms`, facts, `Γ`, `Δ`, `Θ`, `χ`, `Σ`, `Μ`, `Φ`, `Obs`, `Rel`, and `Π`.
+- Typing vocabulary: typing, resource, session, effect, and coeffect judgments.
+- Reduction vocabulary: `wouldBlock`, `errMore`, shallow-handler reduction, and coeffect reduction.
+- Runner and bridge vocabulary: `Reify`, `Reflect`, trampoline, runner, `Suspension`, and coalgebra.
+- Compilation vocabulary: `compile_to_go`, outcome compilation, handler compilation, and contextual compilation.
+- Session and outcome vocabulary: duality, projection, `Outcome`, `Π`, `Backoff`, `ErrWouldBlock`, and `ErrMore`.
+- Metatheory vocabulary: soundness, scope-relative completeness, consistency, preservation, and progress.
+- Workflow vocabulary: `analyze`, `lift`, `formalize`, `typecheck`, `reduce`, `prove`, `compile_to_go`, and `verify`, together with saved-stage records.
+- Middleware vocabulary: shallow-handler composition across `code.hybscloud.com/iox`, `code.hybscloud.com/kont`, `code.hybscloud.com/cove`, and `code.hybscloud.com/takt`.
+- Property vocabulary: `Structural_Soundness`, `Conservativity`, `Composability`, `Parametricity`, and `extension_admissibility`.
 
 Read the formalization files in this order:
 

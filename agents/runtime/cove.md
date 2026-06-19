@@ -52,6 +52,13 @@ MonotoneFacts =
   {capability_present, registration_done, terminal_observed}
 NonMonotoneFacts =
   {frontier_live, buffer_owned, fd_open, ring_not_closed, token_live}
+Source_cove =
+  {path("cove/constraint.go"), path("cove/view.go"), path("cove/cmd.go"),
+   path("cove/req.go"), path("cove/req_expr.go"), path("cove/rule.go"),
+   path("cove/rule_expr.go"), path("cove/checked.go"),
+   path("cove/checked_expr.go"), path("cove/step.go"),
+   path("cove/kripke.go"), path("cove/bridge.go")}
+source_checked(Source_cove) ⇔ ∀ f ∈ Source_cove. read_current_source(f)
 World = (MonotoneFactsState, EphemeralFactsState, Requirements, Epoch)
 monotone_facts(w) ⊆ MonotoneFacts
 ephemeral_facts(w) ⊆ NonMonotoneFacts
@@ -92,6 +99,14 @@ GuardedSuspensionView(ctx,s,guard) ⇔
   SuspensionView(ctx,s)
   ∧ guard ∈ Guard
   ∧ guard_holds(ctx,guard)
+CodingObligation_cove(ctx,s,guard,cqe) ⇔
+  source_checked(Source_cove)
+  ∧ GuardedSuspensionView(ctx,s,guard)
+  ∧ support(ContextExtension(ctx,cqe)) ⊆ C
+  ∧ borrowed_cqe_pointer ∉ ContextExtension(ctx,cqe)
+  ∧ ∀ F ∈ NonMonotoneFacts. check_at_use_epoch(F)
+  ∧ ∀ F ∈ NonMonotoneFacts. reject(cache_across(F,suspension_frontier))
+  ∧ project(CtxCarrier ∪ ExprCarrier ∪ KripkeCarrier ∪ {World},B) = ∅
 resume(GuardedSuspensionView(ctx,s,guard),v) →
   requirement_evidence(guard,ctx) ∈ C
 ¬requirements_hold(ctx) → decision_owner({wait, reroute, abandon}) = C
