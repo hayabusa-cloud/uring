@@ -40,7 +40,7 @@ jobs:
       matrix:
         go-version: [ '1.26.x', 'stable' ]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -204,8 +204,8 @@ jobs:
 
           go test -race -count=1 -timeout=180s -skip "$URING_CI_UNSUPPORTED_ZC_TESTS|$URING_CI_UNSUPPORTED_ZC_EXAMPLES" ./...
 
-  vet-build-darwin:
-    name: Vet & Build (Darwin/arm64, Go ${{ matrix.go-version }})
+  vet-build-test-darwin:
+    name: Vet, Build & Test (Darwin/arm64, Go ${{ matrix.go-version }})
     runs-on: macos-latest
     timeout-minutes: 5
     strategy:
@@ -213,7 +213,7 @@ jobs:
       matrix:
         go-version: [ '1.26.x', 'stable' ]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -239,6 +239,9 @@ jobs:
           CGO_ENABLED: '0'
         run: go build ./...
 
+      - name: Test with race detector
+        run: go test -race -count=1 -timeout=120s ./...
+
   upload-coverage:
     name: Upload Coverage
     runs-on: ubuntu-latest
@@ -248,7 +251,7 @@ jobs:
       id-token: write
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -259,7 +262,7 @@ jobs:
           path: .
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         with:
           use_oidc: true
           files: ./coverage.out
@@ -279,7 +282,7 @@ jobs:
         target:
           - { goos: darwin, goarch: arm64 }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
