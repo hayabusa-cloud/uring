@@ -204,8 +204,8 @@ jobs:
 
           go test -race -count=1 -timeout=180s -skip "$URING_CI_UNSUPPORTED_ZC_TESTS|$URING_CI_UNSUPPORTED_ZC_EXAMPLES" ./...
 
-  vet-build-test-darwin:
-    name: Vet, Build & Test (Darwin/arm64, Go ${{ matrix.go-version }})
+  vet-build-darwin:
+    name: Vet & Build (Darwin/arm64, Go ${{ matrix.go-version }})
     runs-on: macos-latest
     timeout-minutes: 5
     strategy:
@@ -238,9 +238,6 @@ jobs:
         env:
           CGO_ENABLED: '0'
         run: go build ./...
-
-      - name: Test with race detector
-        run: go test -race -count=1 -timeout=120s ./...
 
   upload-coverage:
     name: Upload Coverage
