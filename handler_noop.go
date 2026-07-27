@@ -2,8 +2,6 @@
 // Use of this source code is governed by a MIT-style
 // license that can be found in the LICENSE file.
 
-//go:build linux
-
 package uring
 
 import "code.hybscloud.com/iofd"
@@ -99,7 +97,7 @@ var _ ListenerHandler = NoopListenerHandler{}
 //	   totalBytes int
 //	}
 //
-//	func (h *myHandler) OnData(buf []byte, hasMore bool) {
+//	func (h *myHandler) OnData(buf []byte, bufferMore bool) {
 //	   h.totalBytes += len(buf)
 //	}
 type NoopIncrementalHandler struct{}

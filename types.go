@@ -13,58 +13,8 @@ import (
 	"net"
 	"unsafe"
 
-	"code.hybscloud.com/iofd"
 	"code.hybscloud.com/sock"
 	"code.hybscloud.com/zcall"
-)
-
-// Network address and socket type aliases.
-type (
-	// Sockaddr is the socket address interface used by socket operations.
-	Sockaddr = sock.Sockaddr
-
-	// Addr is the network address interface used by connect and bind helpers.
-	Addr = sock.Addr
-
-	// RawSockaddrAny is the widest raw socket address storage type.
-	RawSockaddrAny = sock.RawSockaddrAny
-
-	// RawSockaddr is the base raw socket address structure.
-	RawSockaddr = sock.RawSockaddr
-
-	// RawSockaddrInet4 is the raw IPv4 socket address structure.
-	RawSockaddrInet4 = sock.RawSockaddrInet4
-
-	// RawSockaddrInet6 is the raw IPv6 socket address structure.
-	RawSockaddrInet6 = sock.RawSockaddrInet6
-
-	// RawSockaddrUnix is the raw Unix domain socket address structure.
-	RawSockaddrUnix = sock.RawSockaddrUnix
-
-	// NetworkType represents the network address family.
-	NetworkType = sock.NetworkType
-
-	// UnderlyingProtocol represents the transport protocol.
-	UnderlyingProtocol = sock.UnderlyingProtocol
-
-	// Socket is the minimal interface for socket operations.
-	Socket = sock.Socket
-)
-
-// Pollable file-descriptor aliases.
-type (
-	// PollFd represents a file descriptor that can be polled by uring helpers.
-	PollFd = iofd.PollFd
-
-	// PollCloser extends PollFd with close capability.
-	PollCloser = iofd.PollCloser
-)
-
-// Network family aliases.
-const (
-	NetworkUnix = sock.NetworkUnix
-	NetworkIPv4 = sock.NetworkIPv4
-	NetworkIPv6 = sock.NetworkIPv6
 )
 
 // Raw socket address size constants.
@@ -113,13 +63,6 @@ const (
 // IPPROTO_UDPLITE is UDP-Lite protocol number.
 const IPPROTO_UDPLITE = sock.IPPROTO_UDPLITE
 
-// IoVec is the scatter/gather I/O vector type.
-type IoVec = zcall.Iovec
-
-// Timespec represents a time value with nanosecond precision.
-// Layout matches struct timespec in Linux.
-type Timespec = zcall.Timespec
-
 // Msghdr represents a message header for sendmsg/recvmsg.
 // Layout matches struct msghdr in Linux (LP64).
 type Msghdr = zcall.Msghdr
@@ -140,15 +83,6 @@ const O_LARGEFILE = 0x8000
 
 // AT_FDCWD is the special value for current working directory.
 const AT_FDCWD = -100
-
-// EpollEvent represents an epoll event.
-// Layout matches struct epoll_event in Linux.
-type EpollEvent struct {
-	Events uint32
-	_      int32 // padding
-	Fd     int32
-	Pad    int32
-}
 
 // Epoll constants.
 const (
