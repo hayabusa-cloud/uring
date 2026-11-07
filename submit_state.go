@@ -65,10 +65,16 @@ func (ur *ioUring) abortSubmitSlot(slot submitSlot) {
 	ur.unlockSubmitState()
 }
 
-// publishSubmitSlot makes the SQE visible to the kernel and unlocks submit
-// state.
+// publishSubmitSlot makes the SQE visible to the kernel and unlocks submit state.
 func (ur *ioUring) publishSubmitSlot(slot submitSlot, sqeCtx SQEContext) {
 	slot.sqe.userData = sqeCtx.Raw()
+	// Retain the submitted fields before the kernel can consume the SQE.
+	switch sqeCtx.Mode() {
+	case CtxModeIndirect:
+		sqeCtx.IndirectSQE().ioUringSqe = *slot.sqe
+	case CtxModeExtended:
+		sqeCtx.ExtSQE().SQE = *slot.sqe
+	}
 	if ur.params.flags&IORING_SETUP_NO_SQARRAY == 0 {
 		ur.sq.array[slot.index] = slot.index
 	}

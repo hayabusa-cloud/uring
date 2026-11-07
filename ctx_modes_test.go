@@ -44,63 +44,83 @@ func TestScopedExtSQEBasic(t *testing.T) {
 }
 
 func TestScopedExtSQESubmitted(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
+	ring := newTestRing(t, func(opt *uring.Options) {
+		opt.Entries = 1
 	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	mustStartRing(t, ring)
 
-	// Get a scope
 	scope := ring.NewScopedExtSQE()
 	if !scope.Valid() {
 		t.Fatal("scope should be valid")
 	}
-
-	// Mark as submitted
-	scope.Submitted()
-
-	// Keep the Ext pointer for manual return
 	ext := scope.Ext
-
-	// Release should be no-op when submitted
-	scope.Release()
-	if scope.Ext == nil {
-		// Ext is still set because we marked it as submitted
-		// The pool return was skipped
+	uring.CtxV1Of(ext).Val1 = 42
+	if err := ring.Nop(uring.PackExtended(ext)); err != nil {
+		scope.Release()
+		t.Fatalf("Nop: %v", err)
 	}
 
-	// Manually return to pool (simulating CQE handler)
+	scope.Submitted()
+	scope.Release()
+	if scope.Ext != ext {
+		t.Error("Release changed the submitted scope's context")
+	}
+	if ring.ExtSQE() != nil {
+		t.Fatal("Release returned the submitted context before completion")
+	}
+
+	cqe, ok := waitForOp(t, ring, uring.IORING_OP_NOP, 2*time.Second)
+	if !ok || cqe.Res != 0 || !cqe.Extended() || cqe.ExtSQE() != ext || cqe.HasMore() {
+		t.Fatalf("unexpected completion: present=%v cqe=%+v", ok, cqe)
+	}
+	if got := uring.CtxV1Of(cqe.ExtSQE()).Val1; got != 42 {
+		t.Errorf("completion metadata = %d, want 42", got)
+	}
+	if ring.ExtSQE() != nil {
+		t.Fatal("completion returned the context before explicit release")
+	}
+
 	ring.PutExtSQE(ext)
+	reused := ring.ExtSQE()
+	if reused != ext {
+		t.Fatal("explicit return did not restore the one-entry pool")
+	}
+	ring.PutExtSQE(reused)
 }
 
 func TestWithExtSQE(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
+	ring := newTestRing(t, func(opt *uring.Options) {
+		opt.Entries = 1
 	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	mustStartRing(t, ring)
 
 	t.Run("success", func(t *testing.T) {
 		var gotExt *uring.ExtSQE
 		err := ring.WithExtSQE(func(ext *uring.ExtSQE) error {
 			gotExt = ext
-			if ext == nil {
-				t.Error("ext should not be nil")
-			}
-			// Return nil - caller is responsible for pool return
-			ring.PutExtSQE(ext)
-			return nil
+			uring.CtxV1Of(ext).Val1 = 123
+			return ring.Nop(uring.PackExtended(ext))
 		})
 		if err != nil {
-			t.Errorf("WithExtSQE: %v", err)
+			t.Fatalf("WithExtSQE: %v", err)
 		}
 		if gotExt == nil {
-			t.Error("callback was not called")
+			t.Fatal("callback was not called")
 		}
+		if ring.ExtSQE() != nil {
+			t.Fatal("successful callback returned the submitted context")
+		}
+		cqe, ok := waitForOp(t, ring, uring.IORING_OP_NOP, 2*time.Second)
+		if !ok || cqe.Res != 0 || !cqe.Extended() || cqe.ExtSQE() != gotExt || cqe.HasMore() {
+			t.Fatalf("unexpected completion: present=%v cqe=%+v", ok, cqe)
+		}
+		if got := uring.CtxV1Of(cqe.ExtSQE()).Val1; got != 123 {
+			t.Errorf("completion metadata = %d, want 123", got)
+		}
+		ring.PutExtSQE(gotExt)
+		reused := ring.ExtSQE()
+		if reused != gotExt {
+			t.Fatal("explicit return did not restore the one-entry pool")
+		}
+		ring.PutExtSQE(reused)
 	})
 
 	t.Run("error", func(t *testing.T) {
@@ -111,6 +131,37 @@ func TestWithExtSQE(t *testing.T) {
 		if err != testErr {
 			t.Errorf("expected test error, got: %v", err)
 		}
+		ext := ring.ExtSQE()
+		if ext == nil {
+			t.Fatal("callback error leaked its context")
+		}
+		ring.PutExtSQE(ext)
+	})
+
+	t.Run("submission blocked", func(t *testing.T) {
+		if err := ring.Nop(uring.ForFD(0)); err != nil {
+			t.Fatalf("fill SQ: %v", err)
+		}
+		var gotExt *uring.ExtSQE
+		err := ring.WithExtSQE(func(ext *uring.ExtSQE) error {
+			gotExt = ext
+			return ring.Nop(uring.PackExtended(ext))
+		})
+		if !errors.Is(err, iox.ErrWouldBlock) {
+			t.Fatalf("full SQ: got %v, want ErrWouldBlock", err)
+		}
+		if gotExt == nil {
+			t.Fatal("callback was not called despite an available context")
+		}
+		cqe, ok := waitForOp(t, ring, uring.IORING_OP_NOP, 2*time.Second)
+		if !ok || cqe.Res != 0 || cqe.Extended() || cqe.HasMore() {
+			t.Fatalf("unexpected completion: present=%v cqe=%+v", ok, cqe)
+		}
+		reused := ring.ExtSQE()
+		if reused != gotExt {
+			t.Fatal("failed submission did not return its context")
+		}
+		ring.PutExtSQE(reused)
 	})
 }
 
@@ -363,8 +414,7 @@ func TestExtendedModeSubmission(t *testing.T) {
 				t.Error("CQE should have FullSQE for Extended mode")
 			}
 
-			// Get ExtSQE - UserData may be modified by submission
-			// The key test is that we can recover the pointer
+			// Recover the borrowed ExtSQE; submission preserves its UserData.
 			extResult := cqe.ExtSQE()
 			if extResult == nil {
 				t.Error("ExtSQE returned nil")

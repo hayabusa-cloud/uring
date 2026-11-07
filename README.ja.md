@@ -178,14 +178,18 @@ direct の 64 ビット配置に収まらない独自メタデータが必要な
 
 ```go
 ext := ring.ExtSQE()
+if ext == nil {
+	return iox.ErrWouldBlock
+}
 meta := uring.CtxV1Of(ext)
 meta.Val1 = requestSeq
 
 sqeCtx := uring.PackExtended(ext)
 fmt.Printf("sqe context mode=%d seq=%d\n", sqeCtx.Mode(), meta.Val1)
+ring.PutExtSQE(ext)
 ```
 
-`NewContextPools` はすぐに使えるプールを返します。`Reset` は、借用中のコンテキストをすべて返却し終えたあとにプールを再利用する場合にのみ呼び出してください。
+`NewContextPools` はすぐに使えるプールを返します。コンテキストプールの枯渇とサブミッションキューの容量は独立しています。リクエストのすべての完了処理と借用参照へのアクセスを終えてから、コンテキストを借用元のプールへ返却してください。`Reset` は両方のプールをクリアし、未返却の借用を無効にします。プールへのすべてのアクセスを停止し、そのコンテキストを使う操作が完了してから呼び出してください。`Reset` 後に以前の借用へアクセスしたり、返却したりしてはいけません。
 
 ### `CQEView` による完了ディスパッチ
 
@@ -408,19 +412,22 @@ for i := range n {
 
 ```go
 type ConnState struct {
-    Addr    netip.AddrPort
-    Created int64
+	Addr    netip.AddrPort
+	Created int64
 }
 
 ext := ring.ExtSQE()
+if ext == nil {
+	return iox.ErrWouldBlock
+}
 ctx := uring.Ctx1V1Of[ConnState](ext)
 ctx.Ref1 = connState
 ctx.Val1 = sequenceNumber
 
 sqeCtx := uring.PackExtended(ext)
 if err := ring.Send(sqeCtx, &fd, payload); err != nil {
-    ring.PutExtSQE(ext)
-    return err
+	ring.PutExtSQE(ext)
+	return err
 }
 ```
 

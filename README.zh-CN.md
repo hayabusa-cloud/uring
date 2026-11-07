@@ -178,14 +178,18 @@ sqeCtx := uring.ForFD(fd).
 
 ```go
 ext := ring.ExtSQE()
+if ext == nil {
+	return iox.ErrWouldBlock
+}
 meta := uring.CtxV1Of(ext)
 meta.Val1 = requestSeq
 
 sqeCtx := uring.PackExtended(ext)
 fmt.Printf("sqe context mode=%d seq=%d\n", sqeCtx.Mode(), meta.Val1)
+ring.PutExtSQE(ext)
 ```
 
-`NewContextPools` 返回开箱即用的对象池。仅在所有借出的上下文已归还、且需要复用该池时，才调用 `Reset`。
+`NewContextPools` 返回可立即使用的对象池。上下文池耗尽与提交队列容量无关。所有请求完成事件和借用访问处理完毕后，将上下文归还给原池。`Reset` 会清空两个池并使尚未归还的借用失效；调用前必须停止所有池访问，并完成使用这些上下文的操作。`Reset` 之后不得访问或归还旧借用。
 
 ### 通过 `CQEView` 分发完成事件
 
@@ -408,19 +412,22 @@ for i := range n {
 
 ```go
 type ConnState struct {
-    Addr    netip.AddrPort
-    Created int64
+	Addr    netip.AddrPort
+	Created int64
 }
 
 ext := ring.ExtSQE()
+if ext == nil {
+	return iox.ErrWouldBlock
+}
 ctx := uring.Ctx1V1Of[ConnState](ext)
 ctx.Ref1 = connState
 ctx.Val1 = sequenceNumber
 
 sqeCtx := uring.PackExtended(ext)
 if err := ring.Send(sqeCtx, &fd, payload); err != nil {
-    ring.PutExtSQE(ext)
-    return err
+	ring.PutExtSQE(ext)
+	return err
 }
 ```
 

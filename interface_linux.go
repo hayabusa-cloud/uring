@@ -363,38 +363,40 @@ func (ur *Uring) Wait(cqes []CQEView) (n int, err error) {
 // Context Pool Accessors
 // ========================================
 
-// ExtSQE acquires an ExtSQE from the pool for Extended mode submissions.
-// Returns nil if the pool is exhausted (ring is full - natural backpressure).
-// The returned ExtSQE is borrowed until PutExtSQE after the corresponding CQE
-// is processed. Callers must not retain pointers into SQE or UserData after
-// release.
+// ExtSQE borrows a cleared ExtSQE for Extended mode submissions.
+// It returns nil if the context pool is exhausted, independently of SQ capacity.
+// Keep the context until all request completions and borrowed access finish,
+// then return it to this ring with PutExtSQE.
 //
 //go:nosplit
 func (ur *Uring) ExtSQE() *ExtSQE {
 	return ur.ctxPools.Extended()
 }
 
-// PutExtSQE returns an ExtSQE to the pool after completion processing.
-// Must be called exactly once per ExtSQE to maintain pool balance.
-// After this call the ExtSQE, typed context views, and raw CastUserData
-// overlays derived from it are invalid.
+// PutExtSQE clears and returns an ExtSQE borrowed from this ring.
+// Call exactly once after all request completions and borrowed access finish.
+// This includes terminal multishot and zero-copy notification CQEs when present.
+// After return, the ExtSQE and all views into it are invalid.
 //
 //go:nosplit
 func (ur *Uring) PutExtSQE(sqe *ExtSQE) {
 	ur.ctxPools.PutExtended(sqe)
 }
 
-// IndirectSQE acquires an IndirectSQE from the pool for Indirect mode submissions.
-// Returns nil if the pool is exhausted.
-// The returned IndirectSQE is borrowed until PutIndirectSQE.
+// IndirectSQE borrows an IndirectSQE for Indirect mode submissions.
+// It returns nil if the context pool is exhausted, independently of SQ capacity.
+// Initialize its retained contents before use. Keep it until all request
+// completions and borrowed access finish, then return it with PutIndirectSQE.
 //
 //go:nosplit
 func (ur *Uring) IndirectSQE() *IndirectSQE {
 	return ur.ctxPools.Indirect()
 }
 
-// PutIndirectSQE returns an IndirectSQE to the pool.
-// After this call the IndirectSQE is invalid and must not be reused.
+// PutIndirectSQE returns an IndirectSQE borrowed from this ring without clearing it.
+// Call exactly once after all request completions and borrowed access finish.
+// This includes terminal multishot and zero-copy notification CQEs when present.
+// After return, the IndirectSQE and all views into it are invalid.
 //
 //go:nosplit
 func (ur *Uring) PutIndirectSQE(sqe *IndirectSQE) {

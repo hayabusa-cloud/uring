@@ -7,17 +7,14 @@
 package uring
 
 import (
-	"math"
 	"sync/atomic"
 	"unsafe"
 
 	"code.hybscloud.com/spin"
 )
 
-const (
-	contextPoolEntryEmpty    = 1 << 62
-	contextPoolEntryTurnMask = contextPoolEntryEmpty>>32 - 1
-)
+// Entries pair a uint32 position with a 31-bit slot index or an empty marker.
+const contextPoolEntryEmpty = 1 << 31
 
 type contextPoolQueue struct {
 	entries  []atomic.Uint64
@@ -27,9 +24,9 @@ type contextPoolQueue struct {
 	mask     uint32
 }
 
-// ContextPools holds pooled IndirectSQE and ExtSQE contexts.
-// IndirectSQE slots use explicit aligned backing; extended slots pair each
-// ExtSQE with adjacent GC-visible sidecar anchors.
+// ContextPools holds independent pools of IndirectSQE and ExtSQE contexts.
+// The zero value is not usable; construct pools with NewContextPools.
+// All methods except Reset are safe for concurrent use.
 type ContextPools struct {
 	indirect      []IndirectSQE
 	indirectQueue *contextPoolQueue
@@ -40,6 +37,7 @@ type ContextPools struct {
 
 // NewContextPools creates pooled IndirectSQE and ExtSQE contexts with the given
 // per-pool capacity. New pools are ready for immediate use.
+// Capacity is rounded up to a power of two. Values outside [1, 1<<31] panic.
 func NewContextPools(capacity int) *ContextPools {
 	n := alignPoolCapacity(capacity)
 	return &ContextPools{
@@ -51,13 +49,15 @@ func NewContextPools(capacity int) *ContextPools {
 }
 
 func alignPoolCapacity(capacity int) int {
-	if capacity < 1 || capacity > math.MaxUint32 {
-		panic("uring: capacity must be between 1 and MaxUint32")
+	if capacity < 1 || capacity > 1<<31 {
+		panic("uring: capacity must be between 1 and 1<<31")
 	}
 	return roundToPowerOf2(capacity)
 }
 
 // Indirect borrows an IndirectSQE from the pool. Returns nil if exhausted.
+// The slot retains its previous contents; initialize it before use.
+// Return it with PutIndirect after all operations and borrowed access finish.
 //
 //go:nosplit
 func (p *ContextPools) Indirect() *IndirectSQE {
@@ -68,14 +68,17 @@ func (p *ContextPools) Indirect() *IndirectSQE {
 	return &p.indirect[entry]
 }
 
-// PutIndirect returns an IndirectSQE to the pool.
+// PutIndirect returns an IndirectSQE without clearing its contents.
+// It must be an outstanding borrow from this pool with no pending operations
+// or borrowed access. Do not access or return it again after this call.
 //
 //go:nosplit
 func (p *ContextPools) PutIndirect(indirect *IndirectSQE) {
 	p.indirectQueue.put(p.indirectIndex(indirect))
 }
 
-// Extended borrows an ExtSQE from the pool. Returns nil if exhausted.
+// Extended borrows a cleared ExtSQE from the pool. Returns nil if exhausted.
+// Return it with PutExtended after all operations and borrowed access finish.
 //
 //go:nosplit
 func (p *ContextPools) Extended() *ExtSQE {
@@ -86,7 +89,9 @@ func (p *ContextPools) Extended() *ExtSQE {
 	return &p.extended[entry].ext
 }
 
-// PutExtended returns an ExtSQE to the pool and clears its sidecar anchors.
+// PutExtended clears an ExtSQE's SQE, UserData, and sidecar anchors, then returns
+// it to the pool. It must be an outstanding borrow from this pool with no pending
+// operations or borrowed access. Do not access or return it again afterward.
 //
 //go:nosplit
 func (p *ContextPools) PutExtended(ext *ExtSQE) {
@@ -99,11 +104,15 @@ func (p *ContextPools) PutExtended(ext *ExtSQE) {
 }
 
 // IndirectAvailable returns the number of IndirectSQE slots available.
+// The count is exact only when no borrow or return overlaps the call.
+// Use Indirect to acquire a slot; this count does not reserve one.
 func (p *ContextPools) IndirectAvailable() int {
 	return p.indirectQueue.available()
 }
 
 // ExtendedAvailable returns the number of ExtSQE slots available.
+// The count is exact only when no borrow or return overlaps the call.
+// Use Extended to acquire a slot; this count does not reserve one.
 func (p *ContextPools) ExtendedAvailable() int {
 	return p.extendedQueue.available()
 }
@@ -114,7 +123,10 @@ func (p *ContextPools) Capacity() int {
 }
 
 // Reset scrubs pooled slot state and reinitializes both pool queues, making all
-// slots available again.
+// slots available again. Caller must stop all pool access and finish operations
+// using its contexts before calling Reset. Reset invalidates outstanding borrows;
+// do not access or return those contexts afterward. Reset is not safe for
+// concurrent use.
 func (p *ContextPools) Reset() {
 	for i := range p.indirect {
 		p.indirect[i] = IndirectSQE{}
@@ -140,7 +152,7 @@ func newContextPoolQueue(capacity int) *contextPoolQueue {
 
 func (q *contextPoolQueue) reset() {
 	for i := range q.entries {
-		q.entries[i].Store(uint64(i))
+		q.entries[i].Store(uint64(i)<<32 | uint64(i))
 	}
 	q.head.Store(0)
 	q.tail.Store(q.capacity)
@@ -162,13 +174,14 @@ func (q *contextPoolQueue) get() (uint32, bool) {
 			return 0, false
 		}
 
-		nextTurn := (h/q.capacity + 1) & contextPoolEntryTurnMask
-		if e == q.empty(nextTurn) {
+		// The next producer position wraps with the uint32 queue counters.
+		empty := uint64(h+q.capacity)<<32 | contextPoolEntryEmpty
+		if e == empty {
 			q.head.CompareAndSwap(h, h+1)
 			sw.Once()
 			continue
 		}
-		ok := q.entries[i].CompareAndSwap(e, q.empty(nextTurn))
+		ok := q.entries[i].CompareAndSwap(e, empty)
 		q.head.CompareAndSwap(h, h+1)
 		if ok {
 			return uint32(e & uint64(q.mask)), true
@@ -195,9 +208,9 @@ func (q *contextPoolQueue) put(entry uint32) {
 			panic("uring: context pool overflow")
 		}
 
-		turn := (t / q.capacity) & contextPoolEntryTurnMask
 		i := t & q.mask
-		ok := q.entries[i].CompareAndSwap(q.empty(turn), e)
+		position := uint64(t) << 32
+		ok := q.entries[i].CompareAndSwap(position|contextPoolEntryEmpty, position|e)
 		q.tail.CompareAndSwap(t, t+1)
 		if ok {
 			return
@@ -208,10 +221,6 @@ func (q *contextPoolQueue) put(entry uint32) {
 
 func (q *contextPoolQueue) available() int {
 	return int(q.tail.Load() - q.head.Load())
-}
-
-func (q *contextPoolQueue) empty(turn uint32) uint64 {
-	return contextPoolEntryEmpty | uint64(turn&contextPoolEntryTurnMask)
 }
 
 func (p *ContextPools) indirectIndex(indirect *IndirectSQE) uint32 {

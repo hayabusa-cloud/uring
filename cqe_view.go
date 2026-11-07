@@ -12,16 +12,18 @@ import "code.hybscloud.com/iofd"
 // It exposes kernel completion facts directly and lets caller-side runtime
 // code decide how to route or interpret them. When available,
 // it also exposes the submission context that produced those facts.
-// A copied CQEView is a completion observation, not durable route state. If it
-// is stored beyond the current dispatch turn, caller code must pair it with
-// caller-owned route state.
+// Indirect and Extended contexts reference shared targets. Copying a CQEView
+// does not copy or root those targets. Caller must keep targets live and
+// serialize access. Copy needed facts before target mutation, reuse, or release;
+// never dereference a released target. Caller code owns payload lifetimes,
+// completion routing, and retirement.
 //
 // # Property Patterns
 //
 //   - Direct: FullSQE reports false and Extended reports false. Available
 //     data: Op, SQE flags, BufGroup, FD, Res, and CQE flags.
 //   - Indirect: FullSQE reports true and Extended reports false. Available
-//     data: Direct facts plus a full ioUringSqe copy.
+//     data: Direct facts plus a borrowed 64-byte base SQE.
 //   - Extended: FullSQE reports true and Extended reports true. Available
 //     data: Indirect facts plus the borrowed ExtSQE escape hatch.
 //
@@ -49,8 +51,9 @@ type CQEView struct {
 	ctx   SQEContext
 }
 
-// FullSQE reports whether full SQE information is available.
-// Returns true for Indirect and Extended modes.
+// FullSQE reports whether the context retains a 64-byte base SQE.
+// It is true for Indirect and Extended modes and does not include SQE128
+// extensions. The retained fields remain borrowed from the context target.
 //
 //go:nosplit
 func (c *CQEView) FullSQE() bool {
@@ -96,17 +99,18 @@ func (c *CQEView) FD() iofd.FD {
 	}
 }
 
-// ExtSQE returns the borrowed ExtSQE backing Extended mode contexts.
-// Caller should check Extended() first.
+// ExtSQE returns the borrowed target for an Extended context.
+// Caller must check Extended() and keep the target live; copy needed facts
+// before target mutation, reuse, or release.
 //
 //go:nosplit
 func (c *CQEView) ExtSQE() *ExtSQE {
 	return c.ctx.ExtSQE()
 }
 
-// SQE returns a view of the submitted SQE when the context retains one.
-// Caller should check FullSQE() first; Direct mode returns an invalid view
-// because it keeps only compact completion-context facts.
+// SQE borrows the retained 64-byte base SQE in Indirect and Extended modes.
+// Direct mode returns an invalid view. Copy needed fields before target
+// mutation, reuse, or release; copying the view preserves the same alias.
 //
 //go:nosplit
 func (c *CQEView) SQE() SQEView {
@@ -120,8 +124,8 @@ func (c *CQEView) SQE() SQEView {
 	}
 }
 
-// Context returns the underlying SQEContext.
-// Use this for advanced mode-specific inspection beyond the CQEView helpers.
+// Context returns the packed SQEContext.
+// Pointer modes retain the same borrowed target; this does not copy its fields.
 //
 //go:nosplit
 func (c *CQEView) Context() SQEContext {

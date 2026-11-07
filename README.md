@@ -178,14 +178,18 @@ When you need caller-owned metadata beyond the 64-bit direct layout, borrow an `
 
 ```go
 ext := ring.ExtSQE()
+if ext == nil {
+	return iox.ErrWouldBlock
+}
 meta := uring.CtxV1Of(ext)
 meta.Val1 = requestSeq
 
 sqeCtx := uring.PackExtended(ext)
 fmt.Printf("sqe context mode=%d seq=%d\n", sqeCtx.Mode(), meta.Val1)
+ring.PutExtSQE(ext)
 ```
 
-`NewContextPools` returns pools that are ready to use. Call `Reset` only after all borrowed contexts have been returned and you want to reuse the pool set.
+`NewContextPools` returns pools that are ready to use. Context-pool exhaustion is independent of submission-queue capacity. Return each context to its originating pool after all request completions and borrowed access finish. `Reset` clears both pools and invalidates outstanding borrows; call it only after stopping all pool access and finishing operations that use its contexts. Do not access or return old borrows after `Reset`.
 
 ### Completion dispatch with `CQEView`
 
@@ -408,19 +412,22 @@ Extended contexts carry per-connection references through the submit → complet
 
 ```go
 type ConnState struct {
-    Addr    netip.AddrPort
-    Created int64
+	Addr    netip.AddrPort
+	Created int64
 }
 
 ext := ring.ExtSQE()
+if ext == nil {
+	return iox.ErrWouldBlock
+}
 ctx := uring.Ctx1V1Of[ConnState](ext)
 ctx.Ref1 = connState
 ctx.Val1 = sequenceNumber
 
 sqeCtx := uring.PackExtended(ext)
 if err := ring.Send(sqeCtx, &fd, payload); err != nil {
-    ring.PutExtSQE(ext)
-    return err
+	ring.PutExtSQE(ext)
+	return err
 }
 ```
 

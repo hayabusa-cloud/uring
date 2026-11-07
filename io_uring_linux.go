@@ -716,7 +716,6 @@ func (ur *ioUring) submitPacked3(sqeCtx SQEContext, ioprio uint16, addr uint64, 
 		return err
 	}
 	slot.fill3(sqeCtx, ioprio, addr, n)
-	mirrorExtendedSQE(sqeCtx, slot.sqe)
 	ur.publishSubmitSlot(slot, sqeCtx)
 	return nil
 }
@@ -728,7 +727,6 @@ func (ur *ioUring) submitPacked6(sqeCtx SQEContext, ioprio uint16, off uint64, a
 		return err
 	}
 	slot.fill6(sqeCtx, ioprio, off, addr, n, uflags)
-	mirrorExtendedSQE(sqeCtx, slot.sqe)
 	ur.publishSubmitSlot(slot, sqeCtx)
 	return nil
 }
@@ -740,19 +738,8 @@ func (ur *ioUring) submitPacked9(sqeCtx SQEContext, ioprio uint16, off uint64, a
 		return err
 	}
 	slot.fill9(sqeCtx, ioprio, off, addr, n, uflags, personality, spliceFdIn)
-	mirrorExtendedSQE(sqeCtx, slot.sqe)
 	ur.publishSubmitSlot(slot, sqeCtx)
 	return nil
-}
-
-// mirrorExtendedSQE copies the filled kernel SQE back into the ExtSQE so that
-// ExtCQE.Op() and ExtCQE.FD() can read the submitted fields at completion time.
-//
-//go:nosplit
-func mirrorExtendedSQE(sqeCtx SQEContext, e *ioUringSqe) {
-	if sqeCtx.IsExtended() {
-		sqeCtx.ExtSQE().SQE = *e
-	}
 }
 
 func (slot submitSlot) fill3(sqeCtx SQEContext, ioprio uint16, addr uint64, n int) {

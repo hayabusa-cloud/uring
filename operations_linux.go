@@ -413,7 +413,6 @@ func (ur *ioUring) close(sqeCtx SQEContext) error {
 		slot.sqe.fd = 0
 		slot.sqe.spliceFdIn = int32(uint32(fileIndex) + 1)
 	}
-	mirrorExtendedSQE(ctx, slot.sqe)
 	ur.publishSubmitSlot(slot, ctx)
 	return nil
 }
@@ -1262,7 +1261,6 @@ func (ur *ioUring) nop128(sqeCtx SQEContext) error {
 		flags:  sqeCtx.Flags(),
 		fd:     sqeCtx.FD(),
 	}
-	mirrorExtendedSQE(ctx, slot.sqe)
 	ur.publishSubmitSlot(slot, ctx)
 	return nil
 }
@@ -1293,7 +1291,6 @@ func (ur *ioUring) uringCmd128(sqeCtx SQEContext, cmdOp uint32, cmdData []byte) 
 	if len(cmdData) > 0 {
 		copy(slot.inlineCmdData128(), cmdData)
 	}
-	mirrorExtendedSQE(ctx, slot.sqe)
 	ur.publishSubmitSlot(slot, ctx)
 	return nil
 }

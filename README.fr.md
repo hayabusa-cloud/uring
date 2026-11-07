@@ -178,14 +178,18 @@ Lorsqu'on a besoin de métadonnées contrôlées par l'appelant au-delà du layo
 
 ```go
 ext := ring.ExtSQE()
+if ext == nil {
+	return iox.ErrWouldBlock
+}
 meta := uring.CtxV1Of(ext)
 meta.Val1 = requestSeq
 
 sqeCtx := uring.PackExtended(ext)
 fmt.Printf("sqe context mode=%d seq=%d\n", sqeCtx.Mode(), meta.Val1)
+ring.PutExtSQE(ext)
 ```
 
-`NewContextPools` renvoie des pools prêts à l'emploi. N'appelez `Reset` qu'après avoir restitué tous les contextes empruntés et uniquement si vous souhaitez réutiliser l'ensemble de pools.
+`NewContextPools` renvoie des pools prêts à l'emploi. L'épuisement du pool de contextes est indépendant de la capacité de la file de soumission. Restituez chaque contexte à son pool d'origine après avoir traité toutes les complétions de la requête et terminé tout accès au contexte emprunté. `Reset` vide les deux pools et invalide les emprunts en cours ; appelez-le uniquement après avoir arrêté tout accès aux pools et terminé les opérations utilisant leurs contextes. Après `Reset`, n'accédez plus aux anciens emprunts et ne les restituez pas.
 
 ### Dispatch des complétions avec `CQEView`
 
@@ -408,19 +412,22 @@ Les contextes étendus transportent les références par connexion tout au long 
 
 ```go
 type ConnState struct {
-    Addr    netip.AddrPort
-    Created int64
+	Addr    netip.AddrPort
+	Created int64
 }
 
 ext := ring.ExtSQE()
+if ext == nil {
+	return iox.ErrWouldBlock
+}
 ctx := uring.Ctx1V1Of[ConnState](ext)
 ctx.Ref1 = connState
 ctx.Val1 = sequenceNumber
 
 sqeCtx := uring.PackExtended(ext)
 if err := ring.Send(sqeCtx, &fd, payload); err != nil {
-    ring.PutExtSQE(ext)
-    return err
+	ring.PutExtSQE(ext)
+	return err
 }
 ```
 

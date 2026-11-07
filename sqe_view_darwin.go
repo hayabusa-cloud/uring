@@ -8,27 +8,30 @@ package uring
 
 import "code.hybscloud.com/iofd"
 
-// SQEView provides read-only access to submission queue entry fields.
-// It mirrors the Linux observable contract over the Darwin compatibility SQE.
+// SQEView borrows read-only access to a 64-byte base SQE.
+// Copying the view does not copy the fields or transfer ownership. Copy needed
+// fields before target mutation, reuse, or release; never access released
+// storage. SQE128 extensions are outside this view. The zero value is invalid.
 type SQEView struct {
 	sqe *ioUringSqe
 }
 
-// ViewSQE creates an SQEView from an IndirectSQE.
+// ViewSQE borrows the base SQE from indirect; it does not copy its fields.
 //
 //go:nosplit
 func ViewSQE(indirect *IndirectSQE) SQEView {
 	return SQEView{sqe: &indirect.ioUringSqe}
 }
 
-// ViewExtSQE creates an SQEView from an ExtSQE.
+// ViewExtSQE borrows the base SQE from ext; it does not copy its fields.
 //
 //go:nosplit
 func ViewExtSQE(ext *ExtSQE) SQEView {
 	return SQEView{sqe: &ext.SQE}
 }
 
-// Valid reports whether the view points to a valid SQE.
+// Valid reports whether the view contains a non-nil pointer.
+// It does not check whether the target has been mutated, reused, or released.
 //
 //go:nosplit
 func (v SQEView) Valid() bool {

@@ -7,6 +7,7 @@
 package uring
 
 import (
+	"math"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -268,7 +269,7 @@ type ioUring struct {
 	params      *ioUringParams
 
 	// Simulated SQ using a buffered channel
-	sqChan chan *ioUringSqe
+	sqChan chan *darwinSubmission
 	sqHead uint32
 	sqTail uint32
 
@@ -292,6 +293,11 @@ type ioUring struct {
 	closed   atomic.Bool
 
 	ops []ioUringProbeOp
+}
+
+type darwinSubmission struct {
+	sqe     ioUringSqe
+	payload []byte
 }
 
 type ioUringProbe struct {
@@ -393,7 +399,7 @@ func newIoUring(entries int, opts ...func(params *ioUringParams)) (*ioUring, err
 
 	ur := &ioUring{
 		params:   params,
-		sqChan:   make(chan *ioUringSqe, entries),
+		sqChan:   make(chan *darwinSubmission, entries),
 		cqChan:   make(chan *ioUringCqe, entries*2),
 		cqMask:   uint32(entries*2 - 1),
 		bufs:     [][]byte{},
@@ -529,11 +535,7 @@ func (ur *ioUring) stop() error {
 
 	stopChan := ur.stopChan
 	ur.stopChan = nil
-	waitWorkers := ur.enabled.Load()
-	ur.enabled.Store(false)
-	ur.bufs = nil
-	ur.files = nil
-	ur.ops = nil
+	waitWorkers := ur.enabled.Swap(false)
 	ur.lifecycleMu.Unlock()
 
 	if stopChan != nil {
@@ -542,6 +544,12 @@ func (ur *ioUring) stop() error {
 	if waitWorkers {
 		ur.workerWg.Wait()
 	}
+
+	ur.lifecycleMu.Lock()
+	ur.bufs = nil
+	ur.files = nil
+	ur.ops = nil
+	ur.lifecycleMu.Unlock()
 	return nil
 }
 
@@ -552,28 +560,29 @@ func (ur *ioUring) enable() error {
 		return nil
 	}
 	ur.enabled.Store(true)
+	stopChan := ur.stopChan
 
 	// Start worker goroutines to process SQEs
 	numWorkers := 4
 	for range numWorkers {
 		ur.workerWg.Add(1)
-		go ur.worker()
+		go ur.worker(stopChan)
 	}
 	return nil
 }
 
 // worker processes SQEs and produces CQEs.
-func (ur *ioUring) worker() {
+func (ur *ioUring) worker(stopChan <-chan struct{}) {
 	defer ur.workerWg.Done()
 	for {
 		select {
-		case <-ur.stopChan:
+		case <-stopChan:
 			return
-		case sqe := <-ur.sqChan:
-			if sqe == nil {
+		case submission := <-ur.sqChan:
+			if submission == nil {
 				continue
 			}
-			cqe := ur.executeSQE(sqe)
+			cqe := ur.executeSQE(submission)
 			if cqe != nil {
 				select {
 				case ur.cqChan <- cqe:
@@ -586,7 +595,8 @@ func (ur *ioUring) worker() {
 }
 
 // executeSQE executes a submission queue entry and returns a completion.
-func (ur *ioUring) executeSQE(sqe *ioUringSqe) *ioUringCqe {
+func (ur *ioUring) executeSQE(submission *darwinSubmission) *ioUringCqe {
+	sqe := &submission.sqe
 	cqe := &ioUringCqe{
 		userData: sqe.userData,
 		flags:    0,
@@ -595,14 +605,14 @@ func (ur *ioUring) executeSQE(sqe *ioUringSqe) *ioUringCqe {
 	switch sqe.opcode {
 	case IORING_OP_NOP:
 		cqe.res = 0
-	case IORING_OP_READ:
-		cqe.res = ur.doRead(sqe)
-	case IORING_OP_WRITE:
-		cqe.res = ur.doWrite(sqe)
+	case IORING_OP_READ, IORING_OP_READ_FIXED:
+		cqe.res = ur.doRead(sqe, submission.payload)
+	case IORING_OP_WRITE, IORING_OP_WRITE_FIXED:
+		cqe.res = ur.doWrite(sqe, submission.payload)
 	case IORING_OP_RECV:
-		cqe.res = ur.doRecv(sqe)
+		cqe.res = ur.doRecv(sqe, submission.payload)
 	case IORING_OP_SEND:
-		cqe.res = ur.doSend(sqe)
+		cqe.res = ur.doSend(sqe, submission.payload)
 	case IORING_OP_SOCKET:
 		cqe.res = ur.doSocket(sqe)
 	case IORING_OP_ACCEPT:
@@ -631,12 +641,26 @@ func (ur *ioUring) executeSQE(sqe *ioUringSqe) *ioUringCqe {
 
 // submitPacked submits an SQE with packed context.
 func (ur *ioUring) submitPacked(sqeCtx SQEContext, fn func(e *ioUringSqe)) error {
-	sqe := &ioUringSqe{}
-	fn(sqe)
-	sqe.userData = sqeCtx.Raw()
+	return ur.submitPackedWithPayload(sqeCtx, nil, fn)
+}
+
+func (ur *ioUring) submitPackedWithPayload(sqeCtx SQEContext, payload []byte, fn func(e *ioUringSqe)) error {
+	submission := &darwinSubmission{payload: payload}
+	fn(&submission.sqe)
+	if submission.sqe.flags&IOSQE_FIXED_FILE != 0 {
+		return ErrNotSupported
+	}
+	submission.sqe.userData = sqeCtx.Raw()
+	// Retain the submitted fields before the consumer can execute the SQE.
+	switch sqeCtx.Mode() {
+	case CtxModeIndirect:
+		sqeCtx.IndirectSQE().ioUringSqe = submission.sqe
+	case CtxModeExtended:
+		sqeCtx.ExtSQE().SQE = submission.sqe
+	}
 
 	select {
-	case ur.sqChan <- sqe:
+	case ur.sqChan <- submission:
 		return nil
 	default:
 		return iox.ErrWouldBlock
@@ -652,13 +676,16 @@ func (ur *ioUring) submitPacked3(sqeCtx SQEContext, ioprio uint16, addr uint64, 
 		e.fd = sqeCtx.FD()
 		e.addr = addr
 		e.len = uint32(n)
-		mirrorExtendedSQE(sqeCtx, e)
 	})
 }
 
 // submitPacked6 submits a 6-argument operation.
 func (ur *ioUring) submitPacked6(sqeCtx SQEContext, ioprio uint16, off uint64, addr uint64, n int, uflags uint32) error {
-	return ur.submitPacked(sqeCtx, func(e *ioUringSqe) {
+	return ur.submitPacked6WithPayload(sqeCtx, nil, ioprio, off, addr, n, uflags)
+}
+
+func (ur *ioUring) submitPacked6WithPayload(sqeCtx SQEContext, payload []byte, ioprio uint16, off uint64, addr uint64, n int, uflags uint32) error {
+	return ur.submitPackedWithPayload(sqeCtx, payload, func(e *ioUringSqe) {
 		e.opcode = sqeCtx.Op()
 		e.flags = sqeCtx.Flags()
 		e.ioprio = ioprio
@@ -667,13 +694,16 @@ func (ur *ioUring) submitPacked6(sqeCtx SQEContext, ioprio uint16, off uint64, a
 		e.addr = addr
 		e.len = uint32(n)
 		e.uflags = uflags
-		mirrorExtendedSQE(sqeCtx, e)
 	})
 }
 
 // submitPacked9 submits a 9-argument operation.
 func (ur *ioUring) submitPacked9(sqeCtx SQEContext, ioprio uint16, off uint64, addr uint64, n int, uflags uint32, personality uint16, spliceFdIn int32) error {
-	return ur.submitPacked(sqeCtx, func(e *ioUringSqe) {
+	return ur.submitPacked9WithPayload(sqeCtx, nil, ioprio, off, addr, n, uflags, personality, spliceFdIn)
+}
+
+func (ur *ioUring) submitPacked9WithPayload(sqeCtx SQEContext, payload []byte, ioprio uint16, off uint64, addr uint64, n int, uflags uint32, personality uint16, spliceFdIn int32) error {
+	return ur.submitPackedWithPayload(sqeCtx, payload, func(e *ioUringSqe) {
 		e.opcode = sqeCtx.Op()
 		e.flags = sqeCtx.Flags()
 		e.ioprio = ioprio
@@ -685,13 +715,16 @@ func (ur *ioUring) submitPacked9(sqeCtx SQEContext, ioprio uint16, off uint64, a
 		e.bufIndex = sqeCtx.BufGroup()
 		e.personality = personality
 		e.spliceFdIn = spliceFdIn
-		mirrorExtendedSQE(sqeCtx, e)
 	})
 }
 
 // submitExtended submits an SQE using Extended mode context.
 func (ur *ioUring) submitExtended(sqeCtx SQEContext) error {
 	ext := sqeCtx.ExtSQE()
+	switch ext.SQE.opcode {
+	case IORING_OP_READ, IORING_OP_WRITE, IORING_OP_RECV, IORING_OP_SEND:
+		return ErrNotSupported
+	}
 	return ur.submitPacked(sqeCtx, func(e *ioUringSqe) {
 		*e = ext.SQE
 	})
@@ -780,26 +813,47 @@ func (ur *ioUring) bufRingCQAdvance(br *ioUringBufRing, count int) {
 }
 
 // I/O operation implementations
-func (ur *ioUring) doRead(sqe *ioUringSqe) int32 {
-	buf := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(sqe.addr))), sqe.len)
-	n, err := syscall.Read(int(sqe.fd), buf)
+func (ur *ioUring) doRead(sqe *ioUringSqe, buf []byte) int32 {
+	var n int
+	var err error
+	switch {
+	case sqe.off == math.MaxUint64:
+		n, err = syscall.Read(int(sqe.fd), buf)
+	case sqe.off <= math.MaxInt64:
+		n, err = syscall.Pread(int(sqe.fd), buf, int64(sqe.off))
+		if err == syscall.ESPIPE && sqe.off == 0 {
+			n, err = syscall.Read(int(sqe.fd), buf)
+		}
+	default:
+		return -int32(syscall.EINVAL)
+	}
 	if err != nil {
 		return -int32(err.(syscall.Errno))
 	}
 	return int32(n)
 }
 
-func (ur *ioUring) doWrite(sqe *ioUringSqe) int32 {
-	buf := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(sqe.addr))), sqe.len)
-	n, err := syscall.Write(int(sqe.fd), buf)
+func (ur *ioUring) doWrite(sqe *ioUringSqe, buf []byte) int32 {
+	var n int
+	var err error
+	switch {
+	case sqe.off == math.MaxUint64:
+		n, err = syscall.Write(int(sqe.fd), buf)
+	case sqe.off <= math.MaxInt64:
+		n, err = syscall.Pwrite(int(sqe.fd), buf, int64(sqe.off))
+		if err == syscall.ESPIPE && sqe.off == 0 {
+			n, err = syscall.Write(int(sqe.fd), buf)
+		}
+	default:
+		return -int32(syscall.EINVAL)
+	}
 	if err != nil {
 		return -int32(err.(syscall.Errno))
 	}
 	return int32(n)
 }
 
-func (ur *ioUring) doRecv(sqe *ioUringSqe) int32 {
-	buf := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(sqe.addr))), sqe.len)
+func (ur *ioUring) doRecv(sqe *ioUringSqe, buf []byte) int32 {
 	n, _, err := syscall.Recvfrom(int(sqe.fd), buf, int(sqe.uflags))
 	if err != nil {
 		return -int32(err.(syscall.Errno))
@@ -807,13 +861,12 @@ func (ur *ioUring) doRecv(sqe *ioUringSqe) int32 {
 	return int32(n)
 }
 
-func (ur *ioUring) doSend(sqe *ioUringSqe) int32 {
-	buf := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(sqe.addr))), sqe.len)
-	err := syscall.Sendto(int(sqe.fd), buf, int(sqe.uflags), nil)
+func (ur *ioUring) doSend(sqe *ioUringSqe, buf []byte) int32 {
+	n, err := syscall.SendmsgN(int(sqe.fd), buf, nil, nil, int(sqe.uflags))
 	if err != nil {
 		return -int32(err.(syscall.Errno))
 	}
-	return int32(len(buf))
+	return int32(n)
 }
 
 func (ur *ioUring) doSocket(sqe *ioUringSqe) int32 {
@@ -840,11 +893,15 @@ func (ur *ioUring) doConnect(sqe *ioUringSqe) int32 {
 	return -int32(syscall.ENOSYS)
 }
 
+func decodeCloseFileIndex(encoded int32) uint32 {
+	return uint32(encoded) - 1
+}
+
 func (ur *ioUring) doClose(sqe *ioUringSqe) int32 {
 	fd := sqe.fd
 	if sqe.spliceFdIn != 0 {
-		fileIndex := int(sqe.spliceFdIn) - 1
-		if fileIndex < 0 || fileIndex >= len(ur.files) {
+		fileIndex := decodeCloseFileIndex(sqe.spliceFdIn)
+		if uint64(fileIndex) >= uint64(len(ur.files)) {
 			return -int32(syscall.EBADF)
 		}
 		fd = ur.files[fileIndex]
@@ -876,14 +933,6 @@ func (ur *ioUring) doShutdown(sqe *ioUringSqe) int32 {
 func (ur *ioUring) doBind(sqe *ioUringSqe) int32 {
 	// Darwin doesn't support raw pointer bind, return stub error
 	return -int32(syscall.ENOSYS)
-}
-
-// mirrorExtendedSQE copies the filled kernel SQE back into the ExtSQE so that
-// ExtCQE.Op() and ExtCQE.FD() can read the submitted fields at completion time.
-func mirrorExtendedSQE(sqeCtx SQEContext, e *ioUringSqe) {
-	if sqeCtx.IsExtended() {
-		sqeCtx.ExtSQE().SQE = *e
-	}
 }
 
 func (ur *ioUring) doListen(sqe *ioUringSqe) int32 {

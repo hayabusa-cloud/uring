@@ -255,35 +255,40 @@ func (ur *Uring) Wait(cqes []CQEView) (n int, err error) {
 	return ur.ioUring.waitBatch(cqes)
 }
 
-// ExtSQE acquires an ExtSQE from the pool for Extended mode submissions.
-// The returned ExtSQE is borrowed until PutExtSQE after the corresponding CQE
-// is processed. Callers must not retain pointers into SQE or UserData after
-// release.
+// ExtSQE borrows a cleared ExtSQE for Extended mode submissions.
+// It returns nil if the context pool is exhausted, independently of SQ capacity.
+// Keep the context until all request completions and borrowed access finish,
+// then return it to this ring with PutExtSQE.
 //
 //go:nosplit
 func (ur *Uring) ExtSQE() *ExtSQE {
 	return ur.ctxPools.Extended()
 }
 
-// PutExtSQE returns an ExtSQE to the pool after completion processing.
-// After this call the ExtSQE, typed context views, and raw CastUserData
-// overlays derived from it are invalid.
+// PutExtSQE clears and returns an ExtSQE borrowed from this ring.
+// Call exactly once after all request completions and borrowed access finish.
+// This includes terminal multishot and zero-copy notification CQEs when present.
+// After return, the ExtSQE and all views into it are invalid.
 //
 //go:nosplit
 func (ur *Uring) PutExtSQE(sqe *ExtSQE) {
 	ur.ctxPools.PutExtended(sqe)
 }
 
-// IndirectSQE acquires an IndirectSQE from the pool.
-// The returned IndirectSQE is borrowed until PutIndirectSQE.
+// IndirectSQE borrows an IndirectSQE for Indirect mode submissions.
+// It returns nil if the context pool is exhausted, independently of SQ capacity.
+// Initialize its retained contents before use. Keep it until all request
+// completions and borrowed access finish, then return it with PutIndirectSQE.
 //
 //go:nosplit
 func (ur *Uring) IndirectSQE() *IndirectSQE {
 	return ur.ctxPools.Indirect()
 }
 
-// PutIndirectSQE returns an IndirectSQE to the pool.
-// After this call the IndirectSQE is invalid and must not be reused.
+// PutIndirectSQE returns an IndirectSQE borrowed from this ring without clearing it.
+// Call exactly once after all request completions and borrowed access finish.
+// This includes terminal multishot and zero-copy notification CQEs when present.
+// After return, the IndirectSQE and all views into it are invalid.
 //
 //go:nosplit
 func (ur *Uring) PutIndirectSQE(sqe *IndirectSQE) {
@@ -291,6 +296,8 @@ func (ur *Uring) PutIndirectSQE(sqe *IndirectSQE) {
 }
 
 // SubmitExtended submits an SQE using Extended mode context.
+// Raw READ, WRITE, RECV, and SEND SQEs are unsupported on the Darwin simulator;
+// use the typed operation methods so their payload remains GC-visible.
 func (ur *Uring) SubmitExtended(sqeCtx SQEContext) error {
 	return ur.ioUring.submitExtended(sqeCtx)
 }
@@ -322,6 +329,8 @@ func (ur *Uring) RegisteredBufferCount() int {
 // ========================================
 
 // RegisterFiles registers file descriptors for use with IOSQE_FIXED_FILE flag.
+// On Darwin, only Close consumes registered-file slots; other fixed-file
+// submissions return ErrNotSupported.
 func (ur *Uring) RegisterFiles(fds []int32) error {
 	return ur.registerFiles(fds)
 }
@@ -563,6 +572,9 @@ func (ur *Uring) Receive(sqeCtx SQEContext, pollFD PollFd, b []byte, options ...
 		return ErrInvalidParam
 	}
 	flags, ioprio, offset, n := ur.receiveOptions(b, options)
+	if offset < 0 {
+		return ErrInvalidParam
+	}
 	ctx = ctx.OrFlags(flags | ur.readLikeOpFlags)
 	return ur.receive(ctx, ioprio, b, uint64(offset), n)
 }
@@ -588,6 +600,9 @@ func (ur *Uring) SubmitReceiveMultishot(sqeCtx SQEContext, pollFD PollFd, b []by
 // Caller must keep p valid until the operation completes.
 func (ur *Uring) Send(sqeCtx SQEContext, pollFD PollFd, p []byte, options ...OpOptionFunc) error {
 	flags, ioprio, offset, n := ur.sendOptions(p, options)
+	if offset < 0 {
+		return ErrInvalidParam
+	}
 	ctx := sqeCtx.WithFD(iofd.FD(pollFD.Fd())).OrFlags(flags | ur.writeLikeOpFlags)
 	return ur.send(ctx, ioprio, p, uint64(offset), n)
 }
@@ -721,22 +736,30 @@ func (ur *Uring) Close(sqeCtx SQEContext, options ...OpOptionFunc) error {
 
 // Read performs a read operation.
 // Caller must keep b valid until the operation completes.
+// WithOffset(-1) uses and advances the file's current position.
 func (ur *Uring) Read(sqeCtx SQEContext, b []byte, options ...OpOptionFunc) error {
 	if len(b) < 1 {
 		return ErrInvalidParam
 	}
 	flags, ioprio, offset, n := ur.readOptions(b, options)
+	if offset < -1 {
+		return ErrInvalidParam
+	}
 	ctx := sqeCtx.OrFlags(flags | ur.readLikeOpFlags)
 	return ur.read(ctx, ioprio, b, uint64(offset), n)
 }
 
 // Write performs a write operation.
 // Caller must keep b valid until the operation completes.
+// WithOffset(-1) uses and advances the file's current position.
 func (ur *Uring) Write(sqeCtx SQEContext, b []byte, options ...OpOptionFunc) error {
 	if len(b) < 1 {
 		return ErrInvalidParam
 	}
 	flags, ioprio, offset, n := ur.writeOptions(b, options)
+	if offset < -1 {
+		return ErrInvalidParam
+	}
 	ctx := sqeCtx.OrFlags(flags | ur.writeLikeOpFlags)
 	return ur.write(ctx, ioprio, b, uint64(offset), n)
 }
@@ -778,15 +801,26 @@ func (ur *Uring) WriteV(sqeCtx SQEContext, iovs [][]byte, options ...OpOptionFun
 }
 
 // ReadFixed performs a read with a registered buffer.
+// WithOffset(-1) uses and advances the file's current position.
 func (ur *Uring) ReadFixed(sqeCtx SQEContext, bufIndex int, options ...OpOptionFunc) ([]byte, error) {
+	if bufIndex < 0 || bufIndex >= len(ur.ioUring.bufs) {
+		return nil, ErrInvalidParam
+	}
 	flags, offset, n := ur.readFixedOptions(bufIndex, options)
+	if offset < -1 {
+		return nil, ErrInvalidParam
+	}
 	ctx := sqeCtx.OrFlags(flags | ur.readLikeOpFlags)
 	return ur.readFixed(ctx, bufIndex, uint64(offset), n)
 }
 
-// WriteFixed performs a write with a registered buffer.
+// WriteFixed submits a write of up to n bytes from a registered buffer.
+// WithOffset(-1) uses and advances the file's current position.
 func (ur *Uring) WriteFixed(sqeCtx SQEContext, bufIndex int, n int, options ...OpOptionFunc) error {
 	flags, offset := ur.writeFixedOptions(options)
+	if offset < -1 {
+		return ErrInvalidParam
+	}
 	ctx := sqeCtx.OrFlags(flags | ur.writeLikeOpFlags)
 	return ur.writeFixed(ctx, bufIndex, uint64(offset), n)
 }

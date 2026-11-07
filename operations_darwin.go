@@ -7,6 +7,7 @@
 package uring
 
 import (
+	"math"
 	"unsafe"
 )
 
@@ -150,9 +151,14 @@ func (ur *ioUring) readFixed(sqeCtx SQEContext, bufIndex int, offset uint64, n i
 		return nil, ErrInvalidParam
 	}
 	buf := ur.bufs[bufIndex]
-	addr := uint64(uintptr(unsafe.Pointer(&buf[0])))
-	err := ur.submitPacked6(sqeCtx.WithOp(IORING_OP_READ_FIXED), 0, offset, addr, n, 0)
-	return buf[:n], err
+	if n < 0 || uint(n) > math.MaxUint32 || n > len(buf) {
+		return nil, ErrInvalidParam
+	}
+	payload := buf[:n]
+	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(payload))))
+	ctx := sqeCtx.WithOp(IORING_OP_READ_FIXED).WithBufGroup(uint16(bufIndex))
+	err := ur.submitPacked9WithPayload(ctx, payload, 0, offset, addr, n, 0, 0, 0)
+	return buf, err
 }
 
 // writeFixed writes from a registered buffer.
@@ -161,8 +167,13 @@ func (ur *ioUring) writeFixed(sqeCtx SQEContext, bufIndex int, offset uint64, n 
 		return ErrInvalidParam
 	}
 	buf := ur.bufs[bufIndex]
-	addr := uint64(uintptr(unsafe.Pointer(&buf[0])))
-	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_WRITE_FIXED), 0, offset, addr, n, 0)
+	if n < 0 || uint(n) > math.MaxUint32 || n > len(buf) {
+		return ErrInvalidParam
+	}
+	payload := buf[:n]
+	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(payload))))
+	ctx := sqeCtx.WithOp(IORING_OP_WRITE_FIXED).WithBufGroup(uint16(bufIndex))
+	return ur.submitPacked9WithPayload(ctx, payload, 0, offset, addr, n, 0, 0, 0)
 }
 
 // pollAdd adds a file descriptor to poll.
@@ -318,14 +329,22 @@ func (ur *ioUring) close(sqeCtx SQEContext) error {
 
 // read performs a read operation.
 func (ur *ioUring) read(sqeCtx SQEContext, ioprio uint16, b []byte, off uint64, n int) error {
-	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(b))))
-	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_READ), ioprio, off, addr, n, 0)
+	if len(b) < 1 || n < 0 || uint(n) > math.MaxUint32 || n > len(b) {
+		return ErrInvalidParam
+	}
+	payload := b[:n]
+	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(payload))))
+	return ur.submitPacked6WithPayload(sqeCtx.WithOp(IORING_OP_READ), payload, ioprio, off, addr, n, 0)
 }
 
 // write performs a write operation.
 func (ur *ioUring) write(sqeCtx SQEContext, ioprio uint16, b []byte, off uint64, n int) error {
-	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(b))))
-	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_WRITE), ioprio, off, addr, n, 0)
+	if len(b) < 1 || n < 0 || uint(n) > math.MaxUint32 || n > len(b) {
+		return ErrInvalidParam
+	}
+	payload := b[:n]
+	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(payload))))
+	return ur.submitPacked6WithPayload(sqeCtx.WithOp(IORING_OP_WRITE), payload, ioprio, off, addr, n, 0)
 }
 
 // fadvise provides file advice.
@@ -335,17 +354,24 @@ func (ur *ioUring) fadvise(sqeCtx SQEContext, off uint64, n int, advice int) err
 
 // send sends data on a socket.
 func (ur *ioUring) send(sqeCtx SQEContext, ioprio uint16, b []byte, off uint64, n int) error {
-	if b == nil || len(b) < 1 {
+	if len(b) < 1 || n < 0 || n > math.MaxInt32 || off > uint64(len(b)) || uint64(n) > uint64(len(b))-off {
 		return ErrInvalidParam
 	}
-	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(b))))
-	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_SEND), ioprio, off, addr, n, 0)
+	start := int(off)
+	payload := b[start : start+n]
+	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(payload))))
+	return ur.submitPacked6WithPayload(sqeCtx.WithOp(IORING_OP_SEND), payload, ioprio, 0, addr, n, 0)
 }
 
 // receive receives data from a socket.
 func (ur *ioUring) receive(sqeCtx SQEContext, ioprio uint16, b []byte, off uint64, n int) error {
-	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(b))))
-	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_RECV), ioprio, off, addr, n, 0)
+	if len(b) < 1 || n < 0 || n > math.MaxInt32 || off > uint64(len(b)) || uint64(n) > uint64(len(b))-off {
+		return ErrInvalidParam
+	}
+	start := int(off)
+	payload := b[start : start+n]
+	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(payload))))
+	return ur.submitPacked6WithPayload(sqeCtx.WithOp(IORING_OP_RECV), payload, ioprio, 0, addr, n, 0)
 }
 
 // receiveWithBufferSelect receives with kernel buffer selection.
@@ -405,12 +431,14 @@ func (ur *ioUring) sendFixed(sqeCtx SQEContext, bufIndex int, off uint64, n int,
 		return ErrInvalidParam
 	}
 	buf := ur.bufs[bufIndex]
-	if n < 0 || off > uint64(len(buf)) || uint64(n) > uint64(len(buf))-off {
+	if n < 0 || n > math.MaxInt32 || off > uint64(len(buf)) || uint64(n) > uint64(len(buf))-off {
 		return ErrInvalidParam
 	}
+	start := int(off)
+	payload := buf[start : start+n]
 	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(buf)))) + off
 	ctx := sqeCtx.WithOp(IORING_OP_SEND).WithBufGroup(uint16(bufIndex))
-	return ur.submitPacked9(ctx, IORING_RECVSEND_FIXED_BUF, 0, addr, n, uint32(uflags), 0, 0)
+	return ur.submitPacked9WithPayload(ctx, payload, IORING_RECVSEND_FIXED_BUF, 0, addr, n, uint32(uflags), 0, 0)
 }
 
 // sendZeroCopyFixed sends with zero-copy using registered buffer.
