@@ -6,7 +6,10 @@
 
 package uring
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 func TestOptionsApplySupportsPackageOptionHelpers(t *testing.T) {
 	opt := &Options{}
@@ -22,6 +25,9 @@ func TestOptionsApplySupportsPackageOptionHelpers(t *testing.T) {
 
 func TestOptionsForBudgetDisablesMultiSizeWhenDefaultGroupsDoNotFit(t *testing.T) {
 	opts := OptionsForBudget(64 * MiB)
+	if !opts.MultiIssuers {
+		t.Fatal("MultiIssuers = false, want task-migratable default")
+	}
 	if opts.MultiSizeBuffer != 0 {
 		t.Fatalf("MultiSizeBuffer = %d, want 0", opts.MultiSizeBuffer)
 	}
@@ -377,4 +383,118 @@ func TestGetBufferGidPanicsWithoutProviders(t *testing.T) {
 		}
 	}()
 	ur.getBufferGid(&mockPollFd{fd: 0}, BufferSizeMedium)
+}
+
+func TestDefaultOptionsUseTaskMigratableSetup(t *testing.T) {
+	if !defaultOptions.MultiIssuers {
+		t.Fatal("default MultiIssuers = false, want true")
+	}
+
+	params := ioUringParams{}
+	for _, apply := range newSetupOptions(defaultOptions, false) {
+		apply(&params)
+	}
+	if params.flags&IORING_SETUP_COOP_TASKRUN == 0 {
+		t.Fatal("default setup omitted IORING_SETUP_COOP_TASKRUN")
+	}
+	if params.flags&(IORING_SETUP_SINGLE_ISSUER|IORING_SETUP_DEFER_TASKRUN) != 0 {
+		t.Fatalf("default setup flags = %#x, included pinned-task flags", params.flags)
+	}
+}
+
+func TestExplicitSingleIssuerUsesPinnedTaskSetup(t *testing.T) {
+	opt := defaultOptions
+	opt.MultiIssuers = false
+
+	params := ioUringParams{}
+	for _, apply := range newSetupOptions(opt, false) {
+		apply(&params)
+	}
+	want := uint32(IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN)
+	if params.flags&want != want {
+		t.Fatalf("single-issuer setup flags = %#x, want bits %#x", params.flags, want)
+	}
+	if params.flags&IORING_SETUP_COOP_TASKRUN != 0 {
+		t.Fatalf("single-issuer setup flags = %#x, included IORING_SETUP_COOP_TASKRUN", params.flags)
+	}
+}
+
+func TestOptionsValidateConstructionDomain(t *testing.T) {
+	valid := []struct {
+		name   string
+		mutate func(*Options)
+	}{
+		{"defaults", func(*Options) {}},
+		{"three registered buffers", func(opt *Options) {
+			opt.LockedBufferMem = 3 * registerBufferSize
+		}},
+		{"last single group ID", func(opt *Options) {
+			opt.ReadBufferSize = providedBufferValueMin
+			opt.ReadBufferNum = providedBufferValueMin
+			opt.ReadBufferGidOffset = bufferGroupIDCardinality - 1
+		}},
+		{"last multi group ID", func(opt *Options) {
+			opt.ReadBufferSize = 0
+			opt.ReadBufferNum = 0
+			opt.MultiSizeBuffer = multiSizeBufferScaleMax
+			opt.ReadBufferGidOffset = bufferGroupIDCardinality - (multiSizeBufferScaleMax-1)*int(bufferGroupIndexEnd) - defaultBufferGroupTiers
+		}},
+	}
+	for _, tt := range valid {
+		t.Run(tt.name, func(t *testing.T) {
+			opt := defaultOptions
+			tt.mutate(&opt)
+			if err := opt.validate(); err != nil {
+				t.Fatalf("validate() = %v, want nil", err)
+			}
+		})
+	}
+
+	invalid := []struct {
+		name   string
+		mutate func(*Options)
+	}{
+		{"zero entries", func(opt *Options) { opt.Entries = 0 }},
+		{"too many entries", func(opt *Options) { opt.Entries = EntriesHuge + 1 }},
+		{"locked memory below one buffer", func(opt *Options) { opt.LockedBufferMem = registerBufferSize - 1 }},
+		{"unaligned locked memory", func(opt *Options) { opt.LockedBufferMem = registerBufferSize + 1 }},
+		{"locked memory above package maximum", func(opt *Options) {
+			opt.LockedBufferMem = registerBufferSize * (registerBufferNum + 1)
+		}},
+		{"negative multi-size scale", func(opt *Options) { opt.MultiSizeBuffer = -1 }},
+		{"oversized multi-size scale", func(opt *Options) { opt.MultiSizeBuffer = multiSizeBufferScaleMax + 1 }},
+		{"single buffer size below domain", func(opt *Options) { opt.ReadBufferSize = providedBufferValueMin - 1 }},
+		{"single buffer size above domain", func(opt *Options) { opt.ReadBufferSize = providedBufferValueMax + 1 }},
+		{"single buffer count below domain", func(opt *Options) { opt.ReadBufferNum = providedBufferValueMin - 1 }},
+		{"single buffer count above domain", func(opt *Options) { opt.ReadBufferNum = providedBufferValueMax + 1 }},
+		{"negative group offset", func(opt *Options) { opt.ReadBufferGidOffset = -1 }},
+		{"single group namespace overflow", func(opt *Options) {
+			opt.ReadBufferNum = providedBufferValueMax
+			opt.ReadBufferGidOffset = bufferGroupIDCardinality - providedBufferValueMax/providedBufferGroupEntries + 1
+		}},
+		{"multi group namespace overflow", func(opt *Options) {
+			opt.MultiSizeBuffer = multiSizeBufferScaleMax
+			opt.ReadBufferGidOffset = bufferGroupIDCardinality - (multiSizeBufferScaleMax-1)*int(bufferGroupIndexEnd) - defaultBufferGroupTiers + 1
+		}},
+	}
+	for _, tt := range invalid {
+		t.Run(tt.name, func(t *testing.T) {
+			opt := defaultOptions
+			tt.mutate(&opt)
+			if err := opt.validate(); !errors.Is(err, ErrInvalidParam) {
+				t.Fatalf("validate() = %v, want %v", err, ErrInvalidParam)
+			}
+		})
+	}
+}
+
+func TestNewRejectsInvalidOptionsBeforeSetup(t *testing.T) {
+	ring, err := New(func(opt *Options) { opt.LockedBufferMem = 0 })
+	if ring != nil {
+		_ = ring.Stop()
+		t.Fatal("New returned a ring for invalid options")
+	}
+	if !errors.Is(err, ErrInvalidParam) {
+		t.Fatalf("New error = %v, want %v", err, ErrInvalidParam)
+	}
 }

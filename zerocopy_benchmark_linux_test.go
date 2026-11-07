@@ -117,7 +117,7 @@ func benchmarkNormalSend(b *testing.B, payloadSize int) {
 		// Wait for completion
 		for {
 			n, err := ring.Wait(cqes)
-			if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+			if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 				b.Fatalf("Wait: %v", err)
 			}
 			if n > 0 {
@@ -211,7 +211,7 @@ func benchmarkZeroCopySend(b *testing.B, payloadSize int) {
 		bo := iox.Backoff{}
 		for time.Now().Before(deadline) && (!opDone || !notifDone) {
 			n, err := ring.Wait(cqes)
-			if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+			if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 				b.Fatalf("Wait: %v", err)
 			}
 			if n == 0 {

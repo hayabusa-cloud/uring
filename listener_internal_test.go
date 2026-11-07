@@ -90,7 +90,7 @@ func TestListenerDecodeProducesValidStep(t *testing.T) {
 
 	for time.Now().Before(deadline) {
 		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait: %v", err)
 		}
 
@@ -285,7 +285,7 @@ func TestListenerOpCloseWhilePendingKeepsExtUntilCQEDrained(t *testing.T) {
 
 	for time.Now().Before(deadline) {
 		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait: %v", err)
 		}
 

@@ -72,39 +72,40 @@ const (
 	IORING_OP_LISTEN
 	IORING_OP_RECV_ZC      // Zero-copy receive
 	IORING_OP_EPOLL_WAIT   // Epoll wait
-	IORING_OP_READV_FIXED  // Vectored read with fixed buffer
-	IORING_OP_WRITEV_FIXED // Vectored write with fixed buffer
+	IORING_OP_READV_FIXED  // Vectored read with one fixed buffer
+	IORING_OP_WRITEV_FIXED // Vectored write with one fixed buffer
 	IORING_OP_PIPE         // Create pipe
 	IORING_OP_NOP128       // 128-byte NOP
 	IORING_OP_URING_CMD128 // 128-byte uring command
-	IORING_OP_LAST
+	ioUringOpLast
 )
 
 // Timeout clock and behavior flags mirror Linux IORING_TIMEOUT_* constants.
 // Defined here so darwin build stubs share the same named constants.
 const (
-	IORING_TIMEOUT_ABS           uint32 = 1 << iota // 0x01, absolute timestamp
-	IORING_TIMEOUT_UPDATE                           // 0x02, update existing timeout
-	IORING_TIMEOUT_BOOTTIME                         // 0x04, use CLOCK_BOOTTIME
-	IORING_TIMEOUT_REALTIME                         // 0x08, use CLOCK_REALTIME
-	IORING_LINK_TIMEOUT_UPDATE                      // 0x10, update linked timeout
-	IORING_TIMEOUT_ETIME_SUCCESS                    // 0x20, convert -ETIME to success
-	IORING_TIMEOUT_MULTISHOT                        // 0x40, repeat on expiry
+	IORING_TIMEOUT_ABS           = 1 << iota // 0x01, absolute timestamp
+	IORING_TIMEOUT_UPDATE                    // 0x02, update existing timeout
+	IORING_TIMEOUT_BOOTTIME                  // 0x04, use CLOCK_BOOTTIME
+	IORING_TIMEOUT_REALTIME                  // 0x08, use CLOCK_REALTIME
+	IORING_LINK_TIMEOUT_UPDATE               // 0x10, update linked timeout
+	IORING_TIMEOUT_ETIME_SUCCESS             // 0x20, convert -ETIME to success
+	IORING_TIMEOUT_MULTISHOT                 // 0x40, repeat on expiry
 
 	IORING_TIMEOUT_CLOCK_MASK  = IORING_TIMEOUT_BOOTTIME | IORING_TIMEOUT_REALTIME
 	IORING_TIMEOUT_UPDATE_MASK = IORING_TIMEOUT_UPDATE | IORING_LINK_TIMEOUT_UPDATE
 )
 
-// Accept/recv ioprio flags
+// Accept operation flags.
 const (
-	IORING_ACCEPT_MULTISHOT = 1 << 0
-	IORING_RECV_MULTISHOT   = 1 << 1
+	IORING_ACCEPT_MULTISHOT  = 1 << 0
+	IORING_ACCEPT_DONTWAIT   = 1 << 1
+	IORING_ACCEPT_POLL_FIRST = 1 << 2
 )
 
-// Send zero-copy flags
+// Send/receive operation flags.
 const (
 	IORING_RECVSEND_POLL_FIRST  = 1 << 0
-	IORING_RECV_MULTISHOT_FLAG  = 1 << 1 // Alias for compatibility
+	IORING_RECV_MULTISHOT       = 1 << 1
 	IORING_RECVSEND_FIXED_BUF   = 1 << 2
 	IORING_SEND_ZC_REPORT_USAGE = 1 << 3
 	IORING_RECVSEND_BUNDLE      = 1 << 4 // Bundle send/recv
@@ -525,3 +526,6 @@ func (ur *ioUring) msgRing(sqeCtx SQEContext, userData int64, res int32) error {
 func (ur *ioUring) msgRingFD(sqeCtx SQEContext, srcFD uint32, dstSlot uint32, userData int64, flags uint32) error {
 	return ErrNotSupported
 }
+
+// Notification CQE usage flags for zero-copy operations.
+const IORING_NOTIF_USAGE_ZC_COPIED = 1 << 31

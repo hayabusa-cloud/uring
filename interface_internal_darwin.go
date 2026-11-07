@@ -11,9 +11,7 @@ var defaultOptions = Options{
 	LockedBufferMem:         registerBufferDefaultMem,
 	ReadBufferSize:          bufferSizeDefault,
 	ReadBufferNum:           EntriesMedium * 2,
-	WriteBufferSize:         bufferSizeDefault,
-	WriteBufferNum:          EntriesMedium,
-	MultiIssuers:            false,
+	MultiIssuers:            true,
 	NotifySucceed:           false,
 	IndirectSubmissionQueue: false,
 }
@@ -29,7 +27,7 @@ func (uo *Options) Apply(opts ...OptionFunc) {
 }
 
 var (
-	// LargeLockedBufferMemOptions uses the maximum registered buffer memory (128 MiB).
+	// LargeLockedBufferMemOptions uses the package maximum registered-buffer memory.
 	// This equals the default and keeps the helper-based option style available.
 	LargeLockedBufferMemOptions OptionFunc = func(opt *Options) {
 		opt.LockedBufferMem = registerBufferSize * registerBufferNum

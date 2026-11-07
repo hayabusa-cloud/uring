@@ -79,7 +79,7 @@ func TestIntegrationZeroCopySend(t *testing.T) {
 
 	for time.Now().Before(deadline) {
 		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait: %v", err)
 		}
 		for i := 0; i < n; i++ {
@@ -176,7 +176,7 @@ func cancelAcceptMultishot(t *testing.T, ring *uring.Uring, acceptCtx uring.SQEC
 	b := iox.Backoff{}
 	for time.Now().Before(deadline) && !terminal {
 		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait after cancel: %v", err)
 		}
 		for i := 0; i < n; i++ {
@@ -229,7 +229,7 @@ func TestIntegrationMultishotAcceptPrimeWaitSurfacesImmediateError(t *testing.T)
 
 	for time.Now().Before(deadline) {
 		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("prime Wait: %v", err)
 		}
 		accepted, errRes := consumeAcceptCQEs(cqes[:n])
@@ -286,7 +286,7 @@ func TestIntegrationMultishotAccept(t *testing.T) {
 	// dialing so the poll-first path is armed in-kernel for future connections.
 	cqes := make([]uring.CQEView, 16)
 	n, err := ring.Wait(cqes)
-	if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+	if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 		t.Fatalf("prime Wait: %v", err)
 	}
 	if accepted, errRes := consumeAcceptCQEs(cqes[:n]); errRes != 0 {
@@ -318,7 +318,7 @@ func TestIntegrationMultishotAccept(t *testing.T) {
 
 	for time.Now().Before(deadline) && accepted < numClients {
 		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait: %v", err)
 		}
 		delta, errRes := consumeAcceptCQEs(cqes[:n])

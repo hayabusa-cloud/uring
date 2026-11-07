@@ -28,14 +28,26 @@ const (
 // Options configures the io_uring instance behavior.
 // All fields have sensible defaults if not specified.
 type Options struct {
-	Entries                 int
-	LockedBufferMem         int
-	ReadBufferSize          int
-	ReadBufferNum           int
-	ReadBufferGidOffset     int
-	WriteBufferSize         int
-	WriteBufferNum          int
-	MultiSizeBuffer         int
+	// Entries must be between 1 and EntriesHuge, inclusive.
+	Entries int
+	// LockedBufferMem is the total memory for registered buffers. It must be a
+	// multiple of BufferSizeLarge from BufferSizeLarge through the package
+	// maximum selected by LargeLockedBufferMemOptions.
+	LockedBufferMem int
+	// ReadBufferSize is the size of each single-size provided buffer. New rounds
+	// values in [2, 1<<28] upward to a power of two. Multi-size mode ignores it.
+	ReadBufferSize int
+	// ReadBufferNum is the number of single-size provided buffers. New rounds
+	// values in [2, 1<<28] upward to a power of two. Multi-size mode ignores it.
+	ReadBufferNum int
+	// ReadBufferGidOffset is the non-negative base group ID. The selected buffer
+	// layout must fit in the remaining uint16 group-ID namespace.
+	ReadBufferGidOffset int
+	// MultiSizeBuffer selects single-size mode at 0. Values in [1, 4096] enable
+	// multi-size groups and are rounded upward to a power of two.
+	MultiSizeBuffer int
+	// MultiIssuers mirrors the Linux task-migratable setup contract. It defaults
+	// to true; set it to false only for a caller pinned to one OS thread.
 	MultiIssuers            bool
 	NotifySucceed           bool
 	IndirectSubmissionQueue bool
@@ -44,10 +56,15 @@ type Options struct {
 }
 
 // New creates a new io_uring instance with the specified options.
-// Returns an unstarted ring; call Start() to initialize buffers and enable.
+// It returns ErrInvalidParam for an invalid option domain before creating the
+// ring. A successful call returns an unstarted ring; call Start to initialize
+// buffers and enable it.
 func New(options ...OptionFunc) (*Uring, error) {
 	opt := defaultOptions
 	opt.Apply(options...)
+	if err := opt.validate(); err != nil {
+		return nil, err
+	}
 	if opt.SQE128 {
 		return nil, ErrNotSupported
 	}
@@ -124,10 +141,11 @@ func newSetupOptions(opt Options, sqe128 bool) []func(params *ioUringParams) {
 
 // Uring is the main io_uring interface for submitting and completing I/O operations.
 // It wraps the kernel io_uring instance with buffer management and typed operations.
-// Default rings use the single-issuer fast path, so submit-state operations
-// are not safe for concurrent use by multiple goroutines; caller must
-// serialize submit, Wait, WaitDirect, WaitExtended, and Stop unless MultiIssuers is enabled.
+// Default rings use the task-migratable shared-submit path. Set MultiIssuers
+// to false only for a caller pinned to one OS thread from New through Stop.
 type Uring struct {
+	_ [0]func()
+
 	*ioUring
 	*Options
 	Features *Features
@@ -909,4 +927,276 @@ func (ur *Uring) LinkTimeout(sqeCtx SQEContext, d time.Duration, options ...OpOp
 	ctx := sqeCtx.OrFlags(flags)
 	nano := d.Nanoseconds()
 	return ur.linkTimeout(ctx, &Timespec{Sec: nano / int64(time.Second), Nsec: nano % int64(time.Second)}, 0)
+}
+
+// ReceiveBundle is unavailable on Darwin.
+func (ur *Uring) ReceiveBundle(sqeCtx SQEContext, pollFD PollFd, options ...OpOptionFunc) error {
+
+	return ErrNotSupported
+}
+
+// SubmitReceiveBundleMultishot is unavailable on Darwin.
+func (ur *Uring) SubmitReceiveBundleMultishot(sqeCtx SQEContext, pollFD PollFd, options ...OpOptionFunc) error {
+
+	return ErrNotSupported
+}
+
+// BundleIterator is unavailable on Darwin.
+func (ur *Uring) BundleIterator(cqe CQEView, group uint16) (BundleIterator, bool) {
+	var result0 BundleIterator
+	var result1 bool
+	return result0, result1
+}
+
+// ReceiveZeroCopy is unavailable on Darwin.
+func (ur *Uring) ReceiveZeroCopy(sqeCtx SQEContext, pollFD PollFd, n int, zcrxIfqIdx uint32, options ...OpOptionFunc) error {
+
+	return ErrNotSupported
+}
+
+// EpollWait is unavailable on Darwin.
+func (ur *Uring) EpollWait(sqeCtx SQEContext, events []EpollEvent, timeout int32, options ...OpOptionFunc) error {
+
+	return ErrNotSupported
+}
+
+// ReadvFixed is unavailable on Darwin.
+func (ur *Uring) ReadvFixed(sqeCtx SQEContext, offset int64, bufIndices []int, options ...OpOptionFunc) error {
+
+	return ErrNotSupported
+}
+
+// WritevFixed is unavailable on Darwin.
+func (ur *Uring) WritevFixed(sqeCtx SQEContext, offset int64, bufIndices []int, lengths []int, options ...OpOptionFunc) error {
+
+	return ErrNotSupported
+}
+
+// Pipe is unavailable on Darwin.
+func (ur *Uring) Pipe(sqeCtx SQEContext, fds *[2]iofd.FD, pipeFlags uint32, options ...OpOptionFunc) error {
+
+	return ErrNotSupported
+}
+
+// RegisterZCRXIfq is unavailable on Darwin.
+func (ur *Uring) RegisterZCRXIfq(ifIdx, ifRxq uint32, rqEntries uint32, area *ZCRXAreaReg, region *RegionDesc, rxBufLen uint32) (uint32, ZCRXOffsets, error) {
+	var result0 uint32
+	var result1 ZCRXOffsets
+	return result0, result1, ErrNotSupported
+}
+
+// ZCRXFlushRQ is unavailable on Darwin.
+func (ur *Uring) ZCRXFlushRQ(zcrxID uint32) error {
+
+	return ErrNotSupported
+}
+
+// RegisterBufRingMMAP is unavailable on Darwin.
+func (ur *Uring) RegisterBufRingMMAP(entries int, groupID uint16) (*ioUringBufRing, error) {
+	var result0 *ioUringBufRing
+	return result0, ErrNotSupported
+}
+
+// RegisterBufRingIncremental is unavailable on Darwin.
+func (ur *Uring) RegisterBufRingIncremental(entries int, groupID uint16) (*ioUringBufRing, error) {
+	var result0 *ioUringBufRing
+	return result0, ErrNotSupported
+}
+
+// RegisterBufRingWithFlags is unavailable on Darwin.
+func (ur *Uring) RegisterBufRingWithFlags(entries int, groupID uint16, flags uint16) (*ioUringBufRing, error) {
+	var result0 *ioUringBufRing
+	return result0, ErrNotSupported
+}
+
+// QueryOpcodes is unavailable on Darwin.
+func (ur *Uring) QueryOpcodes() (*QueryOpcode, error) {
+	var result0 *QueryOpcode
+	return result0, ErrNotSupported
+}
+
+// QueryZCRX is unavailable on Darwin.
+func (ur *Uring) QueryZCRX() (*QueryZCRX, error) {
+	var result0 *QueryZCRX
+	return result0, ErrNotSupported
+}
+
+// QuerySCQ is unavailable on Darwin.
+func (ur *Uring) QuerySCQ() (*QuerySCQ, error) {
+	var result0 *QuerySCQ
+	return result0, ErrNotSupported
+}
+
+// RegisterMemRegion is unavailable on Darwin.
+func (ur *Uring) RegisterMemRegion(region *RegionDesc, flags uint64) error {
+
+	return ErrNotSupported
+}
+
+// RegisterNAPI is unavailable on Darwin.
+func (ur *Uring) RegisterNAPI(busyPollTimeout uint32, preferBusyPoll bool, strategy uint32) error {
+
+	return ErrNotSupported
+}
+
+// NAPIAddStaticID is unavailable on Darwin.
+func (ur *Uring) NAPIAddStaticID(napiID uint32) error {
+
+	return ErrNotSupported
+}
+
+// NAPIDelStaticID is unavailable on Darwin.
+func (ur *Uring) NAPIDelStaticID(napiID uint32) error {
+
+	return ErrNotSupported
+}
+
+// UnregisterNAPI is unavailable on Darwin.
+func (ur *Uring) UnregisterNAPI() error {
+
+	return ErrNotSupported
+}
+
+// CloneBuffers is unavailable on Darwin.
+func (ur *Uring) CloneBuffers(srcFD int, srcOff, dstOff, count uint32, replace bool) error {
+
+	return ErrNotSupported
+}
+
+// CloneBuffersFromRegistered is unavailable on Darwin.
+func (ur *Uring) CloneBuffersFromRegistered(srcRegisteredIdx int, srcOff, dstOff, count uint32, replace bool) error {
+
+	return ErrNotSupported
+}
+
+// ResizeRings is unavailable on Darwin.
+func (ur *Uring) ResizeRings(newSQSize, newCQSize uint32) error {
+
+	return ErrNotSupported
+}
+
+// ZCRXExport is unavailable on Darwin.
+func (ur *Uring) ZCRXExport(zcrxID uint32) (iofd.FD, error) {
+
+	return iofd.InvalidFD, ErrNotSupported
+}
+
+// FSetXattr is unavailable on Darwin.
+func (ur *Uring) FSetXattr(sqeCtx SQEContext, name string, value []byte, flags int, options ...OpOptionFunc) error {
+
+	return ErrNotSupported
+}
+
+// SetXattr is unavailable on Darwin.
+func (ur *Uring) SetXattr(sqeCtx SQEContext, path, name string, value []byte, flags int, options ...OpOptionFunc) error {
+
+	return ErrNotSupported
+}
+
+// FGetXattr is unavailable on Darwin.
+func (ur *Uring) FGetXattr(sqeCtx SQEContext, name string, value []byte, options ...OpOptionFunc) error {
+
+	return ErrNotSupported
+}
+
+// GetXattr is unavailable on Darwin.
+func (ur *Uring) GetXattr(sqeCtx SQEContext, path, name string, value []byte, options ...OpOptionFunc) error {
+
+	return ErrNotSupported
+}
+
+// Statx is unavailable on Darwin.
+func (ur *Uring) Statx(sqeCtx SQEContext, path string, flags, mask int, stat *Statx, options ...OpOptionFunc) error {
+
+	return ErrNotSupported
+}
+
+// RenameAt is unavailable on Darwin.
+func (ur *Uring) RenameAt(sqeCtx SQEContext, oldPath, newPath string, flags int, options ...OpOptionFunc) error {
+
+	return ErrNotSupported
+}
+
+// UnlinkAt is unavailable on Darwin.
+func (ur *Uring) UnlinkAt(sqeCtx SQEContext, path string, flags int, options ...OpOptionFunc) error {
+
+	return ErrNotSupported
+}
+
+// MkdirAt is unavailable on Darwin.
+func (ur *Uring) MkdirAt(sqeCtx SQEContext, path string, mode uint32, options ...OpOptionFunc) error {
+
+	return ErrNotSupported
+}
+
+// SymlinkAt is unavailable on Darwin.
+func (ur *Uring) SymlinkAt(sqeCtx SQEContext, target, linkpath string, options ...OpOptionFunc) error {
+
+	return ErrNotSupported
+}
+
+// LinkAt is unavailable on Darwin.
+func (ur *Uring) LinkAt(sqeCtx SQEContext, oldDirfd int, oldPath, newPath string, flags int, options ...OpOptionFunc) error {
+
+	return ErrNotSupported
+}
+
+// FTruncate is unavailable on Darwin.
+func (ur *Uring) FTruncate(sqeCtx SQEContext, length int64, options ...OpOptionFunc) error {
+
+	return ErrNotSupported
+}
+
+// FutexWait is unavailable on Darwin.
+func (ur *Uring) FutexWait(sqeCtx SQEContext, addr *uint32, val uint64, mask uint64, flags uint32, options ...OpOptionFunc) error {
+
+	return ErrNotSupported
+}
+
+// FutexWake is unavailable on Darwin.
+func (ur *Uring) FutexWake(sqeCtx SQEContext, addr *uint32, val uint64, mask uint64, flags uint32, options ...OpOptionFunc) error {
+
+	return ErrNotSupported
+}
+
+// FutexWaitV is unavailable on Darwin.
+func (ur *Uring) FutexWaitV(sqeCtx SQEContext, waitv unsafe.Pointer, count uint32, flags uint32, options ...OpOptionFunc) error {
+
+	return ErrNotSupported
+}
+
+// Waitid is unavailable on Darwin.
+func (ur *Uring) Waitid(sqeCtx SQEContext, idtype, id int, infop unsafe.Pointer, options int, opts ...OpOptionFunc) error {
+
+	return ErrNotSupported
+}
+
+// FixedFdInstall is unavailable on Darwin.
+func (ur *Uring) FixedFdInstall(sqeCtx SQEContext, fixedIndex int, flags uint32, options ...OpOptionFunc) error {
+
+	return ErrNotSupported
+}
+
+// FilesUpdate is unavailable on Darwin.
+func (ur *Uring) FilesUpdate(sqeCtx SQEContext, fds []int32, offset int, options ...OpOptionFunc) error {
+
+	return ErrNotSupported
+}
+
+// UringCmd is unavailable on Darwin.
+func (ur *Uring) UringCmd(sqeCtx SQEContext, cmdOp uint32, cmdData []byte, options ...OpOptionFunc) error {
+
+	return ErrNotSupported
+}
+
+// Nop128 is unavailable on Darwin.
+func (ur *Uring) Nop128(sqeCtx SQEContext, options ...OpOptionFunc) error {
+
+	return ErrNotSupported
+}
+
+// UringCmd128 is unavailable on Darwin.
+func (ur *Uring) UringCmd128(sqeCtx SQEContext, cmdOp uint32, cmdData []byte, options ...OpOptionFunc) error {
+
+	return ErrNotSupported
 }

@@ -224,7 +224,7 @@ type ioUringProbeOp struct {
 }
 
 func newIoUring(entries int, opts ...func(params *ioUringParams)) (*ioUring, error) {
-	if entries < 1 {
+	if entries < 1 || entries > EntriesHuge {
 		return nil, ErrInvalidParam
 	}
 
@@ -386,7 +386,7 @@ func (ur *ioUring) registerBuffers(addr unsafe.Pointer, n, size int) error {
 	if ur.bufs != nil && len(ur.bufs) > 0 {
 		return ErrExists
 	}
-	if n < 1 || size < 1 || 0 != n&(n-1) || 0 != size&(size-1) {
+	if n < 1 || size < 1 || 0 != size&(size-1) {
 		return ErrInvalidParam
 	}
 	vectors := make([]IoVec, 0, n)
@@ -850,8 +850,9 @@ func (ur *ioUring) wakeSQPollLocked() error {
 		return nil
 	}
 	_, err := ioUringEnter(ur.ringFd, uintptr(ur.params.sqEntries), 0, IORING_ENTER_SQ_WAKEUP)
-	// ErrExists/ErrInProgress means another enter is already in progress.
-	if err != nil && err != ErrExists && err != ErrInProgress {
+	// ErrInProgress means another enter is already in progress. ErrExists is a
+	// wrong-task verdict for SINGLE_ISSUER + DEFER_TASKRUN and must stay visible.
+	if err != nil && err != ErrInProgress {
 		return err
 	}
 	return nil
@@ -868,8 +869,9 @@ func (ur *ioUring) flushSubmitLocked() error {
 		needTaskrunKick := n == 0 && ur.params.flags&(IORING_SETUP_DEFER_TASKRUN|IORING_SETUP_COOP_TASKRUN) != 0
 		if n != 0 || needTaskrunKick {
 			_, err := ioUringEnter(ur.ringFd, uintptr(n), 0, IORING_ENTER_GETEVENTS)
-			// ErrExists/ErrInProgress means another enter is already in progress.
-			if err != nil && err != ErrExists && err != ErrInProgress {
+			// ErrExists identifies a wrong submitting task on a deferred
+			// single-issuer ring and must not be suppressed.
+			if err != nil && err != ErrInProgress {
 				ur.releaseConsumedKeepAlive()
 				return err
 			}

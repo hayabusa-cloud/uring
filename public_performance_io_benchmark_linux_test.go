@@ -402,7 +402,7 @@ func waitPublicPerformanceDirectCQEs(b *testing.B, ring *uring.Uring, cqes []uri
 		n, err := ring.WaitDirect(cqes)
 		switch {
 		case err == nil:
-		case err == iox.ErrWouldBlock, err == uring.ErrExists:
+		case err == iox.ErrWouldBlock:
 		default:
 			b.Fatalf("Wait: %v", err)
 		}
@@ -446,7 +446,7 @@ func waitPublicPerformanceZeroCopyCQEs(b *testing.B, ring *uring.Uring, cqes []u
 		n, err := ring.WaitDirect(cqes)
 		switch {
 		case err == nil:
-		case err == iox.ErrWouldBlock, err == uring.ErrExists:
+		case err == iox.ErrWouldBlock:
 		default:
 			b.Fatalf("Wait: %v", err)
 		}

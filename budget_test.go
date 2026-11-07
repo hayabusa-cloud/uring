@@ -7,6 +7,7 @@
 package uring_test
 
 import (
+	"math"
 	"strconv"
 	"testing"
 
@@ -78,13 +79,13 @@ func TestLockedMemForBudget(t *testing.T) {
 		minMem int
 		maxMem int
 	}{
-		// 25% ratio, rounded to power of 2
+		// 25% ratio, rounded to power of 2 and capped at 64 MiB on Linux.
 		{"16MiB_uses_min", 16 * uring.MiB, 8 * uring.MiB, 8 * uring.MiB},
 		{"64MiB", 64 * uring.MiB, 16 * uring.MiB, 16 * uring.MiB},
 		{"256MiB", 256 * uring.MiB, 64 * uring.MiB, 64 * uring.MiB},
-		{"1GiB", 1 * uring.GiB, 256 * uring.MiB, 256 * uring.MiB},
-		{"4GiB", 4 * uring.GiB, 1 * uring.GiB, 1 * uring.GiB},
-		{"16GiB", 16 * uring.GiB, 4 * uring.GiB, 4 * uring.GiB},
+		{"1GiB", 1 * uring.GiB, 64 * uring.MiB, 64 * uring.MiB},
+		{"4GiB", 4 * uring.GiB, 64 * uring.MiB, 64 * uring.MiB},
+		{"16GiB", 16 * uring.GiB, 64 * uring.MiB, 64 * uring.MiB},
 	}
 
 	for _, tt := range tests {
@@ -116,10 +117,10 @@ func TestMultiSizeBufferScale(t *testing.T) {
 		{"1GiB", 1 * uring.GiB, 4},
 		{"4GiB", 4 * uring.GiB, 16},
 		{"8GiB", 8 * uring.GiB, 32},
-		{"16GiB", 16 * uring.GiB, 64},
-		{"32GiB", 32 * uring.GiB, 128},
-		{"64GiB", 64 * uring.GiB, 256},
-		{"128GiB", 128 * uring.GiB, 512},
+		{"16GiB", 16 * uring.GiB, 128},
+		{"32GiB", 32 * uring.GiB, 256},
+		{"64GiB", 64 * uring.GiB, 512},
+		{"128GiB", 128 * uring.GiB, 1024},
 	}
 
 	for _, tt := range tests {
@@ -136,7 +137,7 @@ func TestMultiSizeBufferScale(t *testing.T) {
 	}
 }
 
-func TestOptionsForBudgetDefaultBufferGroupsFit(t *testing.T) {
+func TestOptionsForBudgetBufferProvisioningFits(t *testing.T) {
 	budgets := []int{
 		16 * uring.MiB,
 		64 * uring.MiB,
@@ -154,9 +155,21 @@ func TestOptionsForBudgetDefaultBufferGroupsFit(t *testing.T) {
 		t.Run(budgetName(budget), func(t *testing.T) {
 			opts := uring.OptionsForBudget(budget)
 			bufferMem := bufferGroupMemForBudget(budget)
-			used := baseMem * opts.MultiSizeBuffer
+			used := opts.ReadBufferSize * opts.ReadBufferNum
+			if opts.MultiSizeBuffer > 0 {
+				used = baseMem * opts.MultiSizeBuffer
+			}
 			if used > bufferMem {
-				t.Fatalf("default buffer groups overflow budget: used=%d bufferMem=%d scale=%d", used, bufferMem, opts.MultiSizeBuffer)
+				t.Fatalf("provided buffers overflow budget: used=%d bufferMem=%d scale=%d", used, bufferMem, opts.MultiSizeBuffer)
+			}
+			if opts.MultiSizeBuffer == 0 {
+				target := opts.Entries * 2
+				if opts.ReadBufferNum > target {
+					t.Fatalf("ReadBufferNum=%d exceeds target %d", opts.ReadBufferNum, target)
+				}
+				if opts.ReadBufferNum < target && used*2 <= bufferMem {
+					t.Fatalf("ReadBufferNum=%d is not maximal for %d bytes", opts.ReadBufferNum, bufferMem)
+				}
 			}
 			if opts.MultiSizeBuffer == 0 && bufferMem >= baseMem {
 				t.Fatalf("default buffer groups fit in %d bytes but MultiSizeBuffer is disabled", bufferMem)
@@ -477,9 +490,9 @@ func TestOptionsForSystem_SmallMachine(t *testing.T) {
 }
 
 func TestOptionsForSystem_Equivalence(t *testing.T) {
-	// OptionsForSystem(X) should equal OptionsForBudget(X * 25 / 100)
+	// OptionsForSystem(X) should equal OptionsForBudget(X / 4).
 	systemMem := 2 * uring.GiB
-	expectedBudget := systemMem * 25 / 100
+	expectedBudget := systemMem / 4
 
 	optsSystem := uring.OptionsForSystem(systemMem)
 	optsBudget := uring.OptionsForBudget(expectedBudget)
@@ -495,6 +508,22 @@ func TestOptionsForSystem_Equivalence(t *testing.T) {
 	if optsSystem.MultiSizeBuffer != optsBudget.MultiSizeBuffer {
 		t.Fatalf("MultiSizeBuffer mismatch: system=%d, budget=%d",
 			optsSystem.MultiSizeBuffer, optsBudget.MultiSizeBuffer)
+	}
+}
+
+func TestOptionsForSystemAvoidsIntermediateOverflow(t *testing.T) {
+	systemMemory := math.MaxInt/25 + 1
+	got := uring.OptionsForSystem(systemMemory)
+	want := uring.OptionsForBudget(systemMemory / 4)
+
+	if got.Entries != want.Entries {
+		t.Fatalf("Entries=%d, want %d", got.Entries, want.Entries)
+	}
+	if got.LockedBufferMem != want.LockedBufferMem {
+		t.Fatalf("LockedBufferMem=%d, want %d", got.LockedBufferMem, want.LockedBufferMem)
+	}
+	if got.MultiSizeBuffer != want.MultiSizeBuffer {
+		t.Fatalf("MultiSizeBuffer=%d, want %d", got.MultiSizeBuffer, want.MultiSizeBuffer)
 	}
 }
 

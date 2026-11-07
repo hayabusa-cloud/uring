@@ -400,7 +400,7 @@ for i := range n {
 }
 ```
 
-每一次 `OnStep` 回调观察一个 `MultishotStep`：返回 `MultishotContinue` 保持流活跃，或返回 `MultishotStop` 请求取消。如果回调一直保持启用直到终态观察，`OnStop` 至多以最终错误及 `cancelled` 标志触发一次；在步骤自身上，`step.Cancelled` 在边界处把内核的 `-ECANCELED` 判定与其他失败明确区分开。两个回调都是 `MultishotHandler` 接口（`OnMultishotStep` / `OnMultishotStop`）在构建器侧的投影；需要显式处理器时，可直接实现该接口。`HandleCQE` 用于调用方串行化完成循环内的立即 dispatch；若调用方在该循环之后保留复制 CQE，则需维护自己的 route state，并拒绝已退役订阅的观察。在默认单提交者 ring 上，应从 ring 所有者调用 `Cancel` / `Unsubscribe`，或将它们与提交、`Wait`、`WaitDirect`、`WaitExtended`、`Stop` 以及 `ResizeRings` 串行化。启用 `MultiIssuers` 的 ring 由共享提交路径串行化这些取消 SQE。
+每一次 `OnStep` 回调观察一个 `MultishotStep`：返回 `MultishotContinue` 保持流活跃，或返回 `MultishotStop` 请求取消。如果回调一直保持启用直到终态观察，`OnStop` 至多以最终错误及 `cancelled` 标志触发一次；在步骤自身上，`step.Cancelled` 在边界处把内核的 `-ECANCELED` 判定与其他失败明确区分开。两个回调都是 `MultishotHandler` 接口（`OnMultishotStep` / `OnMultishotStop`）在构建器侧的投影；需要显式处理器时，可直接实现该接口。`HandleCQE` 用于调用方串行化完成循环内的立即 dispatch；若调用方在该循环之后保留复制 CQE，则需维护自己的 route state，并拒绝已退役订阅的观察。在显式单提交者 ring（`MultiIssuers=false`）上，应从固定于 OS 线程的 ring 所有者调用 `Cancel` / `Unsubscribe`，并将其与提交、`Wait`、`WaitDirect`、`WaitExtended`、`Stop` 以及 `ResizeRings` 串行化。默认 `MultiIssuers` ring 通过共享提交路径串行化取消 SQE。
 
 ### 类型化上下文承载连接状态
 
@@ -578,7 +578,7 @@ Idle → Active → Stopping → Retiring → Stopped
 
 - 若需为每个成功操作生成可见的 CQE，启用 `NotifySucceed`。
 - `ring.Features` 报告实际 SQ/CQ 条目数、SQE 槽宽以及本包解析 `user_data` 的字节序。
-- 默认不启用 `MultiIssuers`，此时采用单提交者配置（`SINGLE_ISSUER` + `DEFER_TASKRUN`），由调用方的单一执行路径串行化提交状态操作（`submit`、`Wait`、`WaitDirect`、`WaitExtended`、`Stop` 及 `ResizeRings`）。仅当多个 goroutine 需并发提交或并发调用 `Wait`、`WaitDirect`、`WaitExtended` 时才启用 `MultiIssuers`，这会切换为共享提交的 `COOP_TASKRUN` 配置。
+- 普通 Go 执行和并发提交状态调用应保留默认的任务可迁移 `MultiIssuers=true` 配置（`COOP_TASKRUN`）。仅当所有者在 `New` 前调用 `runtime.LockOSThread`、持续固定到 `Stop`，并串行化 `submit`、`Wait`、`WaitDirect`、`WaitExtended`、`Stop` 与 `ResizeRings` 时，才设置 `MultiIssuers=false`；该显式快速路径请求 `SINGLE_ISSUER` + `DEFER_TASKRUN`。
 - `EpollWait` 要求 `timeout` 为 `0`；如需设置截止时间，使用 `LinkTimeout`。
 - 借用式完成视图与池化上下文应及时释放。
 - `ListenerOp.Close` 会立即关闭监听 FD。若仍有设置 CQE 待处理，需先回收该 CQE，再调用 `Close` 将借用的 `ExtSQE` 归还池中。

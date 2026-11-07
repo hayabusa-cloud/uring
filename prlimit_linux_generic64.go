@@ -6,4 +6,17 @@
 
 package uring
 
-const prlimit64Sysno = 261
+const (
+	prlimit64Sysno     = 261
+	sizeofEpollEvent   = 16
+	epollEventFDOffset = 8
+)
+
+// EpollEvent represents an epoll event.
+// Layout matches struct epoll_event in Linux on generic 64-bit architectures.
+type EpollEvent struct {
+	Events uint32
+	_      int32
+	Fd     int32
+	Pad    int32
+}

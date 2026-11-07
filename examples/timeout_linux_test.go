@@ -68,8 +68,7 @@ func TestBasicTimeout(t *testing.T) {
 		n, err := ring.Wait(cqes)
 		// Ignore transient errors that occur in WSL2
 		if err != nil &&
-			!errors.Is(err, iox.ErrWouldBlock) &&
-			!errors.Is(err, uring.ErrExists) {
+			!errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait: %v", err)
 		}
 		for i := 0; i < n; i++ {
@@ -144,8 +143,7 @@ func TestMultipleTimeouts(t *testing.T) {
 		n, err := ring.Wait(cqes)
 		// Ignore transient errors that occur in WSL2
 		if err != nil &&
-			!errors.Is(err, iox.ErrWouldBlock) &&
-			!errors.Is(err, uring.ErrExists) {
+			!errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait: %v", err)
 		}
 		for i := 0; i < n; i++ {
@@ -230,8 +228,7 @@ func TestPollWithTimeout(t *testing.T) {
 		n, err := ring.Wait(cqes)
 		// Ignore transient errors that occur in WSL2
 		if err != nil &&
-			!errors.Is(err, iox.ErrWouldBlock) &&
-			!errors.Is(err, uring.ErrExists) {
+			!errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait: %v", err)
 		}
 		for i := 0; i < n; i++ {
@@ -318,7 +315,7 @@ func TestLinkedTimeout(t *testing.T) {
 
 	for time.Now().Before(deadline) && (!nopDone || !timeoutDone) {
 		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait: %v", err)
 		}
 		for i := 0; i < n; i++ {

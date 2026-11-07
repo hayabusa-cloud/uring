@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1120,5 +1121,33 @@ func TestWaitBatchExtendedUsesCQE32Stride(t *testing.T) {
 	}
 	if cqes[1].Ext != ext2 {
 		t.Fatalf("cqes[1].Ext = %p, want %p", cqes[1].Ext, ext2)
+	}
+}
+
+func TestRegisterBuffersAcceptsNonPowerOfTwoCount(t *testing.T) {
+	ur := newTestIoUring(t)
+	const (
+		bufferCount = 3
+		bufferSize  = 1 << 12
+	)
+	buffers := make([]byte, bufferCount*bufferSize)
+	if err := ur.registerBuffers(unsafe.Pointer(unsafe.SliceData(buffers)), bufferCount, bufferSize); err != nil {
+		t.Fatalf("registerBuffers: %v", err)
+	}
+	if err := ur.unregisterBuffers(); err != nil {
+		t.Fatalf("unregisterBuffers: %v", err)
+	}
+	runtime.KeepAlive(buffers)
+}
+
+func TestNewIoUringRejectsEntriesOutsideSetupDomain(t *testing.T) {
+	for _, entries := range []int{-1, 0, EntriesHuge + 1} {
+		ur, err := newIoUring(entries)
+		if ur != nil {
+			t.Fatalf("newIoUring(%d) = non-nil ring, want nil", entries)
+		}
+		if !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("newIoUring(%d) error = %v, want %v", entries, err, ErrInvalidParam)
+		}
 	}
 }

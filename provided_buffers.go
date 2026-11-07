@@ -7,26 +7,23 @@
 package uring
 
 import (
-	"math"
 	"unsafe"
 
 	"code.hybscloud.com/iobuf"
 )
 
 func newUringProvideBuffers(size, n int) *uringProvideBuffers {
-	if size < 2 || size > (1<<28) {
+	if size < providedBufferValueMin || size > providedBufferValueMax {
 		panic("uring: size must be between 2 and 268435456")
 	}
-	if n < 2 || n > (1<<28) {
+	if n < providedBufferValueMin || n > providedBufferValueMax {
 		panic("uring: n must be between 2 and 268435456")
 	}
 	size = roundToPowerOf2(size)
 	n = roundToPowerOf2(n)
-	mask := n - 1
-	mask |= math.MaxInt16
 	gn := 1
-	if n > (1 << 15) {
-		gn, n = n>>15, 1<<15
+	if n > providedBufferGroupEntries {
+		gn, n = n/providedBufferGroupEntries, providedBufferGroupEntries
 	}
 	mem := iobuf.AlignedMem(int(size)*n*gn, iobuf.PageSize)
 	ptr := unsafe.Pointer(unsafe.SliceData(mem))
@@ -34,7 +31,6 @@ func newUringProvideBuffers(size, n int) *uringProvideBuffers {
 		gn:    gn,
 		n:     n,
 		gMask: gn - 1,
-		mask:  mask,
 		mem:   mem,
 		ptr:   ptr,
 		size:  size,
@@ -45,7 +41,6 @@ type uringProvideBuffers struct {
 	gn        int
 	n         int
 	gMask     int
-	mask      int
 	mem       []byte
 	ptr       unsafe.Pointer
 	size      int
@@ -101,7 +96,7 @@ func newUringBufferGroups(scale int) *uringProvideBufferGroups {
 // newUringBufferGroupsWithConfig creates buffer groups with custom configuration.
 // Tiers with zero count are not allocated.
 func newUringBufferGroupsWithConfig(scale int, cfg BufferGroupsConfig) *uringProvideBufferGroups {
-	if scale < 1 || scale > (1<<12) {
+	if scale < 1 || scale > multiSizeBufferScaleMax {
 		panic("uring: scale must be between 1 and 4096")
 	}
 	scale = roundToPowerOf2(scale)

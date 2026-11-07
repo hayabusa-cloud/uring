@@ -32,10 +32,7 @@ const (
 
 	// Memory allocation ratios
 	lockedMemRatio = 25      // 25% for registered buffers
-	minLockedMem   = 8 * MiB // 8 MiB minimum (no maximum cap)
-
-	// System memory to io_uring budget ratio
-	systemMemoryRatio = 25 // 25% of system memory for io_uring
+	minLockedMem   = 8 * MiB // 8 MiB minimum; package registration cap applies
 )
 
 // OptionsForSystem returns Options configured for a machine with the given total memory.
@@ -54,7 +51,7 @@ const (
 //
 //	opts := OptionsForSystem(3840 * MiB)  // 3.75 GiB
 func OptionsForSystem(systemMemory int) Options {
-	budget := systemMemory * systemMemoryRatio / 100
+	budget := systemMemory / 4
 	return OptionsForBudget(budget)
 }
 
@@ -65,9 +62,11 @@ func OptionsForSystem(systemMemory int) Options {
 //
 // Memory is distributed as:
 //   - Ring entries: sized to match expected throughput (more budget = more entries)
-//   - Registered buffers: 25% for zero-copy operations (minimum 8 MiB, no maximum cap)
-//   - Buffer groups: use the remaining budget after registered buffers and ring overhead
+//   - Registered buffers: target 25%, rounded upward with an 8 MiB minimum,
+//     and bounded by the package registration cap
+//   - Provided buffers: use the remaining budget after registered buffers and ring overhead
 //   - Multi-size buffer groups use the default tier set and are disabled when it does not fit
+//   - Single-size fallback reduces its buffer count when the default count does not fit
 //
 // Example:
 //
@@ -88,15 +87,20 @@ func OptionsForBudget(budget int) Options {
 	}
 
 	scale := scaleForMem(bufferGroupMem, DefaultBufferGroupsConfig())
+	readBufferNum := entries * 2
+	if scale == 0 {
+		for readBufferNum > providedBufferValueMin && readBufferNum*bufferSizeDefault > bufferGroupMem {
+			readBufferNum >>= 1
+		}
+	}
 
 	return Options{
 		Entries:         entries,
 		LockedBufferMem: lockedMem,
 		ReadBufferSize:  bufferSizeDefault,
-		ReadBufferNum:   entries * 2,
-		WriteBufferSize: bufferSizeDefault,
-		WriteBufferNum:  entries,
+		ReadBufferNum:   readBufferNum,
 		MultiSizeBuffer: scale,
+		MultiIssuers:    true,
 	}
 }
 
@@ -105,7 +109,8 @@ func OptionsForBudget(budget int) Options {
 // largest tier set that fits in the remaining buffer-group memory.
 //
 // Budget handling matches OptionsForBudget's memory reservation:
-//   - registered buffers use 25% of the budget (minimum 8 MiB)
+//   - registered buffers target 25% of the budget, rounded upward with an
+//     8 MiB minimum, and bounded by the package registration cap
 //   - ring overhead is reserved from the same budget
 //   - buffer groups use the remaining memory
 //   - if the remaining memory cannot fit the minimal tier set, the returned config is empty and scale is 0
@@ -162,8 +167,7 @@ func lockedMemForBudget(budget int) int {
 	if mem < minLockedMem {
 		mem = minLockedMem
 	}
-	// No maximum cap - let users allocate as much as their budget allows
-	return roundToPowerOf2(mem)
+	return min(roundToPowerOf2(mem), registerBufferSize*registerBufferNum)
 }
 
 func ringOverhead(entries int) int {

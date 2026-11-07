@@ -117,7 +117,7 @@ func sliceOfTitanArray(mem []byte, start, count int) []TitanBuffer {
 }
 
 // RegisterBufferPool is a pool of registered buffers for io_uring.
-// Uses 4KB buffers optimized for page-aligned I/O operations.
+// Uses 128 KiB registered buffers aligned with RegisterBuffer.
 type RegisterBufferPool struct {
 	items []RegisterBuffer
 }

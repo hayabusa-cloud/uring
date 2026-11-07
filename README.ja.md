@@ -400,7 +400,7 @@ for i := range n {
 }
 ```
 
-`OnStep` コールバックは 1 件の `MultishotStep` を観察します。ストリームを維持するなら `MultishotContinue` を、キャンセルを要求するなら `MultishotStop` を返します。コールバックが終端観察まで有効なままなら、`OnStop` は最終エラーと `cancelled` フラグを伴って高々一度だけ実行されます。ステップ自身の `step.Cancelled` は、境界上でカーネルが `-ECANCELED` を返した判定をその他の失敗と明示的に区別します。両コールバックは `MultishotHandler` インタフェース（`OnMultishotStep` / `OnMultishotStop`）のビルダー側射影です。明示的なハンドラを書く場合はこのインタフェースを直接実装してください。`HandleCQE` は呼び出し側の直列化された完了ループ内で即時 dispatch するための補助です。コピー済み CQE をそのループの後も保持する場合、呼び出し側が独自の route state を保持し、すでに解放されたサブスクリプションの観察を拒否してください。既定の単一発行者リングでは、`Cancel` / `Unsubscribe` はリング所有者から呼び出すか、発行、`Wait`、`WaitDirect`、`WaitExtended`、`Stop`、`ResizeRings` と直列化してください。`MultiIssuers` リングでは、共有発行パスがこれらのキャンセル SQE を直列化します。
+`OnStep` コールバックは 1 件の `MultishotStep` を観察します。ストリームを維持するなら `MultishotContinue` を、キャンセルを要求するなら `MultishotStop` を返します。コールバックが終端観察まで有効なままなら、`OnStop` は最終エラーと `cancelled` フラグを伴って高々一度だけ実行されます。ステップ自身の `step.Cancelled` は、境界上でカーネルが `-ECANCELED` を返した判定をその他の失敗と明示的に区別します。両コールバックは `MultishotHandler` インタフェース（`OnMultishotStep` / `OnMultishotStop`）のビルダー側射影です。明示的なハンドラを書く場合はこのインタフェースを直接実装してください。`HandleCQE` は呼び出し側の直列化された完了ループ内で即時 dispatch するための補助です。コピー済み CQE をそのループの後も保持する場合、呼び出し側が独自の route state を保持し、すでに解放されたサブスクリプションの観察を拒否してください。明示的な単一発行者リング（`MultiIssuers=false`）では、OS スレッドに固定したリング所有者から `Cancel` / `Unsubscribe` を呼び、発行、`Wait`、`WaitDirect`、`WaitExtended`、`Stop`、`ResizeRings` と直列化してください。デフォルトの `MultiIssuers` リングでは、共有発行パスがキャンセル SQE を直列化します。
 
 ### 型付きコンテキストによるコネクション状態
 
@@ -578,7 +578,7 @@ Idle → Active → Stopping → Retiring → Stopped
 
 - すべての成功操作に可視の CQE が必要な場合は `NotifySucceed` を有効にする。
 - `ring.Features` は実際の SQ エントリ数・CQ エントリ数・SQE スロット幅・`user_data` 解釈時のバイト順を返す。
-- 既定では `MultiIssuers` を無効のまま、単一発行者構成（`SINGLE_ISSUER` + `DEFER_TASKRUN`）を使用する。この構成では、呼び出し側が 1 つの実行パスで発行状態操作（`submit`、`Wait`、`WaitDirect`、`WaitExtended`、`Stop`、`ResizeRings`）を直列化する。複数 goroutine から並行して発行または `Wait`、`WaitDirect`、`WaitExtended` 呼び出しを行う必要がある場合にのみ `MultiIssuers` を有効にし、`COOP_TASKRUN` 構成に切り替える。
+- 通常の Go 実行および発行状態の並行呼び出しでは、デフォルトのタスク移動可能な `MultiIssuers=true` 構成（`COOP_TASKRUN`）を維持します。`MultiIssuers=false` は、所有者が `New` より前に `runtime.LockOSThread` を呼び、`Stop` まで固定されたまま、`submit`、`Wait`、`WaitDirect`、`WaitExtended`、`Stop`、`ResizeRings` を直列化する場合に限って使用します。この明示的な高速パスは `SINGLE_ISSUER` + `DEFER_TASKRUN` を要求します。
 - `EpollWait` の `timeout` は `0` のままにすること。期限が必要な場合は `LinkTimeout` を使う。
 - 借用中の完了ビューやプール由来のコンテキストは速やかに解放すること。
 - `ListenerOp.Close` はリスナー FD を即座に閉じる。構築中の CQE が未回収の場合は、その CQE を回収してから再度 `Close` を呼び出し、借用中の `ExtSQE` をプールに返却する。

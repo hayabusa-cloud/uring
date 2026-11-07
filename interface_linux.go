@@ -35,29 +35,31 @@ const (
 // Options configures the io_uring instance behavior.
 // All fields have sensible defaults if not specified.
 type Options struct {
-	// Entries specifies the number of SQE slots (use Entries* constants).
+	// Entries specifies the number of SQE slots and must be between 1 and
+	// EntriesHuge, inclusive (use Entries* constants).
 	Entries int
-	// LockedBufferMem is the total memory for registered buffers (bytes).
+	// LockedBufferMem is the total memory for registered buffers. It must be a
+	// multiple of BufferSizeLarge from BufferSizeLarge through the package
+	// maximum selected by LargeLockedBufferMemOptions.
 	LockedBufferMem int
-	// ReadBufferSize is the size of each read buffer (bytes).
+	// ReadBufferSize is the size of each single-size provided buffer. New rounds
+	// values in [2, 1<<28] upward to a power of two. Multi-size mode ignores it.
 	ReadBufferSize int
-	// ReadBufferNum is the number of read buffers to allocate.
+	// ReadBufferNum is the number of single-size provided buffers. New rounds
+	// values in [2, 1<<28] upward to a power of two. Multi-size mode ignores it.
 	ReadBufferNum int
-	// ReadBufferGidOffset is the base group ID for read buffers.
+	// ReadBufferGidOffset is the non-negative base group ID. The selected buffer
+	// layout must fit in the remaining uint16 group-ID namespace.
 	ReadBufferGidOffset int
-	// WriteBufferSize is the size of each write buffer (bytes).
-	WriteBufferSize int
-	// WriteBufferNum is the number of write buffers to allocate.
-	WriteBufferNum int
-	// MultiSizeBuffer enables multiple buffer size groups when > 0.
+	// MultiSizeBuffer selects single-size mode at 0. Values in [1, 4096] enable
+	// multi-size groups and are rounded upward to a power of two.
 	MultiSizeBuffer int
-	// MultiIssuers enables the shared-submit configuration for rings that accept
-	// submissions from multiple goroutines. When false, New requests
-	// SINGLE_ISSUER + DEFER_TASKRUN and callers must serialize submit-state
-	// operations such as submit, Wait, WaitDirect, WaitExtended, Stop, and ring
-	// resize so the default fast path can skip shared synchronization. When
-	// true, it requests COOP_TASKRUN and keeps the shared-submit synchronization
-	// path.
+	// MultiIssuers selects the task-migratable shared-submit configuration.
+	// It defaults to true because a Go goroutine may execute on different Linux
+	// tasks even when caller code serializes every ring operation. Set it to
+	// false only when the goroutine is locked to one OS thread from New through
+	// Stop; that requests SINGLE_ISSUER + DEFER_TASKRUN and removes shared-submit
+	// synchronization.
 	MultiIssuers bool
 	// NotifySucceed ensures CQEs are generated for all successful operations.
 	NotifySucceed bool
@@ -76,10 +78,15 @@ type Options struct {
 }
 
 // New creates a new io_uring instance with the specified options.
-// Returns an unstarted ring; call Start() to initialize buffers and enable.
+// It returns ErrInvalidParam for an invalid option domain before creating the
+// ring. A successful call returns an unstarted ring; call Start to initialize
+// buffers and enable it.
 func New(options ...OptionFunc) (*Uring, error) {
 	opt := defaultOptions
 	opt.Apply(options...)
+	if err := opt.validate(); err != nil {
+		return nil, err
+	}
 	baseSetupOpts := newSetupOptions(opt, false)
 	setupOpts := newSetupOptions(opt, opt.SQE128)
 	r, err := newIoUring(opt.Entries, setupOpts...)
@@ -165,10 +172,10 @@ func newSetupOptions(opt Options, sqe128 bool) []func(params *ioUringParams) {
 
 // Uring is the main io_uring interface for submitting and completing I/O operations.
 // It wraps the kernel io_uring instance with buffer management and typed operations.
-// Default rings use the single-issuer fast path, so submit-state operations
-// are not safe for concurrent use by multiple goroutines; caller must
-// serialize submit, Wait, WaitDirect, WaitExtended, Stop, and ResizeRings
-// unless MultiIssuers is enabled.
+// Default rings use the task-migratable shared-submit path. Set MultiIssuers
+// to false only when one goroutine is locked to one OS thread from New through
+// Stop and serializes submit, Wait, WaitDirect, WaitExtended, Stop, and
+// ResizeRings.
 type Uring struct {
 	*ioUring
 	*Options
@@ -1259,11 +1266,12 @@ func (ur *Uring) WritevFixed(sqeCtx SQEContext, offset int64, bufIndices []int, 
 }
 
 // Pipe creates a pipe using io_uring.
-// The fds parameter must point to an int32[2] array where the kernel
+// The fds parameter must point to a [2]iofd.FD array where the kernel
 // will write the read end (fds[0]) and write end (fds[1]) file descriptors.
 // On successful completion, fds[0] will be the read end and fds[1] the write end.
-// Caller must keep fds valid until the operation completes.
-func (ur *Uring) Pipe(sqeCtx SQEContext, fds *[2]int32, pipeFlags uint32, options ...OpOptionFunc) error {
+// Caller must keep fds valid until the operation completes. After a successful
+// completion, caller owns both descriptors.
+func (ur *Uring) Pipe(sqeCtx SQEContext, fds *[2]iofd.FD, pipeFlags uint32, options ...OpOptionFunc) error {
 	flags := ur.operationOptions(options)
 	ctx := sqeCtx.OrFlags(flags)
 	return ur.pipe(ctx, fds, pipeFlags)
@@ -1572,9 +1580,10 @@ func (ur *Uring) ResizeRings(newSQSize, newCQSize uint32) error {
 // ========================================
 
 // ZCRXExport exports a ZCRX instance for cross-ring sharing.
-// Returns a file descriptor that can be passed to another process.
+// The returned descriptor is owned by the caller and can be passed to another
+// process. The caller must close it after all users are drained.
 // Requires kernel 6.19+.
-func (ur *Uring) ZCRXExport(zcrxID uint32) (int, error) {
+func (ur *Uring) ZCRXExport(zcrxID uint32) (iofd.FD, error) {
 	ctrl := ZCRXCtrl{
 		ZcrxID: zcrxID,
 		Op:     ZCRX_CTRL_EXPORT,
@@ -1582,11 +1591,11 @@ func (ur *Uring) ZCRXExport(zcrxID uint32) (int, error) {
 	// The zcrx_fd is at offset 0 of the export data
 	err := ur.zcrxCtrl(&ctrl)
 	if err != nil {
-		return -1, err
+		return iofd.InvalidFD, err
 	}
 	// Extract fd from Data field (first 4 bytes)
 	fd := *(*uint32)(unsafe.Pointer(&ctrl.Data[0]))
-	return int(fd), nil
+	return iofd.FD(int32(fd)), nil
 }
 
 // ========================================

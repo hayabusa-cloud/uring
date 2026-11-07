@@ -166,3 +166,45 @@ func TestDarwinSQEView(t *testing.T) {
 		}
 	})
 }
+
+func TestDarwinNewIoUringRejectsEntriesOutsideSetupDomain(t *testing.T) {
+	for _, entries := range []int{-1, 0, EntriesHuge + 1} {
+		ur, err := newIoUring(entries)
+		if ur != nil {
+			t.Fatalf("newIoUring(%d) = non-nil ring, want nil", entries)
+		}
+		if err != ErrInvalidParam {
+			t.Fatalf("newIoUring(%d) error = %v, want %v", entries, err, ErrInvalidParam)
+		}
+	}
+}
+
+func TestDarwinNewUringProvideBuffersRoundsAndPartitionsCount(t *testing.T) {
+	buffers := newUringProvideBuffers(3, 3)
+	if buffers.size != 4 {
+		t.Fatalf("size = %d, want 4", buffers.size)
+	}
+	if buffers.n != 4 {
+		t.Fatalf("n = %d, want 4", buffers.n)
+	}
+	if buffers.gn != 1 || buffers.gMask != 0 {
+		t.Fatalf("group geometry = (%d, %d), want (1, 0)", buffers.gn, buffers.gMask)
+	}
+
+	buffers = newUringProvideBuffers(3, providedBufferGroupEntries+1)
+	if buffers.n != providedBufferGroupEntries {
+		t.Fatalf("split n = %d, want %d", buffers.n, providedBufferGroupEntries)
+	}
+	if buffers.gn != 2 || buffers.gMask != 1 {
+		t.Fatalf("split group geometry = (%d, %d), want (2, 1)", buffers.gn, buffers.gMask)
+	}
+	if err := buffers.register(nil, 0); err != nil {
+		t.Fatalf("register split buffers: %v", err)
+	}
+	if got, want := len(buffers.mem), buffers.size*buffers.n*buffers.gn; got != want {
+		t.Fatalf("split backing length = %d, want %d", got, want)
+	}
+	if got := buffers.buf(bufferGroupIndex(1), 0); len(got) != buffers.size {
+		t.Fatalf("second group buffer length = %d, want %d", len(got), buffers.size)
+	}
+}

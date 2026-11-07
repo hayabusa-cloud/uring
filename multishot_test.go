@@ -132,7 +132,7 @@ func TestSubmitAcceptMultishotCancelTerminates(t *testing.T) {
 
 	for accepted == 0 && time.Now().Before(acceptDeadline) {
 		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait: %v", err)
 		}
 		for i := 0; i < n; i++ {
@@ -171,7 +171,7 @@ func TestSubmitAcceptMultishotCancelTerminates(t *testing.T) {
 	b.Reset()
 	for time.Now().Before(stopDeadline) && !terminalAccept {
 		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait after cancel: %v", err)
 		}
 		for i := 0; i < n; i++ {
@@ -242,7 +242,7 @@ func TestSubmitReceiveMultishot(t *testing.T) {
 	// Prime Wait: no data has been written yet, so any recv CQE here
 	// should carry Res==0 (multishot armed, no payload).
 	n, err := ring.Wait(cqes)
-	if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+	if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 		t.Fatalf("prime Wait: %v", err)
 	}
 	for i := 0; i < n; i++ {
@@ -273,7 +273,7 @@ func TestSubmitReceiveMultishot(t *testing.T) {
 
 	for time.Now().Before(deadline) && totalBytes < len(payload) {
 		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait: %v", err)
 		}
 
@@ -322,7 +322,7 @@ func TestSubmitReceiveMultishot(t *testing.T) {
 	b.Reset()
 	for time.Now().Before(stopDeadline) && !terminalRecv {
 		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait after cancel: %v", err)
 		}
 		for i := 0; i < n; i++ {
@@ -400,7 +400,7 @@ func TestMultishotHandlerStopRequest(t *testing.T) {
 
 	for time.Now().Before(deadline) {
 		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait: %v", err)
 		}
 
@@ -520,7 +520,7 @@ func TestMultishotCancelIdempotent(t *testing.T) {
 	b := iox.Backoff{}
 	for time.Now().Before(deadline) && sub.State() != uring.SubscriptionStopped {
 		_, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait: %v", err)
 		}
 		b.Wait()
@@ -592,7 +592,7 @@ func TestMultishotStressAccept(t *testing.T) {
 
 	for time.Now().Before(deadline) && accepted < numConnections {
 		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Logf("Wait: %v", err)
 		}
 		for i := 0; i < n; i++ {
@@ -620,7 +620,7 @@ func TestMultishotStressAccept(t *testing.T) {
 	stopDeadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(stopDeadline) && !terminalSeen {
 		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait after cancel: %v", err)
 		}
 		for i := 0; i < n; i++ {

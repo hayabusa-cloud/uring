@@ -9,6 +9,8 @@ package uring
 import (
 	"math"
 	"unsafe"
+
+	"code.hybscloud.com/iofd"
 )
 
 // Refactored from code.hybscloud.com/sox.
@@ -956,10 +958,10 @@ func (ur *ioUring) writevFixed(sqeCtx SQEContext, offset uint64, bufIndices []in
 }
 
 // pipe creates a pipe using io_uring.
-// The fds parameter must point to an int32[2] array where the kernel
+// The fds parameter must point to a [2]iofd.FD array where the kernel
 // will write the read end (fds[0]) and write end (fds[1]) file descriptors.
 // The fd field in sqeCtx is not used.
-func (ur *ioUring) pipe(sqeCtx SQEContext, fds *[2]int32, flags uint32) error {
+func (ur *ioUring) pipe(sqeCtx SQEContext, fds *[2]iofd.FD, flags uint32) error {
 	ctx := sqeCtx.WithOp(IORING_OP_PIPE)
 	slot, err := ur.reserveSubmitSlot()
 	if err != nil {

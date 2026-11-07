@@ -89,8 +89,9 @@
 //	}
 //
 //	// Cancel when done
-//	// On single-issuer rings, call Cancel from the ring owner or otherwise
-//	// serialize it with submit, Wait, WaitDirect, WaitExtended, Stop, and ResizeRings.
+//	// On explicit single-issuer rings, call Cancel from the OS-thread-pinned
+//	// ring owner and serialize it with submit, Wait, WaitDirect,
+//	// WaitExtended, Stop, and ResizeRings.
 //	if err := sub.Cancel(); err != nil {
 //	    return err
 //	}

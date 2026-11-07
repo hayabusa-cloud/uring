@@ -93,8 +93,7 @@ func waitForOp(t *testing.T, ring *uring.Uring, op uint8, timeout time.Duration)
 	for time.Now().Before(deadline) {
 		n, err := ring.Wait(cqes)
 		if err != nil &&
-			!errors.Is(err, iox.ErrWouldBlock) &&
-			!errors.Is(err, uring.ErrExists) {
+			!errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait: %v", err)
 		}
 		if n > 0 {
