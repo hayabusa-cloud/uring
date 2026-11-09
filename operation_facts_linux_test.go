@@ -361,6 +361,55 @@ func TestMulticastRejectsSharedContext(t *testing.T) {
 	}
 }
 
+func TestMulticastEmptyAndInvalidRangesDoNotSubmit(t *testing.T) {
+	ring := newTestRing(t)
+	ctx := uring.ForFD(0)
+	payload := []byte("payload")
+	for _, tc := range []struct {
+		name string
+		size int
+		send func(uring.SendTargets, int64, int) (int, error)
+	}{
+		{"user buffer", len(payload), func(targets uring.SendTargets, off int64, n int) (int, error) {
+			return ring.Multicast(ctx, targets, -1, payload, off, n)
+		}},
+		{"registered buffer", len(ring.RegisteredBuffer(0)), func(targets uring.SendTargets, off int64, n int) (int, error) {
+			return ring.Multicast(ctx, targets, 0, nil, off, n)
+		}},
+		{"zero copy", len(ring.RegisteredBuffer(0)), func(targets uring.SendTargets, off int64, n int) (int, error) {
+			return ring.MulticastZeroCopy(ctx, targets, 0, off, n)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			available := ring.SQAvailable()
+			if n, err := tc.send(&operationTargets{}, 0, 1); n != 0 || err != nil {
+				t.Fatalf("empty targets: accepted=%d error=%v", n, err)
+			}
+			targets := &operationTargets{fds: []iofd.FD{-1}}
+			for _, bounds := range [][2]int{{-1, 1}, {0, -1}, {tc.size + 1, 0}, {tc.size, 1}} {
+				if n, err := tc.send(targets, int64(bounds[0]), bounds[1]); n != 0 || !errors.Is(err, uring.ErrInvalidParam) {
+					t.Fatalf("range %v: accepted=%d error=%v", bounds, n, err)
+				}
+			}
+			if got := ring.SQAvailable(); got != available {
+				t.Fatalf("available SQEs=%d, want %d", got, available)
+			}
+		})
+	}
+	targets := &operationTargets{fds: []iofd.FD{-1}}
+	missing := ring.RegisteredBufferCount()
+	if n, err := ring.Multicast(ctx, targets, missing, nil, 0, 1); n != 0 || !errors.Is(err, uring.ErrInvalidParam) {
+		t.Fatalf("missing registered buffer: accepted=%d error=%v", n, err)
+	}
+	if n, err := ring.MulticastZeroCopy(ctx, targets, missing, 0, 1); n != 0 || !errors.Is(err, uring.ErrInvalidParam) {
+		t.Fatalf("missing zero-copy buffer: accepted=%d error=%v", n, err)
+	}
+	var cqes [1]uring.CQEView
+	if n, err := ring.Wait(cqes[:]); n != 0 || !errors.Is(err, iox.ErrWouldBlock) {
+		t.Fatalf("empty or invalid fanout published work: n=%d error=%v", n, err)
+	}
+}
+
 func TestZeroCopyRejectsSkippedCompletion(t *testing.T) {
 	ring := newTestRing(t)
 	pool := uring.NewContextPools(1)

@@ -98,3 +98,52 @@ func TestFutexWaitValueMismatch(t *testing.T) {
 		t.Fatalf("mismatched value: present=%v result=%d, want -EAGAIN", ok, cqe.Res)
 	}
 }
+
+func TestUringCmdInlineRetriesAfterSQDrain(t *testing.T) {
+	ring := newTestRing(t, func(o *uring.Options) {
+		o.Entries = uring.EntriesPico
+		o.SQE128 = true
+	})
+	capacity := ring.SQAvailable()
+	for range capacity {
+		if err := ring.Nop(uring.ForFD(0)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var command [80]byte
+	ctx := uring.PackDirect(uring.IORING_OP_URING_CMD, 0, 0, -1)
+	if err := ring.UringCmdInline(ctx, 0, command[:]); !errors.Is(err, iox.ErrWouldBlock) {
+		t.Fatalf("full SQ: %v, want ErrWouldBlock", err)
+	}
+	var cqes [uring.EntriesPico]uring.CQEView
+	var backoff iox.Backoff
+	deadline := time.Now().Add(2 * time.Second)
+	completed := 0
+	for completed < capacity && time.Now().Before(deadline) {
+		n, err := ring.Wait(cqes[:])
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+			t.Fatal(err)
+		}
+		if n == 0 {
+			backoff.Wait()
+			continue
+		}
+		backoff.Reset()
+		for _, cqe := range cqes[:n] {
+			if cqe.Op() != uring.IORING_OP_NOP || cqe.Res != 0 {
+				t.Fatalf("unexpected completion before retry: %+v", cqe)
+			}
+			completed++
+		}
+	}
+	if completed != capacity || ring.SQAvailable() != capacity {
+		t.Fatalf("drain: completed=%d available=%d, want %d", completed, ring.SQAvailable(), capacity)
+	}
+	if err := ring.UringCmdInline(ctx, 0, command[:]); err != nil {
+		t.Fatalf("retry after drain: %v", err)
+	}
+	cqe, ok := waitForOp(t, ring, uring.IORING_OP_URING_CMD, 2*time.Second)
+	if !ok || cqe.FD() != -1 || cqe.Res != -int32(zcall.EBADF) {
+		t.Fatalf("retried command: present=%v cqe=%+v", ok, cqe)
+	}
+}
