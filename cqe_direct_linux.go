@@ -6,20 +6,12 @@
 
 package uring
 
-import (
-	"sync/atomic"
-
-	"code.hybscloud.com/dwcas"
-	"code.hybscloud.com/iofd"
-	"code.hybscloud.com/spin"
-)
+import "code.hybscloud.com/iofd"
 
 // DirectCQE is a compact copied CQE for Direct mode operations.
-// It stores the completion result and unpacked context fields without mode
-// checking or pointer indirection.
+// It stores the completion result, CQE flags, and decoded context fields.
 //
-// Use WaitDirect when every submitted operation uses Direct mode (PackDirect).
-// That path skips the generic Wait/CQEView mode dispatch per CQE.
+// Use [Uring.WaitDirect] when every submitted operation uses [PackDirect].
 //
 // Layout: 16 bytes on supported platforms.
 type DirectCQE struct {
@@ -38,7 +30,8 @@ func (c *DirectCQE) IsSuccess() bool {
 	return cqeIsSuccess(c.Res)
 }
 
-// HasMore reports whether more completions are coming (multishot).
+// HasMore reports IORING_CQE_F_MORE: the request has further completions,
+// including multishot results or a zero-copy notification.
 //
 //go:nosplit
 func (c *DirectCQE) HasMore() bool {
@@ -67,12 +60,9 @@ func (c *DirectCQE) IsNotification() bool {
 	return cqeIsNotification(c.Flags)
 }
 
-// WaitDirect retrieves completion events using the Direct mode fast path.
-// This method skips mode detection since all CQEs are assumed to be
-// from Direct mode submissions (PackDirect).
-//
-// For applications using only Direct mode, this skips the generic mode dispatch
-// that Wait performs per CQE.
+// WaitDirect copies completion events into DirectCQE values, decoding the
+// packed context into the Op, SQEFlags, BufGroup, and FD fields.
+// Use it when every submitted operation uses Direct mode ([PackDirect]).
 //
 // On single-issuer rings it is not safe for concurrent use with submit, Wait,
 // WaitDirect, WaitExtended, Stop, or ResizeRings; caller must serialize those
@@ -95,56 +85,25 @@ func (ur *ioUring) waitBatchDirect(cqes []DirectCQE) (int, error) {
 		return 0, nil
 	}
 
-	ur.lockSubmitState()
-	if ur.closed.Load() || ur.cq.kHead == nil || ur.cq.kTail == nil || ur.cq.kRingMask == nil || len(ur.cq.cqes) == 0 {
-		ur.unlockSubmitState()
-		return 0, ErrClosed
+	claim, available, err := ur.claimCQ(len(cqes))
+	if err != nil {
+		return 0, err
 	}
 
-	sw := spin.Wait{}
-	for {
-		h := atomic.LoadUint32(ur.cq.kHead)
-		t := atomic.LoadUint32(ur.cq.kTail)
-		if h == t {
-			if err := ur.observeCQEmptyLocked(); err != nil {
-				ur.unlockSubmitState()
-				return 0, err
-			}
-			continue
+	h, mask := uint32(claim), *ur.cq.kRingMask
+	n := int(available)
+	for i := range n {
+		e := ur.cq.cqeAt((h + uint32(i)) & mask)
+		ctx := SQEContextFromRaw(e.userData)
+		cqes[i] = DirectCQE{
+			Res:      e.res,
+			Flags:    e.flags,
+			Op:       ctx.Op(),
+			SQEFlags: ctx.Flags(),
+			BufGroup: ctx.BufGroup(),
+			FD:       iofd.FD(ctx.FD()),
 		}
-
-		// Calculate batch size
-		available := t - h
-		want := uint32(len(cqes))
-		if available > want {
-			available = want
-		}
-
-		// Acquire barrier before reading CQE data
-		dwcas.BarrierAcquire()
-
-		// Snapshot before publishing the head advance so copied CQEs cannot race
-		// kernel slot reuse after wrap.
-		mask := *ur.cq.kRingMask
-		n := int(available)
-		for i := range n {
-			e := ur.cq.cqeAt((h + uint32(i)) & mask)
-			ctx := SQEContextFromRaw(e.userData)
-
-			cqes[i] = DirectCQE{
-				Res:      e.res,
-				Flags:    e.flags,
-				Op:       ctx.Op(),
-				SQEFlags: ctx.Flags(),
-				BufGroup: ctx.BufGroup(),
-				FD:       iofd.FD(ctx.FD()),
-			}
-		}
-		if !atomic.CompareAndSwapUint32(ur.cq.kHead, h, h+available) {
-			sw.Once()
-			continue
-		}
-		ur.unlockSubmitState()
-		return n, nil
 	}
+	ur.publishCQ(claim, available)
+	return n, nil
 }

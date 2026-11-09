@@ -17,6 +17,7 @@ import (
 	"unsafe"
 
 	"code.hybscloud.com/iofd"
+	"code.hybscloud.com/spin"
 	"code.hybscloud.com/zcall"
 )
 
@@ -355,7 +356,6 @@ func (ur *Uring) Wait(cqes []CQEView) (n int, err error) {
 		return 0, err
 	}
 
-	// Use batch retrieval: single CAS claims multiple CQEs
 	return ur.ioUring.waitBatch(cqes)
 }
 
@@ -459,15 +459,28 @@ func (ur *Uring) SQAvailable() int {
 // completions. On single-issuer rings it is not safe for concurrent use with ResizeRings;
 // caller must serialize those operations.
 func (ur *Uring) CQPending() int {
-	ur.lockSubmitState()
-	defer ur.unlockSubmitState()
 	if ur.closed.Load() || ur.cq.kHead == nil || ur.cq.kTail == nil {
 		return 0
 	}
 
-	h := atomic.LoadUint32(ur.cq.kHead)
-	t := atomic.LoadUint32(ur.cq.kTail)
-	return int(t - h)
+	var backoff spin.Wait
+	for {
+		var head uint64
+		if ur.submit.shared {
+			head = atomic.LoadUint64(&ur.cq.claimState)
+			if head&cqClaimBusy != 0 {
+				backoff.Once()
+				continue
+			}
+		} else {
+			head = uint64(atomic.LoadUint32(ur.cq.kHead))
+		}
+		tail := atomic.LoadUint32(ur.cq.kTail)
+		if !ur.submit.shared || atomic.LoadUint64(&ur.cq.claimState) == head {
+			return int(tail - uint32(head))
+		}
+		backoff.Once()
+	}
 }
 
 // RingFD returns the io_uring file descriptor.

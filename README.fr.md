@@ -20,7 +20,7 @@ Les surfaces principales sont :
 
 - `Uring`, le handle du ring actif et son jeu d'opérations
 - `SQEContext`, l'identité de soumission acheminée dans `user_data`
-- `CQEView`, la vue de complétion empruntée renvoyée par `Wait`
+- `CQEView`, le descripteur de complétion copié renvoyé par `Wait`
 - la fourniture de tampons, via tampons enregistrés et groupes de tampons multi-tailles
 
 ## Installation
@@ -120,7 +120,7 @@ for {
 | `Uring`               | Initialisation du ring, soumission, récupération des complétions, et méthodes d'opération                    |
 | `Options`             | Entrées du ring, budget de tampons enregistrés, échelle des groupes de tampons et visibilité des complétions |
 | `SQEContext`          | Identité de soumission compacte stockée dans `user_data`                                                     |
-| `CQEView`             | Enregistrement de complétion emprunté avec accesseurs de contexte décodé                                     |
+| `CQEView`             | Descripteur de complétion copié avec accesseurs décodés et cibles empruntées selon le mode                    |
 | `ListenerOp`          | Gestionnaire d'une opération de création d'écouteur avec FD et auxiliaires accept                            |
 | `BundleIterator`      | Itère sur les tampons consommés lors d'une réception groupée                                                 |
 | `IncrementalReceiver` | Gère les réceptions incrémentales de buffer-ring (`IOU_PBUF_RING_INC`)                                       |
@@ -230,7 +230,7 @@ for i := 0; i < n; i++ {
 }
 ```
 
-À la complétion, `CQEView` décode le mode de contexte à la demande. `CQEView`, `IndirectSQE`, `ExtSQE` et les tampons empruntés ne doivent pas survivre au-delà de leur durée de vie documentée.
+À la complétion, `CQEView` décode le mode de contexte à la demande. Son descripteur scalaire est copié ; les cibles des modes Indirect/Extended et les tampons empruntés ne doivent pas survivre au-delà de leur durée de vie documentée.
 
 ## Fourniture de tampons
 
@@ -314,7 +314,7 @@ L'implémentation se structure autour des couches suivantes :
 1. `New` construit un ring noyau désactivé, crée les pools de contexte et détermine la stratégie de tampons.
 2. `Start` enregistre les tampons et active le ring conformément à la base fixe Linux 6.18+.
 3. Les méthodes d'opération publient l'intention en écrivant des SQE.
-4. `Wait` purge les soumissions et renvoie des vues CQE empruntées.
+4. `Wait` purge les soumissions et renvoie des descripteurs CQE copiés.
 5. Le code d'exécution côté appelant décide de l'ordonnancement, des reprises, de l'attente, du routage connexion/session, du retrait des routes, des contrôles de sécurité et de la politique terminale des ressources.
 
 De cette manière, `code.hybscloud.com/uring` reste focalisé sur la mécanique côté noyau tout en préservant la sémantique des complétions au travers de l'interface.
@@ -587,7 +587,7 @@ Au niveau du package, `listener_example_test.go` couvre la création d'écouteur
 - `ring.Features` indique le nombre effectif d'entrées SQ et CQ, la largeur des emplacements SQE, ainsi que l'ordre des octets utilisé par le package pour interpréter `user_data`.
 - Conservez la configuration par défaut `MultiIssuers=true`, migrable entre tâches (`COOP_TASKRUN`), pour l'exécution Go ordinaire et les appels concurrents sur l'état de soumission. Utilisez `MultiIssuers=false` uniquement si le propriétaire appelle `runtime.LockOSThread` avant `New`, reste épinglé jusqu'à `Stop` et sérialise `submit`, `Wait`, `WaitDirect`, `WaitExtended`, `Stop` et `ResizeRings` ; ce chemin rapide explicite demande `SINGLE_ISSUER` + `DEFER_TASKRUN`.
 - `EpollWait` exige que `timeout` vaille `0` ; utilisez `LinkTimeout` si vous avez besoin d'une échéance.
-- Les vues de complétion empruntées et les contextes issus des pools doivent être libérés ou abandonnés sans délai.
+- Les cibles de complétion empruntées et les contextes issus des pools doivent être restitués sans délai.
 - `ListenerOp.Close` ferme le FD de l'écouteur immédiatement. Si un CQE de mise en place est encore en attente, drainez-le d'abord, puis rappelez `Close` pour restituer le `ExtSQE` emprunté au pool.
 
 ## Support de plateforme

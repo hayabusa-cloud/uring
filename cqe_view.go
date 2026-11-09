@@ -8,15 +8,13 @@ package uring
 
 import "code.hybscloud.com/iofd"
 
-// CQEView provides a view into a completion queue entry.
-// It exposes kernel completion facts directly and lets caller-side runtime
-// code decide how to route or interpret them. When available,
-// it also exposes the submission context that produced those facts.
-// Indirect and Extended contexts reference shared targets. Copying a CQEView
-// does not copy or root those targets. Caller must keep targets live and
-// serialize access. Copy needed facts before target mutation, reuse, or release;
-// never dereference a released target. Caller code owns payload lifetimes,
-// completion routing, and retirement.
+// CQEView contains the completion result, flags, and submission context copied
+// by Wait. Direct-mode facts are inline; Indirect and Extended contexts still
+// reference shared targets. Copying a CQEView does not copy or root those targets.
+//
+// Caller must keep targets live and serialize access. Copy needed facts before
+// target mutation, reuse, or release; never dereference a released target.
+// Caller code owns payload lifetimes, completion routing, and retirement.
 //
 // # Property Patterns
 //
@@ -132,8 +130,9 @@ func (c *CQEView) Context() SQEContext {
 	return c.ctx
 }
 
-// BufGroup returns the observed submission buffer group index.
-// It is non-zero only when buffer selection was part of the submission.
+// BufGroup returns the submission buffer group index.
+// Direct mode reads the packed field; pointer modes return zero unless
+// IOSQE_BUFFER_SELECT is set. A zero group ID can also be valid.
 //
 //go:nosplit
 func (c *CQEView) BufGroup() uint16 {
@@ -162,7 +161,8 @@ func (c *CQEView) BufID() uint16 {
 	return cqeBufID(c.Flags)
 }
 
-// HasMore reports whether more completions are coming (multishot).
+// HasMore reports IORING_CQE_F_MORE: the request has further completions,
+// including multishot results or a zero-copy notification.
 //
 //go:nosplit
 func (c *CQEView) HasMore() bool {
@@ -176,8 +176,8 @@ func (c *CQEView) HasBuffer() bool {
 	return cqeHasBuffer(c.Flags)
 }
 
-// SocketNonEmpty reports whether the socket has more data available.
-// This is set when a short read/recv occurred but more data remains.
+// SocketNonEmpty reports whether the kernel observed unread socket data
+// after this receive. It is a completion-time hint, not a current readiness check.
 //
 //go:nosplit
 func (c *CQEView) SocketNonEmpty() bool {

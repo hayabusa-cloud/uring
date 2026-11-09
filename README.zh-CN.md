@@ -20,7 +20,7 @@ Go `io_uring` 内核接口包，面向 Linux 6.18+。
 
 - `Uring`：活跃 ring 的句柄及操作方法集
 - `SQEContext`：通过 `user_data` 传递的提交标识
-- `CQEView`：`Wait` 返回的借用式完成视图
+- `CQEView`：`Wait` 返回的已复制完成描述符
 - 缓冲区供给：通过注册缓冲区与多尺寸缓冲区组实现
 
 ## 安装
@@ -120,7 +120,7 @@ for {
 | `Uring`               | Ring 的初始化、提交、完成回收及操作方法           |
 | `Options`             | Ring 条目数、注册缓冲区预算、缓冲区组配置及完成事件可见性  |
 | `SQEContext`          | 存储于 `user_data` 的紧凑提交标识          |
-| `CQEView`             | 借用式完成记录，提供上下文解码访问器               |
+| `CQEView`             | 已复制完成描述符，提供解码访问器；模式相关目标仍为借用 |
 | `ListenerOp`          | 监听器创建操作的句柄，持有 FD 并提供 accept 辅助方法 |
 | `BundleIterator`      | 遍历 bundle 接收中消耗的缓冲区              |
 | `IncrementalReceiver` | 管理增量缓冲区环接收（`IOU_PBUF_RING_INC`）  |
@@ -230,7 +230,7 @@ for i := 0; i < n; i++ {
 }
 ```
 
-完成时 `CQEView` 按需解码相应的上下文模式。`CQEView`、`IndirectSQE`、`ExtSQE` 及借用缓冲区均不得超出文档约定的生命周期。
+完成时 `CQEView` 按需解码相应的上下文模式。其标量描述符是副本；Indirect/Extended 模式目标及借用缓冲区均不得超出文档约定的生命周期。
 
 ## 缓冲区供给
 
@@ -314,7 +314,7 @@ CQE 路由策略由调用方自行实现，不在本包范围内。监听器的�
 1. `New` 创建处于禁用状态的内核 ring，构造上下文池，选定缓冲区策略。
 2. `Start` 注册缓冲区并启用 ring（固定 Linux 6.18+ 基线）。
 3. 操作方法通过写入 SQE 表达提交意图。
-4. `Wait` 刷新提交并返回借用式 CQE。
+4. `Wait` 刷新提交并返回已复制的 CQE 描述符。
 5. 调用方运行时代码负责调度、重试、挂起、连接与会话路由、路由退役、安全检查以及终态资源策略。
 
 如此分工使 `code.hybscloud.com/uring` 专注于内核侧机制，同时在边界上保持清晰的完成语义。
@@ -587,7 +587,7 @@ Idle → Active → Stopping → Retiring → Stopped
 - `ring.Features` 报告实际 SQ/CQ 条目数、SQE 槽宽以及本包解析 `user_data` 的字节序。
 - 普通 Go 执行和并发提交状态调用应保留默认的任务可迁移 `MultiIssuers=true` 配置（`COOP_TASKRUN`）。仅当所有者在 `New` 前调用 `runtime.LockOSThread`、持续固定到 `Stop`，并串行化 `submit`、`Wait`、`WaitDirect`、`WaitExtended`、`Stop` 与 `ResizeRings` 时，才设置 `MultiIssuers=false`；该显式快速路径请求 `SINGLE_ISSUER` + `DEFER_TASKRUN`。
 - `EpollWait` 要求 `timeout` 为 `0`；如需设置截止时间，使用 `LinkTimeout`。
-- 借用式完成视图与池化上下文应及时释放。
+- 借用式完成目标与池化上下文应及时归还。
 - `ListenerOp.Close` 会立即关闭监听 FD。若仍有设置 CQE 待处理，需先回收该 CQE，再调用 `Close` 将借用的 `ExtSQE` 归还池中。
 
 ## 平台支持

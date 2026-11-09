@@ -8,6 +8,8 @@ package uring_test
 
 import (
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,6 +17,116 @@ import (
 	"code.hybscloud.com/iox"
 	"code.hybscloud.com/uring"
 )
+
+func TestWaitConcurrentConsumersAcrossWrap(t *testing.T) {
+	for _, mode := range []string{"generic", "direct", "extended"} {
+		t.Run(mode, func(t *testing.T) {
+			ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
+				opt.Entries = uring.EntriesNano
+				opt.MultiIssuers = true
+				opt.NotifySucceed = true
+			})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			mustStartRing(t, ring)
+
+			const batch = uring.EntriesNano
+			for round := range 16 {
+				var exts [batch]*uring.ExtSQE
+				for i := range batch {
+					id := int32(round*batch + i)
+					ctx := uring.PackDirect(uring.IORING_OP_NOP, 0, 0, id)
+					if mode == "extended" {
+						exts[i] = ring.ExtSQE()
+						if exts[i] == nil {
+							t.Fatal("extended context pool exhausted")
+						}
+						ctx = uring.PackExtended(exts[i]).WithFD(iofd.FD(id))
+					}
+					if err := ring.Nop(ctx); err != nil {
+						t.Fatalf("Nop: %v", err)
+					}
+				}
+
+				var seen [batch]atomic.Uint32
+				var completed atomic.Int32
+				var workers sync.WaitGroup
+				start := make(chan struct{})
+				deadline := time.Now().Add(2 * time.Second)
+				for _, size := range []int{1, 3, 7} {
+					workers.Go(func() {
+						var generic [7]uring.CQEView
+						var direct [7]uring.DirectCQE
+						var extended [7]uring.ExtCQE
+						var backoff iox.Backoff
+						record := func(fd iofd.FD, res int32, flags uint32) {
+							id := int(fd) - round*batch
+							if id < 0 || id >= batch {
+								t.Errorf("round %d: unexpected completion ID %d", round, fd)
+							} else {
+								seen[id].Add(1)
+							}
+							if res != 0 || flags != 0 {
+								t.Errorf("completion %d: res=%d flags=%#x", fd, res, flags)
+							}
+							completed.Add(1)
+						}
+						<-start
+						for completed.Load() < batch && time.Now().Before(deadline) {
+							var n int
+							var err error
+							switch mode {
+							case "generic":
+								n, err = ring.Wait(generic[:size])
+								for i := range n {
+									record(generic[i].FD(), generic[i].Res, generic[i].Flags)
+								}
+							case "direct":
+								n, err = ring.WaitDirect(direct[:size])
+								for i := range n {
+									record(direct[i].FD, direct[i].Res, direct[i].Flags)
+								}
+							case "extended":
+								n, err = ring.WaitExtended(extended[:size])
+								for i := range n {
+									if extended[i].Ext == nil {
+										t.Error("missing extended context")
+										completed.Add(1)
+										continue
+									}
+									record(extended[i].FD(), extended[i].Res, extended[i].Flags)
+								}
+							}
+							if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+								t.Errorf("Wait: %v", err)
+								return
+							}
+							if n == 0 {
+								backoff.Wait()
+							} else {
+								backoff.Reset()
+							}
+						}
+					})
+				}
+				close(start)
+				workers.Wait()
+				if got := completed.Load(); got != batch {
+					t.Fatalf("round %d: received %d completions, want %d", round, got, batch)
+				}
+				for i := range batch {
+					if got := seen[i].Load(); got != 1 {
+						t.Errorf("round %d: completion %d seen %d times", round, i, got)
+					}
+					if exts[i] != nil {
+						ring.PutExtSQE(exts[i])
+					}
+				}
+			}
+		})
+	}
+}
 
 // TestWaitDirectNOP tests the Direct mode fast-path with NOP operations.
 func TestWaitDirectNOP(t *testing.T) {
@@ -235,7 +347,10 @@ func BenchmarkWaitDirect(b *testing.B) {
 
 		// Wait for completion
 		for {
-			n, _ := ring.WaitDirect(cqes)
+			n, err := ring.WaitDirect(cqes)
+			if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+				b.Fatalf("WaitDirect: %v", err)
+			}
 			if n > 0 {
 				break
 			}
@@ -273,7 +388,10 @@ func BenchmarkWaitExtended(b *testing.B) {
 
 		// Wait for completion and release all returned ExtSQEs
 		for {
-			n, _ := ring.WaitExtended(cqes)
+			n, err := ring.WaitExtended(cqes)
+			if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+				b.Fatalf("WaitExtended: %v", err)
+			}
 			if n > 0 {
 				// Release ALL returned ExtSQEs, not just the first one
 				for j := range n {
@@ -371,7 +489,10 @@ func BenchmarkWaitGeneric(b *testing.B) {
 		_ = ring.Nop(sqeCtx)
 
 		for {
-			n, _ := ring.Wait(cqes)
+			n, err := ring.Wait(cqes)
+			if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+				b.Fatalf("Wait: %v", err)
+			}
 			if n > 0 {
 				break
 			}

@@ -14,7 +14,6 @@ import (
 	"time"
 	"unsafe"
 
-	"code.hybscloud.com/dwcas"
 	"code.hybscloud.com/iobuf"
 	"code.hybscloud.com/iox"
 	"code.hybscloud.com/spin"
@@ -357,6 +356,7 @@ func (ur *ioUring) remapRings(params *ioUringParams) error {
 	ur.cq.kRingEntries = (*uint32)(unsafe.Add(ptr, params.cqOff.ringEntries))
 	ur.cq.kOverflow = (*uint32)(unsafe.Add(ptr, params.cqOff.overflow))
 	ur.cq.cqes = unsafe.Slice((*ioUringCqe)(unsafe.Add(ptr, params.cqOff.cqes)), int(params.cqEntries)*ur.cq.cqeStride)
+	ur.cq.claimState = uint64(atomic.LoadUint32(ur.cq.kHead))
 
 	return nil
 }
@@ -868,28 +868,6 @@ func (ur *ioUring) flushSubmitLocked() error {
 	return nil
 }
 
-func (ur *ioUring) cqReady() bool {
-	h := atomic.LoadUint32(ur.cq.kHead)
-	t := atomic.LoadUint32(ur.cq.kTail)
-	return h != t
-}
-
-// observeCQEmptyLocked performs the nonblocking IOPOLL visibility enter at the
-// empty-CQ boundary. A nil return means the CQ became visible and callers should
-// reread head/tail; a non-nil return is the terminal empty/error verdict.
-func (ur *ioUring) observeCQEmptyLocked() error {
-	if ur.params.flags&IORING_SETUP_IOPOLL == 0 {
-		return ur.cqEmptyErr()
-	}
-	if err := ur.poll(0); err != nil {
-		return err
-	}
-	if ur.cqReady() {
-		return nil
-	}
-	return ur.cqEmptyErr()
-}
-
 func (ur *ioUring) poll(n int) error {
 	if ur.params.flags&IORING_SETUP_IOPOLL == 0 {
 		return nil
@@ -907,124 +885,119 @@ func (ur *ioUring) poll(n int) error {
 	}
 }
 
-func (ur *ioUring) cqEmptyErr() error {
-	overflowCount := uint32(0)
-	if ur.cq.kOverflow != nil {
-		overflowCount = atomic.LoadUint32(ur.cq.kOverflow)
-	}
-	if ur.sq.kFlags != nil && atomic.LoadUint32(ur.sq.kFlags)&IORING_SQ_CQ_OVERFLOW != 0 {
-		atomic.StoreUint32(&ur.cq.overflowSeen, overflowCount)
-		return ErrCQOverflow
-	}
-	if ur.cq.kOverflow == nil {
-		return iox.ErrWouldBlock
-	}
-	for {
-		seen := atomic.LoadUint32(&ur.cq.overflowSeen)
-		if seen == overflowCount {
-			return iox.ErrWouldBlock
-		}
-		if atomic.CompareAndSwapUint32(&ur.cq.overflowSeen, seen, overflowCount) {
-			return ErrCQOverflow
-		}
-	}
-}
-
-// wait spins for one CQE and returns a pointer directly into the CQ ring.
-// The returned *ioUringCqe is borrowed: it remains valid only until the next
-// CAS-advance of kHead (i.e., the next wait call). Callers must read all
-// needed fields before any subsequent completion-queue operation.
-func (ur *ioUring) wait() (*ioUringCqe, error) {
-	ur.lockSubmitState()
+// claimCQ reserves at most limit visible CQEs. Shared consumers acquire the
+// claim word before copying; its sequence binds the observed window to that CAS.
+// Single-issuer callers already serialize consumption. The range must be copied
+// before publishCQ makes its slots reusable and admits the next consumer.
+func (ur *ioUring) claimCQ(limit int) (claim uint64, available uint32, err error) {
 	if ur.closed.Load() || ur.cq.kHead == nil || ur.cq.kTail == nil || ur.cq.kRingMask == nil || len(ur.cq.cqes) == 0 {
-		ur.unlockSubmitState()
-		return nil, ErrClosed
+		return 0, 0, ErrClosed
 	}
 
-	sw := spin.Wait{}
+	var backoff spin.Wait
+	polled := false
 	for {
-		h, t := atomic.LoadUint32(ur.cq.kHead), atomic.LoadUint32(ur.cq.kTail)
-		if h == t {
-			if err := ur.observeCQEmptyLocked(); err != nil {
-				ur.unlockSubmitState()
-				return nil, err
+		if ur.submit.shared {
+			claim = atomic.LoadUint64(&ur.cq.claimState)
+			if claim&cqClaimBusy != 0 {
+				backoff.Once()
+				continue
 			}
-			continue
+		} else {
+			claim = uint64(atomic.LoadUint32(ur.cq.kHead))
 		}
-
-		// Acquire barrier makes CQE contents visible after reading head and tail.
-		dwcas.BarrierAcquire()
-
-		e := ur.cq.cqeAt(h & *ur.cq.kRingMask)
-		ok := atomic.CompareAndSwapUint32(ur.cq.kHead, h, h+1)
-		if ok {
+		head := uint32(claim)
+		// Acquire the kernel's publication before reading the claimed CQEs.
+		tail := atomic.LoadUint32(ur.cq.kTail)
+		if head == tail {
+			// Enter and overflow accounting still share submit-state ownership.
+			// A visible CQ window never needs this lock.
+			ur.lockSubmitState()
+			if !polled && ur.params.flags&IORING_SETUP_IOPOLL != 0 {
+				polled = true
+				if err := ur.poll(0); err != nil {
+					ur.unlockSubmitState()
+					return 0, 0, err
+				}
+			}
+			tail = atomic.LoadUint32(ur.cq.kTail)
+			if head == tail {
+				overflowCount := uint32(0)
+				if ur.cq.kOverflow != nil {
+					overflowCount = atomic.LoadUint32(ur.cq.kOverflow)
+				}
+				if ur.sq.kFlags != nil && atomic.LoadUint32(ur.sq.kFlags)&IORING_SQ_CQ_OVERFLOW != 0 {
+					ur.cq.overflowSeen = overflowCount
+					ur.unlockSubmitState()
+					return 0, 0, ErrCQOverflow
+				}
+				if ur.cq.kOverflow != nil && ur.cq.overflowSeen != overflowCount {
+					ur.cq.overflowSeen = overflowCount
+					ur.unlockSubmitState()
+					return 0, 0, ErrCQOverflow
+				}
+				ur.unlockSubmitState()
+				return 0, 0, iox.ErrWouldBlock
+			}
 			ur.unlockSubmitState()
-			return e, nil
 		}
-		sw.Once()
+
+		available = tail - head
+		if uint64(limit) < uint64(available) {
+			available = uint32(limit)
+		}
+		if !ur.submit.shared || atomic.CompareAndSwapUint64(&ur.cq.claimState, claim, claim|cqClaimBusy) {
+			return claim, available, nil
+		}
+		backoff.Once()
 	}
 }
 
-// waitBatch snapshots and claims multiple CQEs with one CAS.
+// publishCQ releases copied slots before admitting the next CQ consumer.
+func (ur *ioUring) publishCQ(claim uint64, count uint32) {
+	next := claim + uint64(count)
+	atomic.StoreUint32(ur.cq.kHead, uint32(next))
+	if ur.submit.shared {
+		atomic.StoreUint64(&ur.cq.claimState, next&^cqClaimBusy)
+	}
+}
+
+// wait returns one copied CQE from the current completion window.
+func (ur *ioUring) wait() (ioUringCqe, error) {
+	claim, _, err := ur.claimCQ(1)
+	if err != nil {
+		return ioUringCqe{}, err
+	}
+
+	// The kernel may reuse the slot as soon as head is published.
+	e := *ur.cq.cqeAt(uint32(claim) & *ur.cq.kRingMask)
+	ur.publishCQ(claim, 1)
+	return e, nil
+}
+
+// waitBatch copies a completion batch before publishing its head advance.
 func (ur *ioUring) waitBatch(cqes []CQEView) (int, error) {
 	if len(cqes) == 0 {
 		return 0, nil
 	}
 
-	ur.lockSubmitState()
-	if ur.closed.Load() || ur.cq.kHead == nil || ur.cq.kTail == nil || ur.cq.kRingMask == nil || len(ur.cq.cqes) == 0 {
-		ur.unlockSubmitState()
-		return 0, ErrClosed
+	claim, available, err := ur.claimCQ(len(cqes))
+	if err != nil {
+		return 0, err
 	}
 
-	sw := spin.Wait{}
-	for {
-		h := atomic.LoadUint32(ur.cq.kHead)
-		t := atomic.LoadUint32(ur.cq.kTail)
-		if h == t {
-			if err := ur.observeCQEmptyLocked(); err != nil {
-				ur.unlockSubmitState()
-				return 0, err
-			}
-			continue
+	h, mask := uint32(claim), *ur.cq.kRingMask
+	n := int(available)
+	for i := range n {
+		e := ur.cq.cqeAt((h + uint32(i)) & mask)
+		cqes[i] = CQEView{
+			Res:   e.res,
+			Flags: e.flags,
+			ctx:   SQEContextFromRaw(e.userData),
 		}
-
-		// Calculate batch size: min(available, requested)
-		available := t - h
-		want := uint32(len(cqes))
-		if available > want {
-			available = want
-		}
-
-		// Acquire barrier before reading CQE data
-		dwcas.BarrierAcquire()
-
-		// Snapshot the batch before publishing the head advance so value copies
-		// cannot race kernel reuse after ring wrap.
-		mask := *ur.cq.kRingMask
-		n := int(available)
-		for i := range n {
-			e := ur.cq.cqeAt((h + uint32(i)) & mask)
-			cqes[i] = CQEView{
-				Res:   e.res,
-				Flags: e.flags,
-				ctx:   SQEContextFromRaw(e.userData),
-			}
-		}
-		if !atomic.CompareAndSwapUint32(ur.cq.kHead, h, h+available) {
-			sw.Once()
-			continue
-		}
-		ur.unlockSubmitState()
-		return n, nil
 	}
-}
-
-func (ur *ioUring) cqAdvance(nr uint32) {
-	if nr == 0 {
-		return
-	}
-	ur.cq.advance(nr)
+	ur.publishCQ(claim, available)
+	return n, nil
 }
 
 func (ur *ioUring) bufRingInit(br *ioUringBufRing) {
@@ -1063,11 +1036,6 @@ func (ur *ioUring) bufRingHead(groupID uint16, head *uint16) int {
 	}
 	*head = uint16(status.head)
 	return 0
-}
-
-func (ur *ioUring) bufRingCQAdvance(br *ioUringBufRing, count int) {
-	ur.bufRingAdvance(br, count)
-	ur.cqAdvance(uint32(count))
 }
 
 // ioUringRSrcRegister mirrors struct io_uring_rsrc_register
@@ -1215,7 +1183,12 @@ type ioUringSqe128 struct {
 
 var _ [128 - unsafe.Sizeof(ioUringSqe128{})]struct{}
 
+const cqClaimBusy = uint64(1) << 63
+
 type ioUringCq struct {
+	// The high bit owns the CQ copy; the low 63 bits identify its head sequence.
+	// The wider sequence avoids claim ABA at the kernel's 32-bit counter wrap.
+	claimState   uint64
 	kHead        *uint32
 	kTail        *uint32
 	kRingMask    *uint32
@@ -1225,12 +1198,7 @@ type ioUringCq struct {
 	cqeStride    int
 
 	ringSz       uint32
-	overflowSeen uint32
-}
-
-func (cq *ioUringCq) advance(nr uint32) {
-	// Userspace advances kHead after consuming CQEs (kernel updates kTail)
-	atomic.AddUint32(cq.kHead, nr)
+	overflowSeen uint32 // protected by submit-state serialization
 }
 
 func (cq *ioUringCq) cqeAt(index uint32) *ioUringCqe {

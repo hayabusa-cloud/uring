@@ -741,15 +741,15 @@ func (ur *ioUring) poll(n int) error {
 }
 
 // wait waits for a completion queue entry.
-func (ur *ioUring) wait() (*ioUringCqe, error) {
+func (ur *ioUring) wait() (ioUringCqe, error) {
 	select {
 	case cqe := <-ur.cqChan:
 		if cqe != nil {
-			return cqe, nil
+			return *cqe, nil
 		}
 	default:
 	}
-	return nil, iox.ErrWouldBlock
+	return ioUringCqe{}, iox.ErrWouldBlock
 }
 
 // waitBatch retrieves multiple CQEs from the channel.
@@ -780,9 +780,6 @@ func (ur *ioUring) waitBatch(cqes []CQEView) (int, error) {
 	return n, nil
 }
 
-// cqAdvance is a no-op on Darwin (channel-based CQ).
-func (ur *ioUring) cqAdvance(nr uint32) {}
-
 // sqCount returns the number of pending SQEs.
 func (ur *ioUring) sqCount() int {
 	return len(ur.sqChan)
@@ -806,10 +803,6 @@ func (ur *ioUring) bufRingAvailable(br *ioUringBufRing, bgid uint16) int {
 
 func (ur *ioUring) bufRingHead(groupID uint16, head *uint16) int {
 	return 0
-}
-
-func (ur *ioUring) bufRingCQAdvance(br *ioUringBufRing, count int) {
-	ur.bufRingAdvance(br, count)
 }
 
 // I/O operation implementations

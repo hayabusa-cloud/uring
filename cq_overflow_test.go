@@ -117,9 +117,6 @@ func TestWaitStillDrainsVisibleCQEsDuringCQOverflow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("wait: %v", err)
 	}
-	if cqe == nil {
-		t.Fatal("wait returned nil CQE")
-	}
 	if cqe.res != 42 {
 		t.Fatalf("cqe.res = %d, want 42", cqe.res)
 	}

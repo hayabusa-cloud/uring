@@ -161,6 +161,8 @@ func errFromErrno(errno uintptr) error {
 // CompletionError decodes a CQE result into the package error model.
 // Non-negative results are successful byte counts or operation values.
 // Negative results are kernel -errno values.
+// EAGAIN maps to iox.ErrWouldBlock. This result-only decoder does not inspect
+// CQE flags or determine whether the request is terminal.
 func CompletionError(res int32) error {
 	if res >= 0 {
 		return nil
@@ -168,17 +170,17 @@ func CompletionError(res int32) error {
 	return errFromErrno(uintptr(-int64(res)))
 }
 
-// Err decodes c.Res as a completion error.
+// Err decodes c.Res as a completion error, independently of c.Flags.
 func (c *CQEView) Err() error {
 	return CompletionError(c.Res)
 }
 
-// Err decodes c.Res as a completion error.
+// Err decodes c.Res as a completion error, independently of c.Flags.
 func (c *DirectCQE) Err() error {
 	return CompletionError(c.Res)
 }
 
-// Err decodes c.Res as a completion error.
+// Err decodes c.Res as a completion error, independently of c.Flags.
 func (c *ExtCQE) Err() error {
 	return CompletionError(c.Res)
 }

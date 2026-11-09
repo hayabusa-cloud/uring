@@ -20,7 +20,7 @@ The primary surfaces are:
 
 - `Uring`, the live ring handle and operation set
 - `SQEContext`, the submission identity carried in `user_data`
-- `CQEView`, the borrowed completion view returned by `Wait`
+- `CQEView`, the copied completion descriptor returned by `Wait`
 - buffer provisioning through registered buffers and multi-size buffer groups
 
 ## Installation
@@ -120,7 +120,7 @@ for {
 | `Uring` | Ring setup, submission, completion reaping, and operation methods |
 | `Options` | Ring entries, registered-buffer budget, buffer-group scale, and completion visibility |
 | `SQEContext` | Compact submission identity stored in `user_data` |
-| `CQEView` | Borrowed completion record with decoded context accessors |
+| `CQEView` | Copied completion descriptor with decoded accessors and mode-sensitive borrowed targets |
 | `ListenerOp` | Handle to a listener creation operation with FD and accept helpers |
 | `BundleIterator` | Iterates over buffers consumed in a bundle receive |
 | `IncrementalReceiver` | Manages incremental buffer-ring receives (`IOU_PBUF_RING_INC`) |
@@ -230,7 +230,7 @@ for i := 0; i < n; i++ {
 }
 ```
 
-`CQEView` decodes the matching context mode on demand at completion time. `CQEView`, `IndirectSQE`, `ExtSQE`, and borrowed buffers must not outlive their documented lifetimes.
+`CQEView` decodes the matching context mode on demand at completion time. Its scalar descriptor is copied; Indirect/Extended mode targets and borrowed buffers must not outlive their documented lifetimes.
 
 ## Buffer provisioning
 
@@ -314,7 +314,7 @@ The implementation sits at this boundary:
 1. `New` builds a disabled kernel ring, constructs context pools, and selects a buffer strategy.
 2. `Start` registers buffers and enables the ring for the 6.18+ baseline.
 3. Operation methods express intent by writing SQEs.
-4. `Wait` flushes submissions and returns borrowed CQE views.
+4. `Wait` flushes submissions and returns copied CQE descriptors.
 5. Caller-side runtime code decides scheduling, retries, parking, connection/session routing, route retirement, safety checks, and terminal resource policy.
 
 This keeps `code.hybscloud.com/uring` focused on kernel-facing mechanics and preserves completion meaning across the boundary.
@@ -587,7 +587,7 @@ The package-level `listener_example_test.go` covers listener creation with multi
 - `ring.Features` reports actual SQ/CQ entry counts, SQE slot width, and the byte order used to interpret `user_data`.
 - Keep the default `MultiIssuers=true` task-migratable configuration (`COOP_TASKRUN`) for ordinary Go execution and concurrent submit-state calls. Set `MultiIssuers=false` only when the owner calls `runtime.LockOSThread` before `New`, remains pinned through `Stop`, and serializes `submit`, `Wait`, `WaitDirect`, `WaitExtended`, `Stop`, and `ResizeRings`; that explicit fast path requests `SINGLE_ISSUER` + `DEFER_TASKRUN`.
 - `EpollWait` requires `timeout` to remain `0`; use `LinkTimeout` when you need a deadline.
-- Release or discard borrowed completion views and pooled contexts promptly.
+- Return borrowed completion targets and pooled contexts promptly.
 - `ListenerOp.Close` closes the listener FD immediately. If a setup CQE is still pending, drain it first, then call `Close` again to return the borrowed `ExtSQE` to the pool.
 
 ## Platform support
