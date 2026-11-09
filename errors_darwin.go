@@ -52,49 +52,49 @@ var (
 
 // Darwin errno constants
 const (
-	EPERM           = 1
-	EINTR           = 4
-	ENODEV          = 19
-	EINVAL          = 22
-	EAGAIN          = 35
+	EPERM           = uintptr(1)
+	EINTR           = uintptr(4)
+	ENODEV          = uintptr(19)
+	EINVAL          = uintptr(22)
+	EAGAIN          = uintptr(35)
 	EWOULDBLOCK     = EAGAIN
-	EINPROGRESS     = 36
-	EALREADY        = 37
-	ENOTSOCK        = 38
-	EDESTADDRREQ    = 39
-	EMSGSIZE        = 40
-	EPROTOTYPE      = 41
-	ENOPROTOOPT     = 42
-	EPROTONOSUPPORT = 43
-	EOPNOTSUPP      = 45
-	EAFNOSUPPORT    = 47
-	EADDRINUSE      = 48
-	EADDRNOTAVAIL   = 49
-	ENETDOWN        = 50
-	ENETUNREACH     = 51
-	ENETRESET       = 52
-	ECONNABORTED    = 53
-	ECONNRESET      = 54
-	ENOBUFS         = 55
-	EISCONN         = 56
-	ENOTCONN        = 57
-	ESHUTDOWN       = 58
-	ETIMEDOUT       = 60
-	ECONNREFUSED    = 61
-	EHOSTDOWN       = 64
-	EHOSTUNREACH    = 65
-	ENOMEM          = 12
-	EACCES          = 13
-	EFAULT          = 14
-	EBUSY           = 16
-	EEXIST          = 17
-	ENAMETOOLONG    = 63
-	EMFILE          = 24
-	ENFILE          = 23
-	ENOSYS          = 78
-	ENOTSUP         = 45
-	EPIPE           = 32
-	ECANCELED       = 89
+	EINPROGRESS     = uintptr(36)
+	EALREADY        = uintptr(37)
+	ENOTSOCK        = uintptr(38)
+	EDESTADDRREQ    = uintptr(39)
+	EMSGSIZE        = uintptr(40)
+	EPROTOTYPE      = uintptr(41)
+	ENOPROTOOPT     = uintptr(42)
+	EPROTONOSUPPORT = uintptr(43)
+	EOPNOTSUPP      = uintptr(45)
+	EAFNOSUPPORT    = uintptr(47)
+	EADDRINUSE      = uintptr(48)
+	EADDRNOTAVAIL   = uintptr(49)
+	ENETDOWN        = uintptr(50)
+	ENETUNREACH     = uintptr(51)
+	ENETRESET       = uintptr(52)
+	ECONNABORTED    = uintptr(53)
+	ECONNRESET      = uintptr(54)
+	ENOBUFS         = uintptr(55)
+	EISCONN         = uintptr(56)
+	ENOTCONN        = uintptr(57)
+	ESHUTDOWN       = uintptr(58)
+	ETIMEDOUT       = uintptr(60)
+	ECONNREFUSED    = uintptr(61)
+	EHOSTDOWN       = uintptr(64)
+	EHOSTUNREACH    = uintptr(65)
+	ENOMEM          = uintptr(12)
+	EACCES          = uintptr(13)
+	EFAULT          = uintptr(14)
+	EBUSY           = uintptr(16)
+	EEXIST          = uintptr(17)
+	ENAMETOOLONG    = uintptr(63)
+	EMFILE          = uintptr(24)
+	ENFILE          = uintptr(23)
+	ENOSYS          = uintptr(78)
+	ENOTSUP         = uintptr(45)
+	EPIPE           = uintptr(32)
+	ECANCELED       = uintptr(89)
 )
 
 // errFromErrno converts a zcall errno to a semantic error.
@@ -161,6 +161,8 @@ func errFromErrno(errno uintptr) error {
 // CompletionError decodes a CQE result into the package error model.
 // Non-negative results are successful byte counts or operation values.
 // Negative results are kernel -errno values.
+// EAGAIN maps to iox.ErrWouldBlock. This result-only decoder does not inspect
+// CQE flags or determine whether the request is terminal.
 func CompletionError(res int32) error {
 	if res >= 0 {
 		return nil
@@ -168,17 +170,17 @@ func CompletionError(res int32) error {
 	return errFromErrno(uintptr(-int64(res)))
 }
 
-// Err decodes c.Res as a completion error.
+// Err decodes c.Res as a completion error, independently of c.Flags.
 func (c *CQEView) Err() error {
 	return CompletionError(c.Res)
 }
 
-// Err decodes c.Res as a completion error.
+// Err decodes c.Res as a completion error, independently of c.Flags.
 func (c *DirectCQE) Err() error {
 	return CompletionError(c.Res)
 }
 
-// Err decodes c.Res as a completion error.
+// Err decodes c.Res as a completion error, independently of c.Flags.
 func (c *ExtCQE) Err() error {
 	return CompletionError(c.Res)
 }

@@ -7,6 +7,7 @@
 package uring
 
 import (
+	"math"
 	"unsafe"
 )
 
@@ -72,39 +73,40 @@ const (
 	IORING_OP_LISTEN
 	IORING_OP_RECV_ZC      // Zero-copy receive
 	IORING_OP_EPOLL_WAIT   // Epoll wait
-	IORING_OP_READV_FIXED  // Vectored read with fixed buffer
-	IORING_OP_WRITEV_FIXED // Vectored write with fixed buffer
+	IORING_OP_READV_FIXED  // Vectored read with one fixed buffer
+	IORING_OP_WRITEV_FIXED // Vectored write with one fixed buffer
 	IORING_OP_PIPE         // Create pipe
 	IORING_OP_NOP128       // 128-byte NOP
 	IORING_OP_URING_CMD128 // 128-byte uring command
-	IORING_OP_LAST
+	ioUringOpLast
 )
 
 // Timeout clock and behavior flags mirror Linux IORING_TIMEOUT_* constants.
 // Defined here so darwin build stubs share the same named constants.
 const (
-	IORING_TIMEOUT_ABS           uint32 = 1 << iota // 0x01, absolute timestamp
-	IORING_TIMEOUT_UPDATE                           // 0x02, update existing timeout
-	IORING_TIMEOUT_BOOTTIME                         // 0x04, use CLOCK_BOOTTIME
-	IORING_TIMEOUT_REALTIME                         // 0x08, use CLOCK_REALTIME
-	IORING_LINK_TIMEOUT_UPDATE                      // 0x10, update linked timeout
-	IORING_TIMEOUT_ETIME_SUCCESS                    // 0x20, convert -ETIME to success
-	IORING_TIMEOUT_MULTISHOT                        // 0x40, repeat on expiry
+	IORING_TIMEOUT_ABS           = 1 << iota // 0x01, absolute timestamp
+	IORING_TIMEOUT_UPDATE                    // 0x02, update existing timeout
+	IORING_TIMEOUT_BOOTTIME                  // 0x04, use CLOCK_BOOTTIME
+	IORING_TIMEOUT_REALTIME                  // 0x08, use CLOCK_REALTIME
+	IORING_LINK_TIMEOUT_UPDATE               // 0x10, update linked timeout
+	IORING_TIMEOUT_ETIME_SUCCESS             // 0x20, convert -ETIME to success
+	IORING_TIMEOUT_MULTISHOT                 // 0x40, repeat on expiry
 
 	IORING_TIMEOUT_CLOCK_MASK  = IORING_TIMEOUT_BOOTTIME | IORING_TIMEOUT_REALTIME
 	IORING_TIMEOUT_UPDATE_MASK = IORING_TIMEOUT_UPDATE | IORING_LINK_TIMEOUT_UPDATE
 )
 
-// Accept/recv ioprio flags
+// Accept operation flags.
 const (
-	IORING_ACCEPT_MULTISHOT = 1 << 0
-	IORING_RECV_MULTISHOT   = 1 << 1
+	IORING_ACCEPT_MULTISHOT  = 1 << 0
+	IORING_ACCEPT_DONTWAIT   = 1 << 1
+	IORING_ACCEPT_POLL_FIRST = 1 << 2
 )
 
-// Send zero-copy flags
+// Send/receive operation flags.
 const (
 	IORING_RECVSEND_POLL_FIRST  = 1 << 0
-	IORING_RECV_MULTISHOT_FLAG  = 1 << 1 // Alias for compatibility
+	IORING_RECV_MULTISHOT       = 1 << 1
 	IORING_RECVSEND_FIXED_BUF   = 1 << 2
 	IORING_SEND_ZC_REPORT_USAGE = 1 << 3
 	IORING_RECVSEND_BUNDLE      = 1 << 4 // Bundle send/recv
@@ -149,9 +151,14 @@ func (ur *ioUring) readFixed(sqeCtx SQEContext, bufIndex int, offset uint64, n i
 		return nil, ErrInvalidParam
 	}
 	buf := ur.bufs[bufIndex]
-	addr := uint64(uintptr(unsafe.Pointer(&buf[0])))
-	err := ur.submitPacked6(sqeCtx.WithOp(IORING_OP_READ_FIXED), 0, offset, addr, n, 0)
-	return buf[:n], err
+	if n < 0 || uint(n) > math.MaxUint32 || n > len(buf) {
+		return nil, ErrInvalidParam
+	}
+	payload := buf[:n]
+	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(payload))))
+	ctx := sqeCtx.WithOp(IORING_OP_READ_FIXED).WithBufGroup(uint16(bufIndex))
+	err := ur.submitPacked9WithPayload(ctx, payload, 0, offset, addr, n, 0, 0, 0)
+	return buf, err
 }
 
 // writeFixed writes from a registered buffer.
@@ -160,8 +167,13 @@ func (ur *ioUring) writeFixed(sqeCtx SQEContext, bufIndex int, offset uint64, n 
 		return ErrInvalidParam
 	}
 	buf := ur.bufs[bufIndex]
-	addr := uint64(uintptr(unsafe.Pointer(&buf[0])))
-	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_WRITE_FIXED), 0, offset, addr, n, 0)
+	if n < 0 || uint(n) > math.MaxUint32 || n > len(buf) {
+		return ErrInvalidParam
+	}
+	payload := buf[:n]
+	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(payload))))
+	ctx := sqeCtx.WithOp(IORING_OP_WRITE_FIXED).WithBufGroup(uint16(bufIndex))
+	return ur.submitPacked9WithPayload(ctx, payload, 0, offset, addr, n, 0, 0, 0)
 }
 
 // pollAdd adds a file descriptor to poll.
@@ -317,14 +329,22 @@ func (ur *ioUring) close(sqeCtx SQEContext) error {
 
 // read performs a read operation.
 func (ur *ioUring) read(sqeCtx SQEContext, ioprio uint16, b []byte, off uint64, n int) error {
-	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(b))))
-	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_READ), ioprio, off, addr, n, 0)
+	if len(b) < 1 || n < 0 || uint(n) > math.MaxUint32 || n > len(b) {
+		return ErrInvalidParam
+	}
+	payload := b[:n]
+	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(payload))))
+	return ur.submitPacked6WithPayload(sqeCtx.WithOp(IORING_OP_READ), payload, ioprio, off, addr, n, 0)
 }
 
 // write performs a write operation.
 func (ur *ioUring) write(sqeCtx SQEContext, ioprio uint16, b []byte, off uint64, n int) error {
-	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(b))))
-	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_WRITE), ioprio, off, addr, n, 0)
+	if len(b) < 1 || n < 0 || uint(n) > math.MaxUint32 || n > len(b) {
+		return ErrInvalidParam
+	}
+	payload := b[:n]
+	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(payload))))
+	return ur.submitPacked6WithPayload(sqeCtx.WithOp(IORING_OP_WRITE), payload, ioprio, off, addr, n, 0)
 }
 
 // fadvise provides file advice.
@@ -334,17 +354,24 @@ func (ur *ioUring) fadvise(sqeCtx SQEContext, off uint64, n int, advice int) err
 
 // send sends data on a socket.
 func (ur *ioUring) send(sqeCtx SQEContext, ioprio uint16, b []byte, off uint64, n int) error {
-	if b == nil || len(b) < 1 {
+	if len(b) < 1 || n < 0 || n > math.MaxInt32 || off > uint64(len(b)) || uint64(n) > uint64(len(b))-off {
 		return ErrInvalidParam
 	}
-	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(b))))
-	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_SEND), ioprio, off, addr, n, 0)
+	start := int(off)
+	payload := b[start : start+n]
+	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(payload))))
+	return ur.submitPacked6WithPayload(sqeCtx.WithOp(IORING_OP_SEND), payload, ioprio, 0, addr, n, 0)
 }
 
 // receive receives data from a socket.
 func (ur *ioUring) receive(sqeCtx SQEContext, ioprio uint16, b []byte, off uint64, n int) error {
-	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(b))))
-	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_RECV), ioprio, off, addr, n, 0)
+	if len(b) < 1 || n < 0 || n > math.MaxInt32 || off > uint64(len(b)) || uint64(n) > uint64(len(b))-off {
+		return ErrInvalidParam
+	}
+	start := int(off)
+	payload := b[start : start+n]
+	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(payload))))
+	return ur.submitPacked6WithPayload(sqeCtx.WithOp(IORING_OP_RECV), payload, ioprio, 0, addr, n, 0)
 }
 
 // receiveWithBufferSelect receives with kernel buffer selection.
@@ -404,12 +431,14 @@ func (ur *ioUring) sendFixed(sqeCtx SQEContext, bufIndex int, off uint64, n int,
 		return ErrInvalidParam
 	}
 	buf := ur.bufs[bufIndex]
-	if n < 0 || off > uint64(len(buf)) || uint64(n) > uint64(len(buf))-off {
+	if n < 0 || n > math.MaxInt32 || off > uint64(len(buf)) || uint64(n) > uint64(len(buf))-off {
 		return ErrInvalidParam
 	}
+	start := int(off)
+	payload := buf[start : start+n]
 	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(buf)))) + off
 	ctx := sqeCtx.WithOp(IORING_OP_SEND).WithBufGroup(uint16(bufIndex))
-	return ur.submitPacked9(ctx, IORING_RECVSEND_FIXED_BUF, 0, addr, n, uint32(uflags), 0, 0)
+	return ur.submitPacked9WithPayload(ctx, payload, IORING_RECVSEND_FIXED_BUF, 0, addr, n, uint32(uflags), 0, 0)
 }
 
 // sendZeroCopyFixed sends with zero-copy using registered buffer.
@@ -525,3 +554,6 @@ func (ur *ioUring) msgRing(sqeCtx SQEContext, userData int64, res int32) error {
 func (ur *ioUring) msgRingFD(sqeCtx SQEContext, srcFD uint32, dstSlot uint32, userData int64, flags uint32) error {
 	return ErrNotSupported
 }
+
+// Notification CQE usage flags for zero-copy operations.
+const IORING_NOTIF_USAGE_ZC_COPIED = 1 << 31

@@ -40,43 +40,40 @@ const (
 	defaultBacklog           = 1024
 )
 
-// RegisterBuffer is a fixed-size buffer for registered I/O.
-type RegisterBuffer [registerBufferSize]byte
+// Buffer types re-exported from iobuf.
+type (
+	PicoBuffer     = iobuf.PicoBuffer
+	NanoBuffer     = iobuf.NanoBuffer
+	MicroBuffer    = iobuf.MicroBuffer
+	SmallBuffer    = iobuf.SmallBuffer
+	MediumBuffer   = iobuf.MediumBuffer
+	BigBuffer      = iobuf.BigBuffer
+	LargeBuffer    = iobuf.LargeBuffer
+	GreatBuffer    = iobuf.GreatBuffer
+	HugeBuffer     = iobuf.HugeBuffer
+	VastBuffer     = iobuf.VastBuffer
+	GiantBuffer    = iobuf.GiantBuffer
+	TitanBuffer    = iobuf.TitanBuffer
+	RegisterBuffer = [registerBufferSize]byte
+)
 
 // RegisterBufferPool is a pool of RegisterBuffers.
 type RegisterBufferPool struct {
 	items []RegisterBuffer
-	idx   int
 }
 
 // NewRegisterBufferPool creates a new RegisterBufferPool.
-func NewRegisterBufferPool(n int) *RegisterBufferPool {
+func NewRegisterBufferPool(capacity int) *RegisterBufferPool {
 	return &RegisterBufferPool{
-		items: make([]RegisterBuffer, n),
-		idx:   0,
+		items: make([]RegisterBuffer, capacity),
 	}
 }
 
 // Fill fills the pool with buffers.
-func (p *RegisterBufferPool) Fill(fn func() RegisterBuffer) {
+func (p *RegisterBufferPool) Fill(factory func() RegisterBuffer) {
 	for i := range p.items {
-		p.items[i] = fn()
+		p.items[i] = factory()
 	}
-}
-
-// Get gets a buffer from the pool.
-func (p *RegisterBufferPool) Get() (int, []byte) {
-	if p.idx >= len(p.items) {
-		return -1, nil
-	}
-	idx := p.idx
-	p.idx++
-	return idx, p.items[idx][:]
-}
-
-// Put returns a buffer to the pool.
-func (p *RegisterBufferPool) Put(idx int) {
-	// Darwin pool is simple, no actual return logic needed
 }
 
 // AlignedMemBlock returns a page-aligned memory block.

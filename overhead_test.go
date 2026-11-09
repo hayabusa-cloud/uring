@@ -45,7 +45,7 @@ func TestOverheadComparison(t *testing.T) {
 		dl := time.Now().Add(2 * time.Second)
 		for time.Now().Before(dl) {
 			n, err := ring.Wait(cqes)
-			if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+			if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 				t.Fatalf("Wait: %v", err)
 			}
 			if n > 0 {

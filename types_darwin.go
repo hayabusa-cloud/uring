@@ -8,86 +8,9 @@ package uring
 
 import (
 	"context"
-	"net"
 	"unsafe"
 
-	"code.hybscloud.com/iobuf"
 	"code.hybscloud.com/sock"
-)
-
-// Sockaddr represents a socket address (Darwin stub).
-type Sockaddr interface {
-	Raw() (unsafe.Pointer, uint32)
-}
-
-// Addr is an alias for net.Addr (Darwin stub).
-type Addr = net.Addr
-
-// RawSockaddrAny is a generic socket address structure.
-type RawSockaddrAny struct {
-	Len    uint8
-	Family uint8
-	Data   [126]byte
-}
-
-// RawSockaddr is a generic socket address.
-type RawSockaddr struct {
-	Len    uint8
-	Family uint8
-	Data   [14]byte
-}
-
-// RawSockaddrInet4 is an IPv4 socket address.
-type RawSockaddrInet4 struct {
-	Len    uint8
-	Family uint8
-	Port   uint16
-	Addr   [4]byte
-	Zero   [8]byte
-}
-
-// RawSockaddrInet6 is an IPv6 socket address.
-type RawSockaddrInet6 struct {
-	Len      uint8
-	Family   uint8
-	Port     uint16
-	Flowinfo uint32
-	Addr     [16]byte
-	Scope_id uint32
-}
-
-// RawSockaddrUnix is a Unix domain socket address.
-type RawSockaddrUnix struct {
-	Len    uint8
-	Family uint8
-	Path   [104]byte
-}
-
-// NetworkType represents a network type.
-type NetworkType uint8
-
-// UnderlyingProtocol represents an underlying protocol.
-type UnderlyingProtocol uint8
-
-// Socket is a stub interface for sockets.
-type Socket interface{}
-
-// PollFd represents a pollable file descriptor (Darwin stub).
-type PollFd interface {
-	Fd() int
-}
-
-// PollCloser extends PollFd with close capability (Darwin stub).
-type PollCloser interface {
-	PollFd
-	Close() error
-}
-
-// Network type constants (Darwin stub).
-const (
-	NetworkUnix NetworkType = 0
-	NetworkIPv4 NetworkType = 1
-	NetworkIPv6 NetworkType = 2
 )
 
 // Sockaddr size constants (Darwin stub).
@@ -137,15 +60,6 @@ const (
 	MAP_SHARED   = 0x1
 	MAP_POPULATE = 0x0 // Not available on Darwin, ignored
 )
-
-// IoVec is the scatter/gather I/O vector from iobuf.
-type IoVec = iobuf.IoVec
-
-// Timespec represents a time value with nanosecond precision.
-type Timespec struct {
-	Sec  int64
-	Nsec int64
-}
 
 // Msghdr represents a message header for sendmsg/recvmsg.
 type Msghdr struct {

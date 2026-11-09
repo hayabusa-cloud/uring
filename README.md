@@ -20,7 +20,7 @@ The primary surfaces are:
 
 - `Uring`, the live ring handle and operation set
 - `SQEContext`, the submission identity carried in `user_data`
-- `CQEView`, the borrowed completion view returned by `Wait`
+- `CQEView`, the copied completion descriptor returned by `Wait`
 - buffer provisioning through registered buffers and multi-size buffer groups
 
 ## Installation
@@ -120,7 +120,7 @@ for {
 | `Uring` | Ring setup, submission, completion reaping, and operation methods |
 | `Options` | Ring entries, registered-buffer budget, buffer-group scale, and completion visibility |
 | `SQEContext` | Compact submission identity stored in `user_data` |
-| `CQEView` | Borrowed completion record with decoded context accessors |
+| `CQEView` | Copied completion descriptor with decoded accessors and mode-sensitive borrowed targets |
 | `ListenerOp` | Handle to a listener creation operation with FD and accept helpers |
 | `BundleIterator` | Iterates over buffers consumed in a bundle receive |
 | `IncrementalReceiver` | Manages incremental buffer-ring receives (`IOU_PBUF_RING_INC`) |
@@ -178,14 +178,18 @@ When you need caller-owned metadata beyond the 64-bit direct layout, borrow an `
 
 ```go
 ext := ring.ExtSQE()
+if ext == nil {
+	return iox.ErrWouldBlock
+}
 meta := uring.CtxV1Of(ext)
 meta.Val1 = requestSeq
 
 sqeCtx := uring.PackExtended(ext)
 fmt.Printf("sqe context mode=%d seq=%d\n", sqeCtx.Mode(), meta.Val1)
+ring.PutExtSQE(ext)
 ```
 
-`NewContextPools` returns pools that are ready to use. Call `Reset` only after all borrowed contexts have been returned and you want to reuse the pool set.
+`NewContextPools` returns pools that are ready to use. Context-pool exhaustion is independent of submission-queue capacity. Return each context to its originating pool after all request completions and borrowed access finish. `Reset` clears both pools and invalidates outstanding borrows; call it only after stopping all pool access and finishing operations that use its contexts. Do not access or return old borrows after `Reset`.
 
 ### Completion dispatch with `CQEView`
 
@@ -226,7 +230,7 @@ for i := 0; i < n; i++ {
 }
 ```
 
-`CQEView` decodes the matching context mode on demand at completion time. `CQEView`, `IndirectSQE`, `ExtSQE`, and borrowed buffers must not outlive their documented lifetimes.
+`CQEView` decodes the matching context mode on demand at completion time. Its scalar descriptor is copied; Indirect/Extended mode targets and borrowed buffers must not outlive their documented lifetimes.
 
 ## Buffer provisioning
 
@@ -310,7 +314,7 @@ The implementation sits at this boundary:
 1. `New` builds a disabled kernel ring, constructs context pools, and selects a buffer strategy.
 2. `Start` registers buffers and enables the ring for the 6.18+ baseline.
 3. Operation methods express intent by writing SQEs.
-4. `Wait` flushes submissions and returns borrowed CQE views.
+4. `Wait` flushes submissions and returns copied CQE descriptors.
 5. Caller-side runtime code decides scheduling, retries, parking, connection/session routing, route retirement, safety checks, and terminal resource policy.
 
 This keeps `code.hybscloud.com/uring` focused on kernel-facing mechanics and preserves completion meaning across the boundary.
@@ -400,7 +404,7 @@ for i := range n {
 }
 ```
 
-Each `OnStep` callback observes one `MultishotStep`: return `MultishotContinue` to keep the stream live, or `MultishotStop` to request cancellation. If callbacks remain enabled until the terminal observation, `OnStop` runs at most once with the final error and a `cancelled` flag; on the step itself, `step.Cancelled` distinguishes the specific `-ECANCELED` kernel verdict from other failures at the boundary. Both callbacks are the builder-side projection of the `MultishotHandler` interface (`OnMultishotStep` / `OnMultishotStop`); implement that interface directly when you want an explicit handler. `HandleCQE` is for immediate dispatch in the caller's serialized completion loop; if caller code stores copied CQEs beyond that loop, it must keep its own route state and reject observations for retired subscriptions. On default single-issuer rings, call `Cancel` / `Unsubscribe` from the ring owner or otherwise serialize them with submit, `Wait`, `WaitDirect`, `WaitExtended`, `Stop`, and `ResizeRings`. On `MultiIssuers` rings, the shared-submit path serializes their cancel SQEs.
+Each `OnStep` callback observes one `MultishotStep`: return `MultishotContinue` to keep the stream live, or `MultishotStop` to request cancellation. If callbacks remain enabled until the terminal observation, `OnStop` runs at most once with the final error and a `cancelled` flag; on the step itself, `step.Cancelled` distinguishes the specific `-ECANCELED` kernel verdict from other failures at the boundary. Both callbacks are the builder-side projection of the `MultishotHandler` interface (`OnMultishotStep` / `OnMultishotStop`); implement that interface directly when you want an explicit handler. `HandleCQE` is for immediate dispatch in the caller's serialized completion loop; if caller code stores copied CQEs beyond that loop, it must keep its own route state and reject observations for retired subscriptions. On explicit single-issuer rings (`MultiIssuers=false`), call `Cancel` / `Unsubscribe` from the OS-thread-pinned ring owner and serialize them with submit, `Wait`, `WaitDirect`, `WaitExtended`, `Stop`, and `ResizeRings`. Default `MultiIssuers` rings serialize cancel SQEs through the shared-submit path.
 
 ### Per-connection state with typed contexts
 
@@ -408,19 +412,22 @@ Extended contexts carry per-connection references through the submit → complet
 
 ```go
 type ConnState struct {
-    Addr    netip.AddrPort
-    Created int64
+	Addr    netip.AddrPort
+	Created int64
 }
 
 ext := ring.ExtSQE()
+if ext == nil {
+	return iox.ErrWouldBlock
+}
 ctx := uring.Ctx1V1Of[ConnState](ext)
 ctx.Ref1 = connState
 ctx.Val1 = sequenceNumber
 
 sqeCtx := uring.PackExtended(ext)
 if err := ring.Send(sqeCtx, &fd, payload); err != nil {
-    ring.PutExtSQE(ext)
-    return err
+	ring.PutExtSQE(ext)
+	return err
 }
 ```
 
@@ -578,9 +585,9 @@ The package-level `listener_example_test.go` covers listener creation with multi
 
 - Enable `NotifySucceed` when you need a visible CQE for every successful operation.
 - `ring.Features` reports actual SQ/CQ entry counts, SQE slot width, and the byte order used to interpret `user_data`.
-- Leave `MultiIssuers` unset for the default single-issuer configuration (`SINGLE_ISSUER` + `DEFER_TASKRUN`) when a single execution path serializes submit-state operations (`submit`, `Wait`, `WaitDirect`, `WaitExtended`, `Stop`, and `ResizeRings`). Set it only when multiple goroutines need concurrent submission or concurrent calls to `Wait`, `WaitDirect`, or `WaitExtended`; this switches the ring to the shared-submit `COOP_TASKRUN` configuration.
+- Keep the default `MultiIssuers=true` task-migratable configuration (`COOP_TASKRUN`) for ordinary Go execution and concurrent submit-state calls. Set `MultiIssuers=false` only when the owner calls `runtime.LockOSThread` before `New`, remains pinned through `Stop`, and serializes `submit`, `Wait`, `WaitDirect`, `WaitExtended`, `Stop`, and `ResizeRings`; that explicit fast path requests `SINGLE_ISSUER` + `DEFER_TASKRUN`.
 - `EpollWait` requires `timeout` to remain `0`; use `LinkTimeout` when you need a deadline.
-- Release or discard borrowed completion views and pooled contexts promptly.
+- Return borrowed completion targets and pooled contexts promptly.
 - `ListenerOp.Close` closes the listener FD immediately. If a setup CQE is still pending, drain it first, then call `Close` again to return the borrowed `ExtSQE` to the pool.
 
 ## Platform support

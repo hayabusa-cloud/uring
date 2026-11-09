@@ -16,7 +16,9 @@ type IncrementalHandler interface {
 }
 
 // IncrementalReceiver manages receive operations with incremental buffer consumption.
-type IncrementalReceiver struct{}
+type IncrementalReceiver struct {
+	_ [0]func()
+}
 
 // NewIncrementalReceiver creates a receiver (stub on Darwin).
 func NewIncrementalReceiver(ring *Uring, pool *ContextPools, groupID uint16, bufSize int, bufBacking []byte, entries int) *IncrementalReceiver {

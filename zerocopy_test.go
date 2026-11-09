@@ -112,7 +112,7 @@ func TestSendZeroCopyFixed(t *testing.T) {
 	eopnotsupp := false
 	for time.Now().Before(deadline) && (!opCompleted || !notifReceived) {
 		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait: %v", err)
 		}
 		for i := 0; i < n; i++ {
@@ -223,7 +223,7 @@ func TestZeroCopyNotificationFlags(t *testing.T) {
 
 	for time.Now().Before(deadline) {
 		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait: %v", err)
 		}
 		for i := 0; i < n; i++ {
@@ -339,7 +339,7 @@ func TestSendZeroCopyFixedMultiTarget(t *testing.T) {
 
 	for time.Now().Before(deadline) && opCount < numTargets {
 		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait: %v", err)
 		}
 		for i := 0; i < n; i++ {
@@ -454,7 +454,7 @@ func TestZeroCopyBufferSafety(t *testing.T) {
 
 	for time.Now().Before(deadline) && !releaseReady {
 		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait: %v", err)
 		}
 		for i := 0; i < n; i++ {
@@ -536,7 +536,7 @@ func TestZeroCopyBufferSafety(t *testing.T) {
 
 	for time.Now().Before(deadline) && !op2Completed {
 		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait: %v", err)
 		}
 		for i := 0; i < n; i++ {
@@ -633,7 +633,7 @@ func TestZeroCopyLargeBuffer(t *testing.T) {
 
 	for time.Now().Before(deadline) && !opCompleted {
 		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait: %v", err)
 		}
 		for i := 0; i < n; i++ {
@@ -723,7 +723,7 @@ func TestZeroCopyMultipleBuffers(t *testing.T) {
 
 	for time.Now().Before(deadline) && completions < numTests {
 		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait: %v", err)
 		}
 		for i := 0; i < n; i++ {

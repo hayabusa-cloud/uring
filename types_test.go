@@ -9,9 +9,12 @@ package uring
 import (
 	"context"
 	"net"
+	"sync"
 	"testing"
 	"unsafe"
 )
+
+var _ sync.Locker = (*noCopy)(nil)
 
 func TestWriteCString(t *testing.T) {
 	t.Run("valid string", func(t *testing.T) {
@@ -199,7 +202,7 @@ func TestStructSizes(t *testing.T) {
 		{"IoVec", unsafe.Sizeof(IoVec{}), 16},
 		{"Msghdr", unsafe.Sizeof(Msghdr{}), 56},
 		{"OpenHow", unsafe.Sizeof(OpenHow{}), uintptr(SizeofOpenHow)},
-		{"EpollEvent", unsafe.Sizeof(EpollEvent{}), 16},
+		{"EpollEvent", unsafe.Sizeof(EpollEvent{}), sizeofEpollEvent},
 	}
 
 	for _, tt := range tests {
@@ -208,6 +211,15 @@ func TestStructSizes(t *testing.T) {
 				t.Errorf("sizeof(%s) = %d, want %d", tt.name, tt.size, tt.expected)
 			}
 		})
+	}
+}
+
+func TestEpollEventLayout(t *testing.T) {
+	if off := unsafe.Offsetof(EpollEvent{}.Fd); off != epollEventFDOffset {
+		t.Fatalf("offsetof(EpollEvent.Fd) = %d, want %d", off, epollEventFDOffset)
+	}
+	if stride := unsafe.Sizeof([2]EpollEvent{}); stride != 2*sizeofEpollEvent {
+		t.Fatalf("EpollEvent array stride = %d, want %d", stride, 2*sizeofEpollEvent)
 	}
 }
 
@@ -224,22 +236,14 @@ func TestConstants(t *testing.T) {
 	}
 }
 
-func TestNoCopy(t *testing.T) {
-	// Just verify noCopy implements the locker interface for go vet
-	var nc noCopy
-	nc.Lock()
-	nc.Unlock()
-}
-
 // Benchmarks
 
 func BenchmarkWriteCString(b *testing.B) {
 	s := "/path/to/some/file.txt"
 	dst := make([]byte, len(s)+1)
 	b.ReportAllocs()
-	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = writeCString(dst, s)
 	}
 }
@@ -251,9 +255,8 @@ func BenchmarkIoVecFromBytesSlice(b *testing.B) {
 		make([]byte, 4096),
 	}
 	b.ReportAllocs()
-	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, _ = ioVecFromBytesSlice(bufs)
 	}
 }
@@ -262,9 +265,8 @@ func BenchmarkContextUserData(b *testing.B) {
 	ctx := context.Background()
 	ctx = ContextWithUserData(ctx, 42)
 	b.ReportAllocs()
-	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = ContextUserData[int](ctx)
 	}
 }
@@ -275,9 +277,8 @@ func BenchmarkAddrToSockaddr(b *testing.B) {
 		Port: 8080,
 	}
 	b.ReportAllocs()
-	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = AddrToSockaddr(addr)
 	}
 }

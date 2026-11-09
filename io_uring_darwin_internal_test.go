@@ -7,9 +7,14 @@
 package uring
 
 import (
+	"io"
+	"math"
 	"os"
+	"runtime"
 	"syscall"
 	"testing"
+	"time"
+	"unsafe"
 )
 
 func TestDarwinDoCloseUsesRegisteredFileSlot(t *testing.T) {
@@ -70,6 +75,67 @@ func TestDarwinDoCloseRejectsEmptyRegisteredFileSlot(t *testing.T) {
 	}
 	if err := sqeFile.Close(); err != nil {
 		t.Fatalf("sqeFile should stay open on EBADF: %v", err)
+	}
+}
+
+func TestDarwinSignedKernelCarrierDomainsRejectOutOfRange(t *testing.T) {
+	var ur ioUring
+	oversized := oversizedSignedInt32(t)
+	payload := mappedTestSlice[byte](t, oversized)
+	ctx := PackDirect(0, 0, 0, 7)
+
+	tests := []struct {
+		name string
+		call func() error
+	}{
+		{name: "send length", call: func() error { return ur.send(ctx, 0, payload, 0, len(payload)) }},
+		{name: "receive length", call: func() error { return ur.receive(ctx, 0, payload, 0, len(payload)) }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.call(); err != ErrInvalidParam {
+				t.Fatalf("error = %v, want %v", err, ErrInvalidParam)
+			}
+		})
+	}
+}
+
+func TestDarwinFixedBufferRejectsOversizedLen32(t *testing.T) {
+	payload := mappedTestSlice[byte](t, oversizedLen32(t))
+
+	tests := []struct {
+		name string
+		call func(*ioUring) error
+	}{
+		{
+			name: "readFixed",
+			call: func(ur *ioUring) error {
+				_, err := ur.readFixed(PackDirect(0, 0, 0, 0), 0, 0, len(payload))
+				return err
+			},
+		},
+		{
+			name: "writeFixed",
+			call: func(ur *ioUring) error {
+				return ur.writeFixed(PackDirect(0, 0, 0, 0), 0, 0, len(payload))
+			},
+		},
+		{
+			name: "sendFixed",
+			call: func(ur *ioUring) error {
+				return ur.sendFixed(PackDirect(0, 0, 0, 0), 0, 0, len(payload), 0)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ur := &ioUring{bufs: [][]byte{payload}}
+			if err := tt.call(ur); err != ErrInvalidParam {
+				t.Fatalf("%s error = %v, want %v", tt.name, err, ErrInvalidParam)
+			}
+		})
 	}
 }
 
@@ -165,4 +231,459 @@ func TestDarwinSQEView(t *testing.T) {
 			t.Error("expected HasCQESkipSuccess() to be true")
 		}
 	})
+}
+
+func TestDarwinNewIoUringRejectsEntriesOutsideSetupDomain(t *testing.T) {
+	for _, entries := range []int{-1, 0, EntriesHuge + 1} {
+		ur, err := newIoUring(entries)
+		if ur != nil {
+			t.Fatalf("newIoUring(%d) = non-nil ring, want nil", entries)
+		}
+		if err != ErrInvalidParam {
+			t.Fatalf("newIoUring(%d) error = %v, want %v", entries, err, ErrInvalidParam)
+		}
+	}
+}
+
+func TestDarwinNewUringProvideBuffersRoundsAndPartitionsCount(t *testing.T) {
+	buffers := newUringProvideBuffers(3, 3)
+	if buffers.size != 4 {
+		t.Fatalf("size = %d, want 4", buffers.size)
+	}
+	if buffers.n != 4 {
+		t.Fatalf("n = %d, want 4", buffers.n)
+	}
+	if buffers.gn != 1 || buffers.gMask != 0 {
+		t.Fatalf("group geometry = (%d, %d), want (1, 0)", buffers.gn, buffers.gMask)
+	}
+
+	buffers = newUringProvideBuffers(3, providedBufferGroupEntries+1)
+	if buffers.n != providedBufferGroupEntries {
+		t.Fatalf("split n = %d, want %d", buffers.n, providedBufferGroupEntries)
+	}
+	if buffers.gn != 2 || buffers.gMask != 1 {
+		t.Fatalf("split group geometry = (%d, %d), want (2, 1)", buffers.gn, buffers.gMask)
+	}
+	if err := buffers.register(nil, 0); err != nil {
+		t.Fatalf("register split buffers: %v", err)
+	}
+	if got, want := len(buffers.mem), buffers.size*buffers.n*buffers.gn; got != want {
+		t.Fatalf("split backing length = %d, want %d", got, want)
+	}
+	if got := buffers.buf(bufferGroupIndex(1), 0); len(got) != buffers.size {
+		t.Fatalf("second group buffer length = %d, want %d", len(got), buffers.size)
+	}
+}
+
+func TestDarwinStopJoinsWorkersBeforeClearingState(t *testing.T) {
+	for iteration := range 32 {
+		ur, err := newIoUring(1)
+		if err != nil {
+			t.Fatalf("newIoUring[%d]: %v", iteration, err)
+		}
+		ur.bufs = [][]byte{{1}}
+		ur.files = []int32{-1}
+		ur.ops = []ioUringProbeOp{{}}
+		if err := ur.enable(); err != nil {
+			t.Fatalf("enable[%d]: %v", iteration, err)
+		}
+
+		stopped := make(chan error, 1)
+		go func() {
+			stopped <- ur.stop()
+		}()
+
+		select {
+		case err := <-stopped:
+			if err != nil {
+				t.Fatalf("stop[%d]: %v", iteration, err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("stop[%d] did not join workers", iteration)
+		}
+
+		if ur.stopChan != nil {
+			t.Fatalf("stopChan[%d] is non-nil after stop", iteration)
+		}
+		if ur.bufs != nil || ur.files != nil || ur.ops != nil {
+			t.Fatalf("worker-visible state[%d] remains after stop", iteration)
+		}
+	}
+}
+
+func TestDarwinSubmissionRetainsTypedPayload(t *testing.T) {
+	ur, err := newIoUring(2)
+	if err != nil {
+		t.Fatalf("newIoUring: %v", err)
+	}
+	t.Cleanup(func() { _ = ur.stop() })
+
+	payload := []byte("payload-root")
+	wantAddr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(payload)))) + 2
+	if err := ur.send(PackDirect(0, 0, 0, 7), 0, payload, 2, 4); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	payload = nil
+	runtime.GC()
+
+	submission := <-ur.sqChan
+	if got := string(submission.payload); got != "yloa" {
+		t.Fatalf("queued payload = %q, want %q", got, "yloa")
+	}
+	if submission.sqe.addr != wantAddr {
+		t.Fatalf("queued addr = %#x, want %#x", submission.sqe.addr, wantAddr)
+	}
+}
+
+func TestDarwinFixedFileSubmissionBoundary(t *testing.T) {
+	t.Run("reject unresolved operation", func(t *testing.T) {
+		ur := &ioUring{sqChan: make(chan *darwinSubmission, 1)}
+		ctx := PackDirect(0, IOSQE_FIXED_FILE, 0, 0)
+
+		if err := ur.send(ctx, 0, []byte{1}, 0, 1); err != ErrNotSupported {
+			t.Fatalf("send fixed-file error = %v, want %v", err, ErrNotSupported)
+		}
+		if got := len(ur.sqChan); got != 0 {
+			t.Fatalf("queued submissions = %d, want 0", got)
+		}
+	})
+
+	t.Run("preserve close direct", func(t *testing.T) {
+		ur := &ioUring{sqChan: make(chan *darwinSubmission, 1)}
+		ctx := PackDirect(0, IOSQE_FIXED_FILE, 0, 3)
+
+		if err := ur.close(ctx); err != nil {
+			t.Fatalf("close fixed-file: %v", err)
+		}
+		submission := <-ur.sqChan
+		if submission.sqe.flags&IOSQE_FIXED_FILE != 0 {
+			t.Fatalf("queued flags = %#x, want fixed-file flag cleared", submission.sqe.flags)
+		}
+		if got, want := submission.sqe.spliceFdIn, int32(4); got != want {
+			t.Fatalf("queued file slot encoding = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("preserve full-width close direct", func(t *testing.T) {
+		ur := &ioUring{sqChan: make(chan *darwinSubmission, 1)}
+		indirect := &IndirectSQE{}
+		indirect.flags = IOSQE_FIXED_FILE
+		indirect.fd = math.MaxInt32
+
+		if err := ur.close(PackIndirect(indirect)); err != nil {
+			t.Fatalf("close fixed-file: %v", err)
+		}
+		submission := <-ur.sqChan
+		if got, want := submission.sqe.spliceFdIn, int32(math.MinInt32); got != want {
+			t.Fatalf("queued file slot encoding = %d, want %d", got, want)
+		}
+		if got, want := decodeCloseFileIndex(submission.sqe.spliceFdIn), uint32(math.MaxInt32); got != want {
+			t.Fatalf("decoded file index = %d, want %d", got, want)
+		}
+	})
+}
+
+func TestDarwinFixedSendRetainsRegisteredPayloadRange(t *testing.T) {
+	backing := []byte("fixed-payload")
+	wantAddr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(backing)))) + 2
+	ur := &ioUring{
+		bufs:   [][]byte{backing},
+		sqChan: make(chan *darwinSubmission, 1),
+	}
+
+	if err := ur.sendFixed(PackDirect(0, 0, 0, 7), 0, 2, 4, 0); err != nil {
+		t.Fatalf("sendFixed: %v", err)
+	}
+	ur.bufs = nil
+	backing = nil
+	runtime.GC()
+
+	submission := <-ur.sqChan
+	if got := string(submission.payload); got != "xed-" {
+		t.Fatalf("queued payload = %q, want %q", got, "xed-")
+	}
+	if submission.sqe.addr != wantAddr {
+		t.Fatalf("queued addr = %#x, want %#x", submission.sqe.addr, wantAddr)
+	}
+}
+
+func TestDarwinFixedReadWriteRetainSelectedBuffer(t *testing.T) {
+	backing := []byte("fixed-payload")
+	wantAddr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(backing))))
+	ur := &ioUring{
+		bufs:   [][]byte{[]byte("other"), backing},
+		sqChan: make(chan *darwinSubmission, 2),
+	}
+	ctx := PackDirect(0, 0, 0, 7)
+
+	readBuf, err := ur.readFixed(ctx, 1, 3, 5)
+	if err != nil {
+		t.Fatalf("readFixed: %v", err)
+	}
+	if uint64(uintptr(unsafe.Pointer(unsafe.SliceData(readBuf)))) != wantAddr {
+		t.Fatal("readFixed returned a buffer other than the selected registration")
+	}
+	if err := ur.writeFixed(ctx, 1, 4, 5); err != nil {
+		t.Fatalf("writeFixed: %v", err)
+	}
+
+	ur.bufs = nil
+	backing = nil
+	readBuf = nil
+	runtime.GC()
+
+	for _, want := range []struct {
+		opcode uint8
+		offset uint64
+	}{
+		{opcode: IORING_OP_READ_FIXED, offset: 3},
+		{opcode: IORING_OP_WRITE_FIXED, offset: 4},
+	} {
+		submission := <-ur.sqChan
+		if submission.sqe.opcode != want.opcode {
+			t.Fatalf("queued opcode = %d, want %d", submission.sqe.opcode, want.opcode)
+		}
+		if submission.sqe.bufIndex != 1 {
+			t.Fatalf("queued bufIndex = %d, want 1", submission.sqe.bufIndex)
+		}
+		if submission.sqe.off != want.offset {
+			t.Fatalf("queued offset = %d, want %d", submission.sqe.off, want.offset)
+		}
+		if submission.sqe.addr != wantAddr {
+			t.Fatalf("queued addr = %#x, want %#x", submission.sqe.addr, wantAddr)
+		}
+		if got := string(submission.payload); got != "fixed" {
+			t.Fatalf("queued payload = %q, want %q", got, "fixed")
+		}
+	}
+}
+
+func TestDarwinPackedExtendedMirrorIncludesFinalUserData(t *testing.T) {
+	ur, err := newIoUring(2)
+	if err != nil {
+		t.Fatalf("newIoUring: %v", err)
+	}
+	t.Cleanup(func() { _ = ur.stop() })
+
+	ext := &ExtSQE{}
+	ctx := PackExtended(ext)
+	if err := ur.nop(ctx); err != nil {
+		t.Fatalf("nop: %v", err)
+	}
+	if got := ViewExtSQE(ext).UserData(); got != ctx.WithOp(IORING_OP_NOP).Raw() {
+		t.Fatalf("mirrored userData = %#x, want %#x", got, ctx.WithOp(IORING_OP_NOP).Raw())
+	}
+}
+
+func TestDarwinSubmitExtendedRejectsUnrootedBufferOpcode(t *testing.T) {
+	ur, err := newIoUring(2)
+	if err != nil {
+		t.Fatalf("newIoUring: %v", err)
+	}
+	t.Cleanup(func() { _ = ur.stop() })
+
+	ext := &ExtSQE{SQE: ioUringSqe{opcode: IORING_OP_READ, len: 1}}
+	if err := ur.submitExtended(PackExtended(ext)); err != ErrNotSupported {
+		t.Fatalf("submitExtended error = %v, want %v", err, ErrNotSupported)
+	}
+	if len(ur.sqChan) != 0 {
+		t.Fatalf("queued submissions = %d, want 0", len(ur.sqChan))
+	}
+}
+
+func TestDarwinReadWriteUsesPositionedOffsets(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "positioned-io")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = file.Close() })
+
+	if _, err := file.WriteString("abcdef"); err != nil {
+		t.Fatalf("WriteString: %v", err)
+	}
+	if _, err := file.Seek(5, io.SeekStart); err != nil {
+		t.Fatalf("Seek: %v", err)
+	}
+
+	ur := &ioUring{}
+	readBuf := make([]byte, 2)
+	if got := ur.doRead(&ioUringSqe{fd: int32(file.Fd()), off: 1}, readBuf); got != int32(len(readBuf)) {
+		t.Fatalf("positioned read result = %d, want %d", got, len(readBuf))
+	}
+	if got := string(readBuf); got != "bc" {
+		t.Fatalf("positioned read payload = %q, want %q", got, "bc")
+	}
+	if offset, err := file.Seek(0, io.SeekCurrent); err != nil {
+		t.Fatalf("current offset after positioned read: %v", err)
+	} else if offset != 5 {
+		t.Fatalf("current offset after positioned read = %d, want 5", offset)
+	}
+
+	writeBuf := []byte("XY")
+	if got := ur.doWrite(&ioUringSqe{fd: int32(file.Fd()), off: 2}, writeBuf); got != int32(len(writeBuf)) {
+		t.Fatalf("positioned write result = %d, want %d", got, len(writeBuf))
+	}
+	if offset, err := file.Seek(0, io.SeekCurrent); err != nil {
+		t.Fatalf("current offset after positioned write: %v", err)
+	} else if offset != 5 {
+		t.Fatalf("current offset after positioned write = %d, want 5", offset)
+	}
+
+	contents := make([]byte, 6)
+	if _, err := file.ReadAt(contents, 0); err != nil {
+		t.Fatalf("ReadAt: %v", err)
+	}
+	if got := string(contents); got != "abXYef" {
+		t.Fatalf("file contents = %q, want %q", got, "abXYef")
+	}
+
+	currentBuf := make([]byte, 1)
+	if got := ur.doRead(&ioUringSqe{fd: int32(file.Fd()), off: math.MaxUint64}, currentBuf); got != 1 {
+		t.Fatalf("current-position read result = %d, want 1", got)
+	}
+	if got := string(currentBuf); got != "f" {
+		t.Fatalf("current-position read payload = %q, want %q", got, "f")
+	}
+	if offset, err := file.Seek(0, io.SeekCurrent); err != nil {
+		t.Fatalf("current offset after current-position read: %v", err)
+	} else if offset != 6 {
+		t.Fatalf("current offset after current-position read = %d, want 6", offset)
+	}
+
+	currentWrite := []byte("!")
+	if got := ur.doWrite(&ioUringSqe{fd: int32(file.Fd()), off: math.MaxUint64}, currentWrite); got != 1 {
+		t.Fatalf("current-position write result = %d, want 1", got)
+	}
+	if offset, err := file.Seek(0, io.SeekCurrent); err != nil {
+		t.Fatalf("current offset after current-position write: %v", err)
+	} else if offset != 7 {
+		t.Fatalf("current offset after current-position write = %d, want 7", offset)
+	}
+
+	contents = make([]byte, 7)
+	if _, err := file.ReadAt(contents, 0); err != nil {
+		t.Fatalf("ReadAt after current-position write: %v", err)
+	}
+	if got := string(contents); got != "abXYef!" {
+		t.Fatalf("file contents after current-position write = %q, want %q", got, "abXYef!")
+	}
+}
+
+func TestDarwinExecuteFixedReadWrite(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "fixed-io")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = file.Close() })
+
+	if _, err := file.WriteString("abcdef"); err != nil {
+		t.Fatalf("WriteString: %v", err)
+	}
+
+	ur := &ioUring{}
+	readBuf := make([]byte, 2)
+	readCQE := ur.executeSQE(&darwinSubmission{
+		sqe: ioUringSqe{
+			opcode: IORING_OP_READ_FIXED,
+			fd:     int32(file.Fd()),
+			off:    1,
+			len:    uint32(len(readBuf)),
+		},
+		payload: readBuf,
+	})
+	if readCQE == nil || readCQE.res != int32(len(readBuf)) {
+		t.Fatalf("fixed read completion = %#v, want result %d", readCQE, len(readBuf))
+	}
+	if got := string(readBuf); got != "bc" {
+		t.Fatalf("fixed read payload = %q, want %q", got, "bc")
+	}
+
+	writeBuf := []byte("XY")
+	writeCQE := ur.executeSQE(&darwinSubmission{
+		sqe: ioUringSqe{
+			opcode: IORING_OP_WRITE_FIXED,
+			fd:     int32(file.Fd()),
+			off:    2,
+			len:    uint32(len(writeBuf)),
+		},
+		payload: writeBuf,
+	})
+	if writeCQE == nil || writeCQE.res != int32(len(writeBuf)) {
+		t.Fatalf("fixed write completion = %#v, want result %d", writeCQE, len(writeBuf))
+	}
+
+	contents := make([]byte, 6)
+	if _, err := file.ReadAt(contents, 0); err != nil {
+		t.Fatalf("ReadAt: %v", err)
+	}
+	if got := string(contents); got != "abXYef" {
+		t.Fatalf("file contents = %q, want %q", got, "abXYef")
+	}
+}
+
+func TestDarwinReadWriteOffsetZeroFallsBackForPipes(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("Pipe: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = reader.Close()
+		_ = writer.Close()
+	})
+
+	ur := &ioUring{}
+	payload := []byte("x")
+	if got := ur.doWrite(&ioUringSqe{fd: int32(writer.Fd())}, payload); got != 1 {
+		t.Fatalf("pipe write result = %d, want 1", got)
+	}
+
+	buf := make([]byte, 1)
+	if got := ur.doRead(&ioUringSqe{fd: int32(reader.Fd())}, buf); got != 1 {
+		t.Fatalf("pipe read result = %d, want 1", got)
+	}
+	if got := string(buf); got != "x" {
+		t.Fatalf("pipe read payload = %q, want %q", got, "x")
+	}
+}
+
+func TestDarwinReadWriteRejectsOffsetsOutsideInt64(t *testing.T) {
+	invalidOffset := uint64(math.MaxInt64) + 1
+	sqe := &ioUringSqe{fd: -1, off: invalidOffset}
+	ur := &ioUring{}
+
+	if got := ur.doRead(sqe, make([]byte, 1)); got != -int32(syscall.EINVAL) {
+		t.Fatalf("read result = %d, want -EINVAL", got)
+	}
+	if got := ur.doWrite(sqe, []byte{0}); got != -int32(syscall.EINVAL) {
+		t.Fatalf("write result = %d, want -EINVAL", got)
+	}
+}
+
+func TestDarwinDoSendReportsPartialProgress(t *testing.T) {
+	fds, err := syscall.Socketpair(syscall.AF_LOCAL, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatalf("socketpair: %v", err)
+	}
+	defer syscall.Close(fds[0])
+	defer syscall.Close(fds[1])
+
+	if err := syscall.SetNonblock(fds[0], true); err != nil {
+		t.Fatalf("set nonblock: %v", err)
+	}
+	if err := syscall.SetsockoptInt(fds[0], syscall.SOL_SOCKET, syscall.SO_SNDBUF, 4096); err != nil {
+		t.Fatalf("set send buffer: %v", err)
+	}
+	sendBufferSize, err := syscall.GetsockoptInt(fds[0], syscall.SOL_SOCKET, syscall.SO_SNDBUF)
+	if err != nil {
+		t.Fatalf("get send buffer: %v", err)
+	}
+
+	payload := make([]byte, max(1<<20, sendBufferSize*4))
+	res := (&ioUring{}).doSend(&ioUringSqe{fd: int32(fds[0])}, payload)
+	if res <= 0 {
+		t.Fatalf("doSend result = %d, want positive progress", res)
+	}
+	if int(res) >= len(payload) {
+		t.Fatalf("doSend result = %d, want a short send below %d", res, len(payload))
+	}
 }

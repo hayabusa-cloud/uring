@@ -211,3 +211,11 @@ func WithFsyncDataSync() OpOptionFunc {
 		opt.FsyncFlags = 1
 	}
 }
+
+// I/O priority class constants for WithIOPrioClass.
+const (
+	IOPrioClassNone = 0
+	IOPrioClassRT   = 1
+	IOPrioClassBE   = 2
+	IOPrioClassIDLE = 3
+)

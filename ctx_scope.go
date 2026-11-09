@@ -10,35 +10,38 @@ import (
 	"code.hybscloud.com/iox"
 )
 
-// ScopedExtSQE manages ExtSQE lifecycle to prevent pool leaks.
-// It ensures the ExtSQE is returned to the pool on error paths.
-// The wrapped ExtSQE is borrowed until either Submitted transfers release
-// responsibility to completion handling or Release returns it to the pool.
+// ScopedExtSQE holds a borrowed ExtSQE for deferred release on submission failure.
+// After a successful submission, call [ScopedExtSQE.Submitted] to transfer return
+// responsibility to completion handling. The context remains borrowed until
+// [Uring.PutExtSQE] returns it to the pool.
+//
+// A scope must have one owner: do not copy it or use it concurrently.
+// Do not replace Ext or return it directly while the scope owns it.
+// The zero value holds no context and is safe to Release.
 //
 // Usage pattern:
 //
 //	scope := ring.NewScopedExtSQE()
-//	if scope.Ext == nil {
-//	    return iox.ErrWouldBlock
+//	if !scope.Valid() {
+//		return iox.ErrWouldBlock
 //	}
-//	defer scope.Release()  // Returns to pool if not submitted
+//	defer scope.Release()
 //
-//	// ... setup ExtSQE ...
-//
-//	if err := ring.Submit(ctx); err != nil {
-//	    return err  // Release() will return ExtSQE to pool
+//	uring.CtxV1Of(scope.Ext).Val1 = requestID
+//	ctx := uring.PackExtended(scope.Ext).WithFD(fd)
+//	if err := ring.Read(ctx, buf); err != nil {
+//		return err
 //	}
-//	scope.Submitted()  // Mark as submitted, Release() becomes no-op
+//	scope.Submitted()
+//	return nil
 type ScopedExtSQE struct {
 	Ext       *ExtSQE
 	ring      *Uring
 	submitted bool
 }
 
-// NewScopedExtSQE gets an ExtSQE from the pool wrapped in a scope.
-// Returns a scope with nil Ext if the pool is exhausted.
-// The borrowed ExtSQE and all derived UserData views remain valid only until
-// Submitted or Release closes the scope.
+// NewScopedExtSQE borrows a cleared ExtSQE into a scope.
+// It returns a scope with nil Ext if the context pool is exhausted.
 func (ur *Uring) NewScopedExtSQE() ScopedExtSQE {
 	return ScopedExtSQE{
 		Ext:  ur.ExtSQE(),
@@ -46,26 +49,26 @@ func (ur *Uring) NewScopedExtSQE() ScopedExtSQE {
 	}
 }
 
-// Valid reports whether the scope has a valid ExtSQE.
+// Valid reports whether Ext is non-nil.
+// It does not check submission state or whether the context has been returned.
 //
 //go:nosplit
 func (s *ScopedExtSQE) Valid() bool {
 	return s.Ext != nil
 }
 
-// Submitted marks the ExtSQE as submitted.
-// After this call, Release() becomes a no-op.
-// The CQE handler is responsible for returning the ExtSQE to the pool, and any
-// state that must outlive PutExtSQE must be copied before release.
+// Submitted marks a successful submission so Release becomes a no-op.
+// It does not submit or return the context. Completion handling must return it
+// with [Uring.PutExtSQE] after all request completions and borrowed access finish.
 //
 //go:nosplit
 func (s *ScopedExtSQE) Submitted() {
 	s.submitted = true
 }
 
-// Release returns the ExtSQE to the pool if not submitted.
-// This is safe to call multiple times and after Submitted().
-// After Release, the ExtSQE and every typed/raw view derived from it are invalid.
+// Release returns an unsubmitted context to its ring and clears Ext.
+// Returning it invalidates all pointers and views into that borrow.
+// Repeated calls and calls after [ScopedExtSQE.Submitted] are no-ops.
 //
 //go:nosplit
 func (s *ScopedExtSQE) Release() {
@@ -75,24 +78,22 @@ func (s *ScopedExtSQE) Release() {
 	}
 }
 
-// WithExtSQE executes fn with an ExtSQE from the pool.
-// The ExtSQE is automatically returned to the pool if fn returns an error.
+// WithExtSQE calls fn with a cleared ExtSQE borrowed from this ring.
+// It returns [iox.ErrWouldBlock] without calling fn if the pool is exhausted.
 //
-// If fn returns nil, the caller is responsible for eventually returning
-// the ExtSQE to the pool (typically via CQE handler). Typed or raw UserData
-// views produced inside fn are borrowed and must not escape past PutExtSQE.
+// If fn returns an error, the context must still be unsubmitted and borrowed;
+// WithExtSQE returns it to the pool before returning that error.
 //
-// Returns iox.ErrWouldBlock if the pool is exhausted.
+// If fn returns nil, fn is responsible for arranging [Uring.PutExtSQE] exactly
+// once after all request completions and borrowed access finish. Views into the
+// context must not outlive that return. A panic in fn does not return the context.
 //
 // Example:
 //
 //	err := ring.WithExtSQE(func(ext *uring.ExtSQE) error {
-//	    ctx := uring.ViewCtx(ext).Vals0()
-//	    ctx.Fn = handler
-//	    ctx.Data = data
-//
-//	    sqeCtx := uring.PackExtended(ext)
-//	    return ring.Read(sqeCtx, fd, buf)
+//		uring.CtxV1Of(ext).Val1 = requestID
+//		ctx := uring.PackExtended(ext).WithFD(fd)
+//		return ring.Read(ctx, buf)
 //	})
 func (ur *Uring) WithExtSQE(fn func(ext *ExtSQE) error) error {
 	ext := ur.ExtSQE()

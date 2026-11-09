@@ -12,9 +12,17 @@ import (
 	"code.hybscloud.com/iofd"
 )
 
-// SQEContext preserves the Linux bit-level context encoding on Darwin so
-// completion paths can round-trip user_data consistently. Darwin remains a
-// compatibility port and does not promise full Linux io_uring semantics.
+// SQEContext encodes io_uring user_data.
+// Direct mode packs opcode, flags, buffer group, and fd inline.
+// Indirect and Extended modes store tagged addresses of shared context storage.
+//
+// Copying a context does not copy or keep its target alive. Caller must keep
+// pointer targets reachable and address-stable through completion and all
+// borrowed access. Do not change submitted SQE fields, reuse, or release a
+// target while completions for that request remain pending.
+//
+// Darwin preserves the context encoding for compatibility; it does not provide
+// full Linux io_uring semantics.
 type SQEContext uint64
 
 // Context mode constants (bits 62-63).
@@ -105,7 +113,8 @@ func (c SQEContext) BufGroup() uint16 {
 	return c.IndirectSQE().bufIndex
 }
 
-// FD returns the sign-extended 30-bit file descriptor.
+// FD returns the context's raw file descriptor.
+// Direct mode sign-extends its 30-bit field; pointer modes read the full int32.
 func (c SQEContext) FD() int32 {
 	if c.IsDirect() {
 		fdBits := c & ctxFDMask
@@ -120,9 +129,9 @@ func (c SQEContext) FD() int32 {
 	return c.IndirectSQE().fd
 }
 
-// WithOp returns a new context with the opcode replaced.
-// For Direct mode, modifies the inline bits.
-// For Indirect/Extended modes, writes to the pointed-to SQE struct.
+// WithOp returns a context with the opcode replaced.
+// Direct mode returns an updated value; Indirect and Extended modes mutate
+// shared target storage and return c.
 func (c SQEContext) WithOp(op uint8) SQEContext {
 	if c.IsDirect() {
 		return (c &^ (ctxOpMask | ctxModeMask)) | SQEContext(op) | CtxModeDirect
@@ -135,9 +144,9 @@ func (c SQEContext) WithOp(op uint8) SQEContext {
 	return c
 }
 
-// WithFlags returns a new context with the flags replaced.
-// For Direct mode, modifies the inline bits.
-// For Indirect/Extended modes, writes to the pointed-to SQE struct.
+// WithFlags returns a context with the flags replaced.
+// Direct mode returns an updated value; Indirect and Extended modes mutate
+// shared target storage and return c.
 func (c SQEContext) WithFlags(flags uint8) SQEContext {
 	if c.IsDirect() {
 		return (c &^ (ctxFlagsMask | ctxModeMask)) | SQEContext(flags)<<ctxFlagsShift | CtxModeDirect
@@ -150,9 +159,9 @@ func (c SQEContext) WithFlags(flags uint8) SQEContext {
 	return c
 }
 
-// OrFlags returns a new context with flags ORed into the existing set.
-// For Direct mode, modifies the inline bits.
-// For Indirect/Extended modes, writes to the pointed-to SQE struct.
+// OrFlags returns a context with flags ORed into the existing set.
+// Direct mode returns an updated value; Indirect and Extended modes mutate
+// shared target storage and return c.
 func (c SQEContext) OrFlags(flags uint8) SQEContext {
 	if c.IsDirect() {
 		return c | SQEContext(flags)<<ctxFlagsShift
@@ -165,9 +174,9 @@ func (c SQEContext) OrFlags(flags uint8) SQEContext {
 	return c
 }
 
-// WithBufGroup returns a new context with the buffer group replaced.
-// For Direct mode, modifies the inline bits.
-// For Indirect/Extended modes, writes to the pointed-to SQE struct.
+// WithBufGroup returns a context with the buffer group replaced.
+// Direct mode returns an updated value; Indirect and Extended modes mutate
+// shared target storage and return c.
 func (c SQEContext) WithBufGroup(bufGroup uint16) SQEContext {
 	if c.IsDirect() {
 		return (c &^ (ctxBufGrpMask | ctxModeMask)) | SQEContext(bufGroup)<<ctxBufGrpShift | CtxModeDirect
@@ -180,9 +189,9 @@ func (c SQEContext) WithBufGroup(bufGroup uint16) SQEContext {
 	return c
 }
 
-// WithFD returns a new context with the file descriptor replaced.
-// For Direct mode, modifies the inline bits.
-// For Indirect/Extended modes, writes to the pointed-to SQE struct.
+// WithFD returns a context with the file descriptor replaced.
+// Direct mode returns an updated value; Indirect and Extended modes mutate
+// shared target storage and return c.
 func (c SQEContext) WithFD(fd iofd.FD) SQEContext {
 	return c.withFD(int32(fd))
 }
@@ -202,7 +211,6 @@ func (c SQEContext) withFD(fd int32) SQEContext {
 }
 
 // HasBufferSelect reports whether the IOSQE_BUFFER_SELECT flag is set.
-// Only valid for Direct mode contexts.
 func (c SQEContext) HasBufferSelect() bool { return c.Flags()&IOSQE_BUFFER_SELECT != 0 }
 
 // Raw returns the underlying uint64 value for direct use in SQE.userData.
@@ -216,8 +224,10 @@ func (c SQEContext) Raw() uint64 { return uint64(c) }
 //go:nosplit
 func SQEContextFromRaw(v uint64) SQEContext { return SQEContext(v) }
 
-// IndirectSQE holds a complete SQE copy for completion context on Darwin too.
-// Its borrowing rules match Linux when acquired from a Uring-owned pool.
+// IndirectSQE stores the 64-byte base SQE for an indirect context.
+// Submission overwrites it with the encoded SQE. Copy needed fields before
+// mutation, reuse, or release; do not access pooled storage after PutIndirectSQE.
+// Its target lifetime follows the SQEContext contract.
 type IndirectSQE struct {
 	ioUringSqe
 }
@@ -225,7 +235,12 @@ type IndirectSQE struct {
 // Compile-time size assertion.
 var _ [64 - unsafe.Sizeof(IndirectSQE{})]struct{}
 
-// ExtSQE stub for non-Linux (must match linux ExtSQE layout for shared Ctx types).
+// ExtSQE stores a 64-byte base SQE and 64 bytes of caller data.
+// Submission overwrites SQE and preserves UserData; UserData is separate from
+// the kernel's SQE128 extension. Copy needed facts before mutation, reuse, or
+// release; do not access pooled storage after PutExtSQE.
+// Its target lifetime follows the SQEContext contract.
+//
 // The GC does not trace UserData; callers that place pointer-bearing values
 // there must keep the referents reachable outside UserData.
 type ExtSQE struct {
@@ -236,7 +251,8 @@ type ExtSQE struct {
 // Compile-time size assertions to match Linux layout.
 var _ [128 - unsafe.Sizeof(ExtSQE{})]struct{}
 
-// PackIndirect packs an indirect-mode pointer.
+// PackIndirect encodes sqe's address without copying or keeping it alive.
+// Caller must satisfy the SQEContext target-lifetime contract.
 func PackIndirect(sqe *IndirectSQE) SQEContext {
 	ptr := uintptr(unsafe.Pointer(sqe))
 	if ptr&uintptr(ctxModeMask) != 0 {
@@ -245,7 +261,8 @@ func PackIndirect(sqe *IndirectSQE) SQEContext {
 	return SQEContext(ptr) | CtxModeIndirect
 }
 
-// PackExtended packs an extended-mode pointer.
+// PackExtended encodes sqe's address without copying or keeping it alive.
+// Caller must satisfy the SQEContext target-lifetime contract.
 func PackExtended(sqe *ExtSQE) SQEContext {
 	ptr := uintptr(unsafe.Pointer(sqe))
 	if ptr&uintptr(ctxModeMask) != 0 {
@@ -254,7 +271,8 @@ func PackExtended(sqe *ExtSQE) SQEContext {
 	return SQEContext(ptr) | CtxModeExtended
 }
 
-// IndirectSQE returns the indirect pointer stored in `c`.
+// IndirectSQE returns the borrowed indirect target.
+// Caller must ensure c.IsIndirect() and that the target remains live.
 //
 //go:nosplit
 //go:nocheckptr
@@ -265,7 +283,8 @@ func (c SQEContext) IndirectSQE() *IndirectSQE {
 	return (*IndirectSQE)(pointerFromTagged(uintptr(c & ctxPtrMask)))
 }
 
-// ExtSQE returns the extended pointer stored in `c`.
+// ExtSQE returns the borrowed extended target.
+// Caller must ensure c.IsExtended() and that the target remains live.
 //
 //go:nosplit
 //go:nocheckptr
@@ -281,22 +300,11 @@ func pointerFromTagged(u uintptr) unsafe.Pointer {
 	return *(*unsafe.Pointer)(unsafe.Pointer(&u))
 }
 
-// CastUserData casts ExtSQE.UserData to a user-defined type on Darwin too.
-//
-// Prefer the pointer-free typed view helpers when a fixed `UserData` layout is
-// enough. Raw `UserData` remains scalar caller-beware storage; pointer-bearing
-// overlays and `ViewCtx1`...`ViewCtx7` ref layouts still require live roots to
-// stay outside those raw bytes.
-//
-// CastUserData is the low-level escape hatch for code that needs a custom raw
-// struct overlay. Any pointer returned by CastUserData is borrowed from ext and
-// is valid only until the matching PutExtSQE. Callers must not retain the
-// returned pointer, or pointers reachable from it, after release.
-//
-// `ExtSQE.UserData` is raw caller-beware storage. Prefer scalar payloads here;
-// if a raw overlay stores Go pointers, interfaces, func values, maps, slices,
-// strings, chans, or structs containing them in these bytes, caller code must
-// keep the live roots outside `UserData`.
+// CastUserData returns a borrowed *T over ext.UserData.
+// T must fit within the 64-byte UserData array. Copy needed values before
+// mutation, reuse, or release; never access the overlay after storage release.
+// The GC does not trace UserData. Prefer pointer-free types; callers that store
+// pointer-bearing values must keep their referents reachable outside UserData.
 func CastUserData[T any](ext *ExtSQE) *T {
 	var zero T
 	if unsafe.Sizeof(zero) > uintptr(len(ext.UserData)) {

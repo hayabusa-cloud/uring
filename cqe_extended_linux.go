@@ -6,21 +6,12 @@
 
 package uring
 
-import (
-	"sync/atomic"
-
-	"code.hybscloud.com/dwcas"
-	"code.hybscloud.com/iofd"
-	"code.hybscloud.com/spin"
-)
+import "code.hybscloud.com/iofd"
 
 // ExtCQE is a compact copied CQE for Extended mode operations.
-// It stores the completion result, CQE flags, and borrowed ExtSQE pointer
-// without mode checking.
+// It stores the completion result, CQE flags, and borrowed ExtSQE pointer.
 //
-// Use WaitExtended when every submitted operation uses Extended mode
-// (PackExtended). That path skips the generic Wait/CQEView mode dispatch per
-// CQE.
+// Use [Uring.WaitExtended] when every submitted operation uses [PackExtended].
 //
 // Layout: 16 bytes on supported 64-bit platforms.
 type ExtCQE struct {
@@ -36,7 +27,8 @@ func (c *ExtCQE) IsSuccess() bool {
 	return cqeIsSuccess(c.Res)
 }
 
-// HasMore reports whether more completions are coming (multishot).
+// HasMore reports IORING_CQE_F_MORE: the request has further completions,
+// including multishot results or a zero-copy notification.
 //
 //go:nosplit
 func (c *ExtCQE) HasMore() bool {
@@ -86,12 +78,9 @@ func (c *ExtCQE) FD() iofd.FD {
 	return iofd.FD(c.Ext.SQE.fd)
 }
 
-// WaitExtended retrieves completion events using the Extended mode fast path.
-// This method skips mode detection since all CQEs are assumed to be
-// from Extended mode submissions (PackExtended).
-//
-// For applications using only Extended mode, this skips the generic mode
-// dispatch that Wait performs per CQE.
+// WaitExtended copies completion events into ExtCQE values containing the
+// result, CQE flags, and borrowed ExtSQE pointer.
+// Use it when every submitted operation uses Extended mode ([PackExtended]).
 //
 // On single-issuer rings it is not safe for concurrent use with submit, Wait,
 // WaitDirect, WaitExtended, Stop, or ResizeRings; caller must serialize those
@@ -100,7 +89,8 @@ func (c *ExtCQE) FD() iofd.FD {
 // to make completions visible.
 // Caller-side completion code must keep completion referents reachable until
 // CQE reap and serialize retirement.
-// For multishot CQEs, return Ext to the pool only after !HasMore().
+// Return Ext to its owning pool only after all request completions, including
+// zero-copy notifications, and borrowed access finish; see [Uring.PutExtSQE].
 // Returns the number of CQEs retrieved, ErrCQOverflow when the ring enters CQ
 // overflow and no CQEs are immediately claimable, or iox.ErrWouldBlock if none
 // are available.
@@ -117,58 +107,26 @@ func (ur *ioUring) waitBatchExtended(cqes []ExtCQE) (int, error) {
 		return 0, nil
 	}
 
-	ur.lockSubmitState()
-	if ur.closed.Load() || ur.cq.kHead == nil || ur.cq.kTail == nil || ur.cq.kRingMask == nil || len(ur.cq.cqes) == 0 {
-		ur.unlockSubmitState()
-		return 0, ErrClosed
+	claim, available, err := ur.claimCQ(len(cqes))
+	if err != nil {
+		return 0, err
 	}
 
-	sw := spin.Wait{}
-	for {
-		h := atomic.LoadUint32(ur.cq.kHead)
-		t := atomic.LoadUint32(ur.cq.kTail)
-		if h == t {
-			if err := ur.observeCQEmptyLocked(); err != nil {
-				ur.unlockSubmitState()
-				return 0, err
-			}
-			continue
+	h, mask := uint32(claim), *ur.cq.kRingMask
+	n := int(available)
+	for i := range n {
+		e := ur.cq.cqeAt((h + uint32(i)) & mask)
+		ctx := SQEContextFromRaw(e.userData)
+		var ext *ExtSQE
+		if ctx.Mode() == CtxModeExtended {
+			ext = ctx.ExtSQE()
 		}
-
-		// Calculate batch size
-		available := t - h
-		want := uint32(len(cqes))
-		if available > want {
-			available = want
+		cqes[i] = ExtCQE{
+			Res:   e.res,
+			Flags: e.flags,
+			Ext:   ext,
 		}
-
-		// Acquire barrier before reading CQE data
-		dwcas.BarrierAcquire()
-
-		// Snapshot before publishing the head advance so copied CQEs cannot race
-		// kernel slot reuse after wrap.
-		mask := *ur.cq.kRingMask
-		n := int(available)
-		for i := range n {
-			e := ur.cq.cqeAt((h + uint32(i)) & mask)
-			ctx := SQEContextFromRaw(e.userData)
-
-			var ext *ExtSQE
-			if ctx.Mode() == CtxModeExtended {
-				ext = ctx.ExtSQE()
-			}
-
-			cqes[i] = ExtCQE{
-				Res:   e.res,
-				Flags: e.flags,
-				Ext:   ext,
-			}
-		}
-		if !atomic.CompareAndSwapUint32(ur.cq.kHead, h, h+available) {
-			sw.Once()
-			continue
-		}
-		ur.unlockSubmitState()
-		return n, nil
 	}
+	ur.publishCQ(claim, available)
+	return n, nil
 }

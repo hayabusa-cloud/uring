@@ -9,6 +9,8 @@ package uring
 import (
 	"math"
 	"unsafe"
+
+	"code.hybscloud.com/iofd"
 )
 
 // Refactored from code.hybscloud.com/sox.
@@ -411,7 +413,6 @@ func (ur *ioUring) close(sqeCtx SQEContext) error {
 		slot.sqe.fd = 0
 		slot.sqe.spliceFdIn = int32(uint32(fileIndex) + 1)
 	}
-	mirrorExtendedSQE(ctx, slot.sqe)
 	ur.publishSubmitSlot(slot, ctx)
 	return nil
 }
@@ -956,10 +957,10 @@ func (ur *ioUring) writevFixed(sqeCtx SQEContext, offset uint64, bufIndices []in
 }
 
 // pipe creates a pipe using io_uring.
-// The fds parameter must point to an int32[2] array where the kernel
+// The fds parameter must point to a [2]iofd.FD array where the kernel
 // will write the read end (fds[0]) and write end (fds[1]) file descriptors.
 // The fd field in sqeCtx is not used.
-func (ur *ioUring) pipe(sqeCtx SQEContext, fds *[2]int32, flags uint32) error {
+func (ur *ioUring) pipe(sqeCtx SQEContext, fds *[2]iofd.FD, flags uint32) error {
 	ctx := sqeCtx.WithOp(IORING_OP_PIPE)
 	slot, err := ur.reserveSubmitSlot()
 	if err != nil {
@@ -1260,7 +1261,6 @@ func (ur *ioUring) nop128(sqeCtx SQEContext) error {
 		flags:  sqeCtx.Flags(),
 		fd:     sqeCtx.FD(),
 	}
-	mirrorExtendedSQE(ctx, slot.sqe)
 	ur.publishSubmitSlot(slot, ctx)
 	return nil
 }
@@ -1291,7 +1291,6 @@ func (ur *ioUring) uringCmd128(sqeCtx SQEContext, cmdOp uint32, cmdData []byte) 
 	if len(cmdData) > 0 {
 		copy(slot.inlineCmdData128(), cmdData)
 	}
-	mirrorExtendedSQE(ctx, slot.sqe)
 	ur.publishSubmitSlot(slot, ctx)
 	return nil
 }

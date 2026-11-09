@@ -14,7 +14,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"sync/atomic"
+	"runtime"
 	"testing"
 	"time"
 	"unsafe"
@@ -50,7 +50,7 @@ func newPollingDirectFilePath(t *testing.T) string {
 		probeErr = errors.Join(probeErr, fmt.Errorf("%s: %w", base, err))
 	}
 
-	t.Skipf("polling direct-I/O file test requires a writable block-backed filesystem; no usable path found in current working directory or /var/tmp; probe errors: %v", probeErr)
+	t.Skipf("polling file test requires O_DIRECT support; no usable path found in current working directory or /var/tmp; probe errors: %v", probeErr)
 	return ""
 }
 
@@ -226,7 +226,12 @@ func TestIOUring_BasicUsage(t *testing.T) {
 				return
 			}
 			if cqe.res < 0 {
-				t.Errorf("write file: %v", errFromErrno(uintptr(-cqe.res)))
+				err := errFromErrno(uintptr(-cqe.res))
+				if err == ErrNotSupported && ur.params.flags&zcall.IORING_SETUP_IOPOLL != 0 {
+					// O_DIRECT support alone does not establish IOPOLL support.
+					t.Skipf("file or device does not support IOPOLL: %v", err)
+				}
+				t.Errorf("write file: %v", err)
 				return
 			}
 			if cqe.res != int32(len(payload)) {
@@ -488,7 +493,7 @@ func TestIoUring_BufferSelect(t *testing.T) {
 	for range 10 {
 		time.Sleep(100 * time.Millisecond)
 		cqe, err := ur.wait()
-		if cqe == nil || err == iox.ErrWouldBlock {
+		if err == iox.ErrWouldBlock {
 			continue
 		}
 		if err != nil {
@@ -824,17 +829,6 @@ func TestUnregisterBuffersWithoutRegistration(t *testing.T) {
 	_ = ring.ioUring.unregisterBuffers()
 }
 
-func TestCqAdvanceZeroIsNoop(t *testing.T) {
-	ring := newStartedSharedTestRing(t)
-
-	headBefore := atomic.LoadUint32(ring.ioUring.cq.kHead)
-	ring.ioUring.cqAdvance(0)
-	headAfter := atomic.LoadUint32(ring.ioUring.cq.kHead)
-	if headAfter != headBefore {
-		t.Fatalf("cqAdvance(0) changed head: %d -> %d", headBefore, headAfter)
-	}
-}
-
 func TestInlineCmdData128(t *testing.T) {
 	ring := newWrapperTestRing(t)
 
@@ -881,62 +875,6 @@ func TestRegisterPollerOnClosedRing(t *testing.T) {
 	_, err = ring.ioUring.registerPoller(nil)
 	if err != ErrClosed {
 		t.Fatalf("registerPoller on closed ring = %v, want %v", err, ErrClosed)
-	}
-}
-
-func TestBufRingCQAdvanceZero(t *testing.T) {
-	ring := newStartedSharedTestRing(t)
-
-	headBefore := atomic.LoadUint32(ring.ioUring.cq.kHead)
-	br := &ioUringBufRing{}
-	ring.ioUring.bufRingCQAdvance(br, 0)
-	headAfter := atomic.LoadUint32(ring.ioUring.cq.kHead)
-	if headAfter != headBefore {
-		t.Fatalf("bufRingCQAdvance(0) changed CQ head: %d -> %d", headBefore, headAfter)
-	}
-	if br.tail != 0 {
-		t.Fatalf("bufRingCQAdvance(0) changed tail: %d", br.tail)
-	}
-}
-
-func TestCqRingAdvanceZero(t *testing.T) {
-	ring := newStartedSharedTestRing(t)
-
-	headBefore := atomic.LoadUint32(ring.ioUring.cq.kHead)
-	ring.ioUring.cq.advance(0)
-	headAfter := atomic.LoadUint32(ring.ioUring.cq.kHead)
-	if headAfter != headBefore {
-		t.Fatalf("cq.advance(0) changed head: %d -> %d", headBefore, headAfter)
-	}
-}
-
-func TestCQReady(t *testing.T) {
-	var head uint32
-	var tail uint32
-	ur := &ioUring{params: &ioUringParams{}, cq: ioUringCq{kHead: &head, kTail: &tail}}
-
-	if ur.cqReady() {
-		t.Fatal("empty CQ reported ready")
-	}
-
-	tail = 1
-	if !ur.cqReady() {
-		t.Fatal("visible CQE was not reported ready")
-	}
-
-	head = 1
-	if ur.cqReady() {
-		t.Fatal("reaped CQ reported ready")
-	}
-}
-
-func TestObserveCQEmptyLockedNonIOPOLL(t *testing.T) {
-	var head uint32
-	var tail uint32
-	ur := &ioUring{params: &ioUringParams{}, cq: ioUringCq{kHead: &head, kTail: &tail}}
-
-	if err := ur.observeCQEmptyLocked(); !errors.Is(err, iox.ErrWouldBlock) {
-		t.Fatalf("observeCQEmptyLocked() = %v, want %v", err, iox.ErrWouldBlock)
 	}
 }
 
@@ -1030,6 +968,45 @@ func newCQStrideTestRing() *ioUring {
 	}
 }
 
+func TestWaitBatchDoesNotNarrowDestinationLengthBeforeMinimum(t *testing.T) {
+	t.Run("generic", func(t *testing.T) {
+		ur := newCQStrideTestRing()
+		*ur.cq.kTail = 1
+		ur.cq.cqes[0] = ioUringCqe{userData: PackDirect(IORING_OP_NOP, 0, 0, 1).Raw(), res: 11}
+		cqes := mappedTestSlice[CQEView](t, oversizedLen32(t))
+
+		n, err := ur.waitBatch(cqes)
+		if err != nil || n != 1 || cqes[0].Res != 11 || *ur.cq.kHead != 1 {
+			t.Fatalf("waitBatch = (n:%d err:%v res:%d head:%d), want (1 nil 11 1)", n, err, cqes[0].Res, *ur.cq.kHead)
+		}
+	})
+
+	t.Run("direct", func(t *testing.T) {
+		ur := newCQStrideTestRing()
+		*ur.cq.kTail = 1
+		ur.cq.cqes[0] = ioUringCqe{userData: PackDirect(IORING_OP_NOP, 0, 0, 1).Raw(), res: 12}
+		cqes := mappedTestSlice[DirectCQE](t, oversizedLen32(t))
+
+		n, err := ur.waitBatchDirect(cqes)
+		if err != nil || n != 1 || cqes[0].Res != 12 || *ur.cq.kHead != 1 {
+			t.Fatalf("waitBatchDirect = (n:%d err:%v res:%d head:%d), want (1 nil 12 1)", n, err, cqes[0].Res, *ur.cq.kHead)
+		}
+	})
+
+	t.Run("extended", func(t *testing.T) {
+		ur := newCQStrideTestRing()
+		*ur.cq.kTail = 1
+		ext := &ExtSQE{}
+		ur.cq.cqes[0] = ioUringCqe{userData: PackExtended(ext).Raw(), res: 13}
+		cqes := mappedTestSlice[ExtCQE](t, oversizedLen32(t))
+
+		n, err := ur.waitBatchExtended(cqes)
+		if err != nil || n != 1 || cqes[0].Res != 13 || cqes[0].Ext != ext || *ur.cq.kHead != 1 {
+			t.Fatalf("waitBatchExtended = (n:%d err:%v res:%d ext:%p head:%d), want (1 nil 13 %p 1)", n, err, cqes[0].Res, cqes[0].Ext, *ur.cq.kHead, ext)
+		}
+	})
+}
+
 func TestWaitUsesCQE32Stride(t *testing.T) {
 	ur := newCQStrideTestRing()
 	ur.cq.cqes[0] = ioUringCqe{userData: PackDirect(IORING_OP_NOP, 0, 0, 1).Raw(), res: 11}
@@ -1052,6 +1029,28 @@ func TestWaitUsesCQE32Stride(t *testing.T) {
 	}
 	if got := SQEContextFromRaw(second.userData).FD(); got != 2 {
 		t.Fatalf("second.userData FD = %d, want 2", got)
+	}
+}
+
+func TestWaitSnapshotsBeforePublishingHead(t *testing.T) {
+	ur := newCQStrideTestRing()
+	*ur.cq.kTail = 1
+	ur.cq.cqes[0] = ioUringCqe{
+		userData: PackDirect(IORING_OP_NOP, 0, 0, 7).Raw(),
+		res:      17,
+		flags:    IORING_CQE_F_MORE,
+	}
+
+	cqe, err := ur.wait()
+	if err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+
+	// Model immediate kernel reuse after the userspace head publication.
+	ur.cq.cqes[0] = ioUringCqe{res: 99}
+	if cqe.res != 17 || cqe.flags != IORING_CQE_F_MORE || SQEContextFromRaw(cqe.userData).FD() != 7 {
+		t.Fatalf("wait snapshot = {res:%d flags:%d fd:%d}, want {17 %d 7}",
+			cqe.res, cqe.flags, SQEContextFromRaw(cqe.userData).FD(), IORING_CQE_F_MORE)
 	}
 }
 
@@ -1120,5 +1119,33 @@ func TestWaitBatchExtendedUsesCQE32Stride(t *testing.T) {
 	}
 	if cqes[1].Ext != ext2 {
 		t.Fatalf("cqes[1].Ext = %p, want %p", cqes[1].Ext, ext2)
+	}
+}
+
+func TestRegisterBuffersAcceptsNonPowerOfTwoCount(t *testing.T) {
+	ur := newTestIoUring(t)
+	const (
+		bufferCount = 3
+		bufferSize  = 1 << 12
+	)
+	buffers := make([]byte, bufferCount*bufferSize)
+	if err := ur.registerBuffers(unsafe.Pointer(unsafe.SliceData(buffers)), bufferCount, bufferSize); err != nil {
+		t.Fatalf("registerBuffers: %v", err)
+	}
+	if err := ur.unregisterBuffers(); err != nil {
+		t.Fatalf("unregisterBuffers: %v", err)
+	}
+	runtime.KeepAlive(buffers)
+}
+
+func TestNewIoUringRejectsEntriesOutsideSetupDomain(t *testing.T) {
+	for _, entries := range []int{-1, 0, EntriesHuge + 1} {
+		ur, err := newIoUring(entries)
+		if ur != nil {
+			t.Fatalf("newIoUring(%d) = non-nil ring, want nil", entries)
+		}
+		if !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("newIoUring(%d) error = %v, want %v", entries, err, ErrInvalidParam)
+		}
 	}
 }

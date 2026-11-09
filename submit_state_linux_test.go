@@ -688,6 +688,40 @@ func TestEpollWaitRejectsTimeoutAndStagesZeroOff(t *testing.T) {
 	}
 }
 
+func TestPublishSubmitSlotMirrorsExtendedSQE(t *testing.T) {
+	ring := newStartedSharedTestRing(t)
+	ext := &ExtSQE{}
+	const fd int32 = 44
+	ctx := PackExtended(ext).WithOp(IORING_OP_POLL_ADD).withFD(fd)
+
+	slot, err := ring.ioUring.reserveSubmitSlot()
+	if err != nil {
+		t.Fatalf("reserveSubmitSlot: %v", err)
+	}
+	slot.fill6(ctx, 7, 11, 22, 33, 44)
+	ring.ioUring.publishSubmitSlot(slot, ctx)
+
+	sqe := ViewExtSQE(ext)
+	if !sqe.Valid() {
+		t.Fatal("extended SQE view is invalid")
+	}
+	if got := sqe.Opcode(); got != IORING_OP_POLL_ADD {
+		t.Fatalf("extended publish opcode = %d, want %d", got, IORING_OP_POLL_ADD)
+	}
+	if got := sqe.RawFD(); got != fd {
+		t.Fatalf("extended publish fd = %d, want %d", got, fd)
+	}
+	if got := sqe.Addr(); got != 22 {
+		t.Fatalf("extended publish addr = %d, want 22", got)
+	}
+	if got := sqe.Len(); got != 33 {
+		t.Fatalf("extended publish len = %d, want 33", got)
+	}
+	if got := sqe.UserData(); got != ctx.Raw() {
+		t.Fatalf("extended publish userData = %#x, want %#x", got, ctx.Raw())
+	}
+}
+
 func TestCloseAfterFatalResizeClosesRingState(t *testing.T) {
 	cause := errors.New("remap failed")
 	ur := &ioUring{

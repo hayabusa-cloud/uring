@@ -20,7 +20,7 @@ Las superficies principales son:
 
 - `Uring`, el handle del ring activo y su conjunto de operaciones
 - `SQEContext`, la identidad de envío transportada en `user_data`
-- `CQEView`, la vista prestada de completado que devuelve `Wait`
+- `CQEView`, el descriptor copiado de completado que devuelve `Wait`
 - provisión de búferes mediante búferes registrados y grupos de búferes de varios tamaños
 
 ## Instalación
@@ -120,7 +120,7 @@ for {
 | `Uring`               | Inicialización del anillo, envío, recolección de completados y métodos de operación                               |
 | `Options`             | Entradas del anillo, presupuesto de búferes registrados, escala de grupos de búferes y visibilidad de completados |
 | `SQEContext`          | Identidad compacta de envío almacenada en `user_data`                                                             |
-| `CQEView`             | Registro prestado de completado con accesores para contexto decodificado                                          |
+| `CQEView`             | Descriptor copiado de completado con accesores decodificados y objetivos prestados según el modo                  |
 | `ListenerOp`          | Manejador de una operación de creación de escucha con FD y auxiliares de accept                                   |
 | `BundleIterator`      | Itera sobre búferes consumidos en una recepción agrupada                                                          |
 | `IncrementalReceiver` | Gestiona recepciones incrementales de buffer-ring (`IOU_PBUF_RING_INC`)                                           |
@@ -178,14 +178,18 @@ Cuando se necesiten metadatos del llamador que no caben en el layout directo de 
 
 ```go
 ext := ring.ExtSQE()
+if ext == nil {
+	return iox.ErrWouldBlock
+}
 meta := uring.CtxV1Of(ext)
 meta.Val1 = requestSeq
 
 sqeCtx := uring.PackExtended(ext)
 fmt.Printf("sqe context mode=%d seq=%d\n", sqeCtx.Mode(), meta.Val1)
+ring.PutExtSQE(ext)
 ```
 
-`NewContextPools` devuelve pools listos para usar. Llame a `Reset` solo después de haber devuelto todos los contextos prestados y cuando desee reutilizar el conjunto de pools.
+`NewContextPools` devuelve pools listos para usar. El agotamiento del pool de contextos es independiente de la capacidad de la cola de envío. Devuelva cada contexto a su pool de origen cuando hayan terminado todas las finalizaciones de la solicitud y todos los accesos al contexto prestado. `Reset` limpia ambos pools e invalida los préstamos pendientes; llámelo solo tras detener todo acceso a los pools y completar las operaciones que usan sus contextos. Después de `Reset`, no acceda a los préstamos anteriores ni los devuelva.
 
 ### Despacho de completados con `CQEView`
 
@@ -226,7 +230,7 @@ for i := 0; i < n; i++ {
 }
 ```
 
-Al completarse la operación, `CQEView` decodifica el modo de contexto correspondiente bajo demanda. `CQEView`, `IndirectSQE`, `ExtSQE` y los búferes prestados no deben sobrevivir más allá de su tiempo de vida documentado.
+Al completarse la operación, `CQEView` decodifica el modo de contexto correspondiente bajo demanda. Su descriptor escalar es una copia; los objetivos de los modos Indirect/Extended y los búferes prestados no deben sobrevivir más allá de su tiempo de vida documentado.
 
 ## Provisión de búferes
 
@@ -310,7 +314,7 @@ La frontera de implementación se define así:
 1. `New` construye un ring del kernel deshabilitado, crea los pools de contexto y elige la estrategia de búferes.
 2. `Start` registra los búferes y habilita el ring para la línea base fija de Linux 6.18+.
 3. Los métodos de operación declaran intención escribiendo SQE.
-4. `Wait` vacía los envíos y devuelve observaciones prestadas de CQE.
+4. `Wait` vacía los envíos y devuelve descriptores CQE copiados.
 5. El código de ejecución del llamador decide planificación, reintentos, espera, enrutamiento de conexión/sesión, retirada de rutas, comprobaciones de seguridad y política terminal de recursos.
 
 De este modo, `code.hybscloud.com/uring` se mantiene centrado en la mecánica frente al kernel y preserva el significado de los completados a través de la frontera.
@@ -400,7 +404,7 @@ for i := range n {
 }
 ```
 
-Cada llamada a `OnStep` observa un `MultishotStep`: devuelva `MultishotContinue` para mantener el flujo activo o `MultishotStop` para solicitar la cancelación. Si las devoluciones de llamada permanecen habilitadas hasta la observación terminal, `OnStop` se ejecuta como máximo una vez con el error final y la bandera `cancelled`; en el propio paso, `step.Cancelled` distingue en el límite el veredicto específico `-ECANCELED` del kernel del resto de fallos. Ambas devoluciones son la proyección del lado del constructor sobre la interfaz `MultishotHandler` (`OnMultishotStep` / `OnMultishotStop`); implemente la interfaz directamente cuando necesite un manejador explícito. `HandleCQE` sirve para el despacho inmediato en el bucle de finalización serializado del llamador; si el código llamador conserva CQE copiadas más allá de ese bucle, debe mantener su propio estado de ruta y rechazar observaciones de suscripciones ya retiradas. En los rings de emisor único predeterminados, llame a `Cancel` / `Unsubscribe` desde el propietario del ring o serialícelos con envío, `Wait`, `WaitDirect`, `WaitExtended`, `Stop` y `ResizeRings`. En rings con `MultiIssuers`, la ruta de envío compartida serializa sus SQE de cancelación.
+Cada llamada a `OnStep` observa un `MultishotStep`: devuelva `MultishotContinue` para mantener el flujo activo o `MultishotStop` para solicitar la cancelación. Si las devoluciones de llamada permanecen habilitadas hasta la observación terminal, `OnStop` se ejecuta como máximo una vez con el error final y la bandera `cancelled`; en el propio paso, `step.Cancelled` distingue en el límite el veredicto específico `-ECANCELED` del kernel del resto de fallos. Ambas devoluciones son la proyección del lado del constructor sobre la interfaz `MultishotHandler` (`OnMultishotStep` / `OnMultishotStop`); implemente la interfaz directamente cuando necesite un manejador explícito. `HandleCQE` sirve para el despacho inmediato en el bucle de finalización serializado del llamador; si el código llamador conserva CQE copiadas más allá de ese bucle, debe mantener su propio estado de ruta y rechazar observaciones de suscripciones ya retiradas. En rings de emisor único explícitos (`MultiIssuers=false`), llame a `Cancel` / `Unsubscribe` desde el propietario fijado a un hilo del sistema operativo y serialícelos con envío, `Wait`, `WaitDirect`, `WaitExtended`, `Stop` y `ResizeRings`. Los rings `MultiIssuers` predeterminados serializan los SQE de cancelación mediante la ruta de envío compartida.
 
 ### Estado por conexión con contextos tipados
 
@@ -408,19 +412,22 @@ Los contextos extendidos transportan referencias por conexión a lo largo del ci
 
 ```go
 type ConnState struct {
-    Addr    netip.AddrPort
-    Created int64
+	Addr    netip.AddrPort
+	Created int64
 }
 
 ext := ring.ExtSQE()
+if ext == nil {
+	return iox.ErrWouldBlock
+}
 ctx := uring.Ctx1V1Of[ConnState](ext)
 ctx.Ref1 = connState
 ctx.Val1 = sequenceNumber
 
 sqeCtx := uring.PackExtended(ext)
 if err := ring.Send(sqeCtx, &fd, payload); err != nil {
-    ring.PutExtSQE(ext)
-    return err
+	ring.PutExtSQE(ext)
+	return err
 }
 ```
 
@@ -578,9 +585,9 @@ A nivel de paquete, `listener_example_test.go` cubre la creación de escuchas co
 
 - Active `NotifySucceed` cuando necesite un CQE visible por cada operación exitosa.
 - `ring.Features` informa de las entradas reales de SQ y CQ, el ancho de la ranura SQE y el orden de bytes que usa este paquete al interpretar `user_data`.
-- Deje `MultiIssuers` desactivado en la configuración predeterminada de emisor único (`SINGLE_ISSUER` + `DEFER_TASKRUN`), en la que una sola ruta de ejecución del llamador serializa las operaciones de estado de envío (`submit`, `Wait`, `WaitDirect`, `WaitExtended`, `Stop` y `ResizeRings`). Actívelo solo cuando varios goroutines necesiten envío concurrente o llamadas concurrentes a `Wait`, `WaitDirect` o `WaitExtended`; esto conmuta el ring a la configuración de envío compartido con `COOP_TASKRUN`.
+- Mantenga la configuración predeterminada `MultiIssuers=true`, migrable entre tareas (`COOP_TASKRUN`), para la ejecución ordinaria en Go y las llamadas concurrentes al estado de envío. Use `MultiIssuers=false` solo si el propietario llama a `runtime.LockOSThread` antes de `New`, permanece fijado hasta `Stop` y serializa `submit`, `Wait`, `WaitDirect`, `WaitExtended`, `Stop` y `ResizeRings`; esa ruta rápida explícita solicita `SINGLE_ISSUER` + `DEFER_TASKRUN`.
 - `EpollWait` requiere que `timeout` sea `0`; use `LinkTimeout` cuando necesite un plazo.
-- Las vistas prestadas de completado y los contextos en pool deben liberarse o descartarse con prontitud.
+- Los objetivos prestados de completado y los contextos en pool deben devolverse con prontitud.
 - `ListenerOp.Close` cierra el FD del escucha de inmediato. Si aún hay un CQE de configuración pendiente, drene ese CQE y vuelva a llamar a `Close` para devolver el `ExtSQE` prestado al pool.
 
 ## Soporte de plataforma

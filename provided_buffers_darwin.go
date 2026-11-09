@@ -16,6 +16,7 @@ import (
 type uringProvideBuffers struct {
 	mem       []byte
 	size      int
+	gn        int
 	n         int
 	gidOffset uint16
 	gMask     int
@@ -23,15 +24,24 @@ type uringProvideBuffers struct {
 }
 
 func newUringProvideBuffers(size, n int) *uringProvideBuffers {
-	if size < 1 || n < 1 {
-		panic("uring: size and n must be positive")
+	if size < providedBufferValueMin || size > providedBufferValueMax {
+		panic("uring: size must be between 2 and 268435456")
 	}
+	if n < providedBufferValueMin || n > providedBufferValueMax {
+		panic("uring: n must be between 2 and 268435456")
+	}
+	size = roundToPowerOf2(size)
 	n = roundToPowerOf2(n)
+	gn := 1
+	if n > providedBufferGroupEntries {
+		gn, n = n/providedBufferGroupEntries, providedBufferGroupEntries
+	}
 
 	return &uringProvideBuffers{
 		size:  size,
+		gn:    gn,
 		n:     n,
-		gMask: n - 1,
+		gMask: gn - 1,
 	}
 }
 
@@ -40,13 +50,13 @@ func (g *uringProvideBuffers) setGIDOffset(offset int) {
 }
 
 func (g *uringProvideBuffers) register(_ *ioUring, _ uint8) error {
-	g.mem = iobuf.AlignedMem(g.size*g.n, iobuf.PageSize)
+	g.mem = iobuf.AlignedMem(g.size*g.n*g.gn, iobuf.PageSize)
 	g.ptr = unsafe.Pointer(unsafe.SliceData(g.mem))
 	return nil
 }
 
 func (g *uringProvideBuffers) provide(_ *ioUring, _ uint8, _ uint16, index uint16, n int) error {
-	if g.ptr == nil || len(g.mem) != g.size*g.n {
+	if g.ptr == nil || len(g.mem) != g.size*g.n*g.gn {
 		return ErrInvalidParam
 	}
 	if int(index) >= g.n || n < 0 || n > g.size {
@@ -65,7 +75,7 @@ func (g *uringProvideBuffers) bufGroup(f PollFd) uint16 {
 
 func (g *uringProvideBuffers) buf(bufGroup bufferGroupIndex, bufIndex uint32) []byte {
 	i := (int(bufGroup)-int(g.gidOffset))*g.n + int(bufIndex)
-	if i < 0 || i >= g.n {
+	if i < 0 || i >= g.n*g.gn {
 		return nil
 	}
 	return unsafe.Slice((*byte)(unsafe.Add(g.ptr, g.size*i)), g.size)
@@ -90,7 +100,7 @@ func newUringBufferGroups(scale int) *uringProvideBufferGroups {
 }
 
 func newUringBufferGroupsWithConfig(scale int, cfg BufferGroupsConfig) *uringProvideBufferGroups {
-	if scale < 1 || scale > (1<<12) {
+	if scale < 1 || scale > multiSizeBufferScaleMax {
 		panic("uring: scale must be between 1 and 4096")
 	}
 	scale = roundToPowerOf2(scale)

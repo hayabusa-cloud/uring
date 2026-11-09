@@ -21,7 +21,8 @@ type ExtCQE struct {
 // IsSuccess reports whether the operation completed successfully.
 func (c *ExtCQE) IsSuccess() bool { return cqeIsSuccess(c.Res) }
 
-// HasMore reports whether more completions are coming (multishot).
+// HasMore reports IORING_CQE_F_MORE: the request has further completions,
+// including multishot results or a zero-copy notification.
 func (c *ExtCQE) HasMore() bool { return cqeHasMore(c.Flags) }
 
 // HasBuffer reports whether a buffer ID is available.
@@ -43,9 +44,11 @@ func (c *ExtCQE) Op() uint8 { return c.Ext.SQE.opcode }
 // FD returns the file descriptor from the stored SQE.
 func (c *ExtCQE) FD() iofd.FD { return iofd.FD(c.Ext.SQE.fd) }
 
-// WaitExtended retrieves completion events using the Extended mode fast path (darwin stub).
+// WaitExtended copies completion events into ExtCQE values (Darwin stub).
 // On single-issuer rings it is not safe for concurrent use with submit, Wait,
 // WaitDirect, WaitExtended, or Stop; caller must serialize those operations.
+// Return Ext to its owning pool only after all request completions, including
+// zero-copy notifications, and borrowed access finish; see [Uring.PutExtSQE].
 func (ur *Uring) WaitExtended(cqes []ExtCQE) (int, error) {
 	if err := ur.ioUring.enter(); err != nil {
 		return 0, err

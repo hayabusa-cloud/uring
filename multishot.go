@@ -126,10 +126,10 @@ const (
 // Thread Safety:
 // `Cancel` and `Unsubscribe` are safe for the subscription state itself, but
 // cancel submission follows the ring's submit-state serialization contract. On
-// default single-issuer rings, call them from the ring owner or otherwise
-// serialize them with submit, Wait, WaitDirect, WaitExtended, Stop, and
-// ResizeRings. On MultiIssuers rings, the shared-submit lock serializes the
-// cancel SQE.
+// explicit single-issuer rings (MultiIssuers is false), call them from the
+// OS-thread-pinned ring owner and serialize them with submit, Wait, WaitDirect,
+// WaitExtended, Stop, and ResizeRings. On default MultiIssuers rings, the
+// shared-submit lock serializes the cancel SQE.
 // Observer callbacks run on the goroutine that dispatches the CQE, usually `Wait`.
 type MultishotSubscription struct {
 	ring         *Uring
@@ -143,10 +143,10 @@ type MultishotSubscription struct {
 
 // Cancel asks the kernel to stop this multishot operation. The subscription
 // remains live until a terminal CQE arrives. Cancel follows the ring's
-// submit-state serialization contract: on default single-issuer rings, call it
-// from the ring owner or otherwise serialize it with submit, Wait, WaitDirect,
-// WaitExtended, Stop, and ResizeRings; on MultiIssuers rings, the
-// shared-submit lock serializes the cancel SQE.
+// submit-state serialization contract: on explicit single-issuer rings, call
+// it from the OS-thread-pinned ring owner and serialize it with submit, Wait,
+// WaitDirect, WaitExtended, Stop, and ResizeRings; on default MultiIssuers
+// rings, the shared-submit lock serializes the cancel SQE.
 // It is safe to call more than once.
 //
 // If callbacks remain enabled, later CQEs may still deliver `OnMultishotStep`

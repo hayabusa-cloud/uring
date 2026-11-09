@@ -20,7 +20,7 @@ Go で Linux 6.18+ の `io_uring` カーネル境界を扱うパッケージ。
 
 - `Uring`: リングハンドルと操作メソッド群
 - `SQEContext`: `user_data` で運ばれる発行元識別子
-- `CQEView`: `Wait` が返す完了結果の借用ビュー
+- `CQEView`: `Wait` が返すコピー済み完了記述子
 - 登録バッファおよびマルチサイズ buffer group によるバッファ供給
 
 ## インストール
@@ -120,7 +120,7 @@ for {
 | `Uring`               | リングの初期化・発行・完了回収と操作メソッド                          |
 | `Options`             | リングエントリ数、登録バッファ予算、buffer group スケール、完了の可視性      |
 | `SQEContext`          | `user_data` に格納されるコンパクトな発行元識別子                  |
-| `CQEView`             | デコード済みコンテキストアクセサを持つ完了レコードの借用ビュー                 |
+| `CQEView`             | デコード済みアクセサを持つコピー済み完了記述子。モード依存の参照先は借用       |
 | `ListenerOp`          | リスナー作成操作のハンドル。FD の保持と accept ヘルパーを提供            |
 | `BundleIterator`      | バンドル受信で消費されたバッファの走査                             |
 | `IncrementalReceiver` | インクリメンタル buffer-ring 受信の管理（`IOU_PBUF_RING_INC`） |
@@ -178,14 +178,18 @@ direct の 64 ビット配置に収まらない独自メタデータが必要な
 
 ```go
 ext := ring.ExtSQE()
+if ext == nil {
+	return iox.ErrWouldBlock
+}
 meta := uring.CtxV1Of(ext)
 meta.Val1 = requestSeq
 
 sqeCtx := uring.PackExtended(ext)
 fmt.Printf("sqe context mode=%d seq=%d\n", sqeCtx.Mode(), meta.Val1)
+ring.PutExtSQE(ext)
 ```
 
-`NewContextPools` はすぐに使えるプールを返します。`Reset` は、借用中のコンテキストをすべて返却し終えたあとにプールを再利用する場合にのみ呼び出してください。
+`NewContextPools` はすぐに使えるプールを返します。コンテキストプールの枯渇とサブミッションキューの容量は独立しています。リクエストのすべての完了処理と借用参照へのアクセスを終えてから、コンテキストを借用元のプールへ返却してください。`Reset` は両方のプールをクリアし、未返却の借用を無効にします。プールへのすべてのアクセスを停止し、そのコンテキストを使う操作が完了してから呼び出してください。`Reset` 後に以前の借用へアクセスしたり、返却したりしてはいけません。
 
 ### `CQEView` による完了ディスパッチ
 
@@ -226,7 +230,7 @@ for i := 0; i < n; i++ {
 }
 ```
 
-完了時、`CQEView` は対応するコンテキストモードをオンデマンドでデコードします。`CQEView`、`IndirectSQE`、`ExtSQE`、借用バッファは、それぞれ定められたライフタイムを超えて保持しないでください。
+完了時、`CQEView` は対応するコンテキストモードをオンデマンドでデコードします。そのスカラー記述子はコピーされます。Indirect/Extended モードの参照先と借用バッファは、それぞれ定められたライフタイムを超えて保持しないでください。
 
 ## バッファ供給
 
@@ -310,7 +314,7 @@ CQE のルーティング方針はパッケージ外に委ねています。リ�
 1. `New`: 無効状態のカーネルリングを構築し、コンテキストプールを確保し、バッファ戦略を決定する。
 2. `Start`: バッファを登録し、Linux 6.18+ ベースライン向けにリングを有効化する。
 3. 操作メソッド: SQE を書き込んで操作の意図を発行する。
-4. `Wait`: 未送信分をフラッシュし、借用された CQE 完了結果を返す。
+4. `Wait`: 未送信分をフラッシュし、コピー済み CQE 記述子を返す。
 5. 呼び出し側ランタイムコード: スケジューリング、リトライ、待機、コネクションとセッションのルーティング、ルートの終了処理、安全性チェック、終端時のリソース方針を担う。
 
 この構造により、`code.hybscloud.com/uring` はカーネル境界の機構に専念しつつ、境界を越えた完了結果の意味を保持します。
@@ -400,7 +404,7 @@ for i := range n {
 }
 ```
 
-`OnStep` コールバックは 1 件の `MultishotStep` を観察します。ストリームを維持するなら `MultishotContinue` を、キャンセルを要求するなら `MultishotStop` を返します。コールバックが終端観察まで有効なままなら、`OnStop` は最終エラーと `cancelled` フラグを伴って高々一度だけ実行されます。ステップ自身の `step.Cancelled` は、境界上でカーネルが `-ECANCELED` を返した判定をその他の失敗と明示的に区別します。両コールバックは `MultishotHandler` インタフェース（`OnMultishotStep` / `OnMultishotStop`）のビルダー側射影です。明示的なハンドラを書く場合はこのインタフェースを直接実装してください。`HandleCQE` は呼び出し側の直列化された完了ループ内で即時 dispatch するための補助です。コピー済み CQE をそのループの後も保持する場合、呼び出し側が独自の route state を保持し、すでに解放されたサブスクリプションの観察を拒否してください。既定の単一発行者リングでは、`Cancel` / `Unsubscribe` はリング所有者から呼び出すか、発行、`Wait`、`WaitDirect`、`WaitExtended`、`Stop`、`ResizeRings` と直列化してください。`MultiIssuers` リングでは、共有発行パスがこれらのキャンセル SQE を直列化します。
+`OnStep` コールバックは 1 件の `MultishotStep` を観察します。ストリームを維持するなら `MultishotContinue` を、キャンセルを要求するなら `MultishotStop` を返します。コールバックが終端観察まで有効なままなら、`OnStop` は最終エラーと `cancelled` フラグを伴って高々一度だけ実行されます。ステップ自身の `step.Cancelled` は、境界上でカーネルが `-ECANCELED` を返した判定をその他の失敗と明示的に区別します。両コールバックは `MultishotHandler` インタフェース（`OnMultishotStep` / `OnMultishotStop`）のビルダー側射影です。明示的なハンドラを書く場合はこのインタフェースを直接実装してください。`HandleCQE` は呼び出し側の直列化された完了ループ内で即時 dispatch するための補助です。コピー済み CQE をそのループの後も保持する場合、呼び出し側が独自の route state を保持し、すでに解放されたサブスクリプションの観察を拒否してください。明示的な単一発行者リング（`MultiIssuers=false`）では、OS スレッドに固定したリング所有者から `Cancel` / `Unsubscribe` を呼び、発行、`Wait`、`WaitDirect`、`WaitExtended`、`Stop`、`ResizeRings` と直列化してください。デフォルトの `MultiIssuers` リングでは、共有発行パスがキャンセル SQE を直列化します。
 
 ### 型付きコンテキストによるコネクション状態
 
@@ -408,19 +412,22 @@ for i := range n {
 
 ```go
 type ConnState struct {
-    Addr    netip.AddrPort
-    Created int64
+	Addr    netip.AddrPort
+	Created int64
 }
 
 ext := ring.ExtSQE()
+if ext == nil {
+	return iox.ErrWouldBlock
+}
 ctx := uring.Ctx1V1Of[ConnState](ext)
 ctx.Ref1 = connState
 ctx.Val1 = sequenceNumber
 
 sqeCtx := uring.PackExtended(ext)
 if err := ring.Send(sqeCtx, &fd, payload); err != nil {
-    ring.PutExtSQE(ext)
-    return err
+	ring.PutExtSQE(ext)
+	return err
 }
 ```
 
@@ -578,9 +585,9 @@ Idle → Active → Stopping → Retiring → Stopped
 
 - すべての成功操作に可視の CQE が必要な場合は `NotifySucceed` を有効にする。
 - `ring.Features` は実際の SQ エントリ数・CQ エントリ数・SQE スロット幅・`user_data` 解釈時のバイト順を返す。
-- 既定では `MultiIssuers` を無効のまま、単一発行者構成（`SINGLE_ISSUER` + `DEFER_TASKRUN`）を使用する。この構成では、呼び出し側が 1 つの実行パスで発行状態操作（`submit`、`Wait`、`WaitDirect`、`WaitExtended`、`Stop`、`ResizeRings`）を直列化する。複数 goroutine から並行して発行または `Wait`、`WaitDirect`、`WaitExtended` 呼び出しを行う必要がある場合にのみ `MultiIssuers` を有効にし、`COOP_TASKRUN` 構成に切り替える。
+- 通常の Go 実行および発行状態の並行呼び出しでは、デフォルトのタスク移動可能な `MultiIssuers=true` 構成（`COOP_TASKRUN`）を維持します。`MultiIssuers=false` は、所有者が `New` より前に `runtime.LockOSThread` を呼び、`Stop` まで固定されたまま、`submit`、`Wait`、`WaitDirect`、`WaitExtended`、`Stop`、`ResizeRings` を直列化する場合に限って使用します。この明示的な高速パスは `SINGLE_ISSUER` + `DEFER_TASKRUN` を要求します。
 - `EpollWait` の `timeout` は `0` のままにすること。期限が必要な場合は `LinkTimeout` を使う。
-- 借用中の完了ビューやプール由来のコンテキストは速やかに解放すること。
+- 借用中の完了参照先やプール由来のコンテキストは速やかに返却すること。
 - `ListenerOp.Close` はリスナー FD を即座に閉じる。構築中の CQE が未回収の場合は、その CQE を回収してから再度 `Close` を呼び出し、借用中の `ExtSQE` をプールに返却する。
 
 ## 対応プラットフォーム

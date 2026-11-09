@@ -24,7 +24,8 @@ type DirectCQE struct {
 // IsSuccess reports whether the operation completed successfully.
 func (c *DirectCQE) IsSuccess() bool { return cqeIsSuccess(c.Res) }
 
-// HasMore reports whether more completions are coming (multishot).
+// HasMore reports IORING_CQE_F_MORE: the request has further completions,
+// including multishot results or a zero-copy notification.
 func (c *DirectCQE) HasMore() bool { return cqeHasMore(c.Flags) }
 
 // HasBuffer reports whether a buffer ID is available.
@@ -37,7 +38,7 @@ func (c *DirectCQE) BufID() uint16 { return cqeBufID(c.Flags) }
 // IsNotification reports whether this is a zero-copy notification CQE.
 func (c *DirectCQE) IsNotification() bool { return cqeIsNotification(c.Flags) }
 
-// WaitDirect retrieves completion events using the Direct mode fast path (darwin stub).
+// WaitDirect copies completion events into DirectCQE values (Darwin stub).
 // On single-issuer rings it is not safe for concurrent use with submit, Wait,
 // WaitDirect, WaitExtended, or Stop; caller must serialize those operations.
 func (ur *Uring) WaitDirect(cqes []DirectCQE) (int, error) {

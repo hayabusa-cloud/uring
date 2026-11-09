@@ -89,8 +89,9 @@
 //	}
 //
 //	// Cancel when done
-//	// On single-issuer rings, call Cancel from the ring owner or otherwise
-//	// serialize it with submit, Wait, WaitDirect, WaitExtended, Stop, and ResizeRings.
+//	// On explicit single-issuer rings, call Cancel from the OS-thread-pinned
+//	// ring owner and serialize it with submit, Wait, WaitDirect,
+//	// WaitExtended, Stop, and ResizeRings.
 //	if err := sub.Cancel(); err != nil {
 //	    return err
 //	}
@@ -189,8 +190,8 @@
 // `IORING_CQE_F_MORE`. The package keeps the submitted ExtSQE and encoded
 // `user_data` associated with the subscription, and returns the ExtSQE to its
 // pool only after handling a CQE without `HasMore()`. Caller-side runtime code
-// should treat intermediate CQEs as progress for the live subscription and the
-// final CQE as the point where the subscription can be retired.
+// must inspect each result independently of MORE: a live frontier does not
+// imply byte progress or success. The final CQE permits subscription retirement.
 //
 // # Runtime Boundary
 //
@@ -342,9 +343,11 @@
 //
 // # Memory Barriers
 //
-// The package uses [dwcas.BarrierAcquire] and [dwcas.BarrierRelease] for SQ/CQ ring
-// synchronization. On amd64 (TSO), these are compiler barriers. On arm64, they
-// emit DMB ISHLD/ISHST instructions. User code does not manage these barriers.
+// Completion reads acquire the kernel's published tail through Go atomics.
+// Shared consumers claim the CQ copy with CAS and [spin.Wait], copy CQEs, and
+// publish the head before admitting the next consumer. Submission and buffer
+// publication also use [dwcas.BarrierRelease].
+// User code does not manage these barriers.
 //
 // # Dependencies
 //

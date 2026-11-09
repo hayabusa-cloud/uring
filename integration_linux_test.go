@@ -12,12 +12,14 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
 
+	"code.hybscloud.com/iofd"
 	"code.hybscloud.com/iox"
 	"code.hybscloud.com/sock"
 	"code.hybscloud.com/uring"
@@ -273,8 +275,7 @@ func TestTimeoutRemove(t *testing.T) {
 	for time.Now().Before(deadline) && (!timeoutRemoved || !timeoutCanceled) {
 		n, err := ring.Wait(cqes)
 		if err != nil &&
-			!errors.Is(err, iox.ErrWouldBlock) &&
-			!errors.Is(err, uring.ErrExists) {
+			!errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait: %v", err)
 		}
 		for i := 0; i < n; i++ {
@@ -328,8 +329,7 @@ func TestUringLinkTimeoutCycle(t *testing.T) {
 	for time.Now().Before(deadline) && (!nopDone || !timeoutDone) {
 		n, err := ring.Wait(cqes)
 		if err != nil &&
-			!errors.Is(err, iox.ErrWouldBlock) &&
-			!errors.Is(err, uring.ErrExists) {
+			!errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait: %v", err)
 		}
 		for i := 0; i < n; i++ {
@@ -752,7 +752,7 @@ func TestUringPipe(t *testing.T) {
 	mustStartRing(t, ring)
 
 	// Buffer for the two file descriptors (read end, write end)
-	var fds [2]int32
+	var fds [2]iofd.FD
 
 	ctx := uring.PackDirect(uring.IORING_OP_PIPE, 0, 0, 0)
 	if err := ring.Pipe(ctx, &fds, 0); err != nil {
@@ -1282,7 +1282,7 @@ func TestConnectWithDirectSocket(t *testing.T) {
 	acceptDone := false
 	for time.Now().Before(deadline) && (!connectDone || !acceptDone) {
 		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait: %v", err)
 		}
 		if n > 0 {
@@ -1511,7 +1511,7 @@ func TestMsgRingSelf(t *testing.T) {
 
 	for time.Now().Before(deadline) && (!sendCompleted || !recvCompleted) {
 		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait: %v", err)
 		}
 		for i := 0; i < n; i++ {
@@ -1588,7 +1588,7 @@ func TestMsgRing(t *testing.T) {
 
 	for time.Now().Before(deadline) && !srcDone {
 		n, err := srcRing.Wait(srcCQEs)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait (source): %v", err)
 		}
 		for i := 0; i < n; i++ {
@@ -1619,7 +1619,7 @@ func TestMsgRing(t *testing.T) {
 
 	for time.Now().Before(deadline) && !dstDone {
 		n, err := dstRing.Wait(dstCQEs)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait (target): %v", err)
 		}
 		for i := 0; i < n; i++ {
@@ -1706,7 +1706,7 @@ func TestMsgRingFD(t *testing.T) {
 
 	for time.Now().Before(deadline) && !srcDone {
 		n, err := srcRing.Wait(srcCQEs)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait (source): %v", err)
 		}
 		for i := 0; i < n; i++ {
@@ -1739,7 +1739,7 @@ func TestMsgRingFD(t *testing.T) {
 
 	for time.Now().Before(deadline) && !dstDone {
 		n, err := dstRing.Wait(dstCQEs)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait (target): %v", err)
 		}
 		for i := 0; i < n; i++ {
@@ -1960,7 +1960,7 @@ func TestAsyncCancel(t *testing.T) {
 
 	for (!gotTimeout || !gotCancel) && time.Now().Before(deadline) {
 		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait: %v", err)
 		}
 		for i := range n {
@@ -2162,7 +2162,7 @@ func TestPollAddMultishot(t *testing.T) {
 		b := iox.Backoff{}
 		for time.Now().Before(deadline) {
 			n, err := ring.Wait(cqes)
-			if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+			if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 				t.Fatalf("Wait: %v", err)
 			}
 			for j := range n {
@@ -2306,7 +2306,7 @@ func TestPollUpdate(t *testing.T) {
 	for time.Now().Before(deadline) {
 		n, err = ring.Wait(cqes)
 		if err != nil {
-			if errors.Is(err, iox.ErrWouldBlock) || errors.Is(err, uring.ErrExists) {
+			if errors.Is(err, iox.ErrWouldBlock) {
 				b.Wait()
 				continue
 			}
@@ -3235,5 +3235,40 @@ func BenchmarkUringNopCycle(b *testing.B) {
 				break
 			}
 		}
+	}
+}
+
+func TestSingleIssuerWrongTaskWaitReturnsErrExists(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping io_uring task-identity test in short mode")
+	}
+
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
+	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
+		opt.MultiIssuers = false
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	mustStartRing(t, ring)
+
+	waitErr := make(chan error, 1)
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+
+		_, err := ring.Wait(make([]uring.CQEView, 1))
+		waitErr <- err
+	}()
+
+	select {
+	case err := <-waitErr:
+		if !errors.Is(err, uring.ErrExists) {
+			t.Fatalf("wrong-task Wait error = %v, want %v", err, uring.ErrExists)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("wrong-task Wait did not return")
 	}
 }

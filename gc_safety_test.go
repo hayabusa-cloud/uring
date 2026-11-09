@@ -276,7 +276,7 @@ func submitAndRetireZCProbe(t *testing.T, ring *uring.Uring, pool *uring.Context
 	retired := false
 	for time.Now().Before(deadline) {
 		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) && !errors.Is(err, uring.ErrExists) {
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait: %v", err)
 		}
 		for i := 0; i < n; i++ {
