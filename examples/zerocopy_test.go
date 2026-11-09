@@ -7,8 +7,11 @@
 package examples_test
 
 import (
+	"bytes"
 	"errors"
+	"io"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -107,39 +110,32 @@ func TestZCTrackerBasic(t *testing.T) {
 	cqes := make([]uring.CQEView, 16)
 	deadline := time.Now().Add(2 * time.Second)
 	b := iox.Backoff{}
-	completionsSeen := 0
+	// Release can follow one terminal data CQE or a data/notification pair.
 
-	for completionsSeen < 2 && time.Now().Before(deadline) {
+	for len(handler.notificationCh) == 0 && time.Now().Before(deadline) {
 		n, err := ring.Wait(cqes)
 		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait: %v", err)
 		}
+		if n == 0 {
+			b.Wait()
+			continue
+		}
+		b.Reset()
 		for i := range n {
-			if tracker.HandleCQE(cqes[i]) {
-				completionsSeen++
+			if !tracker.HandleCQE(cqes[i]) {
+				t.Fatal("unhandled zero-copy completion")
 			}
 		}
-		if completionsSeen < 2 {
-			b.Wait()
-		}
 	}
 
-	select {
-	case result := <-handler.completedCh:
-		if result < 0 {
-			t.Logf("ZC send result: %d (may be EOPNOTSUPP on loopback)", result)
-		} else {
-			t.Logf("OnCompleted: %d bytes sent", result)
-		}
-	case <-time.After(100 * time.Millisecond):
-		t.Log("OnCompleted not received (expected on loopback)")
+	runtime.KeepAlive(testData)
+	if len(handler.completedCh) != 1 || len(handler.notificationCh) != 1 {
+		t.Fatal("missing zero-copy completion or release callback")
 	}
-
-	select {
-	case result := <-handler.notificationCh:
-		t.Logf("OnNotification: result=%d, buffer can be reused", result)
-	case <-time.After(100 * time.Millisecond):
-		t.Log("OnNotification not received (expected on loopback)")
+	result, releasedResult := <-handler.completedCh, <-handler.notificationCh
+	if result < 0 || result != releasedResult {
+		t.Fatalf("completion=%d release=%d", result, releasedResult)
 	}
 
 	serverConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
@@ -177,7 +173,7 @@ func (h *testZCHandler) OnNotification(result int32) {
 // Architecture:
 //   - Registered buffers are pre-pinned in kernel memory (no per-call pinning)
 //   - MulticastZeroCopy sends to N targets efficiently
-//   - Adaptive threshold decides ZC vs regular send based on payload size
+//   - MulticastZeroCopy chooses copy or zero-copy by payload size and fanout
 //   - Notification-path zero-copy can emit one data CQE plus one notification
 //     CQE per target; terminal data CQEs without MORE use the fallback path
 //
@@ -186,6 +182,7 @@ func TestMulticastZeroCopy(t *testing.T) {
 	ring, err := uring.New(
 		func(opts *uring.Options) {
 			opts.LockedBufferMem = 1 << 20
+			opts.NotifySucceed = true // Observe ordinary sends used for any unsent suffix.
 		},
 		func(opts *uring.Options) {
 			opts.Entries = uring.EntriesMedium
@@ -264,59 +261,89 @@ func TestMulticastZeroCopy(t *testing.T) {
 	copy(buf, message)
 
 	targets := &fdSliceTargets{fds: serverFDs}
-	ctx := uring.PackDirect(uring.IORING_OP_SEND_ZC, 0, 0, 0)
+	ctx := uring.ForFD(0)
 
-	err = ring.MulticastZeroCopy(ctx, targets, bufIndex, 0, messageSize)
-	if err != nil {
-		t.Fatalf("MulticastZeroCopy: %v", err)
+	accepted, submitErr := ring.MulticastZeroCopy(ctx, targets, bufIndex, 0, messageSize)
+	// Even a partial submission leaves the accepted prefix borrowing the buffer.
+	var states [numClients]struct {
+		data, more, notification, released bool
+		result                             int32
 	}
-
+	remaining := accepted
 	cqes := make([]uring.CQEView, 32)
-	completions := 0
 	deadline := time.Now().Add(3 * time.Second)
 	b := iox.Backoff{}
-
-	for completions < numClients && time.Now().Before(deadline) {
+	for remaining > 0 && time.Now().Before(deadline) {
 		n, err := ring.Wait(cqes)
 		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait: %v", err)
 		}
-		completions += n
-		if completions < numClients {
+		if n == 0 {
 			b.Wait()
-		}
-	}
-
-	t.Logf("Multicast to %d targets completed with %d CQEs", numClients, completions)
-
-	if completions == 0 {
-		t.Skip("MulticastZeroCopy not working on this platform (no CQEs received)")
-	}
-
-	// Verify data was actually received by clients
-	// On some platforms (e.g., WSL2), CQEs complete but data isn't sent
-	successCount := 0
-	for i, conn := range clientConns {
-		conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-		recvBuf := make([]byte, messageSize+100)
-		n, err := conn.Read(recvBuf)
-		if err != nil {
-			t.Logf("Client %d read: %v", i, err)
 			continue
 		}
-		if n != messageSize {
-			t.Logf("Client %d: got %d bytes, want %d", i, n, messageSize)
-		} else {
-			successCount++
+		b.Reset()
+		for _, cqe := range cqes[:n] {
+			if cqe.Op() != uring.IORING_OP_SEND_ZC && cqe.Op() != uring.IORING_OP_SEND {
+				t.Fatalf("unexpected opcode %d", cqe.Op())
+			}
+			i := 0
+			for i < accepted && serverFDs[i] != int32(cqe.FD()) {
+				i++
+			}
+			if i == accepted {
+				t.Fatalf("unknown target %d", cqe.FD())
+			}
+			state := &states[i]
+			if cqe.IsNotification() {
+				if state.notification {
+					t.Fatal("duplicate notification")
+				}
+				state.notification = true
+			} else {
+				if state.data {
+					t.Fatal("duplicate data completion")
+				}
+				state.data, state.more, state.result = true, cqe.HasMore(), cqe.Res
+			}
+			if !state.released && state.data && (!state.more || state.notification) {
+				state.released = true
+				remaining--
+			}
 		}
 	}
-
-	if successCount == 0 {
-		t.Skip("MulticastZeroCopy CQEs received but no data sent (platform limitation)")
+	if remaining != 0 {
+		t.Fatalf("%d targets still borrow the registered buffer", remaining)
 	}
-
-	if successCount != numClients {
-		t.Errorf("Only %d/%d clients received data", successCount, numClients)
+	if submitErr != nil || accepted != numClients {
+		t.Fatalf("accepted=%d err=%v", accepted, submitErr)
+	}
+	for i, conn := range clientConns {
+		sent := int(states[i].result)
+		if sent < 0 || sent > messageSize {
+			t.Fatalf("target %d: result=%d", i, sent)
+		}
+		// Admission counts targets, not bytes. Resume this target's suffix only.
+		for sent < messageSize {
+			if err := ring.SendFD(uring.ForFD(serverFDs[i]), iofd.FD(serverFDs[i]), buf[sent:messageSize]); err != nil {
+				t.Fatal(err)
+			}
+			cqe, ok := waitForOp(t, ring, uring.IORING_OP_SEND, time.Second)
+			if !ok || cqe.Res <= 0 || int(cqe.Res) > messageSize-sent {
+				t.Fatalf("suffix send: received=%v result=%d", ok, cqe.Res)
+			}
+			sent += int(cqe.Res)
+		}
+		if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		received := make([]byte, messageSize)
+		if _, err := io.ReadFull(conn, received); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(received, message) {
+			t.Fatalf("target %d: payload mismatch", i)
+		}
 	}
 
 	for _, fd := range serverFDs {
@@ -334,61 +361,6 @@ func (t *fdSliceTargets) Count() int {
 
 func (t *fdSliceTargets) FD(i int) iofd.FD {
 	return iofd.FD(t.fds[i])
-}
-
-// TestZeroCopyThresholds demonstrates how MulticastZeroCopy uses
-// adaptive thresholds to decide between zero-copy and regular sends.
-//
-// Threshold logic:
-//   - N >= 256 targets: any size (fully amortized)
-//   - N >= 64 targets:  128 bytes minimum
-//   - N >= 16 targets:  512 bytes minimum
-//   - N >= 4 targets:   1024 bytes minimum
-//   - N < 4 targets:    1536 bytes minimum
-func TestZeroCopyThresholds(t *testing.T) {
-	testCases := []struct {
-		numTargets int
-		msgSize    int
-		desc       string
-	}{
-		{2, 2048, "2 targets, 2KB - uses ZC (above 1.5KB threshold)"},
-		{2, 1024, "2 targets, 1KB - uses writeFixed (below 1.5KB threshold)"},
-		{8, 1024, "8 targets, 1KB - uses ZC (>=4 targets, threshold 1KB)"},
-		{8, 512, "8 targets, 512B - uses writeFixed (below 1KB threshold)"},
-		{32, 512, "32 targets, 512B - uses ZC (>=16 targets, threshold 512B)"},
-		{128, 128, "128 targets, 128B - uses ZC (>=64 targets, threshold 128B)"},
-	}
-
-	t.Log("Threshold-based zero-copy selection:")
-	t.Log("-----------------------------------------------------")
-
-	for _, tc := range testCases {
-		var threshold int
-		switch {
-		case tc.numTargets >= 256:
-			threshold = 0
-		case tc.numTargets >= 64:
-			threshold = 128
-		case tc.numTargets >= 16:
-			threshold = 512
-		case tc.numTargets >= 4:
-			threshold = 1024
-		default:
-			threshold = 1536
-		}
-
-		usesZC := tc.msgSize >= threshold
-		method := "writeFixed"
-		if usesZC {
-			method = "sendZeroCopyFixed"
-		}
-
-		t.Logf("  %s -> %s", tc.desc, method)
-	}
-
-	t.Log("-----------------------------------------------------")
-	t.Log("Note: Both methods use registered buffers (pre-pinned memory)")
-	t.Log("      ZC avoids additional kernel-side memory copy")
 }
 
 // TestZeroCopyBufferLifecycle demonstrates the critical buffer lifecycle

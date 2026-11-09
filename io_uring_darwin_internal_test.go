@@ -78,6 +78,20 @@ func TestDarwinDoCloseRejectsEmptyRegisteredFileSlot(t *testing.T) {
 	}
 }
 
+func tooManyDarwinIovecs() [][]byte {
+	return make([][]byte, maxIovecs+1)
+}
+
+func TestDarwinSendZeroCopyRejectsOversizedLen32(t *testing.T) {
+	var ur ioUring
+	payload := mappedTestSlice[byte](t, oversizedLen32(t))
+
+	err := ur.sendZeroCopy(PackDirect(0, 0, 0, 0), payload, 0, len(payload), 0)
+	if err != ErrInvalidParam {
+		t.Fatalf("sendZeroCopy oversized len error = %v, want %v", err, ErrInvalidParam)
+	}
+}
+
 func TestDarwinSignedKernelCarrierDomainsRejectOutOfRange(t *testing.T) {
 	var ur ioUring
 	oversized := oversizedSignedInt32(t)
@@ -90,6 +104,14 @@ func TestDarwinSignedKernelCarrierDomainsRejectOutOfRange(t *testing.T) {
 	}{
 		{name: "send length", call: func() error { return ur.send(ctx, 0, payload, 0, len(payload)) }},
 		{name: "receive length", call: func() error { return ur.receive(ctx, 0, payload, 0, len(payload)) }},
+		{name: "receive buffer-select length", call: func() error { return ur.receiveWithBufferSelect(ctx, 0, oversized, 0) }},
+		{name: "send zero-copy length", call: func() error { return ur.sendZeroCopy(ctx, payload, 0, len(payload), 0) }},
+		{name: "socket domain", call: func() error { return ur.socket(ctx, oversized, SOCK_STREAM, 0) }},
+		{name: "socket type", call: func() error { return ur.socket(ctx, AF_INET, oversized, 0) }},
+		{name: "socket protocol", call: func() error { return ur.socket(ctx, AF_INET, SOCK_STREAM, oversized) }},
+		{name: "socket direct protocol", call: func() error { return ur.socketDirect(ctx, AF_INET, SOCK_STREAM, oversized, 0) }},
+		{name: "listen backlog", call: func() error { return ur.listen(ctx, oversized) }},
+		{name: "shutdown mode", call: func() error { return ur.shutdown(ctx, SHUT_RDWR+1) }},
 	}
 
 	for _, tt := range tests {
@@ -127,12 +149,163 @@ func TestDarwinFixedBufferRejectsOversizedLen32(t *testing.T) {
 				return ur.sendFixed(PackDirect(0, 0, 0, 0), 0, 0, len(payload), 0)
 			},
 		},
+		{
+			name: "sendZeroCopyFixed",
+			call: func(ur *ioUring) error {
+				return ur.sendZeroCopyFixed(PackDirect(0, 0, 0, 0), 0, 0, len(payload), 0)
+			},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ur := &ioUring{bufs: [][]byte{payload}}
 			if err := tt.call(ur); err != ErrInvalidParam {
+				t.Fatalf("%s error = %v, want %v", tt.name, err, ErrInvalidParam)
+			}
+		})
+	}
+}
+
+func TestDarwinReadWriteVRejectsInvalidIovs(t *testing.T) {
+	var ur ioUring
+	iovs := tooManyDarwinIovecs()
+
+	if err := ur.readv(PackDirect(0, 0, 0, 0), nil); err != ErrInvalidParam {
+		t.Fatalf("readv(nil) error = %v, want %v", err, ErrInvalidParam)
+	}
+	if err := ur.writev(PackDirect(0, 0, 0, 0), nil); err != ErrInvalidParam {
+		t.Fatalf("writev(nil) error = %v, want %v", err, ErrInvalidParam)
+	}
+	if err := ur.readv(PackDirect(0, 0, 0, 0), iovs); err != ErrInvalidParam {
+		t.Fatalf("readv oversized iovs error = %v, want %v", err, ErrInvalidParam)
+	}
+	if err := ur.writev(PackDirect(0, 0, 0, 0), iovs); err != ErrInvalidParam {
+		t.Fatalf("writev oversized iovs error = %v, want %v", err, ErrInvalidParam)
+	}
+}
+
+func TestDarwinMessageIovecsRejectOversizedCount(t *testing.T) {
+	var ur ioUring
+	iovs := tooManyDarwinIovecs()
+	ctx := PackDirect(0, 0, 0, 7)
+
+	if err := ur.sendmsg(ctx, 0, iovs, nil, nil); err != ErrInvalidParam {
+		t.Fatalf("sendmsg oversized iovs error = %v, want %v", err, ErrInvalidParam)
+	}
+	msg := &Msghdr{Iov: new(IoVec), Iovlen: maxIovecs + 1}
+	if err := ur.recvmsg(ctx, 0, msg); err != ErrInvalidParam {
+		t.Fatalf("recvmsg oversized Iovlen error = %v, want %v", err, ErrInvalidParam)
+	}
+}
+
+func TestDarwinTimeoutRejectsCountOutsideUint32(t *testing.T) {
+	var ur ioUring
+	ts := Timespec{Sec: 1}
+	ctx := PackDirect(0, 0, 0, 7)
+
+	for _, count := range []int{-1, oversizedLen32(t)} {
+		if err := ur.timeout(ctx, count, &ts, 0); err != ErrInvalidParam {
+			t.Fatalf("timeout(count=%d) error = %v, want %v", count, err, ErrInvalidParam)
+		}
+	}
+}
+
+func TestDarwinPollInputContractRejectsInvalidValues(t *testing.T) {
+	var ur ioUring
+	ctx := PackDirect(0, 0, 0, 7)
+	oversized := oversizedLen32(t)
+
+	tests := []struct {
+		name string
+		call func() error
+	}{
+		{name: "negative add events", call: func() error { return ur.pollAdd(ctx, 0, -1) }},
+		{name: "oversized add events", call: func() error { return ur.pollAdd(ctx, 0, oversized) }},
+		{name: "negative update events", call: func() error {
+			return ur.pollUpdate(ctx, 1, 0, -1, IORING_POLL_UPDATE_EVENTS)
+		}},
+		{name: "oversized update events", call: func() error {
+			return ur.pollUpdate(ctx, 1, 0, oversized, IORING_POLL_UPDATE_EVENTS)
+		}},
+		{name: "negative update flags", call: func() error { return ur.pollUpdate(ctx, 1, 0, 0, -1) }},
+		{name: "oversized update flags", call: func() error { return ur.pollUpdate(ctx, 1, 0, 0, oversized) }},
+		{name: "multishot only", call: func() error {
+			return ur.pollUpdate(ctx, 1, 0, 0, IORING_POLL_ADD_MULTI)
+		}},
+		{name: "multishot events", call: func() error {
+			return ur.pollUpdate(ctx, 1, 0, EPOLLIN, IORING_POLL_UPDATE_EVENTS|IORING_POLL_ADD_MULTI)
+		}},
+		{name: "multishot user data", call: func() error {
+			return ur.pollUpdate(ctx, 1, 2, 0, IORING_POLL_UPDATE_USER_DATA|IORING_POLL_ADD_MULTI)
+		}},
+		{name: "multishot combined", call: func() error {
+			return ur.pollUpdate(ctx, 1, 2, EPOLLIN,
+				IORING_POLL_UPDATE_EVENTS|IORING_POLL_UPDATE_USER_DATA|IORING_POLL_ADD_MULTI)
+		}},
+		{name: "user data without flag", call: func() error { return ur.pollUpdate(ctx, 1, 2, 0, 0) }},
+		{name: "events without flag", call: func() error { return ur.pollUpdate(ctx, 1, 0, EPOLLIN, 0) }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.call(); err != ErrInvalidParam {
+				t.Fatalf("error = %v, want %v", err, ErrInvalidParam)
+			}
+		})
+	}
+}
+
+func TestDarwinBoundaryLen32RejectsOversizedInputs(t *testing.T) {
+	var ur ioUring
+	payload := mappedTestSlice[byte](t, oversizedLen32(t))
+	fds := mappedTestSlice[int32](t, oversizedLen32(t))
+
+	tests := []struct {
+		name string
+		call func() error
+	}{
+		{
+			name: "fsetxattr",
+			call: func() error {
+				return ur.fsetxattr(PackDirect(0, 0, 0, 0), "user.payload", payload, 0)
+			},
+		},
+		{
+			name: "setxattr",
+			call: func() error {
+				return ur.setxattr(PackDirect(0, 0, 0, 0), "/tmp/uring-xattr", "user.payload", payload, 0)
+			},
+		},
+		{
+			name: "fgetxattr",
+			call: func() error {
+				return ur.fgetxattr(PackDirect(0, 0, 0, 0), "user.payload", payload)
+			},
+		},
+		{
+			name: "getxattr",
+			call: func() error {
+				return ur.getxattr(PackDirect(0, 0, 0, 0), "/tmp/uring-xattr", "user.payload", payload)
+			},
+		},
+		{
+			name: "filesUpdate",
+			call: func() error {
+				return ur.filesUpdate(PackDirect(0, 0, 0, 0), fds, 0)
+			},
+		},
+		{
+			name: "uringCmd",
+			call: func() error {
+				return ur.uringCmd(PackDirect(0, 0, 0, 0), 0x1234, payload, 0)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.call(); err != ErrInvalidParam {
 				t.Fatalf("%s error = %v, want %v", tt.name, err, ErrInvalidParam)
 			}
 		})
@@ -273,6 +446,79 @@ func TestDarwinNewUringProvideBuffersRoundsAndPartitionsCount(t *testing.T) {
 	if got := buffers.buf(bufferGroupIndex(1), 0); len(got) != buffers.size {
 		t.Fatalf("second group buffer length = %d, want %d", len(got), buffers.size)
 	}
+}
+
+func TestDarwinRegisterFilesRejectsInvalidCountDomains(t *testing.T) {
+	t.Run("register empty", func(t *testing.T) {
+		ur := &ioUring{}
+		if err := ur.registerFiles(nil); err != ErrInvalidParam {
+			t.Fatalf("registerFiles empty error = %v, want %v", err, ErrInvalidParam)
+		}
+		if len(ur.files) != 0 {
+			t.Fatalf("registered file table len = %d, want 0", len(ur.files))
+		}
+	})
+
+	t.Run("register oversized", func(t *testing.T) {
+		ur := &ioUring{}
+		if err := ur.registerFiles(mappedTestSlice[int32](t, oversizedLen32(t))); err != ErrInvalidParam {
+			t.Fatalf("registerFiles oversized error = %v, want %v", err, ErrInvalidParam)
+		}
+		if len(ur.files) != 0 {
+			t.Fatalf("registered file table len = %d, want 0", len(ur.files))
+		}
+	})
+
+	t.Run("update empty", func(t *testing.T) {
+		ur := &ioUring{files: []int32{10, 11}}
+		if _, err := ur.registerFilesUpdate(1, nil); err != ErrInvalidParam {
+			t.Fatalf("registerFilesUpdate empty error = %v, want %v", err, ErrInvalidParam)
+		}
+		if ur.files[0] != 10 || ur.files[1] != 11 {
+			t.Fatalf("registered file table = %v, want [10 11]", ur.files)
+		}
+	})
+
+	t.Run("update oversized", func(t *testing.T) {
+		ur := &ioUring{files: []int32{10, 11}}
+		if _, err := ur.registerFilesUpdate(1, mappedTestSlice[int32](t, oversizedLen32(t))); err != ErrInvalidParam {
+			t.Fatalf("registerFilesUpdate oversized error = %v, want %v", err, ErrInvalidParam)
+		}
+		if ur.files[0] != 10 || ur.files[1] != 11 {
+			t.Fatalf("registered file table = %v, want [10 11]", ur.files)
+		}
+	})
+
+	t.Run("update beyond remaining table", func(t *testing.T) {
+		ur := &ioUring{files: []int32{10, 11}}
+		if _, err := ur.registerFilesUpdate(1, []int32{20, 21}); err != ErrInvalidParam {
+			t.Fatalf("registerFilesUpdate overrun error = %v, want %v", err, ErrInvalidParam)
+		}
+		if ur.files[0] != 10 || ur.files[1] != 11 {
+			t.Fatalf("registered file table = %v, want [10 11]", ur.files)
+		}
+	})
+
+	t.Run("update rejects skip sentinel", func(t *testing.T) {
+		ur := &ioUring{files: []int32{10, 11}}
+		if updated, err := ur.registerFilesUpdate(0, []int32{-2}); updated != 0 || err != ErrInvalidParam {
+			t.Fatalf("registerFilesUpdate(-2) = (%d, %v), want (0, %v)", updated, err, ErrInvalidParam)
+		}
+		if ur.files[0] != 10 || ur.files[1] != 11 {
+			t.Fatalf("registered file table = %v, want [10 11]", ur.files)
+		}
+	})
+
+	t.Run("update reports completion", func(t *testing.T) {
+		ur := &ioUring{files: []int32{10, 11}}
+		updated, err := ur.registerFilesUpdate(0, []int32{20, -1})
+		if err != nil || updated != 2 {
+			t.Fatalf("registerFilesUpdate = (%d, %v), want (2, nil)", updated, err)
+		}
+		if ur.files[0] != 20 || ur.files[1] != -1 {
+			t.Fatalf("registered file table = %v, want [20 -1]", ur.files)
+		}
+	})
 }
 
 func TestDarwinStopJoinsWorkersBeforeClearingState(t *testing.T) {

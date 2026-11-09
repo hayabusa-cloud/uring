@@ -73,6 +73,408 @@ func waitForNopCQE(t *testing.T, ring *Uring) {
 	t.Fatal("NOP completion timeout")
 }
 
+func submitNopAfterInvalidInput(t *testing.T, ring *Uring, id uint16, label string) {
+	t.Helper()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- ring.Nop(PackDirect(IORING_OP_NOP, 0, id, 0))
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Nop after %s: %v", label, err)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("Nop blocked after %s", label)
+	}
+
+	waitForNopCQE(t, ring)
+}
+
+func TestPublicInputDomainRejectsInvalidLengthAndIndex(t *testing.T) {
+	t.Run("read negative WithN", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if err := ring.Read(PackDirect(0, 0, 0, 0), []byte{1}, WithN(-1)); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("Read error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x10, "negative Read WithN")
+	})
+
+	t.Run("write negative WithN", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if err := ring.Write(PackDirect(0, 0, 0, 0), []byte{1}, WithN(-1)); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("Write error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x11, "negative Write WithN")
+	})
+
+	t.Run("read negative WithOffset", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if err := ring.Read(PackDirect(0, 0, 0, 0), []byte{1}, WithOffset(-2)); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("Read error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x2d, "Read offset below current-position sentinel")
+	})
+
+	t.Run("write negative WithOffset", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if err := ring.Write(PackDirect(0, 0, 0, 0), []byte{1}, WithOffset(-2)); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("Write error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x2e, "Write offset below current-position sentinel")
+	})
+
+	t.Run("send negative WithN", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if err := ring.Send(PackDirect(0, 0, 0, 0), &mockPollFd{fd: 1}, []byte{1}, WithN(-1)); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("Send error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x12, "negative Send WithN")
+	})
+
+	t.Run("send negative WithOffset", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if err := ring.Send(PackDirect(0, 0, 0, 0), &mockPollFd{fd: 1}, []byte{1}, WithOffset(-1)); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("Send error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x31, "negative Send WithOffset")
+	})
+
+	t.Run("receive negative WithN", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if err := ring.Receive(PackDirect(0, 0, 0, 0), &mockPollFd{fd: 2}, []byte{1}, WithN(-1)); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("Receive error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x13, "negative Receive WithN")
+	})
+
+	t.Run("receive negative WithOffset", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if err := ring.Receive(PackDirect(0, 0, 0, 0), &mockPollFd{fd: 2}, []byte{1}, WithOffset(-1)); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("Receive error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x32, "negative Receive WithOffset")
+	})
+
+	t.Run("receive multishot caller buffer", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if err := ring.SubmitReceiveMultishot(PackDirect(0, 0, 0, 0), &mockPollFd{fd: 2}, []byte{1}); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("SubmitReceiveMultishot error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x33, "SubmitReceiveMultishot caller buffer")
+	})
+
+	t.Run("receive buffer select zero size", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if err := ring.Receive(PackDirect(0, 0, 0, 0), &mockPollFd{fd: 3}, nil, WithReadBufferSize(0)); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("Receive buffer-select error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x14, "zero Receive buffer size")
+	})
+
+	t.Run("receive buffer select oversized size", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if err := ring.Receive(PackDirect(0, 0, 0, 0), &mockPollFd{fd: 3}, nil, WithReadBufferSize(oversizedSignedInt32(t))); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("Receive buffer-select error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x25, "oversized Receive buffer size")
+	})
+
+	t.Run("receive bundle negative size", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if err := ring.ReceiveBundle(PackDirect(0, 0, 0, 0), &mockPollFd{fd: 4}, WithReadBufferSize(-1)); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("ReceiveBundle error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x15, "negative ReceiveBundle size")
+	})
+
+	t.Run("receive bundle oversized size", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if err := ring.ReceiveBundle(PackDirect(0, 0, 0, 0), &mockPollFd{fd: 4}, WithReadBufferSize(oversizedSignedInt32(t))); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("ReceiveBundle error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x26, "oversized ReceiveBundle size")
+	})
+
+	t.Run("readFixed public invalid buffer index", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if _, err := ring.ReadFixed(PackDirect(0, 0, 0, 0), -1); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("ReadFixed error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x16, "invalid public ReadFixed buffer index")
+	})
+
+	t.Run("readFixed negative WithN", func(t *testing.T) {
+		ring := newStartedTwoRegisteredBuffersSharedTestRing(t)
+		if _, err := ring.ReadFixed(PackDirect(0, 0, 0, 0), 0, WithN(-1)); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("ReadFixed error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x17, "negative ReadFixed WithN")
+	})
+
+	t.Run("readFixed negative WithOffset", func(t *testing.T) {
+		ring := newStartedTwoRegisteredBuffersSharedTestRing(t)
+		if _, err := ring.ReadFixed(PackDirect(0, 0, 0, 0), 0, WithOffset(-2)); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("ReadFixed error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x2f, "ReadFixed offset below current-position sentinel")
+	})
+
+	t.Run("writeFixed negative WithOffset", func(t *testing.T) {
+		ring := newStartedTwoRegisteredBuffersSharedTestRing(t)
+		if err := ring.WriteFixed(PackDirect(0, 0, 0, 0), 0, 1, WithOffset(-2)); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("WriteFixed error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x30, "WriteFixed offset below current-position sentinel")
+	})
+
+	t.Run("internal read buffer select oversized length", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if err := ring.ioUring.readWithBufferSelect(PackDirect(0, 0, 0, 0), oversizedLen32(t), 0); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("readWithBufferSelect error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x27, "oversized readWithBufferSelect length")
+	})
+
+	t.Run("splice negative length", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if err := ring.Splice(PackDirect(0, 0, 0, 0), 0, -1); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("Splice error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x18, "negative Splice length")
+	})
+
+	t.Run("splice oversized length", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if err := ring.Splice(PackDirect(0, 0, 0, 0), 0, oversizedLen32(t)); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("Splice error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x28, "oversized Splice length")
+	})
+
+	t.Run("tee negative length", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if err := ring.Tee(PackDirect(0, 0, 0, 0), 0, -1); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("Tee error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x19, "negative Tee length")
+	})
+
+	t.Run("tee oversized length", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if err := ring.Tee(PackDirect(0, 0, 0, 0), 0, oversizedLen32(t)); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("Tee error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x29, "oversized Tee length")
+	})
+
+	t.Run("receive zero-copy negative length", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if err := ring.ReceiveZeroCopy(PackDirect(0, 0, 0, 0), &mockPollFd{fd: 5}, -1, 0); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("ReceiveZeroCopy error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x1a, "negative ReceiveZeroCopy length")
+	})
+
+	t.Run("receive zero-copy oversized length", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if err := ring.ReceiveZeroCopy(PackDirect(0, 0, 0, 0), &mockPollFd{fd: 5}, oversizedLen32(t), 0); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("ReceiveZeroCopy error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x2a, "oversized ReceiveZeroCopy length")
+	})
+
+	t.Run("writevFixed iovec outside selected buffer", func(t *testing.T) {
+		ring := newStartedTwoRegisteredBuffersSharedTestRing(t)
+		iovs := [][]byte{ring.RegisteredBuffer(1)[:1]}
+		if err := ring.WritevFixed(PackDirect(0, 0, 0, 0), 0, 0, iovs); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("WritevFixed error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x1b, "WritevFixed cross-buffer iovec")
+	})
+
+	t.Run("readvFixed oversized vector count", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		tail := atomic.LoadUint32(ring.ioUring.sq.kTail)
+		if err := ring.ReadvFixed(PackDirect(0, 0, 0, 0), 0, 0, make([][]byte, maxIovecs+1)); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("ReadvFixed error = %v, want %v", err, ErrInvalidParam)
+		}
+		if got := atomic.LoadUint32(ring.ioUring.sq.kTail); got != tail {
+			t.Fatalf("SQ tail = %d, want %d", got, tail)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x34, "oversized ReadvFixed vector count")
+	})
+
+	t.Run("writevFixed oversized vector count", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		tail := atomic.LoadUint32(ring.ioUring.sq.kTail)
+		if err := ring.WritevFixed(PackDirect(0, 0, 0, 0), 0, 0, make([][]byte, maxIovecs+1)); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("WritevFixed error = %v, want %v", err, ErrInvalidParam)
+		}
+		if got := atomic.LoadUint32(ring.ioUring.sq.kTail); got != tail {
+			t.Fatalf("SQ tail = %d, want %d", got, tail)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x35, "oversized WritevFixed vector count")
+	})
+
+	t.Run("readvFixed negative offset", func(t *testing.T) {
+		ring := newStartedTwoRegisteredBuffersSharedTestRing(t)
+		if err := ring.ReadvFixed(PackDirect(0, 0, 0, 0), -2, 0, [][]byte{ring.RegisteredBuffer(0)[:1]}); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("ReadvFixed error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x31, "ReadvFixed offset below current-position sentinel")
+	})
+
+	t.Run("writevFixed negative offset", func(t *testing.T) {
+		ring := newStartedTwoRegisteredBuffersSharedTestRing(t)
+		if err := ring.WritevFixed(PackDirect(0, 0, 0, 0), -2, 0, [][]byte{ring.RegisteredBuffer(0)[:1]}); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("WritevFixed error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x32, "WritevFixed offset below current-position sentinel")
+	})
+
+	t.Run("internal send zero-copy negative length", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if err := ring.ioUring.sendZeroCopy(PackDirect(0, 0, 0, 0), []byte{1}, 0, -1, 0); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("sendZeroCopy error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x1c, "negative sendZeroCopy length")
+	})
+
+	t.Run("internal sendto zero-copy negative length", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if err := ring.ioUring.sendtoZeroCopy(PackDirect(0, 0, 0, 0), []byte{1}, 0, -1, nil, 0); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("sendtoZeroCopy error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x1d, "negative sendtoZeroCopy length")
+	})
+
+	t.Run("file advise negative length", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if err := ring.FileAdvise(PackDirect(0, 0, 0, 0), 0, -1, 0); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("FileAdvise error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x1e, "negative FileAdvise length")
+	})
+
+	t.Run("file advise oversized length", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if err := ring.FileAdvise(PackDirect(0, 0, 0, 0), 0, oversizedLen32(t), 0); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("FileAdvise error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x2b, "oversized FileAdvise length")
+	})
+
+	t.Run("file advise negative offset", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if err := ring.FileAdvise(PackDirect(0, 0, 0, 0), -1, 1, 0); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("FileAdvise error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x22, "negative FileAdvise offset")
+	})
+
+	t.Run("sync file range negative length", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if err := ring.SyncFileRange(PackDirect(0, 0, 0, 0), 0, -1, 0); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("SyncFileRange error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x1f, "negative SyncFileRange length")
+	})
+
+	t.Run("sync file range oversized length", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if err := ring.SyncFileRange(PackDirect(0, 0, 0, 0), 0, oversizedLen32(t), 0); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("SyncFileRange error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x2c, "oversized SyncFileRange length")
+	})
+
+	t.Run("sync file range negative offset", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if err := ring.SyncFileRange(PackDirect(0, 0, 0, 0), -1, 1, 0); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("SyncFileRange error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x23, "negative SyncFileRange offset")
+	})
+
+	t.Run("fallocate negative length", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if err := ring.Fallocate(PackDirect(0, 0, 0, 0), 0, 0, -1); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("Fallocate error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x20, "negative Fallocate length")
+	})
+
+	t.Run("fallocate zero length", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if err := ring.Fallocate(PackDirect(0, 0, 0, 0), 0, 0, 0); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("Fallocate error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x2d, "zero Fallocate length")
+	})
+
+	t.Run("fallocate negative offset", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if err := ring.Fallocate(PackDirect(0, 0, 0, 0), 0, -1, 1); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("Fallocate error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x24, "negative Fallocate offset")
+	})
+
+	t.Run("ftruncate negative length", func(t *testing.T) {
+		ring := newStartedSharedTestRing(t)
+		if err := ring.FTruncate(PackDirect(0, 0, 0, 0), -1); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("FTruncate error = %v, want %v", err, ErrInvalidParam)
+		}
+		submitNopAfterInvalidInput(t, ring, 0x21, "negative FTruncate length")
+	})
+}
+
+func TestSignedKernelCarrierDomainsRejectOutOfRange(t *testing.T) {
+	oversized := oversizedSignedInt32(t)
+	payload := mappedTestSlice[byte](t, oversized)
+	events := mappedTestSlice[EpollEvent](t, oversized)
+	ctx := PackDirect(0, 0, 0, 7)
+
+	tests := []struct {
+		name string
+		call func(*ioUring) error
+	}{
+		{name: "send length", call: func(ur *ioUring) error { return ur.send(ctx, 0, payload, 0, len(payload)) }},
+		{name: "receive length", call: func(ur *ioUring) error { return ur.receive(ctx, 0, payload, 0, len(payload)) }},
+		{name: "receive buffer-select length", call: func(ur *ioUring) error { return ur.receiveWithBufferSelect(ctx, 0, oversized, 1) }},
+		{name: "receive bundle length", call: func(ur *ioUring) error { return ur.receiveBundle(ctx, 0, oversized, 1) }},
+		{name: "send zero-copy length", call: func(ur *ioUring) error { return ur.sendZeroCopy(ctx, payload, 0, len(payload), 0) }},
+		{name: "sendto zero-copy length", call: func(ur *ioUring) error { return ur.sendtoZeroCopy(ctx, payload, 0, len(payload), nil, 0) }},
+		{name: "epoll maxevents", call: func(ur *ioUring) error { return ur.epollWait(ctx, events, 0) }},
+		{name: "socket domain", call: func(ur *ioUring) error { return ur.socket(ctx, oversized, SOCK_STREAM, 0) }},
+		{name: "socket type", call: func(ur *ioUring) error { return ur.socket(ctx, AF_INET, oversized, 0) }},
+		{name: "socket protocol", call: func(ur *ioUring) error { return ur.socket(ctx, AF_INET, SOCK_STREAM, oversized) }},
+		{name: "socket direct protocol", call: func(ur *ioUring) error { return ur.socketDirect(ctx, AF_INET, SOCK_STREAM, oversized, 0) }},
+		{name: "listen backlog", call: func(ur *ioUring) error { return ur.listen(ctx, oversized) }},
+		{name: "shutdown mode", call: func(ur *ioUring) error { return ur.shutdown(ctx, SHUT_RDWR+1) }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ring := newWrapperTestRing(t)
+			tail := atomic.LoadUint32(ring.ioUring.sq.kTail)
+			if err := tt.call(ring.ioUring); !errors.Is(err, ErrInvalidParam) {
+				t.Fatalf("error = %v, want %v", err, ErrInvalidParam)
+			}
+			if got := atomic.LoadUint32(ring.ioUring.sq.kTail); got != tail {
+				t.Fatalf("SQ tail = %d, want %d", got, tail)
+			}
+		})
+	}
+
+	if err := (&ZCTracker{}).SendZC(0, payload, nil); !errors.Is(err, ErrInvalidParam) {
+		t.Fatalf("ZCTracker.SendZC error = %v, want %v", err, ErrInvalidParam)
+	}
+}
+
 func TestSharedSubmitInvalidInputDoesNotPoisonRing(t *testing.T) {
 	t.Run("invalid openat pathname", func(t *testing.T) {
 		ring := newStartedSharedTestRing(t)
@@ -100,7 +502,7 @@ func TestSharedSubmitInvalidInputDoesNotPoisonRing(t *testing.T) {
 
 	t.Run("invalid readvFixed buffer index", func(t *testing.T) {
 		ring := newStartedSharedTestRing(t)
-		if err := ring.ioUring.readvFixed(PackDirect(0, 0, 0, 0), 0, []int{-1}); !errors.Is(err, ErrInvalidParam) {
+		if err := ring.ioUring.readvFixed(PackDirect(0, 0, 0, 0), 0, -1, [][]byte{{1}}); !errors.Is(err, ErrInvalidParam) {
 			t.Fatalf("readvFixed error = %v, want %v", err, ErrInvalidParam)
 		}
 
@@ -123,7 +525,7 @@ func TestSharedSubmitInvalidInputDoesNotPoisonRing(t *testing.T) {
 
 	t.Run("invalid readvFixed empty buffer list", func(t *testing.T) {
 		ring := newStartedSharedTestRing(t)
-		if err := ring.ioUring.readvFixed(PackDirect(0, 0, 0, 0), 0, nil); !errors.Is(err, ErrInvalidParam) {
+		if err := ring.ioUring.readvFixed(PackDirect(0, 0, 0, 0), 0, 0, nil); !errors.Is(err, ErrInvalidParam) {
 			t.Fatalf("readvFixed error = %v, want %v", err, ErrInvalidParam)
 		}
 
@@ -144,9 +546,9 @@ func TestSharedSubmitInvalidInputDoesNotPoisonRing(t *testing.T) {
 		waitForNopCQE(t, ring)
 	})
 
-	t.Run("invalid writevFixed length count", func(t *testing.T) {
+	t.Run("invalid writevFixed empty iovec", func(t *testing.T) {
 		ring := newStartedSharedTestRing(t)
-		if err := ring.ioUring.writevFixed(PackDirect(0, 0, 0, 0), 0, []int{0}, nil); !errors.Is(err, ErrInvalidParam) {
+		if err := ring.ioUring.writevFixed(PackDirect(0, 0, 0, 0), 0, 0, [][]byte{{}}); !errors.Is(err, ErrInvalidParam) {
 			t.Fatalf("writevFixed error = %v, want %v", err, ErrInvalidParam)
 		}
 
@@ -158,22 +560,22 @@ func TestSharedSubmitInvalidInputDoesNotPoisonRing(t *testing.T) {
 		select {
 		case err := <-done:
 			if err != nil {
-				t.Fatalf("Nop after invalid writevFixed length count: %v", err)
+				t.Fatalf("Nop after invalid writevFixed empty iovec: %v", err)
 			}
 		case <-time.After(time.Second):
-			t.Fatal("Nop blocked after invalid writevFixed length count")
+			t.Fatal("Nop blocked after invalid writevFixed empty iovec")
 		}
 
 		waitForNopCQE(t, ring)
 	})
 
-	t.Run("invalid writevFixed buffer length", func(t *testing.T) {
+	t.Run("invalid writevFixed external iovec", func(t *testing.T) {
 		ring := newStartedSharedTestRing(t)
 		buf := ring.RegisteredBuffer(0)
 		if buf == nil {
 			t.Fatal("RegisteredBuffer(0) = nil")
 		}
-		if err := ring.ioUring.writevFixed(PackDirect(0, 0, 0, 0), 0, []int{0}, []int{len(buf) + 1}); !errors.Is(err, ErrInvalidParam) {
+		if err := ring.ioUring.writevFixed(PackDirect(0, 0, 0, 0), 0, 0, [][]byte{make([]byte, 1)}); !errors.Is(err, ErrInvalidParam) {
 			t.Fatalf("writevFixed error = %v, want %v", err, ErrInvalidParam)
 		}
 
@@ -185,10 +587,10 @@ func TestSharedSubmitInvalidInputDoesNotPoisonRing(t *testing.T) {
 		select {
 		case err := <-done:
 			if err != nil {
-				t.Fatalf("Nop after invalid writevFixed buffer length: %v", err)
+				t.Fatalf("Nop after invalid writevFixed external iovec: %v", err)
 			}
 		case <-time.After(time.Second):
-			t.Fatal("Nop blocked after invalid writevFixed buffer length")
+			t.Fatal("Nop blocked after invalid writevFixed external iovec")
 		}
 
 		waitForNopCQE(t, ring)
@@ -355,7 +757,7 @@ func TestSubmitKeepAliveRetainsBindAndXattrRoots(t *testing.T) {
 		ring := newStartedSharedTestRing(t)
 		cmdData := []byte("uring-cmd")
 		cmdCtx := PackDirect(0, IOSQE_IO_LINK, 0, 17)
-		if err := ring.ioUring.uringCmd(cmdCtx, 99, cmdData); err != nil {
+		if err := ring.ioUring.uringCmd(cmdCtx, 99, cmdData, 0); err != nil {
 			t.Fatalf("uringCmd submit: %v", err)
 		}
 
@@ -395,7 +797,7 @@ func TestSubmitKeepAliveRetainsBindAndXattrRoots(t *testing.T) {
 
 		cmdData := []byte("wide-inline-command")
 		cmdCtx := PackDirect(0, IOSQE_IO_LINK, 0, 17)
-		if err := ring.ioUring.uringCmd128(cmdCtx, 123, cmdData); errors.Is(err, ErrNotSupported) {
+		if err := ring.ioUring.uringCmd128(cmdCtx, 123, cmdData, 0); errors.Is(err, ErrNotSupported) {
 			t.Skip("URING_CMD128 opcode not supported on this kernel")
 		} else if err != nil {
 			t.Fatalf("uringCmd128 submit: %v", err)
@@ -422,6 +824,90 @@ func TestSubmitKeepAliveRetainsBindAndXattrRoots(t *testing.T) {
 			t.Fatal("uringCmd128 should not retain external command data")
 		}
 	})
+}
+
+func TestRecvMsgUsesCallerOwnedCompletionStorage(t *testing.T) {
+	ring := newWrapperSyntheticSubmitRing(t, 2)
+	ctx := PackDirect(0, IOSQE_ASYNC, 0, 17)
+	msg1 := Msghdr{}
+
+	if err := ring.ioUring.recvmsg(ctx, 3, &msg1); err != nil {
+		t.Fatalf("first recvmsg: %v", err)
+	}
+	sqe1 := ring.ioUring.sq.sqeAt(0)
+	if got, want := sqe1.addr, uint64(uintptr(unsafe.Pointer(&msg1))); got != want {
+		t.Fatalf("first SQE addr = %#x, want %#x", got, want)
+	}
+	if got, want := sqe1.userData, ctx.WithOp(IORING_OP_RECVMSG).Raw(); got != want {
+		t.Fatalf("first SQE user_data = %#x, want %#x", got, want)
+	}
+	ext1 := ring.ioUring.submit.keepAlive[0].ext
+	if ext1 == nil || ext1.recvMsg != &msg1 {
+		t.Fatal("first submit did not retain the caller header")
+	}
+
+	atomic.StoreUint32(ring.ioUring.sq.kHead, 1)
+	ring.ioUring.lockSubmitState()
+	ring.ioUring.releaseConsumedKeepAlive()
+	ring.ioUring.unlockSubmitState()
+	if ring.ioUring.submit.keepAlive[0].active {
+		t.Fatal("consumed first SQ slot remained active")
+	}
+	if ext1.recvMsg != nil {
+		t.Fatal("recycled submit scratch retained the first caller header")
+	}
+
+	msg2 := Msghdr{}
+	if err := ring.ioUring.recvmsg(ctx, 4, &msg2); err != nil {
+		t.Fatalf("second recvmsg: %v", err)
+	}
+	sqe2 := ring.ioUring.sq.sqeAt(1)
+	if got, want := sqe2.addr, uint64(uintptr(unsafe.Pointer(&msg2))); got != want {
+		t.Fatalf("second SQE addr = %#x, want %#x", got, want)
+	}
+	if sqe1.addr == sqe2.addr {
+		t.Fatal("independent recvmsg submissions share completion storage")
+	}
+	ext2 := ring.ioUring.submit.keepAlive[1].ext
+	if ext2 != ext1 {
+		t.Fatal("submit scratch was not reused by the regression witness")
+	}
+	if ext2.recvMsg != &msg2 {
+		t.Fatal("reused submit scratch did not retain the second caller header")
+	}
+
+	msg1.Controllen = 9
+	if msg2.Controllen != 0 {
+		t.Fatal("first completion metadata aliases the second caller header")
+	}
+}
+
+func TestRecvMsgRejectsInvalidCallerHeaderBeforeSQMutation(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  *Msghdr
+	}{
+		{name: "nil header"},
+		{name: "oversized iovlen", msg: &Msghdr{Iov: new(IoVec), Iovlen: maxIovecs + 1}},
+		{name: "missing iovec", msg: &Msghdr{Iovlen: 1}},
+		{name: "missing control", msg: &Msghdr{Controllen: 1}},
+		{name: "missing name", msg: &Msghdr{Namelen: 1}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ring := newWrapperSyntheticSubmitRing(t, 1)
+			if err := ring.ioUring.recvmsg(PackDirect(0, 0, 0, 3), 0, tt.msg); !errors.Is(err, ErrInvalidParam) {
+				t.Fatalf("recvmsg error = %v, want %v", err, ErrInvalidParam)
+			}
+			if got := atomic.LoadUint32(ring.ioUring.sq.kTail); got != 0 {
+				t.Fatalf("SQ tail = %d, want 0", got)
+			}
+			if keep := &ring.ioUring.submit.keepAlive[0]; keep.active || keep.ext != nil {
+				t.Fatal("invalid caller header reached submit staging")
+			}
+		})
+	}
 }
 
 func TestSubmitKeepAliveRetainsLinkTimeoutTimespec(t *testing.T) {
@@ -514,22 +1000,12 @@ func TestSubmitKeepAliveRetainsOpenHowAndStatxRoots(t *testing.T) {
 
 func TestSubmitStagesFixedVectoredBuffers(t *testing.T) {
 	t.Run("readvFixed stages registered buffer iovecs", func(t *testing.T) {
-		ring := newStartedTwoRegisteredBuffersSharedTestRing(t)
-		if got := ring.RegisteredBufferCount(); got < 2 {
-			t.Fatalf("RegisteredBufferCount = %d, want at least 2", got)
-		}
-
-		f, err := os.CreateTemp("", "uring_submit_readvfixed_*")
-		if err != nil {
-			t.Fatalf("CreateTemp: %v", err)
-		}
-		defer os.Remove(f.Name())
-		defer f.Close()
-
-		buf0 := ring.RegisteredBuffer(0)
-		buf1 := ring.RegisteredBuffer(1)
-		ctx := PackDirect(0, 0, 0, int32(f.Fd()))
-		if err := ring.ReadvFixed(ctx, 41, []int{0, 1}); err != nil {
+		ring := newWrapperSyntheticSubmitRing(t, 8)
+		ring.ioUring.bufs = [][]byte{make([]byte, 96), make([]byte, 128)}
+		buf := ring.RegisteredBuffer(1)
+		iovs := [][]byte{buf[7:23], buf[64:93]}
+		ctx := PackDirect(0, 0, 0, 17)
+		if err := ring.ReadvFixed(ctx, 41, 1, iovs); err != nil {
 			t.Fatalf("ReadvFixed submit: %v", err)
 		}
 
@@ -544,14 +1020,17 @@ func TestSubmitStagesFixedVectoredBuffers(t *testing.T) {
 		if sqe.flags != ring.readLikeOpFlags {
 			t.Fatalf("readvFixed flags = %#x, want %#x", sqe.flags, ring.readLikeOpFlags)
 		}
-		if sqe.fd != int32(f.Fd()) {
-			t.Fatalf("readvFixed fd = %d, want %d", sqe.fd, f.Fd())
+		if sqe.fd != 17 {
+			t.Fatalf("readvFixed fd = %d, want 17", sqe.fd)
 		}
 		if sqe.off != 41 {
 			t.Fatalf("readvFixed off = %d, want 41", sqe.off)
 		}
 		if sqe.len != 2 {
 			t.Fatalf("readvFixed len = %d, want 2", sqe.len)
+		}
+		if sqe.bufIndex != 1 {
+			t.Fatalf("readvFixed bufIndex = %d, want 1", sqe.bufIndex)
 		}
 		if !keep.active {
 			t.Fatal("readvFixed keepAlive not active")
@@ -562,31 +1041,21 @@ func TestSubmitStagesFixedVectoredBuffers(t *testing.T) {
 		if sqe.addr != uint64(uintptr(unsafe.Pointer(&keep.iovs[0]))) {
 			t.Fatal("readvFixed sqe.addr does not point at staged iovecs")
 		}
-		if keep.iovs[0].Base != unsafe.SliceData(buf0) || keep.iovs[0].Len != uint64(len(buf0)) {
-			t.Fatal("readvFixed first iovec does not match registered buffer 0")
+		if keep.iovs[0].Base != unsafe.SliceData(iovs[0]) || keep.iovs[0].Len != uint64(len(iovs[0])) {
+			t.Fatal("readvFixed first iovec does not match the first selected-buffer range")
 		}
-		if keep.iovs[1].Base != unsafe.SliceData(buf1) || keep.iovs[1].Len != uint64(len(buf1)) {
-			t.Fatal("readvFixed second iovec does not match registered buffer 1")
+		if keep.iovs[1].Base != unsafe.SliceData(iovs[1]) || keep.iovs[1].Len != uint64(len(iovs[1])) {
+			t.Fatal("readvFixed second iovec does not match the second selected-buffer range")
 		}
 	})
 
 	t.Run("writevFixed stages registered buffer iovecs", func(t *testing.T) {
-		ring := newStartedTwoRegisteredBuffersSharedTestRing(t)
-		if got := ring.RegisteredBufferCount(); got < 2 {
-			t.Fatalf("RegisteredBufferCount = %d, want at least 2", got)
-		}
-
-		f, err := os.CreateTemp("", "uring_submit_writevfixed_*")
-		if err != nil {
-			t.Fatalf("CreateTemp: %v", err)
-		}
-		defer os.Remove(f.Name())
-		defer f.Close()
-
-		buf0 := ring.RegisteredBuffer(0)
-		buf1 := ring.RegisteredBuffer(1)
-		ctx := PackDirect(0, 0, 0, int32(f.Fd()))
-		if err := ring.WritevFixed(ctx, 73, []int{0, 1}, []int{17, 29}); err != nil {
+		ring := newWrapperSyntheticSubmitRing(t, 8)
+		ring.ioUring.bufs = [][]byte{make([]byte, 96), make([]byte, 128)}
+		buf := ring.RegisteredBuffer(1)
+		iovs := [][]byte{buf[:17], buf[48:77]}
+		ctx := PackDirect(0, 0, 0, 19)
+		if err := ring.WritevFixed(ctx, 73, 1, iovs); err != nil {
 			t.Fatalf("WritevFixed submit: %v", err)
 		}
 
@@ -601,14 +1070,17 @@ func TestSubmitStagesFixedVectoredBuffers(t *testing.T) {
 		if sqe.flags != ring.writeLikeOpFlags {
 			t.Fatalf("writevFixed flags = %#x, want %#x", sqe.flags, ring.writeLikeOpFlags)
 		}
-		if sqe.fd != int32(f.Fd()) {
-			t.Fatalf("writevFixed fd = %d, want %d", sqe.fd, f.Fd())
+		if sqe.fd != 19 {
+			t.Fatalf("writevFixed fd = %d, want 19", sqe.fd)
 		}
 		if sqe.off != 73 {
 			t.Fatalf("writevFixed off = %d, want 73", sqe.off)
 		}
 		if sqe.len != 2 {
 			t.Fatalf("writevFixed len = %d, want 2", sqe.len)
+		}
+		if sqe.bufIndex != 1 {
+			t.Fatalf("writevFixed bufIndex = %d, want 1", sqe.bufIndex)
 		}
 		if !keep.active {
 			t.Fatal("writevFixed keepAlive not active")
@@ -619,13 +1091,70 @@ func TestSubmitStagesFixedVectoredBuffers(t *testing.T) {
 		if sqe.addr != uint64(uintptr(unsafe.Pointer(&keep.iovs[0]))) {
 			t.Fatal("writevFixed sqe.addr does not point at staged iovecs")
 		}
-		if keep.iovs[0].Base != unsafe.SliceData(buf0) || keep.iovs[0].Len != 17 {
-			t.Fatal("writevFixed first iovec does not match staged length for buffer 0")
+		if keep.iovs[0].Base != unsafe.SliceData(iovs[0]) || keep.iovs[0].Len != uint64(len(iovs[0])) {
+			t.Fatal("writevFixed first iovec does not match the first selected-buffer range")
 		}
-		if keep.iovs[1].Base != unsafe.SliceData(buf1) || keep.iovs[1].Len != 29 {
-			t.Fatal("writevFixed second iovec does not match staged length for buffer 1")
+		if keep.iovs[1].Base != unsafe.SliceData(iovs[1]) || keep.iovs[1].Len != uint64(len(iovs[1])) {
+			t.Fatal("writevFixed second iovec does not match the second selected-buffer range")
 		}
 	})
+
+	t.Run("rejects iovec from another registered buffer before reservation", func(t *testing.T) {
+		ring := newWrapperSyntheticSubmitRing(t, 8)
+		ring.ioUring.bufs = [][]byte{make([]byte, 32), make([]byte, 32)}
+		tail := atomic.LoadUint32(ring.ioUring.sq.kTail)
+		err := ring.ReadvFixed(PackDirect(0, 0, 0, 23), 0, 0, [][]byte{ring.RegisteredBuffer(1)[:1]})
+		if !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("ReadvFixed error = %v, want %v", err, ErrInvalidParam)
+		}
+		if got := atomic.LoadUint32(ring.ioUring.sq.kTail); got != tail {
+			t.Fatalf("SQ tail = %d, want %d", got, tail)
+		}
+		if ring.ioUring.submit.keepAlive[0].active {
+			t.Fatal("cross-buffer iovec reached submit staging")
+		}
+	})
+}
+
+func TestFixedVectoredInlineSubmitAllocations(t *testing.T) {
+	tests := []struct {
+		name string
+		call func(*Uring, [][]byte) error
+	}{
+		{
+			name: "read",
+			call: func(ring *Uring, iovs [][]byte) error {
+				return ring.ReadvFixed(PackDirect(0, 0, 0, 11), 0, 0, iovs)
+			},
+		},
+		{
+			name: "write",
+			call: func(ring *Uring, iovs [][]byte) error {
+				return ring.WritevFixed(PackDirect(0, 0, 0, 13), 0, 0, iovs)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ring := newWrapperSyntheticSubmitRing(t, 1)
+			ring.ioUring.bufs = [][]byte{make([]byte, 64)}
+			buf := ring.RegisteredBuffer(0)
+			iovs := [][]byte{buf[:16], buf[32:48]}
+
+			allocs := testing.AllocsPerRun(100, func() {
+				if err := tt.call(ring, iovs); err != nil {
+					panic(err)
+				}
+				tail := atomic.LoadUint32(ring.ioUring.sq.kTail)
+				atomic.StoreUint32(ring.ioUring.sq.kHead, tail)
+				ring.ioUring.releaseConsumedKeepAlive()
+			})
+			if allocs != 0 {
+				t.Fatalf("allocations = %v, want 0", allocs)
+			}
+		})
+	}
 }
 
 func TestOpenAtStagesLongPaths(t *testing.T) {
@@ -666,17 +1195,27 @@ func TestEpollWaitRejectsTimeoutAndStagesZeroOff(t *testing.T) {
 	events := make([]EpollEvent, 1)
 	ctx := PackDirect(0, 0, 0, 0)
 
-	if err := ring.ioUring.epollWait(ctx, &events[0], len(events), 1); !errors.Is(err, ErrInvalidParam) {
+	if err := ring.ioUring.epollWait(ctx, events, 1); !errors.Is(err, ErrInvalidParam) {
 		t.Fatalf("epollWait timeout error = %v, want %v", err, ErrInvalidParam)
 	}
 
-	if err := ring.ioUring.epollWait(ctx, &events[0], len(events), 0); err != nil {
+	if err := ring.ioUring.epollWait(ctx, events, 0); err != nil {
 		t.Fatalf("epollWait submit: %v", err)
 	}
 
 	tail := atomic.LoadUint32(ring.ioUring.sq.kTail)
 	idx := (tail - 1) & *ring.ioUring.sq.kRingMask
 	sqe := ring.ioUring.sq.sqeAt(idx)
+	keep := &ring.ioUring.submit.keepAlive[idx]
+	if keep.ext == nil {
+		t.Fatal("epollWait keepAlive ext = nil")
+	}
+	if len(keep.ext.epollWaitEvents) != len(events) {
+		t.Fatalf("epollWait keepAlive events len = %d, want %d", len(keep.ext.epollWaitEvents), len(events))
+	}
+	if &keep.ext.epollWaitEvents[0] != &events[0] {
+		t.Fatal("epollWait keepAlive did not retain the submitted events root")
+	}
 	if sqe.off != 0 {
 		t.Fatalf("epollWait sqe.off = %d, want 0", sqe.off)
 	}
@@ -685,6 +1224,52 @@ func TestEpollWaitRejectsTimeoutAndStagesZeroOff(t *testing.T) {
 	}
 	if sqe.bufIndex != 0 || sqe.spliceFdIn != 0 {
 		t.Fatalf("epollWait reused stale fields: bufIndex=%d spliceFdIn=%d", sqe.bufIndex, sqe.spliceFdIn)
+	}
+}
+
+func TestEpollWaitRejectsOversizedEvents(t *testing.T) {
+	ring := newStartedSharedTestRing(t)
+	events := mappedTestSlice[EpollEvent](t, oversizedSignedInt32(t))
+	tail := atomic.LoadUint32(ring.ioUring.sq.kTail)
+
+	if err := ring.EpollWait(ForFD(41), events, 0); !errors.Is(err, ErrInvalidParam) {
+		t.Fatalf("EpollWait oversized events error = %v, want %v", err, ErrInvalidParam)
+	}
+	if got := atomic.LoadUint32(ring.ioUring.sq.kTail); got != tail {
+		t.Fatalf("SQ tail = %d, want %d", got, tail)
+	}
+}
+
+func TestEpollWaitMirrorsExtendedSQE(t *testing.T) {
+	ring := newStartedSharedTestRing(t)
+	events := make([]EpollEvent, 2)
+	ext := &ExtSQE{}
+	const fd int32 = 33
+	ctx := PackExtended(ext).withFD(fd)
+
+	if err := ring.ioUring.epollWait(ctx, events, 0); err != nil {
+		t.Fatalf("epollWait submit: %v", err)
+	}
+
+	sqe := ViewExtSQE(ext)
+	if !sqe.Valid() {
+		t.Fatal("extended SQE view is invalid")
+	}
+	if got := sqe.Opcode(); got != IORING_OP_EPOLL_WAIT {
+		t.Fatalf("extended epollWait opcode = %d, want %d", got, IORING_OP_EPOLL_WAIT)
+	}
+	if got := sqe.RawFD(); got != fd {
+		t.Fatalf("extended epollWait fd = %d, want %d", got, fd)
+	}
+	wantAddr := uint64(uintptr(unsafe.Pointer(&events[0])))
+	if got := sqe.Addr(); got != wantAddr {
+		t.Fatalf("extended epollWait addr = %#x, want %#x", got, wantAddr)
+	}
+	if got := sqe.Len(); got != uint32(len(events)) {
+		t.Fatalf("extended epollWait len = %d, want %d", got, len(events))
+	}
+	if got := sqe.UserData(); got != ctx.Raw() {
+		t.Fatalf("extended epollWait userData = %#x, want %#x", got, ctx.Raw())
 	}
 }
 
@@ -821,6 +1406,8 @@ func TestSubmitKeepAliveClearReturnsExtAndClearsRoots(t *testing.T) {
 	keep.iovInline[0] = IoVec{Base: &ctrl, Len: 1}
 	ext := keep.ensureExt(ur)
 	ext.msg = Msghdr{Control: &ctrl, Controllen: 1}
+	ext.epollCtlEvent = EpollEvent{Events: EPOLLIN, Fd: 1}
+	ext.epollWaitEvents = []EpollEvent{{Events: EPOLLIN, Fd: 1}}
 	ext.openHow = &OpenHow{}
 	ext.statx = &Statx{}
 	ext.path1Buf = make([]byte, 300)
@@ -852,6 +1439,12 @@ func TestSubmitKeepAliveClearReturnsExtAndClearsRoots(t *testing.T) {
 	}
 	if reused.msg != (Msghdr{}) {
 		t.Fatal("pooled ext msg was not cleared")
+	}
+	if reused.epollCtlEvent != (EpollEvent{}) {
+		t.Fatal("pooled ext epollCtlEvent was not cleared")
+	}
+	if reused.epollWaitEvents != nil {
+		t.Fatal("pooled ext epollWaitEvents root was not cleared")
 	}
 	if reused.openHow != nil {
 		t.Fatal("pooled ext OpenHow root was not cleared")

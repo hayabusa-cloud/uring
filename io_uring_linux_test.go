@@ -11,10 +11,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
@@ -655,6 +657,883 @@ func TestRemoveBuffersEncodesSQE(t *testing.T) {
 	}
 }
 
+func TestSendWithOffsetEncodesSubrange(t *testing.T) {
+	ring := newWrapperTestRing(t)
+
+	data := []byte("hello-send-offset")
+	const offset = 4
+	ctx := PackDirect(0, 0, 0, 5)
+	if err := ring.ioUring.send(ctx, 0, data, offset, len(data)-offset); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	sqe := lastSubmittedSQE(t, ring)
+	wantAddr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(data)))) + offset
+	if sqe.addr != wantAddr {
+		t.Fatalf("addr = %#x, want %#x", sqe.addr, wantAddr)
+	}
+	if sqe.off != 0 {
+		t.Fatalf("off = %d, want 0", sqe.off)
+	}
+	if sqe.len != uint32(len(data)-offset) {
+		t.Fatalf("len = %d, want %d", sqe.len, len(data)-offset)
+	}
+}
+
+func TestSendRejectsRangePastPayload(t *testing.T) {
+	ring := newWrapperTestRing(t)
+
+	data := []byte("send-range")
+	ctx := PackDirect(0, 0, 0, 5)
+	if err := ring.ioUring.send(ctx, 0, data, 1, len(data)); !errors.Is(err, ErrInvalidParam) {
+		t.Fatalf("send error = %v, want %v", err, ErrInvalidParam)
+	}
+}
+
+func TestReceiveWithOffsetEncodesSubrange(t *testing.T) {
+	ring := newWrapperTestRing(t)
+
+	data := []byte("hello-receive-offset")
+	const offset = 6
+	ctx := PackDirect(0, 0, 0, 7)
+	if err := ring.ioUring.receive(ctx, 0, data, offset, len(data)-offset); err != nil {
+		t.Fatalf("receive: %v", err)
+	}
+
+	sqe := lastSubmittedSQE(t, ring)
+	wantAddr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(data)))) + offset
+	if sqe.addr != wantAddr {
+		t.Fatalf("addr = %#x, want %#x", sqe.addr, wantAddr)
+	}
+	if sqe.off != 0 {
+		t.Fatalf("off = %d, want 0", sqe.off)
+	}
+	if sqe.len != uint32(len(data)-offset) {
+		t.Fatalf("len = %d, want %d", sqe.len, len(data)-offset)
+	}
+	if sqe.uflags != MSG_WAITALL {
+		t.Fatalf("uflags = %d, want %d", sqe.uflags, MSG_WAITALL)
+	}
+}
+
+func TestReceiveRejectsRangePastPayload(t *testing.T) {
+	ring := newWrapperTestRing(t)
+
+	data := []byte("receive-range")
+	ctx := PackDirect(0, 0, 0, 7)
+	if err := ring.ioUring.receive(ctx, 0, data, 1, len(data)); !errors.Is(err, ErrInvalidParam) {
+		t.Fatalf("receive error = %v, want %v", err, ErrInvalidParam)
+	}
+}
+
+func TestStreamSubmitRejectsOversizedLen32(t *testing.T) {
+	payload := mappedTestSlice[byte](t, oversizedLen32(t))
+	udpAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9996}
+
+	tests := []struct {
+		name string
+		call func(*Uring) error
+	}{
+		{
+			name: "Read",
+			call: func(ring *Uring) error {
+				return ring.Read(PackDirect(0, 0, 0, 3), payload)
+			},
+		},
+		{
+			name: "Write",
+			call: func(ring *Uring) error {
+				return ring.Write(PackDirect(0, 0, 0, 4), payload)
+			},
+		},
+		{
+			name: "Send",
+			call: func(ring *Uring) error {
+				return ring.Send(PackDirect(0, 0, 0, 5), &mockPollFd{fd: 5}, payload)
+			},
+		},
+		{
+			name: "Receive",
+			call: func(ring *Uring) error {
+				return ring.Receive(PackDirect(0, 0, 0, 6), &mockPollFd{fd: 6}, payload)
+			},
+		},
+		{
+			name: "sendZeroCopy",
+			call: func(ring *Uring) error {
+				return ring.ioUring.sendZeroCopy(PackDirect(0, 0, 0, 7), payload, 0, len(payload), 0)
+			},
+		},
+		{
+			name: "sendtoZeroCopy with addr",
+			call: func(ring *Uring) error {
+				return ring.ioUring.sendtoZeroCopy(PackDirect(0, 0, 0, 8), payload, 0, len(payload), udpAddr, 0)
+			},
+		},
+		{
+			name: "sendtoZeroCopy without addr",
+			call: func(ring *Uring) error {
+				return ring.ioUring.sendtoZeroCopy(PackDirect(0, 0, 0, 9), payload, 0, len(payload), nil, 0)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ring := newWrapperTestRing(t)
+			tail := atomic.LoadUint32(ring.ioUring.sq.kTail)
+
+			err := tt.call(ring)
+			if !errors.Is(err, ErrInvalidParam) {
+				t.Fatalf("%s error = %v, want %v", tt.name, err, ErrInvalidParam)
+			}
+			if got := atomic.LoadUint32(ring.ioUring.sq.kTail); got != tail {
+				t.Fatalf("SQ tail = %d, want %d", got, tail)
+			}
+		})
+	}
+}
+
+func TestFixedBufferSubmitRejectsOversizedLen32(t *testing.T) {
+	payload := mappedTestSlice[byte](t, oversizedLen32(t))
+
+	tests := []struct {
+		name string
+		call func(*Uring) error
+	}{
+		{
+			name: "readFixed",
+			call: func(ring *Uring) error {
+				_, err := ring.ioUring.readFixed(PackDirect(0, 0, 0, 3), 0, 0, len(payload))
+				return err
+			},
+		},
+		{
+			name: "writeFixed",
+			call: func(ring *Uring) error {
+				return ring.ioUring.writeFixed(PackDirect(0, 0, 0, 4), 0, 0, len(payload))
+			},
+		},
+		{
+			name: "sendFixed",
+			call: func(ring *Uring) error {
+				return ring.ioUring.sendFixed(PackDirect(0, 0, 0, 5), 0, 0, len(payload), 0)
+			},
+		},
+		{
+			name: "sendZeroCopyFixed",
+			call: func(ring *Uring) error {
+				return ring.ioUring.sendZeroCopyFixed(PackDirect(0, 0, 0, 6), 0, 0, len(payload), 0)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ring := newWrapperTestRing(t)
+			ring.ioUring.bufs = [][]byte{payload}
+			tail := atomic.LoadUint32(ring.ioUring.sq.kTail)
+
+			err := tt.call(ring)
+			if !errors.Is(err, ErrInvalidParam) {
+				t.Fatalf("%s error = %v, want %v", tt.name, err, ErrInvalidParam)
+			}
+			if got := atomic.LoadUint32(ring.ioUring.sq.kTail); got != tail {
+				t.Fatalf("SQ tail = %d, want %d", got, tail)
+			}
+		})
+	}
+}
+
+func TestBoundaryLen32RejectsOversizedInputs(t *testing.T) {
+	payload := mappedTestSlice[byte](t, oversizedLen32(t))
+	oversizedFDs := mappedTestSlice[int32](t, oversizedLen32(t))
+
+	tests := []struct {
+		name string
+		call func(*Uring) error
+	}{
+		{
+			name: "Madvise",
+			call: func(ring *Uring) error {
+				return ring.ioUring.madvise(PackDirect(0, 0, 0, 0), payload, 0)
+			},
+		},
+		{
+			name: "FSetXattr",
+			call: func(ring *Uring) error {
+				return ring.FSetXattr(ForFD(5), "user.payload", payload, 0)
+			},
+		},
+		{
+			name: "SetXattr",
+			call: func(ring *Uring) error {
+				return ring.SetXattr(PackDirect(0, 0, 0, 0), "/tmp/uring-xattr", "user.payload", payload, 0)
+			},
+		},
+		{
+			name: "FGetXattr",
+			call: func(ring *Uring) error {
+				return ring.FGetXattr(ForFD(6), "user.payload", payload)
+			},
+		},
+		{
+			name: "GetXattr",
+			call: func(ring *Uring) error {
+				return ring.GetXattr(PackDirect(0, 0, 0, 0), "/tmp/uring-xattr", "user.payload", payload)
+			},
+		},
+		{
+			name: "FilesUpdate",
+			call: func(ring *Uring) error {
+				return ring.FilesUpdate(PackDirect(0, 0, 0, 0), oversizedFDs, 0)
+			},
+		},
+		{
+			name: "UringCmd",
+			call: func(ring *Uring) error {
+				return ring.UringCmd(ForFD(7), 0x1234, payload)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ring := newWrapperSyntheticSubmitRing(t, 8)
+			tail := atomic.LoadUint32(ring.ioUring.sq.kTail)
+
+			err := tt.call(ring)
+			if !errors.Is(err, ErrInvalidParam) {
+				t.Fatalf("%s error = %v, want %v", tt.name, err, ErrInvalidParam)
+			}
+			if got := atomic.LoadUint32(ring.ioUring.sq.kTail); got != tail {
+				t.Fatalf("SQ tail = %d, want %d", got, tail)
+			}
+		})
+	}
+}
+
+func TestIovecSubmitRejectsTooManyIovecs(t *testing.T) {
+	iovs := make([][]byte, maxIovecs+1)
+	tests := []struct {
+		name string
+		call func(*Uring) error
+	}{
+		{name: "ReadV", call: func(ring *Uring) error {
+			return ring.ReadV(PackDirect(0, 0, 0, 3), iovs)
+		}},
+		{name: "WriteV", call: func(ring *Uring) error {
+			return ring.WriteV(PackDirect(0, 0, 0, 4), iovs)
+		}},
+		{name: "ReadvFixed", call: func(ring *Uring) error {
+			return ring.ReadvFixed(PackDirect(0, 0, 0, 5), 0, 0, iovs)
+		}},
+		{name: "WritevFixed", call: func(ring *Uring) error {
+			return ring.WritevFixed(PackDirect(0, 0, 0, 6), 0, 0, iovs)
+		}},
+		{name: "SendMsg", call: func(ring *Uring) error {
+			return ring.SendMsg(PackDirect(0, 0, 0, 0), &mockPollFd{fd: 7}, iovs, nil, nil)
+		}},
+		{name: "RecvMsg", call: func(ring *Uring) error {
+			msg := &Msghdr{Iov: new(IoVec), Iovlen: maxIovecs + 1}
+			return ring.RecvMsg(PackDirect(0, 0, 0, 0), &mockPollFd{fd: 8}, msg)
+		}},
+		{name: "SendmsgZeroCopy", call: func(ring *Uring) error {
+			return ring.ioUring.sendmsgZeroCopy(PackDirect(0, 0, 0, 9), 0, iovs, nil, nil, 0)
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ring := newWrapperSyntheticSubmitRing(t, 8)
+			ring.ioUring.bufs = [][]byte{{1}}
+			tail := atomic.LoadUint32(ring.ioUring.sq.kTail)
+
+			if err := tt.call(ring); !errors.Is(err, ErrInvalidParam) {
+				t.Fatalf("error = %v, want %v", err, ErrInvalidParam)
+			}
+			if got := atomic.LoadUint32(ring.ioUring.sq.kTail); got != tail {
+				t.Fatalf("SQ tail = %d, want %d", got, tail)
+			}
+			idx := int(tail) % len(ring.ioUring.submit.keepAlive)
+			keep := &ring.ioUring.submit.keepAlive[idx]
+			if keep.active || keep.iovs != nil || keep.ext != nil {
+				t.Fatal("invalid vector count reached iovec staging")
+			}
+		})
+	}
+}
+
+func TestMessageSubmitAcceptsIovecDomainEndpoints(t *testing.T) {
+	tests := []struct {
+		name         string
+		stagesIovecs bool
+		call         func(*Uring, [][]byte) error
+	}{
+		{name: "SendMsg", stagesIovecs: true, call: func(ring *Uring, iovs [][]byte) error {
+			return ring.SendMsg(PackDirect(0, 0, 0, 0), &mockPollFd{fd: 7}, iovs, nil, nil)
+		}},
+		{name: "RecvMsg", call: func(ring *Uring, iovs [][]byte) error {
+			vec := make([]IoVec, len(iovs))
+			msg := &Msghdr{Iov: unsafe.SliceData(vec), Iovlen: uint64(len(vec))}
+			return ring.RecvMsg(PackDirect(0, 0, 0, 0), &mockPollFd{fd: 8}, msg)
+		}},
+		{name: "SendmsgZeroCopy", stagesIovecs: true, call: func(ring *Uring, iovs [][]byte) error {
+			return ring.ioUring.sendmsgZeroCopy(PackDirect(0, 0, 0, 9), 0, iovs, nil, nil, 0)
+		}},
+	}
+
+	for _, n := range []int{0, maxIovecs} {
+		var iovs [][]byte
+		if n > 0 {
+			iovs = make([][]byte, n)
+		}
+		for _, tt := range tests {
+			t.Run(fmt.Sprintf("%s/%d", tt.name, n), func(t *testing.T) {
+				ring := newWrapperSyntheticSubmitRing(t, 8)
+
+				if err := tt.call(ring, iovs); err != nil {
+					t.Fatalf("error = %v", err)
+				}
+				keep := &ring.ioUring.submit.keepAlive[0]
+				if !keep.active || keep.ext == nil {
+					t.Fatal("message submit keepAlive is inactive")
+				}
+				if tt.stagesIovecs {
+					if len(keep.iovs) != n {
+						t.Fatalf("staged iovecs = %d, want %d", len(keep.iovs), n)
+					}
+					if keep.ext.msg.Iovlen != uint64(n) {
+						t.Fatalf("staged message iovlen = %d, want %d", keep.ext.msg.Iovlen, n)
+					}
+					return
+				}
+				if keep.iovs != nil {
+					t.Fatalf("RecvMsg staged %d package-owned iovecs, want none", len(keep.iovs))
+				}
+				if keep.ext.recvMsg == nil || keep.ext.recvMsg.Iovlen != uint64(n) {
+					var got uint64
+					if keep.ext.recvMsg != nil {
+						got = keep.ext.recvMsg.Iovlen
+					}
+					t.Fatalf("caller message iovlen = %d, want %d", got, n)
+				}
+			})
+		}
+	}
+}
+
+func TestTimeoutCountDomain(t *testing.T) {
+	maxCount := uint64(^uint32(0))
+	valid := []int{0}
+	if uint64(^uint(0)) > maxCount {
+		valid = append(valid, int(maxCount))
+	}
+	for _, count := range valid {
+		t.Run(fmt.Sprintf("accept/%d", count), func(t *testing.T) {
+			ring := newWrapperSyntheticSubmitRing(t, 2)
+
+			if err := ring.Timeout(PackDirect(0, 0, 0, 0), time.Second, WithCount(count)); err != nil {
+				t.Fatalf("Timeout(count=%d): %v", count, err)
+			}
+			sqe := lastSubmittedSQE(t, ring)
+			if sqe.off != uint64(count) {
+				t.Fatalf("SQE off = %d, want %d", sqe.off, count)
+			}
+		})
+	}
+
+	invalid := []int{-1}
+	if uint64(^uint(0)) > maxCount {
+		invalid = append(invalid, int(maxCount+1))
+	}
+	for _, count := range invalid {
+		t.Run(fmt.Sprintf("reject/%d", count), func(t *testing.T) {
+			ring := newWrapperSyntheticSubmitRing(t, 2)
+			keep := &ring.ioUring.submit.keepAlive[0]
+			sentinel := Timespec{Sec: 7, Nsec: 11}
+			keep.timespec = sentinel
+			before := ring.ioUring.sqCount()
+
+			if err := ring.Timeout(PackDirect(0, 0, 0, 0), time.Second, WithCount(count)); !errors.Is(err, ErrInvalidParam) {
+				t.Fatalf("Timeout(count=%d) error = %v, want %v", count, err, ErrInvalidParam)
+			}
+			if got := ring.ioUring.sqCount(); got != before {
+				t.Fatalf("SQ count = %d, want %d", got, before)
+			}
+			if keep.active || keep.timespec != sentinel {
+				t.Fatalf("invalid count touched submit staging: active=%t timespec=%+v", keep.active, keep.timespec)
+			}
+		})
+	}
+}
+
+func TestPollInputContract(t *testing.T) {
+	maxUint32 := uint64(math.MaxUint32)
+	validEvents := []struct {
+		name   string
+		events int
+	}{
+		{name: "zero", events: 0},
+		{name: "epoll-in", events: EPOLLIN},
+	}
+	if uint64(^uint(0)) > maxUint32 {
+		validEvents = append(validEvents, struct {
+			name   string
+			events int
+		}{name: "uint32-max", events: int(maxUint32)})
+	}
+
+	for _, tt := range validEvents {
+		t.Run("add/"+tt.name, func(t *testing.T) {
+			ring := newWrapperSyntheticSubmitRing(t, 2)
+			if err := ring.PollAdd(PackDirect(0, 0, 0, 7), tt.events); err != nil {
+				t.Fatalf("PollAdd(events=%d): %v", tt.events, err)
+			}
+			sqe := lastSubmittedSQE(t, ring)
+			if sqe.opcode != IORING_OP_POLL_ADD || sqe.len != 0 || sqe.uflags != uint32(tt.events) {
+				t.Fatalf("SQE = {opcode:%d len:%d uflags:%#x}, want {%d 0 %#x}",
+					sqe.opcode, sqe.len, sqe.uflags, IORING_OP_POLL_ADD, uint32(tt.events))
+			}
+		})
+	}
+
+	t.Run("add/multishot", func(t *testing.T) {
+		ring := newWrapperSyntheticSubmitRing(t, 2)
+		if err := ring.PollAddMultishot(PackDirect(0, 0, 0, 7), EPOLLIN); err != nil {
+			t.Fatalf("PollAddMultishot: %v", err)
+		}
+		sqe := lastSubmittedSQE(t, ring)
+		if sqe.len != IORING_POLL_ADD_MULTI || sqe.uflags != EPOLLIN {
+			t.Fatalf("SQE = {len:%d uflags:%#x}, want {%d %#x}",
+				sqe.len, sqe.uflags, IORING_POLL_ADD_MULTI, EPOLLIN)
+		}
+	})
+
+	invalidEvents := []struct {
+		name   string
+		events int
+	}{{name: "negative", events: -1}}
+	if uint64(^uint(0)) > maxUint32 {
+		invalidEvents = append(invalidEvents, struct {
+			name   string
+			events int
+		}{name: "above-uint32", events: int(maxUint32 + 1)})
+	}
+	for _, tt := range invalidEvents {
+		t.Run("add/reject-"+tt.name, func(t *testing.T) {
+			ring := newWrapperSyntheticSubmitRing(t, 2)
+			before := ring.ioUring.sqCount()
+			if err := ring.PollAdd(PackDirect(0, 0, 0, 7), tt.events); !errors.Is(err, ErrInvalidParam) {
+				t.Fatalf("PollAdd(events=%d) error = %v, want %v", tt.events, err, ErrInvalidParam)
+			}
+			if got := ring.ioUring.sqCount(); got != before {
+				t.Fatalf("SQ count = %d, want %d", got, before)
+			}
+		})
+	}
+
+	levelCalls := []struct {
+		name string
+		call func(*Uring) error
+	}{
+		{name: "single", call: func(ring *Uring) error {
+			return ring.PollAddLevel(PackDirect(0, 0, 0, 7), EPOLLIN)
+		}},
+		{name: "multishot", call: func(ring *Uring) error {
+			return ring.PollAddMultishotLevel(PackDirect(0, 0, 0, 7), EPOLLIN)
+		}},
+	}
+	for _, tt := range levelCalls {
+		t.Run("level/reject-"+tt.name, func(t *testing.T) {
+			ring := newWrapperSyntheticSubmitRing(t, 2)
+			before := ring.ioUring.sqCount()
+			if err := tt.call(ring); !errors.Is(err, ErrNotSupported) {
+				t.Fatalf("error = %v, want %v", err, ErrNotSupported)
+			}
+			if got := ring.ioUring.sqCount(); got != before {
+				t.Fatalf("SQ count = %d, want %d", got, before)
+			}
+		})
+	}
+
+	type updateCase struct {
+		name        string
+		newUserData uint64
+		newEvents   int
+		flags       int
+	}
+	validUpdates := []updateCase{
+		{name: "remove"},
+		{name: "events", newEvents: EPOLLIN, flags: IORING_POLL_UPDATE_EVENTS},
+		{name: "user-data", newUserData: 17, flags: IORING_POLL_UPDATE_USER_DATA},
+		{
+			name:        "combined",
+			newUserData: 19,
+			newEvents:   EPOLLOUT,
+			flags: IORING_POLL_UPDATE_EVENTS |
+				IORING_POLL_UPDATE_USER_DATA,
+		},
+	}
+	if uint64(^uint(0)) > maxUint32 {
+		validUpdates = append(validUpdates, updateCase{
+			name: "uint32-max-events", newEvents: int(maxUint32), flags: IORING_POLL_UPDATE_EVENTS,
+		})
+	}
+	for _, tt := range validUpdates {
+		t.Run("update/"+tt.name, func(t *testing.T) {
+			ring := newWrapperSyntheticSubmitRing(t, 2)
+			const oldUserData = uint64(11)
+			if err := ring.PollUpdate(PackDirect(0, 0, 0, 7), oldUserData, tt.newUserData, tt.newEvents, tt.flags); err != nil {
+				t.Fatalf("PollUpdate: %v", err)
+			}
+			sqe := lastSubmittedSQE(t, ring)
+			if sqe.opcode != IORING_OP_POLL_REMOVE || sqe.addr != oldUserData ||
+				sqe.off != tt.newUserData || sqe.len != uint32(tt.flags) ||
+				sqe.uflags != uint32(tt.newEvents) {
+				t.Fatalf("SQE = {opcode:%d addr:%d off:%d len:%d uflags:%#x}",
+					sqe.opcode, sqe.addr, sqe.off, sqe.len, sqe.uflags)
+			}
+		})
+	}
+
+	invalidUpdates := []updateCase{
+		{name: "negative-events", newEvents: -1, flags: IORING_POLL_UPDATE_EVENTS},
+		{name: "negative-flags", flags: -1},
+		{name: "unknown-flag", flags: IORING_POLL_ADD_LEVEL},
+		{name: "multishot-only", flags: IORING_POLL_ADD_MULTI},
+		{name: "multishot-events", newEvents: EPOLLIN, flags: IORING_POLL_UPDATE_EVENTS | IORING_POLL_ADD_MULTI},
+		{name: "multishot-user-data", newUserData: 1, flags: IORING_POLL_UPDATE_USER_DATA | IORING_POLL_ADD_MULTI},
+		{
+			name:        "multishot-combined",
+			newUserData: 1,
+			newEvents:   EPOLLIN,
+			flags: IORING_POLL_UPDATE_EVENTS |
+				IORING_POLL_UPDATE_USER_DATA |
+				IORING_POLL_ADD_MULTI,
+		},
+		{name: "user-data-without-flag", newUserData: 1},
+		{name: "events-without-flag", newEvents: EPOLLIN},
+	}
+	if uint64(^uint(0)) > maxUint32 {
+		invalidUpdates = append(invalidUpdates,
+			updateCase{name: "events-above-uint32", newEvents: int(maxUint32 + 1), flags: IORING_POLL_UPDATE_EVENTS},
+			updateCase{name: "flags-above-uint32", flags: int(maxUint32 + 1)},
+		)
+	}
+	for _, tt := range invalidUpdates {
+		t.Run("update/reject-"+tt.name, func(t *testing.T) {
+			ring := newWrapperSyntheticSubmitRing(t, 2)
+			before := ring.ioUring.sqCount()
+			if err := ring.PollUpdate(PackDirect(0, 0, 0, 7), 11, tt.newUserData, tt.newEvents, tt.flags); !errors.Is(err, ErrInvalidParam) {
+				t.Fatalf("PollUpdate error = %v, want %v", err, ErrInvalidParam)
+			}
+			if got := ring.ioUring.sqCount(); got != before {
+				t.Fatalf("SQ count = %d, want %d", got, before)
+			}
+		})
+	}
+}
+
+func TestVectorSubmitAcceptsMaxIovecs(t *testing.T) {
+	iovs := make([][]byte, maxIovecs)
+	fixedBuf := []byte{1}
+	fixedIovs := make([][]byte, maxIovecs)
+	for i := range fixedIovs {
+		fixedIovs[i] = fixedBuf
+	}
+	tests := []struct {
+		name string
+		call func(*Uring) error
+	}{
+		{name: "ReadV", call: func(ring *Uring) error {
+			return ring.ReadV(PackDirect(0, 0, 0, 3), iovs)
+		}},
+		{name: "WriteV", call: func(ring *Uring) error {
+			return ring.WriteV(PackDirect(0, 0, 0, 4), iovs)
+		}},
+		{name: "ReadvFixed", call: func(ring *Uring) error {
+			return ring.ReadvFixed(PackDirect(0, 0, 0, 5), 0, 0, fixedIovs)
+		}},
+		{name: "WritevFixed", call: func(ring *Uring) error {
+			return ring.WritevFixed(PackDirect(0, 0, 0, 6), 0, 0, fixedIovs)
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ring := newWrapperSyntheticSubmitRing(t, 8)
+			ring.ioUring.bufs = [][]byte{fixedBuf}
+
+			if err := tt.call(ring); err != nil {
+				t.Fatalf("error = %v", err)
+			}
+			sqe := lastSubmittedSQE(t, ring)
+			if sqe.len != maxIovecs {
+				t.Fatalf("SQE len = %d, want %d", sqe.len, maxIovecs)
+			}
+			keep := &ring.ioUring.submit.keepAlive[0]
+			if !keep.active || len(keep.iovs) != maxIovecs {
+				t.Fatalf("staged iovecs = %d, want %d", len(keep.iovs), maxIovecs)
+			}
+		})
+	}
+}
+
+func TestRegisterFilesRejectsInvalidCountDomains(t *testing.T) {
+	t.Run("register oversized", func(t *testing.T) {
+		ur := &ioUring{ringFd: -1}
+		if err := ur.registerFiles(mappedTestSlice[int32](t, oversizedLen32(t))); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("registerFiles oversized error = %v, want %v", err, ErrInvalidParam)
+		}
+		if len(ur.files) != 0 {
+			t.Fatalf("registered file table len = %d, want 0", len(ur.files))
+		}
+	})
+
+	t.Run("update oversized", func(t *testing.T) {
+		ur := &ioUring{ringFd: -1, files: []int32{10, 11}}
+		before := append([]int32(nil), ur.files...)
+		if _, err := ur.registerFilesUpdate(1, mappedTestSlice[int32](t, oversizedLen32(t))); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("registerFilesUpdate oversized error = %v, want %v", err, ErrInvalidParam)
+		}
+		if len(ur.files) != len(before) {
+			t.Fatalf("registered file table len = %d, want %d", len(ur.files), len(before))
+		}
+		for i := range before {
+			if ur.files[i] != before[i] {
+				t.Fatalf("registered file table[%d] = %d, want %d", i, ur.files[i], before[i])
+			}
+		}
+	})
+
+	t.Run("update beyond remaining table", func(t *testing.T) {
+		ur := &ioUring{ringFd: -1, files: []int32{10, 11}}
+		before := append([]int32(nil), ur.files...)
+		if _, err := ur.registerFilesUpdate(1, []int32{20, 21}); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("registerFilesUpdate overrun error = %v, want %v", err, ErrInvalidParam)
+		}
+		for i := range before {
+			if ur.files[i] != before[i] {
+				t.Fatalf("registered file table[%d] = %d, want %d", i, ur.files[i], before[i])
+			}
+		}
+	})
+
+	t.Run("update rejects skip sentinel", func(t *testing.T) {
+		ur := &ioUring{ringFd: -1, files: []int32{10, 11}}
+		if updated, err := ur.registerFilesUpdate(0, []int32{-2}); updated != 0 || !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("registerFilesUpdate(-2) = (%d, %v), want (0, %v)", updated, err, ErrInvalidParam)
+		}
+		if ur.files[0] != 10 || ur.files[1] != 11 {
+			t.Fatalf("registered file table = %v, want [10 11]", ur.files)
+		}
+	})
+}
+
+func TestRegisterFilesUpdatePreservesPartialProgress(t *testing.T) {
+	ur := newTestIoUring(t)
+	f, err := os.Open("/dev/null")
+	if err != nil {
+		t.Fatalf("open /dev/null: %v", err)
+	}
+	defer f.Close()
+
+	fd := int32(f.Fd())
+	if err := ur.registerFiles([]int32{fd, fd}); err != nil {
+		t.Fatalf("registerFiles: %v", err)
+	}
+	updated, err := ur.registerFilesUpdate(0, []int32{fd, math.MaxInt32})
+	if err != nil {
+		t.Fatalf("registerFilesUpdate: %v", err)
+	}
+	if updated != 1 {
+		t.Fatalf("updated = %d, want 1", updated)
+	}
+	if ur.files[0] != fd || ur.files[1] != -1 {
+		t.Fatalf("registered file table = %v, want [%d -1]", ur.files, fd)
+	}
+	runtime.KeepAlive(f)
+}
+
+func TestRegisterFilesUpdatePreservesFirstFailureClear(t *testing.T) {
+	ur := newTestIoUring(t)
+	f, err := os.Open("/dev/null")
+	if err != nil {
+		t.Fatalf("open /dev/null: %v", err)
+	}
+	defer f.Close()
+
+	fd := int32(f.Fd())
+	if err := ur.registerFiles([]int32{fd}); err != nil {
+		t.Fatalf("registerFiles: %v", err)
+	}
+	updated, err := ur.registerFilesUpdate(0, []int32{math.MaxInt32})
+	if updated != 0 || !errors.Is(err, zcall.Errno(zcall.EBADF)) {
+		t.Fatalf("registerFilesUpdate = (%d, %v), want (0, EBADF)", updated, err)
+	}
+	if ur.files[0] != -1 {
+		t.Fatalf("registered file table = %v, want [-1]", ur.files)
+	}
+	runtime.KeepAlive(f)
+}
+
+func TestCloneBuffersPublishesExactViews(t *testing.T) {
+	t.Run("task-registered source", func(t *testing.T) {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+
+		src := newTestIoUring(t)
+		dst := newTestIoUring(t)
+		const bufferSize = 1 << 12
+		backing := make([]byte, 2*bufferSize)
+		if err := src.registerBuffers(unsafe.Pointer(unsafe.SliceData(backing)), 2, bufferSize); err != nil {
+			t.Fatalf("register source buffers: %v", err)
+		}
+
+		type ioUringRsrcUpdate struct {
+			offset uint32
+			resv   uint32
+			data   uint64
+		}
+		registration := ioUringRsrcUpdate{
+			offset: math.MaxUint32,
+			data:   uint64(src.ringFd),
+		}
+		result, errno := zcall.IoUringRegister(
+			uintptr(src.ringFd),
+			IORING_REGISTER_RING_FDS,
+			unsafe.Pointer(&registration),
+			1,
+		)
+		if errno != 0 {
+			t.Fatalf("register source ring: %v", errFromErrno(errno))
+		}
+		if result != 1 {
+			t.Fatalf("register source ring result = %d, want 1", result)
+		}
+		defer func() {
+			unregistration := ioUringRsrcUpdate{offset: registration.offset}
+			result, errno := zcall.IoUringRegister(
+				uintptr(src.ringFd),
+				IORING_UNREGISTER_RING_FDS,
+				unsafe.Pointer(&unregistration),
+				1,
+			)
+			if errno != 0 {
+				t.Errorf("unregister source ring: %v", errFromErrno(errno))
+			} else if result != 1 {
+				t.Errorf("unregister source ring result = %d, want 1", result)
+			}
+		}()
+
+		srcRing := &Uring{ioUring: src}
+		dstRing := &Uring{ioUring: dst}
+		if err := dstRing.CloneBuffersFromRegistered(srcRing, registration.offset, 0, 0, 0, false); err != nil {
+			t.Fatalf("CloneBuffersFromRegistered: %v", err)
+		}
+		if dstRing.RegisteredBufferCount() != 2 {
+			t.Fatalf("destination buffer count = %d, want 2", dstRing.RegisteredBufferCount())
+		}
+		for i := range 2 {
+			got, want := dstRing.RegisteredBuffer(i), srcRing.RegisteredBuffer(i)
+			if len(got) != len(want) || unsafe.SliceData(got) != unsafe.SliceData(want) {
+				t.Fatalf("destination buffer %d does not match task-registered source view", i)
+			}
+		}
+		runtime.KeepAlive(backing)
+	})
+
+	t.Run("whole table into empty destination", func(t *testing.T) {
+		src := newTestIoUring(t)
+		dst := newTestIoUring(t)
+		const bufferSize = 1 << 12
+		backing := make([]byte, 3*bufferSize)
+		if err := src.registerBuffers(unsafe.Pointer(unsafe.SliceData(backing)), 3, bufferSize); err != nil {
+			t.Fatalf("register source buffers: %v", err)
+		}
+
+		srcRing := &Uring{ioUring: src}
+		dstRing := &Uring{ioUring: dst}
+		if err := dstRing.CloneBuffers(srcRing, 0, 0, 0, false); err != nil {
+			t.Fatalf("CloneBuffers: %v", err)
+		}
+		if dstRing.RegisteredBufferCount() != 3 {
+			t.Fatalf("destination buffer count = %d, want 3", dstRing.RegisteredBufferCount())
+		}
+		for i := range 3 {
+			got, want := dstRing.RegisteredBuffer(i), srcRing.RegisteredBuffer(i)
+			if len(got) != len(want) || unsafe.SliceData(got) != unsafe.SliceData(want) {
+				t.Fatalf("destination buffer %d does not match source view", i)
+			}
+		}
+		runtime.KeepAlive(backing)
+	})
+
+	t.Run("replacement preserves outside range", func(t *testing.T) {
+		src := newTestIoUring(t)
+		dst := newTestIoUring(t)
+		const bufferSize = 1 << 12
+		srcBacking := make([]byte, 2*bufferSize)
+		dstBacking := make([]byte, 4*bufferSize)
+		if err := src.registerBuffers(unsafe.Pointer(unsafe.SliceData(srcBacking)), 2, bufferSize); err != nil {
+			t.Fatalf("register source buffers: %v", err)
+		}
+		if err := dst.registerBuffers(unsafe.Pointer(unsafe.SliceData(dstBacking)), 4, bufferSize); err != nil {
+			t.Fatalf("register destination buffers: %v", err)
+		}
+		beforeFirst, beforeLast := dst.bufs[0], dst.bufs[3]
+
+		srcRing := &Uring{ioUring: src}
+		dstRing := &Uring{ioUring: dst}
+		if err := dstRing.CloneBuffers(srcRing, 0, 1, 2, true); err != nil {
+			t.Fatalf("CloneBuffers replace: %v", err)
+		}
+		if unsafe.SliceData(dst.bufs[0]) != unsafe.SliceData(beforeFirst) ||
+			unsafe.SliceData(dst.bufs[3]) != unsafe.SliceData(beforeLast) {
+			t.Fatal("replacement changed a destination view outside the cloned range")
+		}
+		for i := range 2 {
+			if unsafe.SliceData(dst.bufs[i+1]) != unsafe.SliceData(src.bufs[i]) {
+				t.Fatalf("destination buffer %d does not match source buffer %d", i+1, i)
+			}
+		}
+		runtime.KeepAlive(srcBacking)
+		runtime.KeepAlive(dstBacking)
+	})
+}
+
+func TestQueryPreservesEntryFailureAndResultSizeLayout(t *testing.T) {
+	data := byte(0)
+	hdr := QueryHdr{
+		QueryData: uint64(uintptr(unsafe.Pointer(&data))),
+		QueryOp:   math.MaxUint32,
+		Size:      1,
+	}
+	if err := (&ioUring{ringFd: -1}).query(&hdr); !errors.Is(err, ErrNotSupported) {
+		t.Fatalf("query error = %v, want %v", err, ErrNotSupported)
+	}
+	if hdr.Result != -int32(EOPNOTSUPP) {
+		t.Fatalf("query result = %d, want -EOPNOTSUPP", hdr.Result)
+	}
+	if hdr.Size != 0 {
+		t.Fatalf("query result size = %d, want 0 for unsupported operation", hdr.Size)
+	}
+
+	if got := unsafe.Offsetof(QueryOpcode{}.ResultSize); got != 48 {
+		t.Fatalf("QueryOpcode kernel-data size = %d, want 48", got)
+	}
+	if got := unsafe.Offsetof(QueryZCRX{}.Features); got != 20 {
+		t.Fatalf("QueryZCRX Features offset = %d, want 20", got)
+	}
+	if got := unsafe.Offsetof(QueryZCRX{}.ResultSize); got != 40 {
+		t.Fatalf("QueryZCRX kernel-data size = %d, want 40", got)
+	}
+	if got := unsafe.Offsetof(QuerySCQ{}.ResultSize); got != 16 {
+		t.Fatalf("QuerySCQ kernel-data size = %d, want 16", got)
+	}
+}
+
 func TestSendZeroCopyEncodesSQE(t *testing.T) {
 	ring := newWrapperTestRing(t)
 
@@ -677,6 +1556,39 @@ func TestSendZeroCopyEncodesSQE(t *testing.T) {
 	}
 	if sqe.len != uint32(len(data)) {
 		t.Fatalf("len = %d, want %d", sqe.len, len(data))
+	}
+}
+
+func TestSendZeroCopyWithOffsetEncodesSubrange(t *testing.T) {
+	ring := newWrapperTestRing(t)
+
+	data := []byte("hello-zc-offset")
+	const offset = 3
+	ctx := PackDirect(0, 0, 0, 5)
+	if err := ring.ioUring.sendZeroCopy(ctx, data, offset, len(data)-offset, 0); err != nil {
+		t.Fatalf("sendZeroCopy: %v", err)
+	}
+
+	sqe := lastSubmittedSQE(t, ring)
+	wantAddr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(data)))) + offset
+	if sqe.addr != wantAddr {
+		t.Fatalf("addr = %#x, want %#x", sqe.addr, wantAddr)
+	}
+	if sqe.off != 0 {
+		t.Fatalf("off = %d, want 0", sqe.off)
+	}
+	if sqe.len != uint32(len(data)-offset) {
+		t.Fatalf("len = %d, want %d", sqe.len, len(data)-offset)
+	}
+}
+
+func TestSendZeroCopyRejectsRangePastPayload(t *testing.T) {
+	ring := newWrapperTestRing(t)
+
+	data := []byte("send-zc-range")
+	ctx := PackDirect(0, 0, 0, 5)
+	if err := ring.ioUring.sendZeroCopy(ctx, data, 1, len(data), 0); !errors.Is(err, ErrInvalidParam) {
+		t.Fatalf("sendZeroCopy error = %v, want %v", err, ErrInvalidParam)
 	}
 }
 
@@ -726,6 +1638,17 @@ func TestSendtoZeroCopyWithAddrAppliesOffset(t *testing.T) {
 	}
 }
 
+func TestSendtoZeroCopyWithAddrRejectsRangePastPayload(t *testing.T) {
+	ring := newStartedSharedTestRing(t)
+
+	data := []byte("sendto-zc-range")
+	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9997}
+	ctx := PackDirect(0, 0, 0, 10)
+	if err := ring.ioUring.sendtoZeroCopy(ctx, data, 1, len(data), addr, 0); !errors.Is(err, ErrInvalidParam) {
+		t.Fatalf("sendtoZeroCopy error = %v, want %v", err, ErrInvalidParam)
+	}
+}
+
 func TestSendtoZeroCopyWithoutAddrEncodesSQE(t *testing.T) {
 	ring := newWrapperTestRing(t)
 
@@ -744,6 +1667,19 @@ func TestSendtoZeroCopyWithoutAddrEncodesSQE(t *testing.T) {
 	}
 	if sqe.uflags != 0x40 {
 		t.Fatalf("uflags = %#x, want 0x40", sqe.uflags)
+	}
+	if sqe.off != 0 {
+		t.Fatalf("off = %d, want 0", sqe.off)
+	}
+}
+
+func TestSendtoZeroCopyWithoutAddrRejectsRangePastPayload(t *testing.T) {
+	ring := newWrapperTestRing(t)
+
+	data := []byte("sendto-zc-noaddr-range")
+	ctx := PackDirect(0, 0, 0, 11)
+	if err := ring.ioUring.sendtoZeroCopy(ctx, data, 1, len(data), nil, 0); !errors.Is(err, ErrInvalidParam) {
+		t.Fatalf("sendtoZeroCopy error = %v, want %v", err, ErrInvalidParam)
 	}
 }
 
@@ -787,12 +1723,12 @@ func TestSendmsgZeroCopyEncodesSQE(t *testing.T) {
 	}
 }
 
-func TestReadMultiShotEncodesSQE(t *testing.T) {
-	ring := newWrapperTestRing(t)
+func TestReadMultishotEncodesExactSQE(t *testing.T) {
+	ring := newWrapperSyntheticSubmitRing(t, 8)
 
 	ctx := PackDirect(0, 0, 0, 15)
-	if err := ring.ioUring.readMultiShot(ctx, 0, 4096, 7); err != nil {
-		t.Fatalf("readMultiShot: %v", err)
+	if err := ring.ioUring.readMultishot(ctx, 4096, 7); err != nil {
+		t.Fatalf("readMultishot: %v", err)
 	}
 
 	sqe := lastSubmittedSQE(t, ring)
@@ -802,14 +1738,23 @@ func TestReadMultiShotEncodesSQE(t *testing.T) {
 	if sqe.fd != 15 {
 		t.Fatalf("fd = %d, want 15", sqe.fd)
 	}
-	if sqe.len != 4096 {
-		t.Fatalf("len = %d, want 4096", sqe.len)
+	if sqe.off != 4096 {
+		t.Fatalf("off = %d, want 4096", sqe.off)
+	}
+	if sqe.addr != 0 {
+		t.Fatalf("addr = %#x, want 0", sqe.addr)
+	}
+	if sqe.len != 0 {
+		t.Fatalf("len = %d, want 0", sqe.len)
 	}
 	if sqe.flags&IOSQE_BUFFER_SELECT == 0 {
 		t.Fatal("IOSQE_BUFFER_SELECT not set")
 	}
 	if sqe.bufIndex != 7 {
 		t.Fatalf("bufIndex = %d, want 7 (group)", sqe.bufIndex)
+	}
+	if sqe.ioprio != 0 || sqe.uflags != 0 || sqe.personality != 0 || sqe.spliceFdIn != 0 {
+		t.Fatal("readMultishot encoded nonzero optional fields")
 	}
 }
 
@@ -936,8 +1881,8 @@ func TestSubmitSlotResetAndInlineCmdData(t *testing.T) {
 	sqe128 := ioUringSqe128{ioUringSqe: ioUringSqe{opcode: IORING_OP_URING_CMD}}
 	slot = submitSlot{sqe: &sqe, sqe128: &sqe128}
 	data := slot.inlineCmdData128()
-	if len(data) != uringCmd128DataMax {
-		t.Fatalf("inlineCmdData128 len = %d, want %d", len(data), uringCmd128DataMax)
+	if len(data) != uringCmdInlineDataMax {
+		t.Fatalf("inlineCmdData128 len = %d, want %d", len(data), uringCmdInlineDataMax)
 	}
 	data[0] = 0xaa
 	data[len(data)-1] = 0xbb
@@ -1136,6 +2081,26 @@ func TestRegisterBuffersAcceptsNonPowerOfTwoCount(t *testing.T) {
 		t.Fatalf("unregisterBuffers: %v", err)
 	}
 	runtime.KeepAlive(buffers)
+}
+
+func TestRegisterBuffersFailureDoesNotPublishState(t *testing.T) {
+	ur := &ioUring{ringFd: -1}
+	buffer := make([]byte, 1<<12)
+	addr := unsafe.Pointer(unsafe.SliceData(buffer))
+
+	for attempt := range 2 {
+		err := ur.registerBuffers(addr, 1, len(buffer))
+		if err == nil {
+			t.Fatalf("registerBuffers attempt %d succeeded with an invalid ring descriptor", attempt+1)
+		}
+		if errors.Is(err, ErrExists) {
+			t.Fatalf("registerBuffers attempt %d error = %v, want syscall failure", attempt+1, err)
+		}
+		if len(ur.bufs) != 0 {
+			t.Fatalf("registerBuffers attempt %d published %d buffers after failure, want 0", attempt+1, len(ur.bufs))
+		}
+	}
+	runtime.KeepAlive(buffer)
 }
 
 func TestNewIoUringRejectsEntriesOutsideSetupDomain(t *testing.T) {

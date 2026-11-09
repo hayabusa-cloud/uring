@@ -124,12 +124,13 @@ for {
 | `ListenerOp`          | リスナー作成操作のハンドル。FD の保持と accept ヘルパーを提供            |
 | `BundleIterator`      | バンドル受信で消費されたバッファの走査                             |
 | `IncrementalReceiver` | インクリメンタル buffer-ring 受信の管理（`IOU_PBUF_RING_INC`） |
+| `BufferRing`          | 明示的に登録する不透明な提供バッファリング。`Add` で準備し、`Advance` で公開 |
 | `ZCTracker`           | ゼロコピー送信の通知とフォールバックのライフサイクルを追跡              |
 | `ContextPools`        | indirect・extended 発行コンテキストのプール                  |
 | `ZCRXReceiver`        | NIC RX キューからのゼロコピー受信ライフサイクルの管理                  |
 | `ZCRXConfig`          | ZCRX 受信インスタンスの設定                                |
 | `ZCRXHandler`         | ZCRX のデータ・エラー・シャットダウンに対するコールバックインターフェース         |
-| `ZCRXBuffer`          | 配送済みゼロコピー受信ビュー。解放時にカーネルが自動補充                    |
+| `ZCRXBuffer`          | 配送済みゼロコピー受信ビュー。呼び出し側が補充キュー経由で返却する              |
 
 操作メソッド:
 
@@ -148,13 +149,23 @@ for {
 | ポーリング    | `PollAdd`, `PollRemove`, `PollUpdate`, `PollAddLevel`, `PollAddMultishot`, `PollAddMultishotLevel`                                                                  |
 | 非同期      | `EpollWait`, `FutexWait`, `FutexWake`, `FutexWaitV`, `Waitid`                                                                                                       |
 | リングメッセージ | `MsgRing`, `MsgRingFD`, `FixedFdInstall`, `FilesUpdate`                                                                                                             |
-| コマンド     | `UringCmd`, `UringCmd128`, `Nop`, `Nop128`                                                                                                                          |
+| コマンド     | `UringCmd`, `UringCmdInline`, `UringCmd128`, `Nop`, `Nop128`                                                                                                        |
+
+`UringCmdInline` は最大 80 バイトを通常の `IORING_OP_URING_CMD` SQE 内へコピーし、`Options.SQE128` を必要とします。別個の `IORING_OP_URING_CMD128` opcode のサポートは必要ありません。
+
+`WithUringCmdFlags` は `uring_cmd_flags` union を設定します。`IORING_URING_CMD_FIXED` では `sqeCtx.WithBufGroup` に登録済みバッファ index を指定します。`IORING_URING_CMD_MULTISHOT` では `IOSQE_BUFFER_SELECT` も指定し、同じ context field を provided-buffer group として使用します。この 2 つの flag は同時に指定できません。
 
 `Nop128` と `UringCmd128` は `Options.SQE128` 付きで作成したリングと、対応する opcode のカーネルサポートの両方を必要とします。いずれかが欠ける場合は `ErrNotSupported` を返します。
 
 `Uring.Close` は指定したファイルディスクリプタに `IORING_OP_CLOSE` を発行します。リング自体の破棄ではありません。
 
+`PollAddLevel` と `PollAddMultishotLevel` は常に `ErrNotSupported` を返します。Linux io_uring は `IORING_OP_POLL_ADD` でレベルフラグを受け付けません。
+
 ## コンテキスト伝達
+
+`Multicast` はペイロードサイズと宛先数に応じて通常送信とゼロコピー送信を自動選択します。`MulticastZeroCopy` はより低いしきい値でゼロコピーを優先します。どちらも Direct コンテキストを要求し、`(submitted, error)` を返します。`submitted` は先頭から受理された宛先数です。バックプレッシャー時は残りの宛先から再開します。再開時に選択される操作が変わる場合があるため、各 CQE のオペコードとフラグを確認してください。`Multicast` の通常送信は `NotifySucceed` に従います。選択されたゼロコピー送信と `MulticastZeroCopy` の両経路は完了の観測を維持し、明示的な `IOSQE_CQE_SKIP_SUCCESS` を拒否します。
+
+受理されたストリーム送信でも、要求したバイト数より少ない転送で完了する場合があります。通常送信のバイト数を追跡する場合は成功 CQE を有効にし、宛先ごとのデータ結果から未送信の末尾部分だけを再送してください。共有するゼロコピーデータは、受理されたすべての宛先が解放条件に達するまで変更しないでください。[multicast の例](./examples/zerocopy_test.go)は、バイト単位の進捗と解放をそれぞれ追跡します。
 
 `SQEContext` はこのパッケージの主要な識別トークンです。direct モードでは opcode、SQE flags、buffer group ID、ファイルディスクリプタを 64 ビット値ひとつに格納します。
 
@@ -234,7 +245,7 @@ for i := 0; i < n; i++ {
 
 ## バッファ供給
 
-`uring` には実用上 3 つのバッファ経路があります。登録バッファはリング開始時に固定され、固定バッファのファイル I/O で使います。提供バッファリングではカーネルが受信バッファを選び、選択されたバッファ ID を CQE に返します。バンドル受信は 1 つの CQE で連続した論理バッファ範囲を消費し、その範囲を `BundleIterator` で公開します。
+`uring` には実用上 3 つのバッファ経路があります。登録バッファはリング開始時に固定され、固定バッファのファイル I/O で使います。提供バッファリングではカーネルが受信バッファを選び、選択されたバッファ ID を CQE に返します。バンドル受信は公開順にバッファを消費します。再利用後は ID の数値順と一致するとは限りません。`Uring.BundleIterator` は実際の順序を保持します。単独の `NewBundleIterator` には、リングサイズを法とする連続した ID 順の公開が必要です。
 
 - `ReadBufferSize`・`ReadBufferNum` による固定サイズの提供バッファ
 - `MultiSizeBuffer` によるマルチサイズバッファグループ
@@ -255,6 +266,38 @@ ring, err := uring.New(func(o *uring.Options) {
 cfg, scale := uring.BufferConfigForBudget(256 * uring.MiB)
 fmt.Printf("buffer tiers=%+v scale=%d\n", cfg, scale)
 ```
+
+明示的なインクリメンタルリングは空の状態で初期化されます。`Start` の後、設定済みの提供バッファグループが使用していないグループ ID を選び、各バッキングスライスを準備してからバッチを公開します。
+
+```go
+const (
+    groupID = 60000
+    entries = 8
+    bufSize = 4096
+)
+
+backing := make([]byte, entries*bufSize)
+bufRing, err := ring.RegisterBufRingIncremental(entries, groupID)
+if err != nil {
+    return err
+}
+for i := range entries {
+    buf := backing[i*bufSize : (i+1)*bufSize]
+    if err := bufRing.Add(buf, uint16(i), i); err != nil {
+        return err
+    }
+}
+if err := bufRing.Advance(entries); err != nil {
+    return err
+}
+
+pool := uring.NewContextPools(entries)
+receiver := uring.NewIncrementalReceiver(ring, pool, groupID, bufSize, backing, entries)
+```
+
+`BufferRing.Add` はエントリを準備し、`BufferRing.Advance` はそれらを公開して所有権をカーネルへ移します。`backing` を到達可能な状態に保ってください。この receiver の CQE は、CQ の順序で一度ずつ直列に処理します。receiver はバッファ ID ごとに独立したオフセットを保持します。
+
+`IORING_CQE_F_BUF_MORE` は、リクエスト完了後も選択されたバッファをカーネルが保持していることを示します。`IORING_CQE_F_BUFFER` があり、`IORING_CQE_F_BUF_MORE` がない CQE を受け取り、借用中のアクセスがすべて終了してからバッファを再公開してください。結果がゼロまたは負でもバッファが返却されることがあります。buffer-ring の破棄は `Uring.Stop` が担当します。
 
 固定バッファ I/O は登録済みバッファをインデックスで参照します。返されるスライスはリング所有のメモリなので、固定操作が完了するまで有効に保ってください。
 
@@ -284,7 +327,7 @@ if cqe.HasBuffer() {
 }
 ```
 
-バンドル受信は同じ提供バッファストレージを使いますが、1 つの CQE で複数のバッファを消費することがあります。イテレータを処理したら、消費したスロットを回収してください。
+バンドル受信は同じ提供バッファストレージを使いますが、1 つの CQE で複数のバッファを消費することがあります。イテレータを処理したら、消費したスロットを回収してください。`Recycle` はイテレータのすべてのコピーを通じて正確に 1 回だけ呼び出し、返った後は生成されたバッファを読み取らないでください。
 
 ```go
 if err := ring.ReceiveBundle(recvCtx, &socketFD, uring.WithReadBufferSize(uring.BufferSizeSmall)); err != nil {
@@ -295,7 +338,9 @@ if it, ok := ring.BundleIterator(cqe, cqe.BufGroup()); ok {
     for buf := range it.All() {
         handle(buf)
     }
-    it.Recycle(ring)
+    if err := it.Recycle(ring); err != nil {
+        return err
+    }
 }
 ```
 
@@ -333,7 +378,7 @@ CQE のルーティング方針はパッケージ外に委ねています。リ�
 
 ### リング所有イベントループ
 
-シングルイシュアーモード（デフォルト）では、1 つの goroutine がすべての発行状態操作を直列化します。一般的なループでは保留中のワークを発行し、`Wait` が観測可能な進展を返さないときは呼び出し側の `iox.Backoff` を適用し、完了を振り分けます。
+デフォルトのタスク移動可能モードでは、共有された発行状態の同期により goroutine は OS スレッド間を移動できます。リング所有ループは引き続きすべての発行状態操作を直列化できます。一般的なループでは保留中のワークを発行し、`Wait` が観測可能な進展を返さないときは呼び出し側の `iox.Backoff` を適用し、完了を振り分けます。
 
 ```go
 func runLoop(ring *uring.Uring, stop <-chan struct{}) error {
@@ -406,6 +451,8 @@ for i := range n {
 
 `OnStep` コールバックは 1 件の `MultishotStep` を観察します。ストリームを維持するなら `MultishotContinue` を、キャンセルを要求するなら `MultishotStop` を返します。コールバックが終端観察まで有効なままなら、`OnStop` は最終エラーと `cancelled` フラグを伴って高々一度だけ実行されます。ステップ自身の `step.Cancelled` は、境界上でカーネルが `-ECANCELED` を返した判定をその他の失敗と明示的に区別します。両コールバックは `MultishotHandler` インタフェース（`OnMultishotStep` / `OnMultishotStop`）のビルダー側射影です。明示的なハンドラを書く場合はこのインタフェースを直接実装してください。`HandleCQE` は呼び出し側の直列化された完了ループ内で即時 dispatch するための補助です。コピー済み CQE をそのループの後も保持する場合、呼び出し側が独自の route state を保持し、すでに解放されたサブスクリプションの観察を拒否してください。明示的な単一発行者リング（`MultiIssuers=false`）では、OS スレッドに固定したリング所有者から `Cancel` / `Unsubscribe` を呼び、発行、`Wait`、`WaitDirect`、`WaitExtended`、`Stop`、`ResizeRings` と直列化してください。デフォルトの `MultiIssuers` リングでは、共有発行パスがキャンセル SQE を直列化します。
 
+投入済みのキャンセル CQE は、`SubscriptionStopped` または `OnStop` の後も、同じサブスクリプションの `HandleCQE` またはその拡張ハンドラへ渡してください。投入の失敗や何もしない呼び出しでは、新たなキャンセル CQE の処理義務は生じません。サブスクリプションは両コンテキストを所有し、元の終端 CQE の処理、キャンセルの dispatch、キャンセル投入処理がすべて終わってから、元のコンテキストをプールへ返します。これらのコンテキストを手動で返さないでください。[受信の例](./examples/multishot_test.go)は、自然な完了とハンドラからのキャンセルを示します。
+
 ### 型付きコンテキストによるコネクション状態
 
 拡張コンテキストは、グローバルルックアップテーブルを介さずに、発行 → 完了のラウンドトリップ全体にわたってコネクション単位の参照を伝搬します。
@@ -445,7 +492,7 @@ ring.PutExtSQE(ext)
 
 ### デッドライン合成
 
-`LinkTimeout` は `IOSQE_IO_LINK` チェーンを通じて直前の SQE にデッドラインを付与します。操作とタイムアウトが競合し、一方が完了するともう一方はキャンセルされます。
+`LinkTimeout` は `IOSQE_IO_LINK` チェーンを通じて直前の SQE に期限を付与します。期限が切れるとリンク先の操作のキャンセルを試みますが、その操作はすでに完了している場合があります。両方の CQE の結果を確認してください。タイムアウトだけでは、操作がキャンセルされたとは判断できません。
 
 ```go
 recvCtx := uring.ForFD(fd).
@@ -462,7 +509,7 @@ if err := ring.LinkTimeout(timeoutCtx, 5*time.Second); err != nil {
 }
 ```
 
-呼び出し側ランタイムは両方の結果を処理します。受信成功はタイムアウトをキャンセルし、タイムアウト発火は受信をキャンセルします。いずれも CQE を生成するため、ディスパッチループで観察する必要があります。
+リンクする SQE は連続して投入し、この一組の投入を他の投入・待機呼び出しと直列化してください。操作自身の完了までバッファとコンテキストを保持し、終了処理の前に両方の CQE を処理してください。
 
 ## TCP の使用パターン
 
@@ -540,10 +587,10 @@ if err := ring.Receive(recvCtx, &clientFD, buf); err != nil {
 
 ### ライフサイクル
 
-1. CQE32 対応リング上で `NewZCRXReceiver` を生成する。コンストラクタが ZCRX インターフェースキューの登録、補充領域のマッピング、補充リングの準備を行う。
+1. CQE32 対応リング上で `NewZCRXReceiver` を生成する。コンストラクタが ZCRX インターフェースキューを登録し、受信領域をマッピングして、空の補充リングを初期化する。初期受信バッファは Linux が供給し、補充リングは配送済みバッファの返却に使う。
 2. `Start` を呼び出し、リング上で拡張 `RECV_ZC` 操作を発行する。
 3. CQE のディスパッチ経路で ZCRX 完了が `ZCRXHandler` に届く。
-    - `OnData`: NIC マップ領域を指す `ZCRXBuffer` を受け取る。処理後に `Release` を呼んでカーネルにスロットを返却する。ベストエフォートでの停止を要求するには `false` を返す。
+    - `OnData`: NIC マップ領域を指す `ZCRXBuffer` を受け取る。処理後に `Release` を呼び、補充エントリの公開に成功するとスロットがカーネルに返却される。`iox.ErrWouldBlock` が返った場合はバッファを保持し、後で CQE 経路上で解放を再試行する。長さゼロの EOF バッファには補充用の識別情報がなく、エントリを公開せずに解放される。ベストエフォートでの停止を要求するには `false` を返す。
     - `OnError`: CQE エラーを受け取る。ベストエフォートでの停止を要求するには `false` を返す。
     - `OnStopped`: 状態が `Stopped` に移行する直前に一度だけ呼ばれる。
 4. `Stop` を呼び出して非同期キャンセルを発行する。レシーバは `Stopping` → `Retiring` → `Stopped` と遷移する。

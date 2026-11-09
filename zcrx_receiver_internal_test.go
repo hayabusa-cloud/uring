@@ -9,6 +9,7 @@ package uring
 import (
 	"errors"
 	"testing"
+	"time"
 	"unsafe"
 
 	"code.hybscloud.com/iobuf"
@@ -96,7 +97,7 @@ func TestZCRXReceiverHandleCQETerminalErrorDoesNotCancelDeadRequest(t *testing.T
 	defer func() { zcrxAsyncCancelByUserData = prev }()
 
 	calls := 0
-	zcrxAsyncCancelByUserData = func(ring *Uring, userData uint64) error {
+	zcrxAsyncCancelByUserData = func(ring *Uring, _ SQEContext, userData uint64) error {
 		calls++
 		return nil
 	}
@@ -165,6 +166,52 @@ func TestZCRXConfigValidateRqEntriesPowerOfTwo(t *testing.T) {
 	}
 }
 
+func TestZCRXConfigValidateUint32Domains(t *testing.T) {
+	pageSize := int(iobuf.PageSize)
+	oversized := oversizedLen32(t)
+
+	tests := []struct {
+		name string
+		cfg  ZCRXConfig
+	}{
+		{
+			name: "rx queue",
+			cfg: ZCRXConfig{
+				IfName:    "eth0",
+				RxQueue:   oversized,
+				RqEntries: 1024,
+				ChunkSize: pageSize,
+			},
+		},
+		{
+			name: "rq entries",
+			cfg: ZCRXConfig{
+				IfName:    "eth0",
+				RxQueue:   0,
+				RqEntries: oversized,
+				ChunkSize: pageSize,
+			},
+		},
+		{
+			name: "chunk size",
+			cfg: ZCRXConfig{
+				IfName:    "eth0",
+				RxQueue:   0,
+				RqEntries: 1024,
+				ChunkSize: oversized,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.cfg.validate(); !errors.Is(err, ErrInvalidParam) {
+				t.Fatalf("validate() error = %v, want %v", err, ErrInvalidParam)
+			}
+		})
+	}
+}
+
 func TestZCRXConfigValidateChunkSize(t *testing.T) {
 	pageSize := int(iobuf.PageSize)
 	tests := []struct {
@@ -204,7 +251,7 @@ func TestZCRXConfigValidateChunkSize(t *testing.T) {
 	}
 }
 
-func TestZCRXRefillQSeedUsesChunkBoundaries(t *testing.T) {
+func TestZCRXRefillQPublishesReleasedBuffers(t *testing.T) {
 	head := uint32(0)
 	tail := uint32(0)
 	rqes := make([]ZCRXRqe, 8)
@@ -216,7 +263,16 @@ func TestZCRXRefillQSeedUsesChunkBoundaries(t *testing.T) {
 		mask:    uint32(len(rqes) - 1),
 	}
 
-	q.seed(4*1024, 1024, 0xABCD000000000000)
+	for i := range 4 {
+		buf := &ZCRXBuffer{}
+		buf.reset(make([]byte, 512), 1024, uint64(i*1024), 0xABCD000000000000, q)
+		if err := buf.Release(); err != nil {
+			t.Fatalf("Release(%d): %v", i, err)
+		}
+		if got := tail; got != uint32(i+1) {
+			t.Fatalf("published tail after Release(%d): got %d, want %d", i, got, i+1)
+		}
+	}
 
 	if got := q.tail; got != 4 {
 		t.Fatalf("tail: got %d, want 4", got)
@@ -228,6 +284,44 @@ func TestZCRXRefillQSeedUsesChunkBoundaries(t *testing.T) {
 		}
 		if got := q.rqes[i].Len; got != 1024 {
 			t.Fatalf("rqes[%d].Len: got %d, want 1024", i, got)
+		}
+	}
+}
+
+func TestNewZCRXRefillQUsesEffectiveRegistrationEntries(t *testing.T) {
+	region := struct {
+		head uint32
+		tail uint32
+		rqes [8]ZCRXRqe
+	}{}
+	registration := ZCRXIfqRegistration{
+		RqEntries: uint32(len(region.rqes)),
+		Offsets: ZCRXOffsets{
+			Head: uint32(unsafe.Offsetof(region.head)),
+			Tail: uint32(unsafe.Offsetof(region.tail)),
+			Rqes: uint32(unsafe.Offsetof(region.rqes)),
+		},
+	}
+
+	q := newZCRXRefillQ(unsafe.Pointer(&region), registration)
+	if q.kHead != &region.head || q.kTail != &region.tail {
+		t.Fatalf("head/tail = {%p, %p}, want {%p, %p}", q.kHead, q.kTail, &region.head, &region.tail)
+	}
+	if got := len(q.rqes); got != int(registration.RqEntries) {
+		t.Fatalf("refill slice length = %d, want %d", got, registration.RqEntries)
+	}
+	if q.entries != registration.RqEntries || q.mask != registration.RqEntries-1 {
+		t.Fatalf("entries/mask = {%d, %d}, want {%d, %d}", q.entries, q.mask, registration.RqEntries, registration.RqEntries-1)
+	}
+	if q.tail != 0 || region.head != 0 || region.tail != 0 {
+		t.Fatalf("initial local/head/tail = {%d, %d, %d}, want all zero", q.tail, region.head, region.tail)
+	}
+	if got := q.available(); got != registration.RqEntries {
+		t.Fatalf("initial available = %d, want %d", got, registration.RqEntries)
+	}
+	for i, rqe := range region.rqes {
+		if rqe != (ZCRXRqe{}) {
+			t.Fatalf("initial rqes[%d] = %+v, want zero", i, rqe)
 		}
 	}
 }
@@ -532,7 +626,7 @@ func TestZCRXReceiverDeliverDataZeroLengthPayload(t *testing.T) {
 
 func TestZCRXReceiverStopLeavesReceiverActiveWhenCancelFails(t *testing.T) {
 	prev := zcrxAsyncCancelByUserData
-	zcrxAsyncCancelByUserData = func(ring *Uring, userData uint64) error {
+	zcrxAsyncCancelByUserData = func(ring *Uring, _ SQEContext, userData uint64) error {
 		return ErrInvalidParam
 	}
 	t.Cleanup(func() {
@@ -582,25 +676,59 @@ func TestNoopZCRXHandlerStopsWhenReleaseWouldBlock(t *testing.T) {
 }
 
 func TestZCRXReceiverStartNormalizesNilHandler(t *testing.T) {
-	pool := NewContextPools(4)
+	ur := newTestIoUring(t, func(params *ioUringParams) {
+		params.flags = IORING_SETUP_COOP_TASKRUN
+	})
+	ring := &Uring{ioUring: ur}
+	entries := int(ur.params.sqEntries)
+	pending := 0
+	t.Cleanup(func() {
+		cqes := make([]CQEView, entries)
+		deadline := time.Now().Add(time.Second)
+		backoff := iox.Backoff{}
+		for pending > 0 && time.Now().Before(deadline) {
+			n, err := ring.Wait(cqes)
+			if errors.Is(err, iox.ErrWouldBlock) {
+				backoff.Wait()
+				continue
+			}
+			if err != nil {
+				t.Fatalf("drain NOPs: %v", err)
+			}
+			for _, cqe := range cqes[:n] {
+				if cqe.Op() != IORING_OP_NOP || cqe.Res != 0 {
+					t.Fatalf("drain CQE: op=%d res=%d, want successful NOP", cqe.Op(), cqe.Res)
+				}
+			}
+			pending -= n
+		}
+		if pending != 0 {
+			t.Fatalf("undrained NOPs: %d", pending)
+		}
+	})
+	for i := range entries {
+		if err := ur.nop(PackDirect(IORING_OP_NOP, 0, uint16(i), 0)); err != nil {
+			t.Fatalf("fill SQ: %v", err)
+		}
+		pending++
+	}
+	pool := NewContextPools(1)
 
 	r := &ZCRXReceiver{
-		ring: &Uring{ioUring: &ioUring{
-			ringFd: -1,
-		}},
+		ring: ring,
 		pool: pool,
 	}
 
 	err := r.Start(42, nil)
-	if !errors.Is(err, ErrInvalidParam) {
-		t.Fatalf("Start(nil): got %v, want %v", err, ErrInvalidParam)
+	if !errors.Is(err, iox.ErrWouldBlock) {
+		t.Fatalf("Start(nil): got %v, want %v", err, iox.ErrWouldBlock)
 	}
 
 	if _, ok := r.handler.(NoopZCRXHandler); !ok {
 		t.Fatalf("handler type: got %T, want NoopZCRXHandler", r.handler)
 	}
 	if r.ext != nil {
-		t.Fatal("ext: got non-nil, want nil after flush failure cleanup")
+		t.Fatal("ext: got non-nil, want nil after submit failure cleanup")
 	}
 	if got := r.userData.Load(); got != 0 {
 		t.Fatalf("userData: got %d, want 0", got)
@@ -608,9 +736,11 @@ func TestZCRXReceiverStartNormalizesNilHandler(t *testing.T) {
 	if got := r.state.Load(); got != zcrxStateIdle {
 		t.Fatalf("state: got %d, want %d", got, zcrxStateIdle)
 	}
-	if got := pool.Extended(); got == nil {
-		t.Fatal("expected flush failure to return ExtSQE to pool")
+	ext := pool.Extended()
+	if ext == nil {
+		t.Fatal("expected submit failure to return ExtSQE to pool")
 	}
+	pool.PutExtended(ext)
 }
 
 func TestZCRXReceiverStopUsesAtomicUserData(t *testing.T) {
@@ -619,7 +749,7 @@ func TestZCRXReceiverStopUsesAtomicUserData(t *testing.T) {
 
 	calls := 0
 	var seen uint64
-	zcrxAsyncCancelByUserData = func(ring *Uring, userData uint64) error {
+	zcrxAsyncCancelByUserData = func(ring *Uring, _ SQEContext, userData uint64) error {
 		calls++
 		seen = userData
 		return nil
@@ -711,7 +841,7 @@ func TestZCRXReceiverDeliverErrorWithoutHandlerRequestsStop(t *testing.T) {
 	defer func() { zcrxAsyncCancelByUserData = prev }()
 
 	calls := 0
-	zcrxAsyncCancelByUserData = func(ring *Uring, userData uint64) error {
+	zcrxAsyncCancelByUserData = func(ring *Uring, _ SQEContext, userData uint64) error {
 		calls++
 		return nil
 	}
@@ -865,17 +995,26 @@ func TestZCRXReceiverFinishPublishesStoppedAfterOnStopped(t *testing.T) {
 
 func TestZCRXReceiverCloseRequiresStoppedAndClosedRing(t *testing.T) {
 	ring := &Uring{ioUring: &ioUring{ringFd: -1}}
-	areaBuf := make([]byte, 64)
-	ringAreaBuf := make([]byte, 64)
+	areaSize := int(iobuf.PageSize)
+	areaPtr, err := mmapArea(areaSize, false)
+	if err != nil {
+		t.Fatalf("mmap area: %v", err)
+	}
+	ringPtr, err := mmapRing(areaSize)
+	if err != nil {
+		munmapArea(areaPtr, areaSize)
+		t.Fatalf("mmap refill ring: %v", err)
+	}
 	r := &ZCRXReceiver{
 		ring: ring,
 		area: zcrxArea{
-			ptr:      unsafe.Pointer(unsafe.SliceData(areaBuf)),
-			size:     len(areaBuf),
-			ringPtr:  unsafe.Pointer(unsafe.SliceData(ringAreaBuf)),
-			ringSize: len(ringAreaBuf),
+			ptr:      areaPtr,
+			size:     areaSize,
+			ringPtr:  ringPtr,
+			ringSize: areaSize,
 		},
 	}
+	t.Cleanup(r.area.unmap)
 
 	r.state.Store(zcrxStateStopping)
 	if err := r.Close(); !errors.Is(err, iox.ErrWouldBlock) {
@@ -939,4 +1078,40 @@ func TestZCRXMmapHelpersAllocateWritableMemory(t *testing.T) {
 	}
 	defer munmapRing(ring, size)
 	*(*byte)(ring) = 0xa5
+}
+
+func TestZCRXReceiverRetainsIdentityUntilCancelCompletion(t *testing.T) {
+	for _, originalFirst := range []bool{false, true} {
+		name := "cancel_first"
+		if originalFirst {
+			name = "original_first"
+		}
+		t.Run(name, func(t *testing.T) {
+			pool := NewContextPools(1)
+			ext := pool.Extended()
+			h := &zcrxRecordingHandler{}
+			r := &ZCRXReceiver{pool: pool, handler: h, ext: ext}
+			r.state.Store(zcrxStateStopping)
+			cancelCtx := r.cancel.prepare(r)
+			completeCancel := func() {
+				cancelCQEHandler(nil, nil, &ioUringCqe{userData: cancelCtx.Raw()})
+			}
+			if originalFirst {
+				r.finish(ext)
+			} else {
+				completeCancel()
+			}
+			if r.Stopped() || pool.ExtendedAvailable() != 0 {
+				t.Fatal("receiver retired before both completions")
+			}
+			if originalFirst {
+				completeCancel()
+			} else {
+				r.finish(ext)
+			}
+			if !r.Stopped() || r.ext != nil || pool.ExtendedAvailable() != 1 || h.stopped != 1 {
+				t.Fatal("receiver did not retire exactly once after both completions")
+			}
+		})
+	}
 }

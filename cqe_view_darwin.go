@@ -148,29 +148,26 @@ func (c *CQEView) HasBufferMore() bool {
 }
 
 // BundleStartID returns the starting buffer ID for a bundle operation.
-// For bundle receives, buffers are consumed contiguously from this ID.
+// Subsequent buffers follow publication order, not numeric ID order.
 // Only valid when IORING_CQE_F_BUFFER flag is set.
 func (c *CQEView) BundleStartID() uint16 {
 	return uint16(c.Flags >> IORING_CQE_BUFFER_SHIFT)
 }
 
-// BundleCount returns the number of buffers consumed in a bundle operation.
-// For receive bundles, this is derived from the result (bytes received)
-// divided by the buffer size. For accurate count, use with known buffer sizes.
+// BundleCount derives the receive-bundle buffer count from Res, rounding up.
+// bufferSize must be the uniform published buffer size. It returns zero when
+// Res or bufferSize is non-positive.
 func (c *CQEView) BundleCount(bufferSize int) int {
 	if c.Res <= 0 || bufferSize <= 0 {
 		return 0
 	}
-	return (int(c.Res) + bufferSize - 1) / bufferSize
+	return 1 + (int(c.Res)-1)/bufferSize
 }
 
-// BundleBuffers returns the logical range of buffer IDs consumed.
-// The returned startID is the first buffer ID; count is the number of buffers.
-// The range [startID, startID+count) is logical and may wrap around the ring.
-// Callers must apply (id & ringMask) to obtain physical buffer IDs, or use
-// BundleIterator which handles wrap-around automatically.
-func (c *CQEView) BundleBuffers(bufferSize int) (uint16, int) {
-	startID := c.BundleStartID()
-	count := c.BundleCount(bufferSize)
-	return startID, count
+// BundleBuffers returns the first buffer ID and the consumed buffer count.
+// bufferSize must be the uniform published buffer size. The remaining IDs
+// follow publication order and cannot be inferred by adding to startID.
+// Use Uring.BundleIterator for package-managed buffer rings.
+func (c *CQEView) BundleBuffers(bufferSize int) (startID uint16, count int) {
+	return c.BundleStartID(), c.BundleCount(bufferSize)
 }

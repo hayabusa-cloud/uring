@@ -7,7 +7,7 @@
 package uring
 
 import (
-	"sync/atomic"
+	"math"
 	"unsafe"
 
 	"code.hybscloud.com/iofd"
@@ -17,79 +17,69 @@ import (
 // IncrementalHandler handles incremental receive completion events.
 type IncrementalHandler interface {
 	// OnData is called with the newly received fragment.
-	// hasMore indicates whether additional data remains in the same buffer.
+	// bufferMore reports IORING_CQE_F_BUF_MORE: the selected buffer remains
+	// incrementally consumable. It does not report parent-request liveness.
 	// The buffer is valid until this callback returns.
-	OnData(buf []byte, hasMore bool)
+	OnData(buf []byte, bufferMore bool)
 
-	// OnComplete is called when all fragments have been received.
+	// OnComplete is called after a single-shot receive succeeds. The selected
+	// buffer may remain incrementally consumable by a later operation.
 	OnComplete()
 
 	// OnError is called when an error occurs.
 	OnError(err error)
 }
 
-// incrementalState tracks the incremental receive operation state.
-type incrementalState uint32
-
-const (
-	incStateActive    incrementalState = iota // Operation is active
-	incStateCompleted                         // All data received
-	incStateFailed                            // Operation failed
-)
-
-// incrementalTrackerData tracks the multi-CQE state machine for incremental receive.
-// Layout: 16 bytes, fits in Ctx0V5.Data[16].
-type incrementalTrackerData struct {
-	state      atomic.Uint32 // 4 bytes - state machine
-	bufferID   atomic.Uint32 // 4 bytes - current buffer ID
-	totalBytes atomic.Int32  // 4 bytes - total bytes received
-	_          [4]byte       // padding to 16 bytes
-}
-
-var _ [16 - unsafe.Sizeof(incrementalTrackerData{})]struct{}
-
-// transitionToCompleted atomically transitions from Active to Completed.
-//
-//go:nosplit
-func (d *incrementalTrackerData) transitionToCompleted() bool {
-	return d.state.CompareAndSwap(uint32(incStateActive), uint32(incStateCompleted))
-}
-
-// transitionToFailed atomically transitions from Active to Failed.
-//
-//go:nosplit
-func (d *incrementalTrackerData) transitionToFailed() bool {
-	return d.state.CompareAndSwap(uint32(incStateActive), uint32(incStateFailed))
-}
-
-// IncrementalReceiver manages receives that use `IOU_PBUF_RING_INC`.
-// `IORING_CQE_F_BUF_MORE` reports that the current buffer still has unread data.
+// IncrementalReceiver manages single-shot receives over an IOU_PBUF_RING_INC
+// group. It tracks a separate consumed offset for each buffer ID.
+// IORING_CQE_F_BUF_MORE reports that the kernel retained the selected buffer
+// for later incremental consumption.
 type IncrementalReceiver struct {
-	ring       *Uring
-	pool       *ContextPools
-	groupID    uint16
-	bufSize    int
-	bufBacking []byte // Buffer backing memory (GC-safe)
-	bufMask    uint16 // Entries - 1 for wrap-around
+	ring          *Uring
+	pool          *ContextPools
+	groupID       uint16
+	bufSize       int
+	bufBacking    []byte   // Buffer backing memory (GC-safe)
+	bufferOffsets []uint32 // Completions for different buffer IDs can interleave.
 }
 
-// NewIncrementalReceiver creates an incremental receiver.
+// NewIncrementalReceiver creates an incremental receiver over entries
+// contiguous buffers in bufBacking. Buffer ID i must identify
+// bufBacking[i*bufSize:(i+1)*bufSize]. Create the receiver before the group's
+// first receive and use it for every receive that consumes the group.
+// Caller-side completion dispatch must serialize its CQEs in CQ order.
+//
+// Before calling NewIncrementalReceiver, register the same group with
+// [Uring.RegisterBufRingIncremental], add each corresponding bufBacking slice
+// with [BufferRing.Add] using the matching buffer ID, and publish them with
+// [BufferRing.Advance]. The receiver keeps bufBacking reachable but does not own
+// the BufferRing registration, which remains owned by Uring until Stop.
 func NewIncrementalReceiver(ring *Uring, pool *ContextPools, groupID uint16, bufSize int, bufBacking []byte, entries int) *IncrementalReceiver {
-	return &IncrementalReceiver{
+	r := &IncrementalReceiver{
 		ring:       ring,
 		pool:       pool,
 		groupID:    groupID,
 		bufSize:    bufSize,
 		bufBacking: bufBacking,
-		bufMask:    uint16(entries - 1),
 	}
+	if entries > 0 && entries <= 1<<15 {
+		r.bufferOffsets = make([]uint32, entries)
+	}
+	return r
 }
 
-// Recv submits an incremental receive operation.
-// The handler will receive OnData for each data fragment, with hasMore indicating
-// whether additional data remains. OnComplete is called when the message is fully received.
-// Returns iox.ErrWouldBlock if the context pool is exhausted.
+// Recv submits one single-shot receive over the incremental buffer group.
+// The handler receives OnData for a non-empty result. Its bufferMore argument
+// reports whether the selected buffer remains available to later operations.
+// OnComplete runs after the request's successful CQE, including when
+// bufferMore is true.
+//
+// A nil return means the request was queued. Recv returns iox.ErrWouldBlock if
+// the context pool or submission queue is full.
 func (r *IncrementalReceiver) Recv(fd iofd.FD, handler IncrementalHandler) error {
+	if !r.valid() {
+		return ErrInvalidParam
+	}
 	if handler == nil {
 		handler = NoopIncrementalHandler{}
 	}
@@ -120,8 +110,18 @@ func (r *IncrementalReceiver) Recv(fd iofd.FD, handler IncrementalHandler) error
 	return nil
 }
 
-// HandleCQE processes a CQE from an incremental receive operation.
-// Returns true if the CQE was handled, false if it's not an incremental recv CQE.
+func (r *IncrementalReceiver) valid() bool {
+	return r != nil && r.ring != nil && r.pool != nil &&
+		r.bufSize > 0 && r.bufSize <= math.MaxInt32 &&
+		len(r.bufferOffsets) > 0 &&
+		len(r.bufBacking)/r.bufSize >= len(r.bufferOffsets)
+}
+
+// HandleCQE dispatches a receive CQE owned by this receiver and returns true.
+// It returns false for a CQE owned by another receiver or operation.
+// Caller must serialize dispatch in CQ order and dispatch each CQE once.
+// Handling returns the request's ExtSQE to its pool after callbacks finish;
+// copy any needed context-dependent facts before calling HandleCQE.
 func (r *IncrementalReceiver) HandleCQE(cqe CQEView) bool {
 	if !cqe.Extended() {
 		return false
@@ -132,22 +132,19 @@ func (r *IncrementalReceiver) HandleCQE(cqe CQEView) bool {
 	}
 
 	ext := cqe.ExtSQE()
+	if ext == nil {
+		return false
+	}
 	owner, _ := extAnchors(ext).owner.(*IncrementalReceiver)
 	if owner != r {
 		return false
 	}
 
-	ctx := asIncCtx(ext)
-	if ctx == nil {
-		return false
-	}
-	tracker := incGetTrackerData(ctx)
 	handler := incGetHandler(ext)
 	if handler == nil {
-		r.pool.PutExtended(ext)
-		return true
+		handler = NoopIncrementalHandler{}
 	}
-	return r.handleResolvedCQE(cqe, ext, tracker, handler)
+	return r.handleResolvedCQE(cqe, ext, handler)
 }
 
 // incrementalCQEHandler is the static CQE dispatcher for incremental receive.
@@ -162,21 +159,18 @@ var incrementalCQEHandler Handler = func(_ *Uring, _ *ioUringSqe, cqe *ioUringCq
 		return
 	}
 	ext := view.ExtSQE()
+	if ext == nil {
+		return
+	}
 	receiver, _ := extAnchors(ext).owner.(*IncrementalReceiver)
 	if receiver == nil {
 		return
 	}
-	ctx := asIncCtx(ext)
-	if ctx == nil {
-		return
-	}
-	tracker := incGetTrackerData(ctx)
 	handler := incGetHandler(ext)
 	if handler == nil {
-		receiver.pool.PutExtended(ext)
-		return
+		handler = NoopIncrementalHandler{}
 	}
-	receiver.handleResolvedCQE(view, ext, tracker, handler)
+	receiver.handleResolvedCQE(view, ext, handler)
 }
 
 // handleCQEWithHandler processes a CQE with the supplied handler.
@@ -186,77 +180,79 @@ func (r *IncrementalReceiver) handleCQEWithHandler(cqe CQEView, handler Incremen
 		return false
 	}
 	ext := cqe.ExtSQE()
-	ctx := asIncCtx(ext)
-	if ctx == nil {
+	if ext == nil {
 		return false
 	}
-	return r.handleResolvedCQE(cqe, ext, incGetTrackerData(ctx), handler)
+	if handler == nil {
+		handler = NoopIncrementalHandler{}
+	}
+	return r.handleResolvedCQE(cqe, ext, handler)
 }
 
 // handleResolvedCQE processes one incremental receive CQE after ownership,
 // rooting, and handler selection have already been resolved.
-func (r *IncrementalReceiver) handleResolvedCQE(cqe CQEView, ext *ExtSQE, tracker *incrementalTrackerData, handler IncrementalHandler) bool {
-	// Handle error cases
-	if cqe.Res < 0 {
-		if tracker.transitionToFailed() {
+func (r *IncrementalReceiver) handleResolvedCQE(cqe CQEView, ext *ExtSQE, handler IncrementalHandler) bool {
+	if cqe.Res <= 0 {
+		// A worker can consume the selected buffer before receiving any data.
+		if bufID := cqeBufID(cqe.Flags); cqeHasBuffer(cqe.Flags) && !cqeHasBufferMore(cqe.Flags) && int(bufID) < len(r.bufferOffsets) {
+			r.bufferOffsets[bufID] = 0
+		}
+		if cqe.Res < 0 {
 			handler.OnError(errFromErrno(uintptr(-cqe.Res)))
-		}
-		r.pool.PutExtended(ext)
-		return true
-	}
-
-	// Get buffer data
-	hasMore := cqe.HasBufferMore()
-	buf, bufID, err := r.bufferFromCQE(cqe, tracker)
-	if err != nil {
-		if tracker.transitionToFailed() {
-			handler.OnError(err)
-		}
-		r.pool.PutExtended(ext)
-		return true
-	}
-
-	// Track total bytes
-	tracker.totalBytes.Add(cqe.Res)
-	tracker.bufferID.Store(uint32(bufID))
-
-	// Deliver data
-	handler.OnData(buf, hasMore)
-
-	// If no more data, complete
-	if !hasMore {
-		if tracker.transitionToCompleted() {
+		} else {
 			handler.OnComplete()
 		}
 		r.pool.PutExtended(ext)
+		return true
 	}
+
+	bufferMore := cqeHasBufferMore(cqe.Flags)
+	buf, bufID, nextOffset, err := r.bufferFromCQE(cqe)
+	if err != nil {
+		handler.OnError(err)
+		r.pool.PutExtended(ext)
+		return true
+	}
+
+	if bufferMore {
+		r.bufferOffsets[bufID] = uint32(nextOffset)
+	} else {
+		r.bufferOffsets[bufID] = 0
+	}
+
+	handler.OnData(buf, bufferMore)
+	handler.OnComplete()
+	r.pool.PutExtended(ext)
 
 	return true
 }
 
-func (r *IncrementalReceiver) bufferFromCQE(cqe CQEView, tracker *incrementalTrackerData) ([]byte, uint16, error) {
+func (r *IncrementalReceiver) bufferFromCQE(cqe CQEView) ([]byte, uint16, int, error) {
 	if !cqe.HasBuffer() {
-		return nil, 0, ErrInvalidParam
+		return nil, 0, 0, ErrInvalidParam
 	}
 	bufID := cqe.BufID()
-	consumed := int(tracker.totalBytes.Load())
-	if consumed != 0 && tracker.bufferID.Load() != uint32(bufID) {
-		return nil, bufID, ErrInvalidParam
+	if int(bufID) >= len(r.bufferOffsets) {
+		return nil, bufID, 0, ErrInvalidParam
 	}
-	off := int(bufID)*r.bufSize + consumed
-	end := off + int(cqe.Res)
+	bufferOffset := int(r.bufferOffsets[bufID])
+	if bufferOffset > r.bufSize || int(cqe.Res) > r.bufSize-bufferOffset {
+		return nil, bufID, 0, ErrInvalidParam
+	}
+	nextOffset := bufferOffset + int(cqe.Res)
+	off := int(bufID)*r.bufSize + bufferOffset
+	end := int(bufID)*r.bufSize + nextOffset
 	slotEnd := int(bufID+1) * r.bufSize
 	if off < 0 || end < off || end > slotEnd || end > len(r.bufBacking) {
-		return nil, bufID, ErrInvalidParam
+		return nil, bufID, 0, ErrInvalidParam
 	}
-	return r.bufBacking[off:end], bufID, nil
+	return r.bufBacking[off:end], bufID, nextOffset, nil
 }
 
-// incCtx is the raw scalar context layout for incremental receive tracking.
+// incCtx is the raw scalar dispatch context for incremental receive.
 type incCtx struct {
-	Fn      Handler                // 8 bytes - static dispatch function
-	_       [40]byte               // reserved for future scalar state
-	Tracker incrementalTrackerData // 16 bytes - state tracking
+	Fn Handler  // 8 bytes - static dispatch function
+	_  [56]byte // reserved for future scalar state
 }
 
 var _ [64 - unsafe.Sizeof(incCtx{})]struct{}
@@ -267,20 +263,7 @@ func incInitCtx(ext *ExtSQE, receiver *IncrementalReceiver, handler IncrementalH
 	anchors := extAnchors(ext)
 	anchors.owner = receiver
 	anchors.handler = handler
-	ctx.Tracker.state.Store(uint32(incStateActive))
-	ctx.Tracker.bufferID.Store(0)
-	ctx.Tracker.totalBytes.Store(0)
 	return ctx
-}
-
-// asIncCtx interprets ExtSQE UserData as incCtx.
-func asIncCtx(ext *ExtSQE) *incCtx {
-	return (*incCtx)(unsafe.Pointer(&ext.UserData[0]))
-}
-
-// incGetTrackerData returns the tracker data from an incCtx.
-func incGetTrackerData(ctx *incCtx) *incrementalTrackerData {
-	return &ctx.Tracker
 }
 
 // incGetHandler returns the anchored IncrementalHandler.

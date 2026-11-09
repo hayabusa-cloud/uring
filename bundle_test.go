@@ -84,14 +84,15 @@ func TestBundleCQEResult(t *testing.T) {
 		bufferSize int
 		wantCount  int
 	}{
-		{res: 0, bufferSize: 1024, wantCount: 0},    // No data
-		{res: 1024, bufferSize: 1024, wantCount: 1}, // Exactly one buffer
-		{res: 1025, bufferSize: 1024, wantCount: 2}, // Partial second buffer
-		{res: 2048, bufferSize: 1024, wantCount: 2}, // Exactly two buffers
-		{res: 4096, bufferSize: 1024, wantCount: 4}, // Four buffers
-		{res: -1, bufferSize: 1024, wantCount: 0},   // Error result
-		{res: 100, bufferSize: 0, wantCount: 0},     // Invalid buffer size
-		{res: 100, bufferSize: -1, wantCount: 0},    // Negative buffer size
+		{res: 0, bufferSize: 1024, wantCount: 0},               // No data
+		{res: 1024, bufferSize: 1024, wantCount: 1},            // Exactly one buffer
+		{res: 1025, bufferSize: 1024, wantCount: 2},            // Partial second buffer
+		{res: 2048, bufferSize: 1024, wantCount: 2},            // Exactly two buffers
+		{res: 4096, bufferSize: 1024, wantCount: 4},            // Four buffers
+		{res: -1, bufferSize: 1024, wantCount: 0},              // Error result
+		{res: 100, bufferSize: 0, wantCount: 0},                // Invalid buffer size
+		{res: 100, bufferSize: -1, wantCount: 0},               // Negative buffer size
+		{res: 2, bufferSize: int(^uint(0) >> 1), wantCount: 1}, // Overflow-free ceiling division
 	}
 
 	for _, tc := range testCases {

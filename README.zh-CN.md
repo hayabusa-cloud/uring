@@ -124,12 +124,13 @@ for {
 | `ListenerOp`          | 监听器创建操作的句柄，持有 FD 并提供 accept 辅助方法 |
 | `BundleIterator`      | 遍历 bundle 接收中消耗的缓冲区              |
 | `IncrementalReceiver` | 管理增量缓冲区环接收（`IOU_PBUF_RING_INC`）  |
+| `BufferRing`          | 显式注册的不透明提供缓冲区环；`Add` 暂存，`Advance` 发布 |
 | `ZCTracker`           | 跟踪零拷贝发送的通知与回退生命周期              |
 | `ContextPools`        | Indirect 与 extended 提交上下文的对象池    |
 | `ZCRXReceiver`        | NIC RX 队列零拷贝接收的生命周期管理            |
 | `ZCRXConfig`          | ZCRX 接收实例的配置                     |
 | `ZCRXHandler`         | ZCRX 数据、错误及关闭的回调接口               |
-| `ZCRXBuffer`          | 已交付的零拷贝接收视图，释放时内核自动回填            |
+| `ZCRXBuffer`          | 已交付的零拷贝接收视图，由调用方通过回填队列归还        |
 
 操作一览：
 
@@ -148,13 +149,23 @@ for {
 | 轮询 | `PollAdd`, `PollRemove`, `PollUpdate`, `PollAddLevel`, `PollAddMultishot`, `PollAddMultishotLevel` |
 | 异步 | `EpollWait`, `FutexWait`, `FutexWake`, `FutexWaitV`, `Waitid` |
 | 环消息 | `MsgRing`, `MsgRingFD`, `FixedFdInstall`, `FilesUpdate` |
-| 命令 | `UringCmd`, `UringCmd128`, `Nop`, `Nop128` |
+| 命令 | `UringCmd`, `UringCmdInline`, `UringCmd128`, `Nop`, `Nop128` |
+
+`UringCmdInline` 将最多 80 字节复制到普通 `IORING_OP_URING_CMD` SQE 中，并要求使用 `Options.SQE128`；它不要求内核支持独立的 `IORING_OP_URING_CMD128` opcode。
+
+`WithUringCmdFlags` 用于设置 `uring_cmd_flags` union。使用 `IORING_URING_CMD_FIXED` 时，通过 `sqeCtx.WithBufGroup` 指定注册缓冲区索引；使用 `IORING_URING_CMD_MULTISHOT` 时，还必须设置 `IOSQE_BUFFER_SELECT`，并将同一 context field 用作 provided-buffer group。这两个 flag 不能同时使用。
 
 `Nop128` 和 `UringCmd128` 需要以 `Options.SQE128` 创建的 ring，且内核须声明支持相应 opcode，否则返回 `ErrNotSupported`。
 
 `Uring.Close` 提交的是针对目标文件描述符的 `IORING_OP_CLOSE` 操作，而非 ring 本身的销毁方法。
 
+`PollAddLevel` 和 `PollAddMultishotLevel` 始终返回 `ErrNotSupported`；Linux io_uring 不允许 `IORING_OP_POLL_ADD` 使用 level 标志。
+
 ## 上下文传递
+
+`Multicast` 根据负载大小和目标数量自动选择普通发送或零拷贝发送；`MulticastZeroCopy` 使用更低的阈值，优先选择零拷贝。两者都要求 Direct 上下文并返回 `(submitted, error)`，其中 `submitted` 表示已接受的目标前缀长度。遇到背压后，从剩余目标继续提交。恢复调用可能选择不同的操作，因此应检查每个 CQE 的操作码和标志。`Multicast` 的普通发送遵循 `NotifySucceed`；选中的零拷贝发送和 `MulticastZeroCopy` 的两条路径都会保留完成证据，并拒绝显式的 `IOSQE_CQE_SKIP_SUCCESS`。
+
+已受理的流式发送仍可能只完成部分字节。跟踪普通发送的字节数时，应保留成功 CQE，并根据每个目标的数据结果只续传尚未发送的尾部。共享的零拷贝数据必须保持不变，直到所有已受理目标都满足释放条件。[multicast 示例](./examples/zerocopy_test.go)展示了如何分别跟踪字节进度和释放。
 
 `SQEContext` 是本包的核心标识令牌。Direct 模式将 opcode、SQE flags、buffer-group ID 与文件描述符打包为一个 64 位值。
 
@@ -234,7 +245,7 @@ for i := 0; i < n; i++ {
 
 ## 缓冲区供给
 
-`uring` 提供三类常用缓冲区路径：注册缓冲区在 ring 启动时固定并用于固定缓冲区文件 I/O；提供缓冲区环让内核在接收完成时选择缓冲区，并在 CQE 中返回缓冲区 ID；捆绑接收可以在一个 CQE 中消耗一段连续的逻辑缓冲区范围，并通过 `BundleIterator` 暴露该范围。
+`uring` 提供三类常用缓冲区路径：注册缓冲区在 ring 启动时固定并用于固定缓冲区文件 I/O；提供缓冲区环让内核选择接收缓冲区，并在 CQE 中返回缓冲区 ID；捆绑接收按发布顺序消耗缓冲区，回收后该顺序可能不同于 ID 的数值顺序。`Uring.BundleIterator` 保留实际顺序；独立的 `NewBundleIterator` 要求按环大小取模后连续的 ID 顺序发布。
 
 - 通过 `ReadBufferSize` 与 `ReadBufferNum` 配置固定尺寸的提供缓冲区
 - 通过 `MultiSizeBuffer` 启用多尺寸缓冲区组
@@ -255,6 +266,38 @@ ring, err := uring.New(func(o *uring.Options) {
 cfg, scale := uring.BufferConfigForBudget(256 * uring.MiB)
 fmt.Printf("buffer tiers=%+v scale=%d\n", cfg, scale)
 ```
+
+显式增量 ring 初始化为空。`Start` 之后，选择一个未被已配置提供缓冲区组使用的组 ID，暂存每个后备切片，然后发布该批次：
+
+```go
+const (
+    groupID = 60000
+    entries = 8
+    bufSize = 4096
+)
+
+backing := make([]byte, entries*bufSize)
+bufRing, err := ring.RegisterBufRingIncremental(entries, groupID)
+if err != nil {
+    return err
+}
+for i := range entries {
+    buf := backing[i*bufSize : (i+1)*bufSize]
+    if err := bufRing.Add(buf, uint16(i), i); err != nil {
+        return err
+    }
+}
+if err := bufRing.Advance(entries); err != nil {
+    return err
+}
+
+pool := uring.NewContextPools(entries)
+receiver := uring.NewIncrementalReceiver(ring, pool, groupID, bufSize, backing, entries)
+```
+
+`BufferRing.Add` 暂存条目；`BufferRing.Advance` 发布条目并将所有权转移给内核。保持 `backing` 可达。按 CQ 顺序串行处理此 receiver 的 CQE，每条仅处理一次；receiver 为每个缓冲区 ID 独立维护偏移量。
+
+`IORING_CQE_F_BUF_MORE` 表示内核在请求完成后仍保留所选缓冲区。只有 CQE 包含 `IORING_CQE_F_BUFFER`、不含 `IORING_CQE_F_BUF_MORE`，且所有借用访问均已结束时，才能重新发布该缓冲区。零或负的结果也可能归还缓冲区。buffer-ring 的销毁由 `Uring.Stop` 负责。
 
 Fixed-buffer I/O 通过索引使用注册缓冲区。返回的切片属于 ring 内存；在 fixed 操作完成前保持其有效：
 
@@ -284,7 +327,7 @@ if cqe.HasBuffer() {
 }
 ```
 
-捆绑接收使用同一套提供缓冲区存储，但一个 CQE 可能消耗多个缓冲区。处理迭代器后，将消耗的槽位回收：
+捆绑接收使用同一套提供缓冲区存储，但一个 CQE 可能消耗多个缓冲区。处理迭代器后，将消耗的槽位回收。在迭代器的所有副本中，`Recycle` 只能调用一次；调用返回后，不得再读取已生成的缓冲区：
 
 ```go
 if err := ring.ReceiveBundle(recvCtx, &socketFD, uring.WithReadBufferSize(uring.BufferSizeSmall)); err != nil {
@@ -295,7 +338,9 @@ if it, ok := ring.BundleIterator(cqe, cqe.BufGroup()); ok {
     for buf := range it.All() {
         handle(buf)
     }
-    it.Recycle(ring)
+    if err := it.Recycle(ring); err != nil {
+        return err
+    }
 }
 ```
 
@@ -333,7 +378,7 @@ CQE 路由策略由调用方自行实现，不在本包范围内。监听器的�
 
 ### Ring 所有者事件循环
 
-在单提交者模式（默认）下，一个 goroutine 串行化所有提交状态操作。典型循环会提交待处理工作，在 `Wait` 没有返回可观察进展时使用调用方持有的 `iox.Backoff`，然后分发完成事件。
+在默认的任务可迁移模式下，共享提交状态同步允许 goroutine 在不同 OS 线程之间迁移。ring 所有者循环仍可串行化全部提交状态操作：提交待处理工作，在 `Wait` 没有返回可观察进展时使用调用方持有的 `iox.Backoff`，然后分发完成事件。
 
 ```go
 func runLoop(ring *uring.Uring, stop <-chan struct{}) error {
@@ -406,6 +451,8 @@ for i := range n {
 
 每一次 `OnStep` 回调观察一个 `MultishotStep`：返回 `MultishotContinue` 保持流活跃，或返回 `MultishotStop` 请求取消。如果回调一直保持启用直到终态观察，`OnStop` 至多以最终错误及 `cancelled` 标志触发一次；在步骤自身上，`step.Cancelled` 在边界处把内核的 `-ECANCELED` 判定与其他失败明确区分开。两个回调都是 `MultishotHandler` 接口（`OnMultishotStep` / `OnMultishotStop`）在构建器侧的投影；需要显式处理器时，可直接实现该接口。`HandleCQE` 用于调用方串行化完成循环内的立即 dispatch；若调用方在该循环之后保留复制 CQE，则需维护自己的 route state，并拒绝已退役订阅的观察。在显式单提交者 ring（`MultiIssuers=false`）上，应从固定于 OS 线程的 ring 所有者调用 `Cancel` / `Unsubscribe`，并将其与提交、`Wait`、`WaitDirect`、`WaitExtended`、`Stop` 以及 `ResizeRings` 串行化。默认 `MultiIssuers` ring 通过共享提交路径串行化取消 SQE。
 
+每个已入队的取消 CQE 都应交给同一订阅的 `HandleCQE` 或其扩展处理器，即使已到达 `SubscriptionStopped` 或触发 `OnStop`。提交失败或未执行新提交的调用不会产生新的取消 CQE 处理义务。订阅拥有两个上下文，只有在处理完原请求的终态 CQE、完成取消分派且取消提交过程结束后，才将原上下文归还池。不要手动归还这些上下文。[接收示例](./examples/multishot_test.go)展示了自然完成和由处理器请求的取消。
+
 ### 类型化上下文承载连接状态
 
 扩展上下文可以在提交 → 完成的往返全程携带连接级引用，无需全局查找表：
@@ -445,7 +492,7 @@ ring.PutExtSQE(ext)
 
 ### 截止时间组合
 
-`LinkTimeout` 通过 `IOSQE_IO_LINK` 链将截止时间附加到前一个 SQE 上。操作与超时互相竞争：一方完成，另一方被取消。
+`LinkTimeout` 通过 `IOSQE_IO_LINK` 链将截止时间附加到前一个 SQE 上。到期时会尝试取消关联操作，但该操作可能已经完成。必须检查两条 CQE 的结果；超时本身不能证明操作已被取消。
 
 ```go
 recvCtx := uring.ForFD(fd).
@@ -462,7 +509,7 @@ if err := ring.LinkTimeout(timeoutCtx, 5*time.Second); err != nil {
 }
 ```
 
-调用方运行时需同时处理两种结果：接收成功会取消超时，超时触发会取消接收。两者均产生 CQE，分发循环必须观察处理。
+连续提交关联的 SQE，并将这对提交与其他提交和等待调用串行化。保留操作的缓冲区和上下文，直到该操作自身完成；结束前必须处理两条 CQE。
 
 ## TCP 使用模式
 
@@ -540,10 +587,10 @@ if err := ring.Receive(recvCtx, &clientFD, buf); err != nil {
 
 ### 生命周期
 
-1. 在支持 CQE32 的 ring 上调用 `NewZCRXReceiver` 创建接收器。构造器会注册 ZCRX 接口队列、映射补充区域并准备补充 ring。
+1. 在支持 CQE32 的 ring 上调用 `NewZCRXReceiver` 创建接收器。构造器会注册 ZCRX 接口队列、映射接收区域并初始化空的补充 ring。Linux 提供初始接收缓冲区；补充 ring 用于归还已交付的缓冲区。
 2. 调用 `Start`，在 ring 上提交扩展 `RECV_ZC` 操作。
 3. CQE 分发时，ZCRX 完成事件路由至 `ZCRXHandler`：
-   - `OnData` 交付指向 NIC 映射区域的 `ZCRXBuffer`，处理完毕后调用 `Release` 将槽位回填给内核；返回 `false` 请求尽力停止。
+   - `OnData` 交付指向 NIC 映射区域的 `ZCRXBuffer`。处理完毕后调用 `Release`，成功发布回填条目后才将槽位归还内核。若返回 `iox.ErrWouldBlock`，调用方必须保留缓冲区，稍后在 CQE 路径上重试释放。零长度 EOF 缓冲区没有回填标识，释放时不发布回填条目。返回 `false` 请求尽力停止。
    - `OnError` 交付 CQE 错误；返回 `false` 请求尽力停止。
    - `OnStopped` 在进入 `Stopped` 前的终态退出阶段被调用一次。
 4. 调用 `Stop` 提交异步取消，接收器依次经历 `Stopping` → `Retiring` → `Stopped`。

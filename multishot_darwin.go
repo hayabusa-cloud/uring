@@ -16,7 +16,11 @@ const (
 	MultishotStop
 )
 
-// MultishotStep is the canonical observation surface for multishot CQEs.
+// MultishotStep describes one observed multishot CQE.
+//
+// CQE is a copied descriptor. Its context target is borrowed only during
+// OnMultishotStep; copy needed target fields before returning.
+// Negative CQE.Res values are decoded into Err. Cancelled reports -ECANCELED.
 type MultishotStep struct {
 	CQE       CQEView
 	Err       error
@@ -88,10 +92,4 @@ func (ur *Uring) AcceptMultishot(sqeCtx SQEContext, handler MultishotHandler, op
 // ReceiveMultishot creates a multishot receive subscription (stub on Darwin).
 func (ur *Uring) ReceiveMultishot(sqeCtx SQEContext, handler MultishotHandler, options ...OpOptionFunc) (*MultishotSubscription, error) {
 	return nil, ErrNotSupported
-}
-
-// asyncCancelByUserData submits an async cancel request using userData.
-func (ur *Uring) asyncCancelByUserData(userData uint64) error {
-	ctx := PackDirect(IORING_OP_ASYNC_CANCEL, 0, 0, 0)
-	return ur.asyncCancel(ctx, userData)
 }

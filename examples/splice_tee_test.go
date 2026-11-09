@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"code.hybscloud.com/iofd"
 	"code.hybscloud.com/iox"
 	"code.hybscloud.com/uring"
 	"code.hybscloud.com/zcall"
@@ -73,7 +74,7 @@ func TestSpliceBasics(t *testing.T) {
 	// Step 1: Splice from file to pipe (file → pipe)
 	srcFD := int32(srcFile.Fd())
 	ctx1 := uring.PackDirect(uring.IORING_OP_SPLICE, 0, 0, pipeWrite)
-	if err := ring.Splice(ctx1, int(srcFD), len(testData)); err != nil {
+	if err := ring.Splice(ctx1, iofd.FD(srcFD), len(testData)); err != nil {
 		t.Fatalf("Splice (file→pipe): %v", err)
 	}
 
@@ -104,7 +105,7 @@ func TestSpliceBasics(t *testing.T) {
 	// Step 2: Splice from pipe to file (pipe → file)
 	dstFD := int32(dstFile.Fd())
 	ctx2 := uring.PackDirect(uring.IORING_OP_SPLICE, 0, 0, dstFD)
-	if err := ring.Splice(ctx2, int(pipeRead), int(result1)); err != nil {
+	if err := ring.Splice(ctx2, iofd.FD(pipeRead), int(result1)); err != nil {
 		t.Fatalf("Splice (pipe→file): %v", err)
 	}
 
@@ -194,7 +195,7 @@ func TestTeeOperation(t *testing.T) {
 
 	// Tee from source to destination (duplicates without consuming)
 	ctx := uring.PackDirect(uring.IORING_OP_TEE, 0, 0, dstWrite)
-	if err := ring.Tee(ctx, int(srcRead), len(testData)); err != nil {
+	if err := ring.Tee(ctx, iofd.FD(srcRead), len(testData)); err != nil {
 		t.Fatalf("Tee: %v", err)
 	}
 

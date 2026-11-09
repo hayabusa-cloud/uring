@@ -593,7 +593,7 @@ func TestMultishotStressAccept(t *testing.T) {
 	for time.Now().Before(deadline) && accepted < numConnections {
 		n, err := ring.Wait(cqes)
 		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
-			t.Logf("Wait: %v", err)
+			t.Fatalf("Wait: %v", err)
 		}
 		for i := 0; i < n; i++ {
 			cqe := cqes[i]

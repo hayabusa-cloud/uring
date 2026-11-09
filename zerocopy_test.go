@@ -73,7 +73,7 @@ func TestSendZeroCopyFixed(t *testing.T) {
 	defer serverConn.Close()
 
 	// Prepare test data in registered buffer
-	// Note: Data must be >= 1536 bytes to trigger zero-copy path (threshold for single target)
+	// The payload exceeds the single-target zero-copy threshold.
 	testData := make([]byte, 2048)
 	for i := range testData {
 		testData[i] = byte('A' + i%26)
@@ -96,7 +96,7 @@ func TestSendZeroCopyFixed(t *testing.T) {
 	targets := &singleTarget{fd: iofd.FD(serverFile.Fd())}
 
 	ctx := uring.PackDirect(uring.IORING_OP_SEND_ZC, 0, 0, int32(targets.fd))
-	err = ring.MulticastZeroCopy(ctx, targets, 0, 0, len(testData))
+	_, err = ring.MulticastZeroCopy(ctx, targets, 0, 0, len(testData))
 	if err != nil {
 		t.Fatalf("MulticastZeroCopy: %v", err)
 	}
@@ -209,7 +209,7 @@ func TestZeroCopyNotificationFlags(t *testing.T) {
 	// Submit zero-copy send (using the write FD)
 	targets := &singleTarget{fd: fds[1]}
 	ctx := uring.PackDirect(uring.IORING_OP_SEND_ZC, 0, 0, int32(fds[1]))
-	err = ring.MulticastZeroCopy(ctx, targets, 0, 0, len(testData))
+	_, err = ring.MulticastZeroCopy(ctx, targets, 0, 0, len(testData))
 	if err != nil {
 		t.Fatalf("MulticastZeroCopy: %v", err)
 	}
@@ -312,7 +312,7 @@ func TestSendZeroCopyFixedMultiTarget(t *testing.T) {
 	}()
 
 	// Prepare test data in registered buffer
-	// Note: Data must be >= 1536 bytes to trigger zero-copy path (threshold for < 4 targets)
+	// Each target uses the zero-copy completion protocol.
 	regBuf := ring.RegisteredBuffer(0)
 	testData := make([]byte, 2048)
 	for i := range testData {
@@ -325,7 +325,7 @@ func TestSendZeroCopyFixedMultiTarget(t *testing.T) {
 
 	// Submit multicast zero-copy
 	ctx := uring.PackDirect(uring.IORING_OP_SEND_ZC, 0, 0, 0)
-	err = ring.MulticastZeroCopy(ctx, targets, 0, 0, len(testData))
+	_, err = ring.MulticastZeroCopy(ctx, targets, 0, 0, len(testData))
 	if err != nil {
 		t.Fatalf("MulticastZeroCopy: %v", err)
 	}
@@ -429,7 +429,7 @@ func TestZeroCopyBufferSafety(t *testing.T) {
 	regBuf := ring.RegisteredBuffer(0)
 
 	// Test 1: Send first message
-	// Note: Data must be >= 1536 bytes to trigger zero-copy path (threshold for single target)
+	// Keep this registered payload unchanged until release evidence arrives.
 	msg1 := make([]byte, 2048)
 	for i := range msg1 {
 		msg1[i] = byte('1')
@@ -438,7 +438,7 @@ func TestZeroCopyBufferSafety(t *testing.T) {
 
 	targets := &singleTarget{fd: fds[1]}
 	ctx := uring.PackDirect(uring.IORING_OP_SEND_ZC, 0, 0, int32(fds[1]))
-	err = ring.MulticastZeroCopy(ctx, targets, 0, 0, len(msg1))
+	_, err = ring.MulticastZeroCopy(ctx, targets, 0, 0, len(msg1))
 	if err != nil {
 		t.Fatalf("first MulticastZeroCopy: %v", err)
 	}
@@ -523,7 +523,7 @@ func TestZeroCopyBufferSafety(t *testing.T) {
 	copy(regBuf, msg2)
 
 	ctx2 := uring.PackDirect(uring.IORING_OP_SEND_ZC, 0, 1, int32(fds[1]))
-	err = ring.MulticastZeroCopy(ctx2, targets, 0, 0, len(msg2))
+	_, err = ring.MulticastZeroCopy(ctx2, targets, 0, 0, len(msg2))
 	if err != nil {
 		t.Fatalf("second MulticastZeroCopy: %v", err)
 	}
@@ -620,7 +620,7 @@ func TestZeroCopyLargeBuffer(t *testing.T) {
 
 	// Use smaller size to avoid socket buffer issues
 	sendSize := min(bufLen, 65536)
-	err = ring.MulticastZeroCopy(ctx, targets, 0, 0, sendSize)
+	_, err = ring.MulticastZeroCopy(ctx, targets, 0, 0, sendSize)
 	if err != nil {
 		t.Fatalf("MulticastZeroCopy: %v", err)
 	}
@@ -709,7 +709,7 @@ func TestZeroCopyMultipleBuffers(t *testing.T) {
 	for i := 0; i < numTests; i++ {
 		targets := &singleTarget{fd: pairs[i][1]}
 		ctx := uring.PackDirect(uring.IORING_OP_SEND_ZC, 0, uint16(i), int32(pairs[i][1]))
-		err := ring.MulticastZeroCopy(ctx, targets, i, 0, len(messages[i]))
+		_, err := ring.MulticastZeroCopy(ctx, targets, i, 0, len(messages[i]))
 		if err != nil {
 			t.Fatalf("MulticastZeroCopy[%d]: %v", i, err)
 		}
@@ -762,7 +762,7 @@ func TestZeroCopyErrorHandling(t *testing.T) {
 	t.Run("invalid_fd", func(t *testing.T) {
 		targets := &singleTarget{fd: -1}
 		ctx := uring.PackDirect(uring.IORING_OP_SEND_ZC, 0, 0, -1)
-		err := ring.MulticastZeroCopy(ctx, targets, 0, 0, 100)
+		_, err := ring.MulticastZeroCopy(ctx, targets, 0, 0, 2048)
 		if err != nil {
 			t.Logf("expected error for invalid FD: %v", err)
 		}
@@ -772,7 +772,10 @@ func TestZeroCopyErrorHandling(t *testing.T) {
 		deadline := time.Now().Add(time.Second)
 		b := iox.Backoff{}
 		for time.Now().Before(deadline) {
-			n, _ := ring.Wait(cqes)
+			n, err := ring.Wait(cqes)
+			if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+				t.Fatalf("Wait: %v", err)
+			}
 			for i := 0; i < n; i++ {
 				cqe := &cqes[i]
 				if cqe.Op() == uring.IORING_OP_SEND_ZC && !cqe.IsNotification() {
@@ -799,7 +802,7 @@ func TestZeroCopyErrorHandling(t *testing.T) {
 
 		targets := &singleTarget{fd: fds[1]}
 		ctx := uring.PackDirect(uring.IORING_OP_SEND_ZC, 0, 0, int32(fds[1]))
-		err = ring.MulticastZeroCopy(ctx, targets, 0, 0, 100)
+		_, err = ring.MulticastZeroCopy(ctx, targets, 0, 0, 2048)
 		if err != nil {
 			t.Logf("submit error (may be expected): %v", err)
 		}
@@ -809,7 +812,10 @@ func TestZeroCopyErrorHandling(t *testing.T) {
 		deadline := time.Now().Add(time.Second)
 		b := iox.Backoff{}
 		for time.Now().Before(deadline) {
-			n, _ := ring.Wait(cqes)
+			n, err := ring.Wait(cqes)
+			if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+				t.Fatalf("Wait: %v", err)
+			}
 			for i := 0; i < n; i++ {
 				cqe := &cqes[i]
 				if cqe.Op() == uring.IORING_OP_SEND_ZC && !cqe.IsNotification() {
@@ -851,14 +857,13 @@ func TestZeroCopySequentialSends(t *testing.T) {
 	const numSends = 5
 
 	for seq := 0; seq < numSends; seq++ {
-		// Keep the payload above MulticastZeroCopy's single-target threshold so
-		// this test observes SEND_ZC CQEs instead of the fixed-send fallback.
+		// Each payload exceeds the single-target zero-copy threshold.
 		msg := bytes.Repeat([]byte{byte('0' + seq)}, 2048)
 		copy(regBuf, msg)
 
 		targets := &singleTarget{fd: fds[1]}
 		ctx := uring.PackDirect(uring.IORING_OP_SEND_ZC, 0, uint16(seq), int32(fds[1]))
-		err := ring.MulticastZeroCopy(ctx, targets, 0, 0, len(msg))
+		_, err := ring.MulticastZeroCopy(ctx, targets, 0, 0, len(msg))
 		if err != nil {
 			t.Fatalf("send[%d]: %v", seq, err)
 		}
@@ -872,7 +877,10 @@ func TestZeroCopySequentialSends(t *testing.T) {
 		unsupported := false
 
 		for time.Now().Before(deadline) && (!opDone || !notifDone) {
-			n, _ := ring.Wait(cqes)
+			n, err := ring.Wait(cqes)
+			if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+				t.Fatalf("Wait: %v", err)
+			}
 			for i := 0; i < n; i++ {
 				cqe := &cqes[i]
 				if cqe.Op() == uring.IORING_OP_SEND_ZC {

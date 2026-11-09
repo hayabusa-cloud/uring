@@ -11,7 +11,9 @@ import (
 )
 
 // BundleIterator iterates over buffers consumed in a bundle receive operation.
-type BundleIterator struct{}
+type BundleIterator struct {
+	_ [0]func() // Preserve the Linux type's non-comparability without storing state.
+}
 
 // NewBundleIterator creates an iterator (stub on Darwin).
 func NewBundleIterator(cqe CQEView, bufBacking []byte, bufSize int, ringEntries int) (BundleIterator, bool) {
@@ -29,12 +31,12 @@ func (it BundleIterator) All() iter.Seq[[]byte] {
 	return func(yield func([]byte) bool) {}
 }
 
-// AllWithSlotID returns an iterator yielding masked ring slot ID and data.
+// AllWithSlotID yields each buffer ID and its data in publication order.
 func (it BundleIterator) AllWithSlotID() iter.Seq2[uint16, []byte] {
 	return func(yield func(uint16, []byte) bool) {}
 }
 
-// SlotID returns the masked ring slot ID at the given index.
+// SlotID returns the buffer ID at the given index in the bundle.
 func (it BundleIterator) SlotID(index int) uint16 { return 0 }
 
 // Buffer returns the buffer at the given index.
@@ -46,5 +48,5 @@ func (it BundleIterator) Collect() [][]byte { return nil }
 // CopyTo copies all bundle data to the destination.
 func (it BundleIterator) CopyTo(dst []byte) int { return 0 }
 
-// Recycle returns consumed buffers to the buffer ring (stub on Darwin).
-func (it BundleIterator) Recycle(ur *Uring) {}
+// Recycle reports that bundled receive buffers are unavailable on Darwin.
+func (it BundleIterator) Recycle(ur *Uring) error { return ErrNotSupported }

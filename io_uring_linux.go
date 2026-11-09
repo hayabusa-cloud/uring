@@ -9,6 +9,7 @@ package uring
 import (
 	"errors"
 	"fmt"
+	"math"
 	"runtime"
 	"sync/atomic"
 	"time"
@@ -146,9 +147,9 @@ const (
 	IORING_REGISTER_CLONE_BUFFERS    = zcall.IORING_REGISTER_CLONE_BUFFERS // Clone buffers from another ring
 	IORING_REGISTER_SEND_MSG_RING    = zcall.IORING_REGISTER_SEND_MSG_RING // Send MSG_RING without ring
 	IORING_REGISTER_ZCRX_IFQ         = zcall.IORING_REGISTER_ZCRX_IFQ      // Register ZCRX interface queue
-	IORING_REGISTER_RESIZE_RINGS     = zcall.IORING_REGISTER_RESIZE_RINGS  // Resize CQ ring
-	IORING_REGISTER_MEM_REGION       = zcall.IORING_REGISTER_MEM_REGION    // Memory region setup (6.19+)
-	IORING_REGISTER_QUERY            = zcall.IORING_REGISTER_QUERY         // Query ring state (6.19+)
+	IORING_REGISTER_RESIZE_RINGS     = zcall.IORING_REGISTER_RESIZE_RINGS  // Resize SQ and CQ rings
+	IORING_REGISTER_MEM_REGION       = zcall.IORING_REGISTER_MEM_REGION    // Memory region setup (6.13+)
+	IORING_REGISTER_QUERY            = zcall.IORING_REGISTER_QUERY         // Query ring state (6.18+)
 	IORING_REGISTER_ZCRX_CTRL        = zcall.IORING_REGISTER_ZCRX_CTRL     // ZCRX control operations (6.19+)
 )
 
@@ -278,7 +279,7 @@ func (slot submitSlot) inlineCmdData128() []byte {
 	if slot.sqe128 == nil {
 		return nil
 	}
-	return unsafe.Slice((*byte)(unsafe.Pointer(&slot.sqe128.pad[0])), uringCmd128DataMax)
+	return unsafe.Slice((*byte)(unsafe.Pointer(&slot.sqe128.pad[0])), uringCmdInlineDataMax)
 }
 
 func sqeBytesFromFlags(flags uint32) int {
@@ -383,18 +384,18 @@ func (ur *ioUring) feature(feat uint32) bool {
 }
 
 func (ur *ioUring) registerBuffers(addr unsafe.Pointer, n, size int) error {
-	if ur.bufs != nil && len(ur.bufs) > 0 {
+	if len(ur.bufs) > 0 {
 		return ErrExists
 	}
 	if n < 1 || size < 1 || 0 != size&(size-1) {
 		return ErrInvalidParam
 	}
 	vectors := make([]IoVec, 0, n)
-	ur.bufs = make([][]byte, 0, n)
+	buffers := make([][]byte, 0, n)
 	for i := range n {
 		base := unsafe.Add(addr, i*size)
 		vectors = append(vectors, IoVec{Base: (*byte)(base), Len: uint64(size)})
-		ur.bufs = append(ur.bufs, unsafe.Slice((*byte)(base), size))
+		buffers = append(buffers, unsafe.Slice((*byte)(base), size))
 	}
 	data := uintptr(unsafe.Pointer(unsafe.SliceData(vectors)))
 	reg := ioUringRSrcRegister{nr: uint32(n), data: uint64(data)}
@@ -404,12 +405,13 @@ func (ur *ioUring) registerBuffers(addr unsafe.Pointer, n, size int) error {
 	if errno != 0 {
 		return errFromErrno(errno)
 	}
+	ur.bufs = buffers
 
 	return nil
 }
 
 func (ur *ioUring) unregisterBuffers() error {
-	if ur.bufs == nil || len(ur.bufs) < 1 {
+	if len(ur.bufs) < 1 {
 		return ErrNotFound
 	}
 	_, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_UNREGISTER_BUFFERS, nil, 0)
@@ -425,10 +427,10 @@ func (ur *ioUring) unregisterBuffers() error {
 // Using registered files reduces per-operation overhead by avoiding
 // file reference management on each I/O operation.
 func (ur *ioUring) registerFiles(fds []int32) error {
-	if ur.files != nil && len(ur.files) > 0 {
+	if len(ur.files) > 0 {
 		return ErrExists
 	}
-	if len(fds) < 1 {
+	if len(fds) < 1 || uint(len(fds)) > math.MaxUint32 {
 		return ErrInvalidParam
 	}
 
@@ -454,7 +456,7 @@ func (ur *ioUring) registerFiles(fds []int32) error {
 // Entries are initially empty (-1) and can be populated with registerFilesUpdate.
 // Sparse registration allows dynamic file management without pre-populating all entries.
 func (ur *ioUring) registerFilesSparse(count uint32) error {
-	if ur.files != nil && len(ur.files) > 0 {
+	if len(ur.files) > 0 {
 		return ErrExists
 	}
 	if count < 1 {
@@ -482,15 +484,24 @@ func (ur *ioUring) registerFilesSparse(count uint32) error {
 
 // registerFilesUpdate updates registered files at the specified offset.
 // Use -1 to clear a slot, or a valid fd to set it.
-func (ur *ioUring) registerFilesUpdate(offset uint32, fds []int32) error {
-	if ur.files == nil || len(ur.files) < 1 {
-		return ErrNotFound
+func (ur *ioUring) registerFilesUpdate(offset uint32, fds []int32) (int, error) {
+	if len(ur.files) < 1 {
+		return 0, ErrNotFound
 	}
-	if len(fds) < 1 {
-		return ErrInvalidParam
+	if len(fds) < 1 || uint(len(fds)) > math.MaxUint32 {
+		return 0, ErrInvalidParam
 	}
-	if int(offset)+len(fds) > len(ur.files) {
-		return ErrInvalidParam
+	if uint64(offset) > uint64(len(ur.files)) {
+		return 0, ErrInvalidParam
+	}
+	start := int(offset)
+	if len(fds) > len(ur.files)-start {
+		return 0, ErrInvalidParam
+	}
+	for _, fd := range fds {
+		if fd < -1 {
+			return 0, ErrInvalidParam
+		}
 	}
 
 	// io_uring_files_update struct layout
@@ -503,20 +514,27 @@ func (ur *ioUring) registerFilesUpdate(offset uint32, fds []int32) error {
 		offset: offset,
 		fds:    uint64(uintptr(unsafe.Pointer(unsafe.SliceData(fds)))),
 	}
-	_, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_REGISTER_FILES_UPDATE, unsafe.Pointer(&up), uintptr(len(fds)))
+	result, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_REGISTER_FILES_UPDATE, unsafe.Pointer(&up), uintptr(len(fds)))
 	if errno != 0 {
-		return errFromErrno(errno)
+		// Linux clears the destination before acquiring the replacement file.
+		if errno == uintptr(zcall.EBADF) || errno == ENOMEM {
+			ur.files[start] = -1
+		}
+		return 0, errFromErrno(errno)
 	}
 
-	// Update local tracking
-	copy(ur.files[offset:], fds)
+	updated := int(result)
+	copy(ur.files[start:start+updated], fds[:updated])
+	if updated < len(fds) {
+		ur.files[start+updated] = -1
+	}
 
-	return nil
+	return updated, nil
 }
 
 // unregisterFiles removes all registered file descriptors.
 func (ur *ioUring) unregisterFiles() error {
-	if ur.files == nil || len(ur.files) < 1 {
+	if len(ur.files) < 1 {
 		return ErrNotFound
 	}
 	_, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_UNREGISTER_FILES, nil, 0)
@@ -1325,7 +1343,7 @@ const (
 )
 
 // ========================================
-// Query Interface (Linux 6.19+)
+// Query Interface (Linux 6.18+)
 // ========================================
 
 // Query operation types for IORING_REGISTER_QUERY.
@@ -1347,7 +1365,7 @@ type QueryHdr struct {
 }
 
 // QueryOpcode returns information about supported io_uring operations.
-// Matches struct io_uring_query_opcode in Linux.
+// Fields before ResultSize match struct io_uring_query_opcode in Linux.
 type QueryOpcode struct {
 	NrRequestOpcodes  uint32 // Number of supported IORING_OP_* opcodes
 	NrRegisterOpcodes uint32 // Number of supported IORING_REGISTER_* opcodes
@@ -1357,29 +1375,35 @@ type QueryOpcode struct {
 	SqeFlags          uint64 // Bitmask of IOSQE_* flags
 	NrQueryOpcodes    uint32 // Number of available query opcodes
 	_                 uint32
+	ResultSize        uint32 // Number of query-data bytes returned by the kernel
 }
 
+// ZCRX query feature flags.
+const ZCRX_FEATURE_RX_PAGE_SIZE = 1 << 0
+
 // QueryZCRX returns information about ZCRX capabilities.
-// Matches struct io_uring_query_zcrx in Linux.
+// Fields before ResultSize match struct io_uring_query_zcrx in Linux.
 type QueryZCRX struct {
 	RegisterFlags  uint64 // Bitmask of supported ZCRX_REG_* flags
 	AreaFlags      uint64 // Bitmask of IORING_ZCRX_AREA_* flags
 	NrCtrlOpcodes  uint32 // Number of supported ZCRX_CTRL_* opcodes
-	_              uint32
+	Features       uint32 // ZCRX_FEATURE_* bitmask (Linux 7.0+; reserved before then)
 	RqHdrSize      uint32 // Refill ring header size
 	RqHdrAlignment uint32 // Header alignment requirement
 	_              uint64
+	ResultSize     uint32 // Number of query-data bytes returned by the kernel
 }
 
 // QuerySCQ returns information about SQ/CQ rings.
-// Matches struct io_uring_query_scq in Linux.
+// Fields before ResultSize match struct io_uring_query_scq in Linux.
 type QuerySCQ struct {
 	HdrSize      uint64 // SQ/CQ rings header size
 	HdrAlignment uint64 // Header alignment requirement
+	ResultSize   uint32 // Number of query-data bytes returned by the kernel
 }
 
 // ========================================
-// Memory Region Support (Linux 6.19+)
+// Memory Region Support (Linux 6.13+)
 // ========================================
 
 // Memory region types.
@@ -1412,7 +1436,7 @@ type MemRegionReg struct {
 }
 
 // ========================================
-// NAPI Support (Linux 6.19+)
+// NAPI Support (Linux 6.9+; static tracking requires Linux 6.13+)
 // ========================================
 
 // NAPI operation types.
@@ -1483,7 +1507,7 @@ const (
 )
 
 // ========================================
-// Clone Buffers (Linux 6.19+)
+// Clone Buffers (Linux 6.12+; offsets and replacement require Linux 6.13+)
 // ========================================
 
 // Clone buffers registration flags.
@@ -1591,8 +1615,16 @@ type ZCRXIfqReg struct {
 	RegionPtr uint64      // Pointer to memory region descriptor
 	Offsets   ZCRXOffsets // Offsets within the ring
 	ZcrxID    uint32      // ZCRX instance ID (output)
-	RxBufLen  uint32      // Chunk size hint; 0 defaults to page size
+	RxBufLen  uint32      // Chunk size in/out (Linux 7.0+); must be zero before then
 	Resv      [3]uint64   // Reserved
+}
+
+// ZCRXIfqRegistration is the observable result of ZCRX interface-queue registration.
+type ZCRXIfqRegistration struct {
+	ID        uint32
+	RqEntries uint32 // Effective refill queue entry count.
+	Offsets   ZCRXOffsets
+	RxBufLen  uint32
 }
 
 // ZCRXCtrl is the control structure for ZCRX operations.
@@ -1617,7 +1649,7 @@ func (ur *ioUring) registerZCRXIfq(reg *ZCRXIfqReg) error {
 
 // zcrxCtrl performs a ZCRX control operation.
 func (ur *ioUring) zcrxCtrl(ctrl *ZCRXCtrl) error {
-	_, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_REGISTER_ZCRX_CTRL, unsafe.Pointer(ctrl), 1)
+	_, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_REGISTER_ZCRX_CTRL, unsafe.Pointer(ctrl), 0)
 	if errno != 0 {
 		return errFromErrno(errno)
 	}
@@ -1625,17 +1657,17 @@ func (ur *ioUring) zcrxCtrl(ctrl *ZCRXCtrl) error {
 }
 
 // ========================================
-// Query Interface Methods (Linux 6.19+)
+// Query Interface Methods (Linux 6.18+)
 // ========================================
 
 // query performs a query operation on the io_uring ring.
 // This can be used to query supported opcodes, ZCRX capabilities, or ring info.
 func (ur *ioUring) query(hdr *QueryHdr) error {
-	_, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_REGISTER_QUERY, unsafe.Pointer(hdr), 1)
+	_, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_REGISTER_QUERY, unsafe.Pointer(hdr), 0)
 	if errno != 0 {
 		return errFromErrno(errno)
 	}
-	return nil
+	return CompletionError(hdr.Result)
 }
 
 // queryOpcodes queries the kernel for supported io_uring operations.
@@ -1645,12 +1677,13 @@ func (ur *ioUring) queryOpcodes() (*QueryOpcode, error) {
 	hdr := QueryHdr{
 		QueryOp:   IO_URING_QUERY_OPCODES,
 		QueryData: uint64(uintptr(unsafe.Pointer(result))),
-		Size:      uint32(unsafe.Sizeof(*result)),
+		Size:      uint32(unsafe.Offsetof(result.ResultSize)),
 	}
 	err := ur.query(&hdr)
 	if err != nil {
 		return nil, err
 	}
+	result.ResultSize = hdr.Size
 	return result, nil
 }
 
@@ -1660,12 +1693,13 @@ func (ur *ioUring) queryZCRX() (*QueryZCRX, error) {
 	hdr := QueryHdr{
 		QueryOp:   IO_URING_QUERY_ZCRX,
 		QueryData: uint64(uintptr(unsafe.Pointer(result))),
-		Size:      uint32(unsafe.Sizeof(*result)),
+		Size:      uint32(unsafe.Offsetof(result.ResultSize)),
 	}
 	err := ur.query(&hdr)
 	if err != nil {
 		return nil, err
 	}
+	result.ResultSize = hdr.Size
 	return result, nil
 }
 
@@ -1675,17 +1709,18 @@ func (ur *ioUring) querySCQ() (*QuerySCQ, error) {
 	hdr := QueryHdr{
 		QueryOp:   IO_URING_QUERY_SCQ,
 		QueryData: uint64(uintptr(unsafe.Pointer(result))),
-		Size:      uint32(unsafe.Sizeof(*result)),
+		Size:      uint32(unsafe.Offsetof(result.ResultSize)),
 	}
 	err := ur.query(&hdr)
 	if err != nil {
 		return nil, err
 	}
+	result.ResultSize = hdr.Size
 	return result, nil
 }
 
 // ========================================
-// Memory Region Methods (Linux 6.19+)
+// Memory Region Methods (Linux 6.13+)
 // ========================================
 
 // registerMemRegion registers a memory region with the io_uring ring.
@@ -1699,7 +1734,7 @@ func (ur *ioUring) registerMemRegion(reg *MemRegionReg) error {
 }
 
 // ========================================
-// NAPI Methods (Linux 6.19+)
+// NAPI Methods (Linux 6.9+; static tracking requires Linux 6.13+)
 // ========================================
 
 // registerNAPI registers NAPI busy polling with the io_uring ring.
@@ -1714,7 +1749,7 @@ func (ur *ioUring) registerNAPI(napi *NapiReg) error {
 
 // unregisterNAPI unregisters NAPI busy polling from the io_uring ring.
 func (ur *ioUring) unregisterNAPI() error {
-	_, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_UNREGISTER_NAPI, nil, 0)
+	_, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_UNREGISTER_NAPI, nil, 1)
 	if errno != 0 {
 		return errFromErrno(errno)
 	}
@@ -1722,7 +1757,7 @@ func (ur *ioUring) unregisterNAPI() error {
 }
 
 // ========================================
-// Clone Buffers Methods (Linux 6.19+)
+// Clone Buffers Methods (Linux 6.12+; offsets and replacement require Linux 6.13+)
 // ========================================
 
 // cloneBuffers clones registered buffers from another io_uring ring.
@@ -1739,23 +1774,15 @@ func (ur *ioUring) cloneBuffers(clone *CloneBuffers) error {
 // Resize Rings Methods
 // ========================================
 
-// resizeRings asks the kernel to resize the SQ and CQ rings of an io_uring
-// instance without recreating it.
+// resizeRings replaces the SQ/CQ mappings while preserving pending entries
+// and their submission storage.
 //
-// Requirements:
-//   - The ring must not use SQPOLL mode
-//   - The ring must not be in CQ overflow condition
-//   - newSQSize and newCQSize must be power-of-two values
+// The kernel requires DEFER_TASKRUN and no pending CQ overflow. Requested
+// sizes are rounded up to powers of two and clamped to kernel limits. A zero
+// SQ size keeps the current size; a zero CQ size selects twice the resulting SQ.
 //
-// The kernel copies pending SQ and CQ entries during resize. The request may
-// still fail with EINVAL on hosts that do not accept the requested resize.
-// If newSQSize is 0, the current SQ size is reused in the kernel request so
-// callers can resize only the CQ ring (and newCQSize still defaults to 2×SQ
-// when left at 0).
-// If newCQSize is 0, it defaults to 2×newSQSize.
-// A post-register remap failure is terminal: the ring is closed because the
-// kernel has already committed the resize and userspace can no longer trust the
-// stale mappings safely.
+// A post-register remap failure closes the ring: the kernel has committed the
+// resize, so the old userspace mappings can no longer drive it.
 func (ur *ioUring) resizeRings(newSQSize, newCQSize uint32) error {
 	ur.lockSubmitState()
 	defer ur.unlockSubmitState()
@@ -1764,6 +1791,8 @@ func (ur *ioUring) resizeRings(newSQSize, newCQSize uint32) error {
 	if newSQSize == 0 {
 		newSQSize = ur.params.sqEntries
 	}
+	// Linux accepts only resize-control flags here. It inherits and returns
+	// immutable layout flags such as SQE128 and CQE32.
 	params := ioUringParams{
 		sqEntries: newSQSize,
 		cqEntries: newCQSize,
@@ -1781,33 +1810,83 @@ func (ur *ioUring) resizeRings(newSQSize, newCQSize uint32) error {
 	}
 	oldKeepAliveHead := ur.submit.keepAliveHead
 	oldKeepAlive := ur.submit.keepAlive
+	oldSQ := ur.sq
+	oldCQ := ur.cq
 	oldRingPtr := ur.sq.ringPtr
 	oldRingMapSz := ur.ringMapSz()
 	oldSqesPtr := ur.sq.sqesPtr
 	oldSqeMapSz := ur.sq.sqeMapSz
-	if ur.params.flags&IORING_SETUP_SQE128 != 0 {
-		params.flags |= IORING_SETUP_SQE128
-	}
 
 	_, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_REGISTER_RESIZE_RINGS, unsafe.Pointer(&params), 1)
 	if errno != 0 {
 		return errFromErrno(errno)
 	}
 
-	zcall.Munmap(oldSqesPtr, oldSqeMapSz)
-	zcall.Munmap(oldRingPtr, oldRingMapSz)
+	// Pending entries remain readable through the old mappings until relocation.
+	defer zcall.Munmap(oldSqesPtr, oldSqeMapSz)
+	defer zcall.Munmap(oldRingPtr, oldRingMapSz)
 	ur.clearRingViews()
 	if err := ur.remapRings(&params); err != nil {
 		return ur.closeAfterFatalResize(fmt.Errorf("remap resized rings: %w", err))
 	}
+	// Registration freezes the old CQ. Preserve complete entries, including
+	// CQE32 payloads that older kernels copy in 16-byte units during resize.
+	cqHead := atomic.LoadUint32(oldCQ.kHead)
+	cqTail := atomic.LoadUint32(oldCQ.kTail)
+	for idx := cqHead; idx != cqTail; idx++ {
+		src := int(idx&*oldCQ.kRingMask) * oldCQ.cqeStride
+		dst := int(idx&*ur.cq.kRingMask) * ur.cq.cqeStride
+		copy(ur.cq.cqes[dst:dst+ur.cq.cqeStride], oldCQ.cqes[src:src+oldCQ.cqeStride])
+	}
 
-	if len(oldKeepAlive) != int(params.sqEntries) {
-		newKeepAlive := make([]submitKeepAlive, int(params.sqEntries))
-		newMask := params.sqEntries - 1
-		for idx := oldKeepAliveHead; idx != oldTail; idx++ {
-			newKeepAlive[idx&newMask] = oldKeepAlive[idx&oldMask]
+	resizedSQ := len(oldKeepAlive) != int(params.sqEntries)
+	if resizedSQ {
+		ur.submit.keepAlive = make([]submitKeepAlive, int(params.sqEntries))
+	}
+	newMask := params.sqEntries - 1
+	for idx := oldKeepAliveHead; idx != oldTail; idx++ {
+		oldIndex, newIndex := idx&oldMask, idx&newMask
+		sqe := ur.sq.sqeAt(newIndex)
+		// Reconstruct complete entries: older kernels copy only 64-byte units
+		// during resize, including on SQE128 rings.
+		if params.flags&IORING_SETUP_SQE128 != 0 {
+			*ur.sq.sqe128At(newIndex) = *oldSQ.sqe128At(oldIndex)
+		} else {
+			*sqe = *oldSQ.sqeAt(oldIndex)
 		}
-		ur.submit.keepAlive = newKeepAlive
+		if params.flags&IORING_SETUP_NO_SQARRAY == 0 {
+			ur.sq.array[newIndex] = newIndex
+		}
+		if !resizedSQ {
+			continue
+		}
+		keep := &ur.submit.keepAlive[newIndex]
+		*keep = oldKeepAlive[oldIndex]
+		// Iovec slices and ext pointers retain their original backing. Inline
+		// timespecs have only integer SQE addresses, so rebase those addresses.
+		oldAddr := uint64(uintptr(unsafe.Pointer(&oldKeepAlive[oldIndex].timespec)))
+		newAddr := uint64(uintptr(unsafe.Pointer(&keep.timespec)))
+		switch sqe.opcode {
+		case IORING_OP_TIMEOUT, IORING_OP_LINK_TIMEOUT:
+			if sqe.addr != oldAddr {
+				continue
+			}
+			sqe.addr = newAddr
+		case IORING_OP_TIMEOUT_REMOVE:
+			if sqe.uflags&IORING_TIMEOUT_UPDATE_MASK == 0 || sqe.off != oldAddr {
+				continue
+			}
+			sqe.off = newAddr
+		default:
+			continue
+		}
+		ctx := SQEContextFromRaw(sqe.userData)
+		switch ctx.Mode() {
+		case CtxModeIndirect:
+			ctx.IndirectSQE().ioUringSqe = *sqe
+		case CtxModeExtended:
+			ctx.ExtSQE().SQE = *sqe
+		}
 	}
 
 	ur.params.sqEntries = params.sqEntries

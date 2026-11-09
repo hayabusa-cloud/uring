@@ -22,7 +22,8 @@ type OpOption struct {
 	// For io_uring-specific ops: operation-defined flags (e.g. IORING_ACCEPT_MULTISHOT).
 	IOPrio uint16
 	// Registered file table slot index for direct descriptor operations.
-	FileIndex uint32
+	// nil leaves the target unspecified.
+	FileIndex *uint32
 	// Registered credential personality ID (0 = caller's credentials).
 	Personality uint16
 	// Listen backlog depth.
@@ -37,11 +38,11 @@ type OpOption struct {
 	FileMode os.FileMode
 	// Advisory hint for fadvise/madvise operations.
 	Fadvise int
-	// File offset for positioned I/O operations.
+	// File position or socket-buffer byte offset; see [WithOffset].
 	Offset int64
-	// Size limit (nil = use buffer length).
+	// Optional byte limit; nil uses the operation's default. See [WithN].
 	N *int
-	// Completion count for timeout operations.
+	// Completion count for timeout operations. Values must fit uint32.
 	Count int
 	// Timeout clock and behavior flags (IORING_TIMEOUT_ABS, _BOOTTIME, _REALTIME, etc.)
 	TimeoutFlags uint32
@@ -49,6 +50,8 @@ type OpOption struct {
 	SpliceFlags uint32
 	// Fsync behavior flags (IORING_FSYNC_DATASYNC).
 	FsyncFlags uint32
+	// URING_CMD behavior flags (IORING_URING_CMD_FIXED, _MULTISHOT).
+	UringCmdFlags uint32
 }
 
 const (
@@ -79,22 +82,21 @@ var defaultUringOpOption = OpOption{
 	Count:           1,
 }
 
-// OpOptionFunc is a type that defines a functional option for configuring a OpOption.
+// OpOptionFunc configures an [OpOption].
 type OpOptionFunc func(opt *OpOption)
 
-// Apply applies the given option functions to the OpOption.
+// Apply applies option functions in order.
 func (uo *OpOption) Apply(opts ...OpOptionFunc) {
 	for _, f := range opts {
 		f(uo)
 	}
 }
 
-// WithFileIndex sets the file index for direct descriptor operations.
-// For socket/accept direct, pass IORING_FILE_INDEX_ALLOC for auto-allocation,
-// or a specific slot index (0-based) into the registered file table.
+// WithFileIndex makes SocketRaw create a direct descriptor at the specified
+// zero-based slot. IORING_FILE_INDEX_ALLOC requests auto-allocation.
 func WithFileIndex(idx uint32) OpOptionFunc {
 	return func(opt *OpOption) {
-		opt.FileIndex = idx
+		opt.FileIndex = &idx
 	}
 }
 
@@ -134,14 +136,28 @@ func WithBacklog(n int) OpOptionFunc {
 	}
 }
 
-// WithOffset sets the file offset for positioned I/O operations.
+// WithOffset sets the file position or buffer offset used by an operation.
+// [Uring.Read], [Uring.Write], [Uring.ReadFixed], and [Uring.WriteFixed] use a
+// file offset; -1 uses and advances the file's current position.
+// [Uring.Send], [Uring.SendFD], [Uring.Receive], and [Uring.ReceiveFD] use a
+// nonnegative byte offset within the supplied buffer. Receive operations
+// with buffer selection ignore this option.
+// [ZCTracker.SendZC] uses a byte offset within its buffer;
+// [ZCTracker.SendZCFixed] uses one within its explicit offset/length range.
 func WithOffset(offset int64) OpOptionFunc {
 	return func(opt *OpOption) {
 		opt.Offset = offset
 	}
 }
 
-// WithN sets the size limit for read/write/splice operations.
+// WithN sets the byte limit for operations that use it.
+// [Uring.Read], [Uring.Write], and [Uring.ReadFixed] cap it at the buffer length.
+// [Uring.Send], [Uring.SendFD], [Uring.Receive], and [Uring.ReceiveFD] require
+// it to fit the supplied buffer after [WithOffset]. Receive operations with
+// buffer selection use [WithReadBufferSize] instead.
+// [ZCTracker.SendZC] and [ZCTracker.SendZCFixed] require a positive limit that
+// fits the selected buffer range after [WithOffset].
+// [Uring.WriteFixed], [Uring.Splice], and [Uring.Tee] use their explicit lengths.
 func WithN(n int) OpOptionFunc {
 	return func(opt *OpOption) {
 		opt.N = &n
@@ -170,6 +186,7 @@ func WithFadvise(advice int) OpOptionFunc {
 }
 
 // WithCount sets the completion count for timeout operations.
+// Values must be in the inclusive uint32 domain.
 func WithCount(cnt int) OpOptionFunc {
 	return func(opt *OpOption) {
 		opt.Count = cnt
@@ -177,7 +194,9 @@ func WithCount(cnt int) OpOptionFunc {
 }
 
 // WithReadBufferSize sets the kernel-provided buffer size for receive operations
-// with buffer selection.
+// with buffer selection. For raw multishot receive, zero leaves the kernel
+// length uncapped and selects the default-size buffer group. Single-shot
+// receive requires a positive size.
 func WithReadBufferSize(n int) OpOptionFunc {
 	return func(opt *OpOption) {
 		opt.ReadBufferSize = n
@@ -247,5 +266,16 @@ func WithSpliceFlags(flags uint32) OpOptionFunc {
 func WithFsyncDataSync() OpOptionFunc {
 	return func(opt *OpOption) {
 		opt.FsyncFlags = 1
+	}
+}
+
+// WithUringCmdFlags sets IORING_OP_URING_CMD behavior flags.
+// IORING_URING_CMD_FIXED interprets sqeCtx.BufGroup as a registered buffer
+// index. IORING_URING_CMD_MULTISHOT requires IOSQE_BUFFER_SELECT and
+// interprets sqeCtx.BufGroup as a provided-buffer group. FIXED and MULTISHOT
+// are mutually exclusive.
+func WithUringCmdFlags(flags uint32) OpOptionFunc {
+	return func(opt *OpOption) {
+		opt.UringCmdFlags = flags
 	}
 }

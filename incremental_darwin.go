@@ -10,8 +10,11 @@ import "code.hybscloud.com/iofd"
 
 // IncrementalHandler handles incremental receive completion events.
 type IncrementalHandler interface {
-	OnData(buf []byte, hasMore bool)
+	// OnData is not called by the Darwin stub.
+	OnData(buf []byte, bufferMore bool)
+	// OnComplete is not called by the Darwin stub.
 	OnComplete()
+	// OnError is not called by the Darwin stub.
 	OnError(err error)
 }
 

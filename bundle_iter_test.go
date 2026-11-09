@@ -7,10 +7,30 @@
 package uring_test
 
 import (
+	"errors"
 	"testing"
 
 	"code.hybscloud.com/uring"
 )
+
+func TestBundleIteratorFreeConstructorCannotRecycle(t *testing.T) {
+	const (
+		bufCount = 4
+		bufSize  = 16
+	)
+	iter, ok := uring.NewBundleIterator(
+		uring.CQEView{Res: bufSize},
+		make([]byte, bufCount*bufSize),
+		bufSize,
+		bufCount,
+	)
+	if !ok {
+		t.Fatal("NewBundleIterator returned false")
+	}
+	if err := iter.Recycle(&uring.Uring{}); !errors.Is(err, uring.ErrInvalidParam) {
+		t.Fatalf("Recycle free iterator = %v, want %v", err, uring.ErrInvalidParam)
+	}
+}
 
 // TestBundleIteratorBasic tests basic bundle iteration.
 func TestBundleIteratorBasic(t *testing.T) {
@@ -398,6 +418,27 @@ func TestBundleIteratorNilCases(t *testing.T) {
 	_, ok = uring.NewBundleIterator(cqe, backing[:128], 64, 4)
 	if ok {
 		t.Error("expected false for insufficient backing memory")
+	}
+
+	const maxRingEntries = 1 << 15
+	maxBacking := make([]byte, maxRingEntries)
+	if _, ok = uring.NewBundleIterator(uring.CQEView{Res: 1}, maxBacking, 1, maxRingEntries); !ok {
+		t.Errorf("expected true for %d ring entries", maxRingEntries)
+	}
+	if allocs := testing.AllocsPerRun(1000, func() {
+		if _, valid := uring.NewBundleIterator(uring.CQEView{Res: 1}, maxBacking, 1, maxRingEntries); !valid {
+			panic("maximum valid ring rejected")
+		}
+	}); allocs != 0 {
+		t.Errorf("NewBundleIterator allocations = %v, want 0", allocs)
+	}
+
+	// Linux buffer rings reject the ambiguous 16-bit full/empty boundary.
+	for _, entries := range []int{1 << 16, 1 << 17} {
+		_, ok = uring.NewBundleIterator(uring.CQEView{Res: 1}, make([]byte, entries), 1, entries)
+		if ok {
+			t.Errorf("expected false for %d ring entries", entries)
+		}
 	}
 }
 

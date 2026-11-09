@@ -455,7 +455,7 @@ func (ur *ioUring) registerFiles(fds []int32) error {
 	if ur.files != nil && len(ur.files) > 0 {
 		return ErrExists
 	}
-	if len(fds) < 1 {
+	if len(fds) < 1 || uint(len(fds)) > math.MaxUint32 {
 		return ErrInvalidParam
 	}
 	ur.files = make([]int32, len(fds))
@@ -479,15 +479,27 @@ func (ur *ioUring) registerFilesSparse(count uint32) error {
 }
 
 // registerFilesUpdate simulates file update (darwin stub).
-func (ur *ioUring) registerFilesUpdate(offset uint32, fds []int32) error {
+func (ur *ioUring) registerFilesUpdate(offset uint32, fds []int32) (int, error) {
 	if ur.files == nil || len(ur.files) < 1 {
-		return ErrNotFound
+		return 0, ErrNotFound
 	}
-	if int(offset)+len(fds) > len(ur.files) {
-		return ErrInvalidParam
+	if len(fds) < 1 || uint(len(fds)) > math.MaxUint32 {
+		return 0, ErrInvalidParam
 	}
-	copy(ur.files[offset:], fds)
-	return nil
+	if uint64(offset) > uint64(len(ur.files)) {
+		return 0, ErrInvalidParam
+	}
+	start := int(offset)
+	if len(fds) > len(ur.files)-start {
+		return 0, ErrInvalidParam
+	}
+	for _, fd := range fds {
+		if fd < -1 {
+			return 0, ErrInvalidParam
+		}
+	}
+	copy(ur.files[start:], fds)
+	return len(fds), nil
 }
 
 // unregisterFiles simulates file unregistration (darwin stub).
@@ -1046,36 +1058,39 @@ type QueryHdr struct {
 	_         [3]uint32
 }
 
-// QueryOpcode returns information about supported io_uring operations.
-// Matches struct io_uring_query_opcode in Linux.
+// QueryOpcode describes supported io_uring operations.
 type QueryOpcode struct {
-	NrRequestOpcodes  uint32 // Number of supported IORING_OP_* opcodes
-	NrRegisterOpcodes uint32 // Number of supported IORING_REGISTER_* opcodes
-	FeatureFlags      uint64 // Raw kernel feature bitmask returned by IORING_REGISTER_QUERY
-	RingSetupFlags    uint64 // Bitmask of IORING_SETUP_* flags
-	EnterFlags        uint64 // Bitmask of IORING_ENTER_* flags
-	SqeFlags          uint64 // Bitmask of IOSQE_* flags
-	NrQueryOpcodes    uint32 // Number of available query opcodes
+	NrRequestOpcodes  uint32
+	NrRegisterOpcodes uint32
+	FeatureFlags      uint64
+	RingSetupFlags    uint64
+	EnterFlags        uint64
+	SqeFlags          uint64
+	NrQueryOpcodes    uint32
 	_                 uint32
+	ResultSize        uint32
 }
 
-// QueryZCRX returns information about ZCRX capabilities.
-// Matches struct io_uring_query_zcrx in Linux.
+// ZCRX query feature flags.
+const ZCRX_FEATURE_RX_PAGE_SIZE = 1 << 0
+
+// QueryZCRX describes ZCRX capabilities.
 type QueryZCRX struct {
-	RegisterFlags  uint64 // Bitmask of supported ZCRX_REG_* flags
-	AreaFlags      uint64 // Bitmask of IORING_ZCRX_AREA_* flags
-	NrCtrlOpcodes  uint32 // Number of supported ZCRX_CTRL_* opcodes
-	_              uint32
-	RqHdrSize      uint32 // Refill ring header size
-	RqHdrAlignment uint32 // Header alignment requirement
+	RegisterFlags  uint64
+	AreaFlags      uint64
+	NrCtrlOpcodes  uint32
+	Features       uint32
+	RqHdrSize      uint32
+	RqHdrAlignment uint32
 	_              uint64
+	ResultSize     uint32
 }
 
-// QuerySCQ returns information about SQ/CQ rings.
-// Matches struct io_uring_query_scq in Linux.
+// QuerySCQ describes SQ/CQ ring header requirements.
 type QuerySCQ struct {
-	HdrSize      uint64 // SQ/CQ rings header size
-	HdrAlignment uint64 // Header alignment requirement
+	HdrSize      uint64
+	HdrAlignment uint64
+	ResultSize   uint32
 }
 
 // RegionDesc describes a memory region for io_uring.
@@ -1185,19 +1200,26 @@ type ZCRXAreaReg struct {
 	Resv        [2]uint64 // Reserved
 }
 
-// ZCRXIfqReg is the interface queue registration for ZCRX.
-// Matches struct io_uring_zcrx_ifq_reg in Linux.
+// ZCRXIfqReg configures a ZCRX interface queue.
 type ZCRXIfqReg struct {
-	IfIdx     uint32      // Network interface index
-	IfRxq     uint32      // RX queue index
-	RqEntries uint32      // Number of refill queue entries
-	Flags     uint32      // ZCRX_REG_* flags
-	AreaPtr   uint64      // Pointer to ZCRXAreaReg
-	RegionPtr uint64      // Pointer to memory region descriptor
-	Offsets   ZCRXOffsets // Offsets within the ring
-	ZcrxID    uint32      // ZCRX instance ID (output)
-	RxBufLen  uint32      // Chunk size hint; 0 defaults to page size
-	Resv      [3]uint64   // Reserved
+	IfIdx     uint32
+	IfRxq     uint32
+	RqEntries uint32
+	Flags     uint32
+	AreaPtr   uint64
+	RegionPtr uint64
+	Offsets   ZCRXOffsets
+	ZcrxID    uint32
+	RxBufLen  uint32
+	Resv      [3]uint64
+}
+
+// ZCRXIfqRegistration is the observable result of ZCRX interface-queue registration.
+type ZCRXIfqRegistration struct {
+	ID        uint32
+	RqEntries uint32 // Effective refill queue entry count.
+	Offsets   ZCRXOffsets
+	RxBufLen  uint32
 }
 
 // ZCRXCtrl is the control structure for ZCRX operations.

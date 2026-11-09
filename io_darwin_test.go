@@ -18,6 +18,13 @@ type dummyPollFd int
 
 func (d dummyPollFd) Fd() int { return int(d) }
 
+func TestDarwinBundleCountAvoidsIntegerOverflow(t *testing.T) {
+	cqe := uring.CQEView{Res: 2}
+	if got := cqe.BundleCount(int(^uint(0) >> 1)); got != 1 {
+		t.Fatalf("BundleCount = %d, want 1", got)
+	}
+}
+
 func TestDarwinReadWriteRejectEmptyBuffer(t *testing.T) {
 	var ring uring.Uring
 	var ctx uring.SQEContext
@@ -127,6 +134,18 @@ func TestDarwinReceiveRejectsNilAndEmptyBuffer(t *testing.T) {
 	}
 	if err := ring.SubmitReceiveMultishot(ctx, fd, []byte{}); !errors.Is(err, uring.ErrInvalidParam) {
 		t.Fatalf("SubmitReceiveMultishot(empty): got %v, want %v", err, uring.ErrInvalidParam)
+	}
+	if err := ring.SubmitReceiveMultishot(ctx, fd, make([]byte, 1)); !errors.Is(err, uring.ErrInvalidParam) {
+		t.Fatalf("SubmitReceiveMultishot(caller buffer): got %v, want %v", err, uring.ErrInvalidParam)
+	}
+}
+
+func TestDarwinFallocateRejectsZeroLength(t *testing.T) {
+	var ring uring.Uring
+	var ctx uring.SQEContext
+
+	if err := ring.Fallocate(ctx, 0, 0, 0); !errors.Is(err, uring.ErrInvalidParam) {
+		t.Fatalf("Fallocate(zero length): got %v, want %v", err, uring.ErrInvalidParam)
 	}
 }
 

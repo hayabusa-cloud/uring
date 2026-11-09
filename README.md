@@ -124,12 +124,13 @@ for {
 | `ListenerOp` | Handle to a listener creation operation with FD and accept helpers |
 | `BundleIterator` | Iterates over buffers consumed in a bundle receive |
 | `IncrementalReceiver` | Manages incremental buffer-ring receives (`IOU_PBUF_RING_INC`) |
+| `BufferRing` | Opaque explicitly registered provided-buffer ring; `Add` stages and `Advance` publishes |
 | `ZCTracker` | Tracks zero-copy send notification and fallback lifecycle |
 | `ContextPools` | Pools for indirect and extended submission contexts |
 | `ZCRXReceiver` | Zero-copy receive lifecycle over a NIC RX queue |
 | `ZCRXConfig` | Configuration for a ZCRX receive instance |
 | `ZCRXHandler` | Callback interface for ZCRX data, errors, and shutdown |
-| `ZCRXBuffer` | Delivered zero-copy receive view with kernel refill on release |
+| `ZCRXBuffer` | Delivered zero-copy receive view with caller-managed refill release |
 
 Operations:
 
@@ -148,13 +149,23 @@ Operations:
 | Poll | `PollAdd`, `PollRemove`, `PollUpdate`, `PollAddLevel`, `PollAddMultishot`, `PollAddMultishotLevel` |
 | Async | `EpollWait`, `FutexWait`, `FutexWake`, `FutexWaitV`, `Waitid` |
 | Ring msg | `MsgRing`, `MsgRingFD`, `FixedFdInstall`, `FilesUpdate` |
-| Cmd | `UringCmd`, `UringCmd128`, `Nop`, `Nop128` |
+| Cmd | `UringCmd`, `UringCmdInline`, `UringCmd128`, `Nop`, `Nop128` |
+
+`UringCmdInline` copies up to 80 bytes into an ordinary `IORING_OP_URING_CMD` SQE and requires `Options.SQE128`; it does not require support for the separate `IORING_OP_URING_CMD128` opcode.
+
+`WithUringCmdFlags` writes the `uring_cmd_flags` union. For `IORING_URING_CMD_FIXED`, set the registered-buffer index with `sqeCtx.WithBufGroup`; for `IORING_URING_CMD_MULTISHOT`, also set `IOSQE_BUFFER_SELECT` and use the same context field as the provided-buffer group. The two flags are mutually exclusive.
 
 `Nop128` and `UringCmd128` require a ring created with `Options.SQE128` and kernel support for the corresponding opcodes. Without both, they return `ErrNotSupported`.
 
 `Uring.Close` submits `IORING_OP_CLOSE` for a target file descriptor. It is not a ring teardown method.
 
+`PollAddLevel` and `PollAddMultishotLevel` always return `ErrNotSupported`; Linux io_uring does not admit the level flag for `IORING_OP_POLL_ADD`.
+
 ## Context transport
+
+`Multicast` automatically selects ordinary or zero-copy sends by payload size and target count; `MulticastZeroCopy` uses lower thresholds to favor zero-copy. Both require a Direct context and return `(submitted, error)`: `submitted` counts the accepted target prefix. Resume with the remaining targets after backpressure. Inspect each CQE's opcode and flags because a resumed call can select a different operation. Ordinary `Multicast` sends follow `NotifySucceed`; selected zero-copy sends and both `MulticastZeroCopy` paths retain completion evidence and reject explicit `IOSQE_CQE_SKIP_SUCCESS`.
+
+Each accepted stream send may complete with fewer bytes than requested. Keep success CQEs enabled when tracking ordinary-send byte counts, and use each target's data result to resume only its unsent suffix. Keep shared zero-copy bytes immutable until every accepted target reaches its release condition. The [multicast example](./examples/zerocopy_test.go) demonstrates both byte progress and release tracking.
 
 `SQEContext` is the primary identity token. In direct mode it packs the opcode, SQE flags, buffer-group ID, and file descriptor into a single 64-bit value.
 
@@ -234,7 +245,7 @@ for i := 0; i < n; i++ {
 
 ## Buffer provisioning
 
-`uring` has three practical buffer paths. Registered buffers are pinned during ring setup and used by fixed-buffer file I/O. Provided buffer rings let the kernel choose a receive buffer and report the selected buffer ID in the CQE. Bundle receives consume a contiguous logical range of provided buffers and expose that range through `BundleIterator`.
+`uring` has three practical buffer paths. Registered buffers are pinned during ring setup and used by fixed-buffer file I/O. Provided buffer rings let the kernel choose a receive buffer and report the selected buffer ID in the CQE. Bundle receives consume buffers in publication order, which can differ from numeric ID order after recycling. `Uring.BundleIterator` preserves that order. The standalone `NewBundleIterator` requires consecutive IDs modulo the ring size.
 
 - fixed-size provided buffers through `ReadBufferSize` and `ReadBufferNum`
 - multi-size buffer groups through `MultiSizeBuffer`
@@ -255,6 +266,38 @@ Use `OptionsForBudget` to start from an explicit memory budget, or `BufferConfig
 cfg, scale := uring.BufferConfigForBudget(256 * uring.MiB)
 fmt.Printf("buffer tiers=%+v scale=%d\n", cfg, scale)
 ```
+
+Explicit incremental rings are initialized empty. After `Start`, choose a group ID not used by the configured provided-buffer groups, stage each backing slice, then publish the batch:
+
+```go
+const (
+    groupID = 60000
+    entries = 8
+    bufSize = 4096
+)
+
+backing := make([]byte, entries*bufSize)
+bufRing, err := ring.RegisterBufRingIncremental(entries, groupID)
+if err != nil {
+    return err
+}
+for i := range entries {
+    buf := backing[i*bufSize : (i+1)*bufSize]
+    if err := bufRing.Add(buf, uint16(i), i); err != nil {
+        return err
+    }
+}
+if err := bufRing.Advance(entries); err != nil {
+    return err
+}
+
+pool := uring.NewContextPools(entries)
+receiver := uring.NewIncrementalReceiver(ring, pool, groupID, bufSize, backing, entries)
+```
+
+`BufferRing.Add` stages entries; `BufferRing.Advance` publishes them and transfers ownership to the kernel. Keep `backing` reachable. Dispatch this receiver's CQEs once, serially in CQ order; it tracks offsets independently for each buffer ID.
+
+`IORING_CQE_F_BUF_MORE` retains the selected buffer even after the request completes. Recycle only after a CQE reports `IORING_CQE_F_BUFFER` without `IORING_CQE_F_BUF_MORE` and borrowed access has ended. A zero or negative result can also return a buffer. `Uring.Stop` owns buffer-ring teardown.
 
 Fixed-buffer I/O uses a registered buffer by index. The returned slice is ring-owned memory; keep it live until the fixed operation completes:
 
@@ -284,7 +327,7 @@ if cqe.HasBuffer() {
 }
 ```
 
-Bundle receives use the same provided-buffer storage but may consume more than one buffer in a single CQE. Process the iterator, then recycle the consumed slots:
+Bundle receives use the same provided-buffer storage but may consume more than one buffer in a single CQE. Process the iterator, then recycle the consumed slots. Call `Recycle` exactly once across all copies of an iterator; after it returns, do not read the yielded buffers:
 
 ```go
 if err := ring.ReceiveBundle(recvCtx, &socketFD, uring.WithReadBufferSize(uring.BufferSizeSmall)); err != nil {
@@ -295,7 +338,9 @@ if it, ok := ring.BundleIterator(cqe, cqe.BufGroup()); ok {
     for buf := range it.All() {
         handle(buf)
     }
-    it.Recycle(ring)
+    if err := it.Recycle(ring); err != nil {
+        return err
+    }
 }
 ```
 
@@ -333,7 +378,7 @@ Context and abstract-execution layers above this boundary do not change `code.hy
 
 ### Ring-owning event loop
 
-In single-issuer mode (the default), one goroutine serializes all submit-state operations. A typical loop submits pending work, applies caller-owned `iox.Backoff` when `Wait` reports no observable progress, and dispatches completions:
+In the default task-migratable mode, shared submission-state synchronization allows a goroutine to move between OS threads. A ring-owner loop may still serialize all submit-state operations: it submits pending work, applies caller-owned `iox.Backoff` when `Wait` reports no observable progress, and dispatches completions:
 
 ```go
 func runLoop(ring *uring.Uring, stop <-chan struct{}) error {
@@ -406,6 +451,8 @@ for i := range n {
 
 Each `OnStep` callback observes one `MultishotStep`: return `MultishotContinue` to keep the stream live, or `MultishotStop` to request cancellation. If callbacks remain enabled until the terminal observation, `OnStop` runs at most once with the final error and a `cancelled` flag; on the step itself, `step.Cancelled` distinguishes the specific `-ECANCELED` kernel verdict from other failures at the boundary. Both callbacks are the builder-side projection of the `MultishotHandler` interface (`OnMultishotStep` / `OnMultishotStop`); implement that interface directly when you want an explicit handler. `HandleCQE` is for immediate dispatch in the caller's serialized completion loop; if caller code stores copied CQEs beyond that loop, it must keep its own route state and reject observations for retired subscriptions. On explicit single-issuer rings (`MultiIssuers=false`), call `Cancel` / `Unsubscribe` from the OS-thread-pinned ring owner and serialize them with submit, `Wait`, `WaitDirect`, `WaitExtended`, `Stop`, and `ResizeRings`. Default `MultiIssuers` rings serialize cancel SQEs through the shared-submit path.
 
+Route every queued cancellation CQE through the same subscription's `HandleCQE` or its extended handler, even after `SubscriptionStopped` or `OnStop`. Failed submission or a no-op creates no new cancellation CQE obligation. The subscription owns both contexts and returns the original to its pool only after original terminality, cancellation dispatch, and cancellation submission have finished. Do not return these contexts manually. The [receive example](./examples/multishot_test.go) demonstrates natural completion and handler-requested cancellation.
+
 ### Per-connection state with typed contexts
 
 Extended contexts carry per-connection references through the submit → complete round-trip without a global lookup table:
@@ -445,7 +492,7 @@ Keep live Go pointer roots reachable outside `UserData`. The GC does not trace t
 
 ### Deadline composition
 
-`LinkTimeout` attaches a deadline to the preceding SQE through an `IOSQE_IO_LINK` chain. The operation and the timeout race: exactly one completes, and the other is cancelled.
+`LinkTimeout` attaches a deadline to the preceding SQE through an `IOSQE_IO_LINK` chain. Expiry attempts to cancel the linked operation, which may already have completed. Inspect both CQE results; a timeout does not prove that the operation was cancelled.
 
 ```go
 recvCtx := uring.ForFD(fd).
@@ -462,7 +509,7 @@ if err := ring.LinkTimeout(timeoutCtx, 5*time.Second); err != nil {
 }
 ```
 
-The caller-side runtime handles both outcomes: a successful receive cancels the timeout, and a fired timeout cancels the receive. Both produce CQEs that the dispatch loop must observe.
+Submit the linked SQEs contiguously, serializing the pair with other submit and wait calls. Keep the operation's buffers and context live until its own completion, and drain both CQEs before teardown.
 
 ## TCP usage patterns
 
@@ -540,10 +587,10 @@ After each submit, reuse the `Wait` loop from the ring lifecycle section to obse
 
 ### Lifecycle
 
-1. With a CQE32-enabled ring, create the receiver with `NewZCRXReceiver`. The constructor registers the ZCRX interface queue, maps the refill area, and prepares the refill ring.
+1. With a CQE32-enabled ring, create the receiver with `NewZCRXReceiver`. The constructor registers the ZCRX interface queue, maps the receive area, and initializes an empty refill ring. Linux supplies the initial receive buffers; the refill ring returns delivered buffers.
 2. Call `Start` to submit the extended `RECV_ZC` operation.
 3. On the CQE dispatch path, ZCRX completions route to the `ZCRXHandler`:
-    - `OnData` delivers a `ZCRXBuffer` pointing into the NIC-mapped area. Call `Release` when done to return the slot to the kernel. Return `false` to request a best-effort stop.
+    - `OnData` delivers a `ZCRXBuffer` pointing into the NIC-mapped area. Call `Release` when done; successful refill publication returns the slot to the kernel. If it returns `iox.ErrWouldBlock`, retain the buffer and retry release later on the CQE path. A zero-length EOF buffer has no refill identity and releases without a refill entry. Return `false` to request a best-effort stop.
     - `OnError` delivers CQE errors. Return `false` to request a best-effort stop.
     - `OnStopped` fires once during terminal retirement, before the state reaches `Stopped`.
 4. Call `Stop` to submit an async cancel. The receiver transitions through `Stopping` → `Retiring` → `Stopped`.

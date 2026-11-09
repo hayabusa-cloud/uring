@@ -7,6 +7,8 @@
 package uring
 
 import (
+	"errors"
+	"math"
 	"net"
 	"strings"
 	"testing"
@@ -62,6 +64,41 @@ func TestListenerInitCtxNormalizesNilHandler(t *testing.T) {
 	}
 	if _, ok := handler.(NoopListenerHandler); !ok {
 		t.Fatalf("handler type: got %T, want NoopListenerHandler", handler)
+	}
+}
+
+func TestPrepareListenerSocketRejectsInvalidIntDomains(t *testing.T) {
+	pool := NewContextPools(1)
+	ext := pool.Extended()
+	if ext == nil {
+		t.Fatal("pool exhausted")
+	}
+	defer pool.PutExtended(ext)
+
+	tests := []struct {
+		name    string
+		domain  int
+		sockTyp int
+		proto   int
+		backlog int
+	}{
+		{name: "negative domain", domain: -1, sockTyp: SOCK_STREAM | SOCK_CLOEXEC, proto: IPPROTO_TCP, backlog: 128},
+		{name: "oversized domain", domain: math.MaxUint16 + 1, sockTyp: SOCK_STREAM | SOCK_CLOEXEC, proto: IPPROTO_TCP, backlog: 128},
+		{name: "negative socket type", domain: AF_INET, sockTyp: -1, proto: IPPROTO_TCP, backlog: 128},
+		{name: "oversized socket type", domain: AF_INET, sockTyp: oversizedSignedInt32(t), proto: IPPROTO_TCP, backlog: 128},
+		{name: "negative proto", domain: AF_INET, sockTyp: SOCK_STREAM | SOCK_CLOEXEC, proto: -1, backlog: 128},
+		{name: "oversized proto", domain: AF_INET, sockTyp: SOCK_STREAM | SOCK_CLOEXEC, proto: oversizedSignedInt32(t), backlog: 128},
+		{name: "negative backlog", domain: AF_INET, sockTyp: SOCK_STREAM | SOCK_CLOEXEC, proto: IPPROTO_TCP, backlog: -1},
+		{name: "oversized backlog", domain: AF_INET, sockTyp: SOCK_STREAM | SOCK_CLOEXEC, proto: IPPROTO_TCP, backlog: oversizedSignedInt32(t)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := PrepareListenerSocket(ext, tt.domain, tt.sockTyp, tt.proto, nil, tt.backlog, nil)
+			if !errors.Is(err, ErrInvalidParam) {
+				t.Fatalf("PrepareListenerSocket error = %v, want %v", err, ErrInvalidParam)
+			}
+		})
 	}
 }
 

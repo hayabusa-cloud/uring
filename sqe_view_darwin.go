@@ -94,7 +94,7 @@ func (v SQEView) Len() uint32 {
 	return v.sqe.len
 }
 
-// UFlags returns the union flags field.
+// UFlags returns the operation-specific union flags field.
 //
 //go:nosplit
 func (v SQEView) UFlags() uint32 {

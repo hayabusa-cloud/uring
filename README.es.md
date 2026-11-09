@@ -124,12 +124,13 @@ for {
 | `ListenerOp`          | Manejador de una operación de creación de escucha con FD y auxiliares de accept                                   |
 | `BundleIterator`      | Itera sobre búferes consumidos en una recepción agrupada                                                          |
 | `IncrementalReceiver` | Gestiona recepciones incrementales de buffer-ring (`IOU_PBUF_RING_INC`)                                           |
+| `BufferRing`          | Ring opaco de búferes provistos registrado explícitamente; `Add` prepara y `Advance` publica                     |
 | `ZCTracker`           | Rastrea el ciclo de vida de notificación y fallback del envío de copia cero                                      |
 | `ContextPools`        | Pools para contextos de envío indirectos y extendidos                                                             |
 | `ZCRXReceiver`        | Ciclo de vida de recepción de copia cero sobre una cola RX de NIC                                                 |
 | `ZCRXConfig`          | Configuración de una instancia de recepción ZCRX                                                                  |
 | `ZCRXHandler`         | Interfaz de devolución de llamada para datos, errores y cierre ZCRX                                               |
-| `ZCRXBuffer`          | Vista de recepción de copia cero entregada, con reposición del kernel al liberar                                  |
+| `ZCRXBuffer`          | Vista de recepción de copia cero con devolución gestionada por el llamador mediante la cola de reposición          |
 
 Operaciones:
 
@@ -148,13 +149,23 @@ Operaciones:
 | Poll | `PollAdd`, `PollRemove`, `PollUpdate`, `PollAddLevel`, `PollAddMultishot`, `PollAddMultishotLevel` |
 | Async | `EpollWait`, `FutexWait`, `FutexWake`, `FutexWaitV`, `Waitid` |
 | Ring msg | `MsgRing`, `MsgRingFD`, `FixedFdInstall`, `FilesUpdate` |
-| Cmd | `UringCmd`, `UringCmd128`, `Nop`, `Nop128` |
+| Cmd | `UringCmd`, `UringCmdInline`, `UringCmd128`, `Nop`, `Nop128` |
+
+`UringCmdInline` copia hasta 80 bytes en una SQE ordinaria `IORING_OP_URING_CMD` y requiere `Options.SQE128`; no requiere compatibilidad con el opcode separado `IORING_OP_URING_CMD128`.
+
+`WithUringCmdFlags` escribe la unión `uring_cmd_flags`. Para `IORING_URING_CMD_FIXED`, establezca el índice del búfer registrado con `sqeCtx.WithBufGroup`; para `IORING_URING_CMD_MULTISHOT`, establezca también `IOSQE_BUFFER_SELECT` y use el mismo campo de contexto como grupo de búferes proporcionados. Los dos flags son mutuamente excluyentes.
 
 `Nop128` y `UringCmd128` requieren un ring creado con `Options.SQE128` y soporte del kernel para los opcodes correspondientes. Sin ambos, devuelven `ErrNotSupported`.
 
 `Uring.Close` envía `IORING_OP_CLOSE` sobre un descriptor de archivo destino. No es un método de desmontaje del ring.
 
+`PollAddLevel` y `PollAddMultishotLevel` siempre devuelven `ErrNotSupported`; io_uring de Linux no admite el indicador de nivel para `IORING_OP_POLL_ADD`.
+
 ## Transporte de contexto
+
+`Multicast` selecciona automáticamente envíos ordinarios o de copia cero según el tamaño del mensaje y el número de destinos; `MulticastZeroCopy` usa umbrales menores para favorecer la copia cero. Ambos requieren un contexto Direct y devuelven `(submitted, error)`: `submitted` cuenta el prefijo de destinos aceptado. Ante contrapresión, continúe con los destinos restantes. Examine el código de operación y los indicadores de cada CQE, ya que una llamada reanudada puede seleccionar otra operación. Los envíos ordinarios de `Multicast` siguen `NotifySucceed`; los envíos de copia cero seleccionados y ambas rutas de `MulticastZeroCopy` conservan la evidencia de finalización y rechazan `IOSQE_CQE_SKIP_SUCCESS` explícito.
+
+Cada envío aceptado sobre un socket de flujo puede completar menos bytes de los solicitados. Mantenga habilitadas las CQE de éxito para seguir el número de bytes de los envíos ordinarios y use el resultado de datos de cada destino para reenviar solo el sufijo pendiente. Mantenga inmutables los bytes compartidos de copia cero hasta que todos los destinos aceptados alcancen su condición de liberación. El [ejemplo multicast](./examples/zerocopy_test.go) muestra el seguimiento del progreso en bytes y de la liberación.
 
 `SQEContext` es el token de identidad principal en este paquete. En modo directo, empaqueta el opcode, las marcas del SQE, el identificador de grupo de búferes y el descriptor de archivo en un único valor de 64 bits.
 
@@ -234,7 +245,7 @@ Al completarse la operación, `CQEView` decodifica el modo de contexto correspon
 
 ## Provisión de búferes
 
-`uring` ofrece tres rutas prácticas para búferes. Los búferes registrados quedan fijados durante el arranque del ring y se usan con I/O de archivo con búfer fijo. Los anillos de búferes provistos permiten que el kernel elija un búfer de recepción y devuelva su ID en el CQE. Las recepciones agrupadas consumen un rango lógico contiguo de búferes provistos y lo exponen mediante `BundleIterator`.
+`uring` ofrece tres rutas prácticas para búferes. Los búferes registrados quedan fijados durante el arranque del ring y se usan con I/O de archivo con búfer fijo. Los anillos de búferes provistos permiten que el kernel elija un búfer de recepción y devuelva su ID en el CQE. Las recepciones agrupadas siguen el orden de publicación, que puede diferir del orden numérico de los ID después del reciclaje. `Uring.BundleIterator` conserva ese orden. El constructor independiente `NewBundleIterator` requiere ID consecutivos módulo el tamaño del ring.
 
 - búferes provistos de tamaño fijo mediante `ReadBufferSize` y `ReadBufferNum`
 - grupos de búferes de varios tamaños mediante `MultiSizeBuffer`
@@ -255,6 +266,38 @@ Utilice `OptionsForBudget` para partir de un presupuesto de memoria explícito, 
 cfg, scale := uring.BufferConfigForBudget(256 * uring.MiB)
 fmt.Printf("buffer tiers=%+v scale=%d\n", cfg, scale)
 ```
+
+Los rings incrementales explícitos se inicializan vacíos. Después de `Start`, elija un ID de grupo que no usen los grupos de búferes provistos configurados, prepare cada slice del almacenamiento y publique el lote:
+
+```go
+const (
+    groupID = 60000
+    entries = 8
+    bufSize = 4096
+)
+
+backing := make([]byte, entries*bufSize)
+bufRing, err := ring.RegisterBufRingIncremental(entries, groupID)
+if err != nil {
+    return err
+}
+for i := range entries {
+    buf := backing[i*bufSize : (i+1)*bufSize]
+    if err := bufRing.Add(buf, uint16(i), i); err != nil {
+        return err
+    }
+}
+if err := bufRing.Advance(entries); err != nil {
+    return err
+}
+
+pool := uring.NewContextPools(entries)
+receiver := uring.NewIncrementalReceiver(ring, pool, groupID, bufSize, backing, entries)
+```
+
+`BufferRing.Add` prepara las entradas; `BufferRing.Advance` las publica y transfiere su propiedad al kernel. Mantenga `backing` accesible. Procese las CQE de este receptor una sola vez y de forma serializada, en el orden de la CQ; el receptor mantiene un desplazamiento independiente para cada ID de búfer.
+
+`IORING_CQE_F_BUF_MORE` indica que el kernel retiene el búfer seleccionado incluso después de completar la solicitud. Recíclelo solo cuando una CQE indique `IORING_CQE_F_BUFFER` sin `IORING_CQE_F_BUF_MORE` y haya terminado el acceso prestado. Un resultado cero o negativo también puede devolver un búfer. `Uring.Stop` es responsable de desmontar el buffer-ring.
 
 El I/O con búfer fijo usa un búfer registrado por índice. La slice devuelta pertenece al ring; manténgala viva hasta que termine la operación fija:
 
@@ -284,7 +327,7 @@ if cqe.HasBuffer() {
 }
 ```
 
-Las recepciones agrupadas usan el mismo almacenamiento de búferes provistos, pero pueden consumir más de un búfer en un solo CQE. Procese el iterador y después recicle los slots consumidos:
+Las recepciones agrupadas usan el mismo almacenamiento de búferes provistos, pero pueden consumir más de un búfer en un solo CQE. Procese el iterador y después recicle los slots consumidos. Llame a `Recycle` exactamente una vez entre todas las copias de un iterador; después de que retorne, no lea los búferes producidos:
 
 ```go
 if err := ring.ReceiveBundle(recvCtx, &socketFD, uring.WithReadBufferSize(uring.BufferSizeSmall)); err != nil {
@@ -295,7 +338,9 @@ if it, ok := ring.BundleIterator(cqe, cqe.BufGroup()); ok {
     for buf := range it.All() {
         handle(buf)
     }
-    it.Recycle(ring)
+    if err := it.Recycle(ring); err != nil {
+        return err
+    }
 }
 ```
 
@@ -333,7 +378,7 @@ Las capas de contexto y ejecución abstracta por encima de esta frontera no camb
 
 ### Bucle de eventos propietario del ring
 
-En modo de emisor único (el predeterminado), una goroutine serializa todas las operaciones de estado de envío. Un bucle típico emite el trabajo pendiente, aplica un `iox.Backoff` propiedad del llamador cuando `Wait` no informa progreso observable y despacha las finalizaciones:
+En el modo predeterminado migrable entre tareas, la sincronización compartida del estado de envío permite que una goroutine cambie de hilo del sistema operativo. Un bucle propietario del ring aún puede serializar todas las operaciones: emite el trabajo pendiente, aplica un `iox.Backoff` propiedad del llamador cuando `Wait` no informa progreso observable y despacha las finalizaciones:
 
 ```go
 func runLoop(ring *uring.Uring, stop <-chan struct{}) error {
@@ -406,6 +451,8 @@ for i := range n {
 
 Cada llamada a `OnStep` observa un `MultishotStep`: devuelva `MultishotContinue` para mantener el flujo activo o `MultishotStop` para solicitar la cancelación. Si las devoluciones de llamada permanecen habilitadas hasta la observación terminal, `OnStop` se ejecuta como máximo una vez con el error final y la bandera `cancelled`; en el propio paso, `step.Cancelled` distingue en el límite el veredicto específico `-ECANCELED` del kernel del resto de fallos. Ambas devoluciones son la proyección del lado del constructor sobre la interfaz `MultishotHandler` (`OnMultishotStep` / `OnMultishotStop`); implemente la interfaz directamente cuando necesite un manejador explícito. `HandleCQE` sirve para el despacho inmediato en el bucle de finalización serializado del llamador; si el código llamador conserva CQE copiadas más allá de ese bucle, debe mantener su propio estado de ruta y rechazar observaciones de suscripciones ya retiradas. En rings de emisor único explícitos (`MultiIssuers=false`), llame a `Cancel` / `Unsubscribe` desde el propietario fijado a un hilo del sistema operativo y serialícelos con envío, `Wait`, `WaitDirect`, `WaitExtended`, `Stop` y `ResizeRings`. Los rings `MultiIssuers` predeterminados serializan los SQE de cancelación mediante la ruta de envío compartida.
 
+Dirija cada CQE de cancelación encolada al `HandleCQE` de la misma suscripción o a su manejador extendido, incluso después de `SubscriptionStopped` o `OnStop`. Un fallo de envío o una llamada sin efecto no crea una nueva obligación de CQE de cancelación. La suscripción posee ambos contextos y devuelve el original a su pool solo tras procesar la CQE terminal original, despachar la cancelación y finalizar su envío. No devuelva estos contextos manualmente. El [ejemplo de recepción](./examples/multishot_test.go) muestra la finalización natural y la cancelación solicitada por el manejador.
+
 ### Estado por conexión con contextos tipados
 
 Los contextos extendidos transportan referencias por conexión a lo largo del ciclo completo envío → completado, sin necesidad de una tabla de búsqueda global:
@@ -445,7 +492,7 @@ Mantenga las raíces de punteros Go activas accesibles fuera de `UserData`. El G
 
 ### Composición de plazos
 
-`LinkTimeout` adjunta un plazo al SQE anterior a través de una cadena `IOSQE_IO_LINK`. La operación y el tiempo de espera compiten: exactamente uno se completa y el otro se cancela.
+`LinkTimeout` adjunta un plazo al SQE anterior mediante una cadena `IOSQE_IO_LINK`. Al vencer, intenta cancelar la operación enlazada, que puede haber terminado ya. Examine ambos resultados de CQE; el vencimiento no demuestra que la operación se haya cancelado.
 
 ```go
 recvCtx := uring.ForFD(fd).
@@ -462,7 +509,7 @@ if err := ring.LinkTimeout(timeoutCtx, 5*time.Second); err != nil {
 }
 ```
 
-La capa de ejecución del llamador maneja ambos resultados: una recepción exitosa cancela el tiempo de espera, y un tiempo de espera disparado cancela la recepción. Ambos producen CQEs que el bucle de despacho debe observar.
+Envíe los SQE enlazados de forma contigua, serializando el par con las demás llamadas de envío y espera. Mantenga los búferes y el contexto de la operación hasta su propia finalización, y procese ambas CQE antes del cierre.
 
 ## Patrones de uso en TCP
 
@@ -540,10 +587,10 @@ Reutilice el bucle `Wait` de la sección de ciclo de vida del ring tras cada env
 
 ### Ciclo de vida
 
-1. Con un ring habilitado para CQE32, cree el receptor con `NewZCRXReceiver`. El constructor registra la cola de interfaz ZCRX, mapea el área de reposición y prepara el ring de reposición.
+1. Con un ring habilitado para CQE32, cree el receptor con `NewZCRXReceiver`. El constructor registra la cola de interfaz ZCRX, mapea el área de recepción e inicializa un ring de reposición vacío. Linux proporciona los búferes de recepción iniciales; el ring de reposición devuelve los búferes entregados.
 2. Llame a `Start` para enviar la operación extendida `RECV_ZC` en el ring.
 3. En la ruta de despacho de CQE, los completados ZCRX se enrutan al `ZCRXHandler`:
-    - `OnData` entrega un `ZCRXBuffer` que apunta al área mapeada por la NIC. Llame a `Release` al terminar para reponer el slot ante el kernel. Devuelva `false` para solicitar una parada de mejor esfuerzo.
+    - `OnData` entrega un `ZCRXBuffer` que apunta al área mapeada por la NIC. Llame a `Release` al terminar; la publicación correcta en la cola de reposición devuelve el slot al kernel. Si devuelve `iox.ErrWouldBlock`, conserve el búfer y reintente la liberación más tarde en la ruta de CQE. Un búfer EOF de longitud cero no tiene identidad de reposición y se libera sin publicar una entrada. Devuelva `false` para solicitar una parada de mejor esfuerzo.
     - `OnError` entrega errores de CQE. Devuelva `false` para solicitar una parada de mejor esfuerzo.
     - `OnStopped` se ejecuta una vez durante la retirada terminal, antes de que el estado pase a `Stopped`.
 4. Llame a `Stop` para enviar un async cancel. El receptor transita por `Stopping` → `Retiring` → `Stopped`.
