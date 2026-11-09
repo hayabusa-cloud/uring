@@ -163,6 +163,10 @@ Operations:
 
 ## Context transport
 
+`Multicast` automatically selects ordinary or zero-copy sends by payload size and target count; `MulticastZeroCopy` uses lower thresholds to favor zero-copy. Both require a Direct context and return `(submitted, error)`: `submitted` counts the accepted target prefix. Resume with the remaining targets after backpressure. Inspect each CQE's opcode and flags because a resumed call can select a different operation. Ordinary `Multicast` sends follow `NotifySucceed`; selected zero-copy sends and both `MulticastZeroCopy` paths retain completion evidence and reject explicit `IOSQE_CQE_SKIP_SUCCESS`.
+
+Each accepted stream send may complete with fewer bytes than requested. Keep success CQEs enabled when tracking ordinary-send byte counts, and use each target's data result to resume only its unsent suffix. Keep shared zero-copy bytes immutable until every accepted target reaches its release condition. The [multicast example](./examples/zerocopy_test.go) demonstrates both byte progress and release tracking.
+
 `SQEContext` is the primary identity token. In direct mode it packs the opcode, SQE flags, buffer-group ID, and file descriptor into a single 64-bit value.
 
 ```go
@@ -374,7 +378,7 @@ Context and abstract-execution layers above this boundary do not change `code.hy
 
 ### Ring-owning event loop
 
-In single-issuer mode (the default), one goroutine serializes all submit-state operations. A typical loop submits pending work, applies caller-owned `iox.Backoff` when `Wait` reports no observable progress, and dispatches completions:
+In the default task-migratable mode, shared submission-state synchronization allows a goroutine to move between OS threads. A ring-owner loop may still serialize all submit-state operations: it submits pending work, applies caller-owned `iox.Backoff` when `Wait` reports no observable progress, and dispatches completions:
 
 ```go
 func runLoop(ring *uring.Uring, stop <-chan struct{}) error {
@@ -446,6 +450,8 @@ for i := range n {
 ```
 
 Each `OnStep` callback observes one `MultishotStep`: return `MultishotContinue` to keep the stream live, or `MultishotStop` to request cancellation. If callbacks remain enabled until the terminal observation, `OnStop` runs at most once with the final error and a `cancelled` flag; on the step itself, `step.Cancelled` distinguishes the specific `-ECANCELED` kernel verdict from other failures at the boundary. Both callbacks are the builder-side projection of the `MultishotHandler` interface (`OnMultishotStep` / `OnMultishotStop`); implement that interface directly when you want an explicit handler. `HandleCQE` is for immediate dispatch in the caller's serialized completion loop; if caller code stores copied CQEs beyond that loop, it must keep its own route state and reject observations for retired subscriptions. On explicit single-issuer rings (`MultiIssuers=false`), call `Cancel` / `Unsubscribe` from the OS-thread-pinned ring owner and serialize them with submit, `Wait`, `WaitDirect`, `WaitExtended`, `Stop`, and `ResizeRings`. Default `MultiIssuers` rings serialize cancel SQEs through the shared-submit path.
+
+Route every queued cancellation CQE through the same subscription's `HandleCQE` or its extended handler, even after `SubscriptionStopped` or `OnStop`. Failed submission or a no-op creates no new cancellation CQE obligation. The subscription owns both contexts and returns the original to its pool only after original terminality, cancellation dispatch, and cancellation submission have finished. Do not return these contexts manually. The [receive example](./examples/multishot_test.go) demonstrates natural completion and handler-requested cancellation.
 
 ### Per-connection state with typed contexts
 

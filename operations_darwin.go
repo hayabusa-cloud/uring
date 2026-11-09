@@ -485,7 +485,7 @@ func (ur *ioUring) sendZeroCopy(sqeCtx SQEContext, b []byte, off uint64, n int, 
 	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_SEND_ZC), 0, 0, addr, n, uint32(uflags))
 }
 
-// sendFixed sends with a registered buffer.
+// sendFixed submits ordinary SEND from registered buffer storage.
 func (ur *ioUring) sendFixed(sqeCtx SQEContext, bufIndex int, off uint64, n int, uflags int) error {
 	if bufIndex < 0 || bufIndex >= len(ur.bufs) {
 		return ErrInvalidParam
@@ -498,7 +498,7 @@ func (ur *ioUring) sendFixed(sqeCtx SQEContext, bufIndex int, off uint64, n int,
 	payload := buf[start : start+n]
 	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(buf)))) + off
 	ctx := sqeCtx.WithOp(IORING_OP_SEND).WithBufGroup(uint16(bufIndex))
-	return ur.submitPacked9WithPayload(ctx, payload, IORING_RECVSEND_FIXED_BUF, 0, addr, n, uint32(uflags), 0, 0)
+	return ur.submitPacked6WithPayload(ctx, payload, 0, 0, addr, n, uint32(uflags))
 }
 
 // sendZeroCopyFixed sends with zero-copy using registered buffer.

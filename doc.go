@@ -73,6 +73,10 @@
 // serialized completion loop. If copied CQEs outlive that loop, caller code
 // must pair them with its own route state and reject observations for retired
 // subscriptions.
+// Dispatch cancellation CQEs through the same subscription's HandleCQE or
+// their extended handlers, even after State reports SubscriptionStopped.
+// The original pooled context is retained until both the original terminal
+// CQE and any cancellation CQE have been handled.
 //
 //	sqeCtx := uring.ForFD(listenerFD)
 //	sub, err := ring.AcceptMultishot(sqeCtx, handler)
@@ -95,6 +99,7 @@
 //	if err := sub.Cancel(); err != nil {
 //	    return err
 //	}
+//	// Keep dispatching the original terminal CQE and any queued cancellation CQE.
 //
 // Listener setup advances with [DecodeListenerCQE], [PrepareListenerBind],
 // [PrepareListenerListen], and [SetListenerReady]. [ListenerManager] is a thin
@@ -184,16 +189,35 @@
 //
 // # Multishot Subscription Lifecycle
 //
-// A live subscription keeps its submitted [ExtSQE] until the terminal CQE for
-// that operation is handled. The kernel may emit multiple CQEs for the same
-// submission before that terminal CQE; each non-terminal CQE carries
-// `IORING_CQE_F_MORE`. The package keeps the submitted ExtSQE and encoded
-// `user_data` associated with the subscription, and returns the ExtSQE to its
-// pool only after handling a CQE without `HasMore()`. Caller-side runtime code
-// must inspect each result independently of MORE: a live frontier does not
-// imply byte progress or success. The final CQE permits subscription retirement.
+// Each original CQE with IORING_CQE_F_MORE leaves the multishot request live.
+// Handling its terminal CQE sets [SubscriptionStopped] and, if callbacks remain
+// enabled, invokes OnMultishotStop. This ends the original request; a queued
+// cancellation still has its own completion obligation.
+//
+// The subscription owns its submitted [ExtSQE] through original terminality,
+// cancellation dispatch, and any concurrent cancellation submission. The package
+// returns that context to its pool only after all three obligations end. Caller
+// code must not return the subscription's contexts manually, and must dispatch
+// queued cancellation CQEs even after the original stop callback.
+//
+// Inspect each result independently of MORE: a live request does not imply byte
+// progress or success. Returning [MultishotStop] from a non-final callback makes
+// one best-effort cancellation attempt; failed admission leaves the subscription
+// active. Caller code owns any retry through [MultishotSubscription.Cancel].
 //
 // # Runtime Boundary
+//
+// Multicast automatically selects ordinary or zero-copy sends by payload size
+// and target count. MulticastZeroCopy favors zero-copy with lower thresholds.
+// Inspect each CQE's opcode and flags; retrying fewer targets can change selection.
+// Both require Direct contexts and return an accepted target count separately
+// from the error. Retry starts at the first unaccepted target. Each accepted
+// stream send may still complete partially. Keep success CQEs enabled when
+// tracking ordinary-send byte counts, and use each target's data result to
+// decide which byte suffix remains. Keep shared bytes immutable until every
+// zero-copy borrow ends. Zero-copy sends retain required completions
+// independently of NotifySucceed; MulticastZeroCopy also retains completions
+// when its heuristic selects ordinary sends.
 //
 // uring is a kernel boundary, not a scheduler. It owns SQE encoding, CQE
 // observation, `user_data` identity, capability exposure, and kernel-facing

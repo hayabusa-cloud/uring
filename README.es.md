@@ -163,6 +163,10 @@ Operaciones:
 
 ## Transporte de contexto
 
+`Multicast` selecciona automáticamente envíos ordinarios o de copia cero según el tamaño del mensaje y el número de destinos; `MulticastZeroCopy` usa umbrales menores para favorecer la copia cero. Ambos requieren un contexto Direct y devuelven `(submitted, error)`: `submitted` cuenta el prefijo de destinos aceptado. Ante contrapresión, continúe con los destinos restantes. Examine el código de operación y los indicadores de cada CQE, ya que una llamada reanudada puede seleccionar otra operación. Los envíos ordinarios de `Multicast` siguen `NotifySucceed`; los envíos de copia cero seleccionados y ambas rutas de `MulticastZeroCopy` conservan la evidencia de finalización y rechazan `IOSQE_CQE_SKIP_SUCCESS` explícito.
+
+Cada envío aceptado sobre un socket de flujo puede completar menos bytes de los solicitados. Mantenga habilitadas las CQE de éxito para seguir el número de bytes de los envíos ordinarios y use el resultado de datos de cada destino para reenviar solo el sufijo pendiente. Mantenga inmutables los bytes compartidos de copia cero hasta que todos los destinos aceptados alcancen su condición de liberación. El [ejemplo multicast](./examples/zerocopy_test.go) muestra el seguimiento del progreso en bytes y de la liberación.
+
 `SQEContext` es el token de identidad principal en este paquete. En modo directo, empaqueta el opcode, las marcas del SQE, el identificador de grupo de búferes y el descriptor de archivo en un único valor de 64 bits.
 
 ```go
@@ -374,7 +378,7 @@ Las capas de contexto y ejecución abstracta por encima de esta frontera no camb
 
 ### Bucle de eventos propietario del ring
 
-En modo de emisor único (el predeterminado), una goroutine serializa todas las operaciones de estado de envío. Un bucle típico emite el trabajo pendiente, aplica un `iox.Backoff` propiedad del llamador cuando `Wait` no informa progreso observable y despacha las finalizaciones:
+En el modo predeterminado migrable entre tareas, la sincronización compartida del estado de envío permite que una goroutine cambie de hilo del sistema operativo. Un bucle propietario del ring aún puede serializar todas las operaciones: emite el trabajo pendiente, aplica un `iox.Backoff` propiedad del llamador cuando `Wait` no informa progreso observable y despacha las finalizaciones:
 
 ```go
 func runLoop(ring *uring.Uring, stop <-chan struct{}) error {
@@ -446,6 +450,8 @@ for i := range n {
 ```
 
 Cada llamada a `OnStep` observa un `MultishotStep`: devuelva `MultishotContinue` para mantener el flujo activo o `MultishotStop` para solicitar la cancelación. Si las devoluciones de llamada permanecen habilitadas hasta la observación terminal, `OnStop` se ejecuta como máximo una vez con el error final y la bandera `cancelled`; en el propio paso, `step.Cancelled` distingue en el límite el veredicto específico `-ECANCELED` del kernel del resto de fallos. Ambas devoluciones son la proyección del lado del constructor sobre la interfaz `MultishotHandler` (`OnMultishotStep` / `OnMultishotStop`); implemente la interfaz directamente cuando necesite un manejador explícito. `HandleCQE` sirve para el despacho inmediato en el bucle de finalización serializado del llamador; si el código llamador conserva CQE copiadas más allá de ese bucle, debe mantener su propio estado de ruta y rechazar observaciones de suscripciones ya retiradas. En rings de emisor único explícitos (`MultiIssuers=false`), llame a `Cancel` / `Unsubscribe` desde el propietario fijado a un hilo del sistema operativo y serialícelos con envío, `Wait`, `WaitDirect`, `WaitExtended`, `Stop` y `ResizeRings`. Los rings `MultiIssuers` predeterminados serializan los SQE de cancelación mediante la ruta de envío compartida.
+
+Dirija cada CQE de cancelación encolada al `HandleCQE` de la misma suscripción o a su manejador extendido, incluso después de `SubscriptionStopped` o `OnStop`. Un fallo de envío o una llamada sin efecto no crea una nueva obligación de CQE de cancelación. La suscripción posee ambos contextos y devuelve el original a su pool solo tras procesar la CQE terminal original, despachar la cancelación y finalizar su envío. No devuelva estos contextos manualmente. El [ejemplo de recepción](./examples/multishot_test.go) muestra la finalización natural y la cancelación solicitada por el manejador.
 
 ### Estado por conexión con contextos tipados
 

@@ -97,7 +97,7 @@ func TestZCRXReceiverHandleCQETerminalErrorDoesNotCancelDeadRequest(t *testing.T
 	defer func() { zcrxAsyncCancelByUserData = prev }()
 
 	calls := 0
-	zcrxAsyncCancelByUserData = func(ring *Uring, userData uint64) error {
+	zcrxAsyncCancelByUserData = func(ring *Uring, _ SQEContext, userData uint64) error {
 		calls++
 		return nil
 	}
@@ -626,7 +626,7 @@ func TestZCRXReceiverDeliverDataZeroLengthPayload(t *testing.T) {
 
 func TestZCRXReceiverStopLeavesReceiverActiveWhenCancelFails(t *testing.T) {
 	prev := zcrxAsyncCancelByUserData
-	zcrxAsyncCancelByUserData = func(ring *Uring, userData uint64) error {
+	zcrxAsyncCancelByUserData = func(ring *Uring, _ SQEContext, userData uint64) error {
 		return ErrInvalidParam
 	}
 	t.Cleanup(func() {
@@ -749,7 +749,7 @@ func TestZCRXReceiverStopUsesAtomicUserData(t *testing.T) {
 
 	calls := 0
 	var seen uint64
-	zcrxAsyncCancelByUserData = func(ring *Uring, userData uint64) error {
+	zcrxAsyncCancelByUserData = func(ring *Uring, _ SQEContext, userData uint64) error {
 		calls++
 		seen = userData
 		return nil
@@ -841,7 +841,7 @@ func TestZCRXReceiverDeliverErrorWithoutHandlerRequestsStop(t *testing.T) {
 	defer func() { zcrxAsyncCancelByUserData = prev }()
 
 	calls := 0
-	zcrxAsyncCancelByUserData = func(ring *Uring, userData uint64) error {
+	zcrxAsyncCancelByUserData = func(ring *Uring, _ SQEContext, userData uint64) error {
 		calls++
 		return nil
 	}
@@ -995,17 +995,26 @@ func TestZCRXReceiverFinishPublishesStoppedAfterOnStopped(t *testing.T) {
 
 func TestZCRXReceiverCloseRequiresStoppedAndClosedRing(t *testing.T) {
 	ring := &Uring{ioUring: &ioUring{ringFd: -1}}
-	areaBuf := make([]byte, 64)
-	ringAreaBuf := make([]byte, 64)
+	areaSize := int(iobuf.PageSize)
+	areaPtr, err := mmapArea(areaSize, false)
+	if err != nil {
+		t.Fatalf("mmap area: %v", err)
+	}
+	ringPtr, err := mmapRing(areaSize)
+	if err != nil {
+		munmapArea(areaPtr, areaSize)
+		t.Fatalf("mmap refill ring: %v", err)
+	}
 	r := &ZCRXReceiver{
 		ring: ring,
 		area: zcrxArea{
-			ptr:      unsafe.Pointer(unsafe.SliceData(areaBuf)),
-			size:     len(areaBuf),
-			ringPtr:  unsafe.Pointer(unsafe.SliceData(ringAreaBuf)),
-			ringSize: len(ringAreaBuf),
+			ptr:      areaPtr,
+			size:     areaSize,
+			ringPtr:  ringPtr,
+			ringSize: areaSize,
 		},
 	}
+	t.Cleanup(r.area.unmap)
 
 	r.state.Store(zcrxStateStopping)
 	if err := r.Close(); !errors.Is(err, iox.ErrWouldBlock) {
@@ -1069,4 +1078,40 @@ func TestZCRXMmapHelpersAllocateWritableMemory(t *testing.T) {
 	}
 	defer munmapRing(ring, size)
 	*(*byte)(ring) = 0xa5
+}
+
+func TestZCRXReceiverRetainsIdentityUntilCancelCompletion(t *testing.T) {
+	for _, originalFirst := range []bool{false, true} {
+		name := "cancel_first"
+		if originalFirst {
+			name = "original_first"
+		}
+		t.Run(name, func(t *testing.T) {
+			pool := NewContextPools(1)
+			ext := pool.Extended()
+			h := &zcrxRecordingHandler{}
+			r := &ZCRXReceiver{pool: pool, handler: h, ext: ext}
+			r.state.Store(zcrxStateStopping)
+			cancelCtx := r.cancel.prepare(r)
+			completeCancel := func() {
+				cancelCQEHandler(nil, nil, &ioUringCqe{userData: cancelCtx.Raw()})
+			}
+			if originalFirst {
+				r.finish(ext)
+			} else {
+				completeCancel()
+			}
+			if r.Stopped() || pool.ExtendedAvailable() != 0 {
+				t.Fatal("receiver retired before both completions")
+			}
+			if originalFirst {
+				completeCancel()
+			} else {
+				r.finish(ext)
+			}
+			if !r.Stopped() || r.ext != nil || pool.ExtendedAvailable() != 1 || h.stopped != 1 {
+				t.Fatal("receiver did not retire exactly once after both completions")
+			}
+		})
+	}
 }

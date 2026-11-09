@@ -163,6 +163,10 @@ for {
 
 ## 上下文传递
 
+`Multicast` 根据负载大小和目标数量自动选择普通发送或零拷贝发送；`MulticastZeroCopy` 使用更低的阈值，优先选择零拷贝。两者都要求 Direct 上下文并返回 `(submitted, error)`，其中 `submitted` 表示已接受的目标前缀长度。遇到背压后，从剩余目标继续提交。恢复调用可能选择不同的操作，因此应检查每个 CQE 的操作码和标志。`Multicast` 的普通发送遵循 `NotifySucceed`；选中的零拷贝发送和 `MulticastZeroCopy` 的两条路径都会保留完成证据，并拒绝显式的 `IOSQE_CQE_SKIP_SUCCESS`。
+
+已受理的流式发送仍可能只完成部分字节。跟踪普通发送的字节数时，应保留成功 CQE，并根据每个目标的数据结果只续传尚未发送的尾部。共享的零拷贝数据必须保持不变，直到所有已受理目标都满足释放条件。[multicast 示例](./examples/zerocopy_test.go)展示了如何分别跟踪字节进度和释放。
+
 `SQEContext` 是本包的核心标识令牌。Direct 模式将 opcode、SQE flags、buffer-group ID 与文件描述符打包为一个 64 位值。
 
 ```go
@@ -374,7 +378,7 @@ CQE 路由策略由调用方自行实现，不在本包范围内。监听器的�
 
 ### Ring 所有者事件循环
 
-在单提交者模式（默认）下，一个 goroutine 串行化所有提交状态操作。典型循环会提交待处理工作，在 `Wait` 没有返回可观察进展时使用调用方持有的 `iox.Backoff`，然后分发完成事件。
+在默认的任务可迁移模式下，共享提交状态同步允许 goroutine 在不同 OS 线程之间迁移。ring 所有者循环仍可串行化全部提交状态操作：提交待处理工作，在 `Wait` 没有返回可观察进展时使用调用方持有的 `iox.Backoff`，然后分发完成事件。
 
 ```go
 func runLoop(ring *uring.Uring, stop <-chan struct{}) error {
@@ -446,6 +450,8 @@ for i := range n {
 ```
 
 每一次 `OnStep` 回调观察一个 `MultishotStep`：返回 `MultishotContinue` 保持流活跃，或返回 `MultishotStop` 请求取消。如果回调一直保持启用直到终态观察，`OnStop` 至多以最终错误及 `cancelled` 标志触发一次；在步骤自身上，`step.Cancelled` 在边界处把内核的 `-ECANCELED` 判定与其他失败明确区分开。两个回调都是 `MultishotHandler` 接口（`OnMultishotStep` / `OnMultishotStop`）在构建器侧的投影；需要显式处理器时，可直接实现该接口。`HandleCQE` 用于调用方串行化完成循环内的立即 dispatch；若调用方在该循环之后保留复制 CQE，则需维护自己的 route state，并拒绝已退役订阅的观察。在显式单提交者 ring（`MultiIssuers=false`）上，应从固定于 OS 线程的 ring 所有者调用 `Cancel` / `Unsubscribe`，并将其与提交、`Wait`、`WaitDirect`、`WaitExtended`、`Stop` 以及 `ResizeRings` 串行化。默认 `MultiIssuers` ring 通过共享提交路径串行化取消 SQE。
+
+每个已入队的取消 CQE 都应交给同一订阅的 `HandleCQE` 或其扩展处理器，即使已到达 `SubscriptionStopped` 或触发 `OnStop`。提交失败或未执行新提交的调用不会产生新的取消 CQE 处理义务。订阅拥有两个上下文，只有在处理完原请求的终态 CQE、完成取消分派且取消提交过程结束后，才将原上下文归还池。不要手动归还这些上下文。[接收示例](./examples/multishot_test.go)展示了自然完成和由处理器请求的取消。
 
 ### 类型化上下文承载连接状态
 

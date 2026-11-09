@@ -7,6 +7,7 @@
 package uring
 
 import (
+	"math"
 	"sync/atomic"
 	"unsafe"
 
@@ -166,6 +167,8 @@ func NewZCTracker(ring *Uring, pool *ContextPools) *ZCTracker {
 // The handler receives OnCompleted for the send CQE and OnNotification when the
 // buffer can be safely reused.
 // Caller must keep buf valid and unmodified until OnNotification runs.
+// Completion notifications are required regardless of NotifySucceed;
+// explicit IOSQE_CQE_SKIP_SUCCESS is invalid.
 // Returns iox.ErrWouldBlock if the context pool is exhausted.
 func (t *ZCTracker) SendZC(fd iofd.FD, buf []byte, handler ZCHandler, options ...OpOptionFunc) error {
 	if len(buf) < 1 {
@@ -198,6 +201,9 @@ func (t *ZCTracker) SendZC(fd iofd.FD, buf []byte, handler ZCHandler, options ..
 		flags = opt.Flags
 		ioprio = opt.IOPrio
 	}
+	if n > math.MaxInt32 || flags&IOSQE_CQE_SKIP_SUCCESS != 0 {
+		return ErrInvalidParam
+	}
 
 	ext := t.pool.Extended()
 	if ext == nil {
@@ -210,7 +216,7 @@ func (t *ZCTracker) SendZC(fd iofd.FD, buf []byte, handler ZCHandler, options ..
 
 	ext.SQE = ioUringSqe{}
 	ext.SQE.opcode = IORING_OP_SEND_ZC
-	ext.SQE.flags = flags | t.ring.writeLikeOpFlags
+	ext.SQE.flags = flags
 	ext.SQE.ioprio = ioprio
 	ext.SQE.fd = int32(fd)
 	ext.SQE.addr = uint64(uintptr(unsafe.Pointer(unsafe.SliceData(buf)))) + uint64(dataOffset)
@@ -231,6 +237,8 @@ func (t *ZCTracker) SendZC(fd iofd.FD, buf []byte, handler ZCHandler, options ..
 // SendZCFixed submits a zero-copy send using a registered buffer.
 // Caller must keep the registered buffer range valid and unmodified until
 // OnNotification runs.
+// Completion notifications are required regardless of NotifySucceed;
+// explicit IOSQE_CQE_SKIP_SUCCESS is invalid.
 // Returns iox.ErrWouldBlock if the context pool is exhausted.
 func (t *ZCTracker) SendZCFixed(fd iofd.FD, bufIndex int, offset int, length int, handler ZCHandler, options ...OpOptionFunc) error {
 	buf := t.ring.RegisteredBuffer(bufIndex)
@@ -268,6 +276,9 @@ func (t *ZCTracker) SendZCFixed(fd iofd.FD, bufIndex int, offset int, length int
 		ioprio = opt.IOPrio
 	}
 	effectiveOffset := offset + dataOffset
+	if flags&IOSQE_CQE_SKIP_SUCCESS != 0 {
+		return ErrInvalidParam
+	}
 
 	ext := t.pool.Extended()
 	if ext == nil {
@@ -281,7 +292,7 @@ func (t *ZCTracker) SendZCFixed(fd iofd.FD, bufIndex int, offset int, length int
 	ext.SQE = ioUringSqe{}
 	// IORING_RECVSEND_FIXED_BUF goes in ioprio, not IOSQE_FIXED_FILE in flags.
 	ext.SQE.opcode = IORING_OP_SEND_ZC
-	ext.SQE.flags = flags | t.ring.writeLikeOpFlags
+	ext.SQE.flags = flags
 	ext.SQE.ioprio = ioprio | IORING_RECVSEND_FIXED_BUF
 	ext.SQE.fd = int32(fd)
 	ext.SQE.addr = uint64(uintptr(unsafe.Pointer(unsafe.SliceData(buf)))) + uint64(effectiveOffset)

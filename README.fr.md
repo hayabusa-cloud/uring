@@ -163,6 +163,10 @@ Opérations :
 
 ## Transport du contexte
 
+`Multicast` choisit automatiquement un envoi ordinaire ou sans copie selon la taille du message et le nombre de destinations ; `MulticastZeroCopy` utilise des seuils plus bas pour favoriser le sans-copie. Les deux exigent un contexte Direct et renvoient `(submitted, error)` : `submitted` compte le préfixe de destinations accepté. En cas de contre-pression, reprendre avec les destinations restantes. Examiner le code d’opération et les indicateurs de chaque CQE, car une reprise peut sélectionner une autre opération. Les envois ordinaires de `Multicast` suivent `NotifySucceed` ; les envois sans copie sélectionnés et les deux chemins de `MulticastZeroCopy` conservent les observations de fin et rejettent `IOSQE_CQE_SKIP_SUCCESS` explicite.
+
+Chaque envoi accepté sur un socket de flux peut transférer moins d'octets que demandé. Gardez les CQE de succès activées pour suivre les octets des envois ordinaires, puis utilisez le résultat de données de chaque destination pour ne reprendre que le suffixe restant. Gardez les octets partagés sans copie immuables jusqu'à ce que chaque destination acceptée atteigne sa condition de libération. L'[exemple multicast](./examples/zerocopy_test.go) montre le suivi des octets transférés et de la libération.
+
 `SQEContext` est le jeton d'identité principal de ce package. En mode direct, il encode l'opcode, les fanions SQE, l'identifiant de groupe de tampons et le descripteur de fichier dans une seule valeur de 64 bits.
 
 ```go
@@ -374,7 +378,7 @@ Les couches de contexte et d'exécution abstraite au-dessus de cette frontière 
 
 ### Boucle d'événements propriétaire du ring
 
-En mode mono-émetteur (le mode par défaut), une seule goroutine sérialise toutes les opérations d'état de soumission. Une boucle classique soumet le travail en attente, applique un `iox.Backoff` détenu par l'appelant quand `Wait` ne signale aucun progrès observable, puis distribue les complétions :
+Dans le mode par défaut, migrable entre tâches, la synchronisation partagée de l'état de soumission permet à une goroutine de changer de thread du système. Une boucle propriétaire du ring peut néanmoins sérialiser toutes les opérations : elle soumet le travail en attente, applique un `iox.Backoff` détenu par l'appelant quand `Wait` ne signale aucun progrès observable, puis distribue les complétions :
 
 ```go
 func runLoop(ring *uring.Uring, stop <-chan struct{}) error {
@@ -446,6 +450,8 @@ for i := range n {
 ```
 
 Chaque rappel `OnStep` observe un `MultishotStep` : renvoyez `MultishotContinue` pour maintenir le flux actif ou `MultishotStop` pour demander l'annulation. Si les rappels restent activés jusqu'à l'observation terminale, `OnStop` s'exécute au plus une fois avec l'erreur finale et l'indicateur `cancelled` ; sur le pas lui-même, `step.Cancelled` distingue à la frontière le verdict spécifique `-ECANCELED` du noyau des autres échecs. Les deux rappels sont la projection côté constructeur de l'interface `MultishotHandler` (`OnMultishotStep` / `OnMultishotStop`) ; implémentez directement cette interface lorsque vous écrivez un gestionnaire explicite. `HandleCQE` sert au dispatch immédiat dans la boucle de complétion sérialisée de l'appelant ; si le code appelant conserve des CQE copiées après cette boucle, il doit garder son propre état de routage et rejeter les observations de souscriptions déjà retirées. Sur les rings mono-émetteur explicites (`MultiIssuers=false`), appelez `Cancel` / `Unsubscribe` depuis le propriétaire épinglé à un thread du système et sérialisez-les avec les opérations de soumission, `Wait`, `WaitDirect`, `WaitExtended`, `Stop` et `ResizeRings`. Les rings `MultiIssuers` par défaut sérialisent les SQE d'annulation par le chemin de soumission partagé.
+
+Transmettez chaque CQE d'annulation soumise au `HandleCQE` de la même souscription ou à son gestionnaire étendu, même après `SubscriptionStopped` ou `OnStop`. Une soumission échouée ou un appel sans effet ne crée aucune nouvelle obligation de CQE d'annulation. La souscription possède les deux contextes et ne rend l'original à son pool qu'après le traitement de la CQE terminale originale, le dispatch d'annulation et la fin de sa soumission. Ne rendez pas ces contextes manuellement. L'[exemple de réception](./examples/multishot_test.go) montre la fin naturelle et l'annulation demandée par le gestionnaire.
 
 ### État par connexion via des contextes typés
 

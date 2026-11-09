@@ -308,7 +308,7 @@ func TestMultishotSubscriptionSubmitCancelStateTracksEnqueue(t *testing.T) {
 	sub.state.Store(uint32(SubscriptionActive))
 
 	errWant := errFromErrno(uintptr(EBUSY))
-	if err := sub.submitCancelUsing(func(uint64) error { return errWant }); err != errWant {
+	if err := sub.submitCancelUsing(func(SQEContext, uint64) error { return errWant }); err != errWant {
 		t.Fatalf("submitCancelUsing(error): got %v, want %v", err, errWant)
 	}
 	if got := sub.State(); got != SubscriptionActive {
@@ -319,7 +319,7 @@ func TestMultishotSubscriptionSubmitCancelStateTracksEnqueue(t *testing.T) {
 	}
 	sub.cancelSubmit.Store(false)
 
-	if err := sub.submitCancelUsing(func(uint64) error { return nil }); err != nil {
+	if err := sub.submitCancelUsing(func(SQEContext, uint64) error { return nil }); err != nil {
 		t.Fatalf("submitCancelUsing(success): %v", err)
 	}
 	if got := sub.State(); got != SubscriptionCancelling {
@@ -409,7 +409,7 @@ func TestMultishotFinalSuccessSkipsCancelAndStops(t *testing.T) {
 	}
 }
 
-func TestMultishotCancelSubmitRetainsExtUntilSubmitReturns(t *testing.T) {
+func TestMultishotCancelRetainsExtUntilBothCompletions(t *testing.T) {
 	pool := NewContextPools(1)
 
 	ext := pool.Extended()
@@ -425,7 +425,7 @@ func TestMultishotCancelSubmitRetainsExtUntilSubmitReturns(t *testing.T) {
 	bindMultishotTestSubscription(sub, ext)
 	sub.state.Store(uint32(SubscriptionActive))
 
-	err := sub.submitCancelUsing(func(uint64) error {
+	err := sub.submitCancelUsing(func(SQEContext, uint64) error {
 		sub.finish(nil, false)
 		if sub.ext.Load() == nil {
 			t.Fatal("ExtSQE retired while cancel submit still used userData")
@@ -441,11 +441,14 @@ func TestMultishotCancelSubmitRetainsExtUntilSubmitReturns(t *testing.T) {
 	if got := sub.State(); got != SubscriptionStopped {
 		t.Fatalf("State after terminal/cancel race = %v, want %v", got, SubscriptionStopped)
 	}
-	if sub.ext.Load() != nil {
-		t.Fatal("ExtSQE not retired after cancel submit returned")
+	if sub.ext.Load() == nil || pool.ExtendedAvailable() != 0 {
+		t.Fatal("ExtSQE retired before cancellation completion")
 	}
-	if got := pool.Extended(); got == nil {
-		t.Fatal("ExtSQE not returned to pool after cancel submit returned")
+	if !sub.HandleCQE(CQEView{ctx: PackExtended(&sub.cancel.slot.ext)}) {
+		t.Fatal("cancellation completion not handled")
+	}
+	if sub.ext.Load() != nil || pool.ExtendedAvailable() != 1 {
+		t.Fatal("ExtSQE not returned after both completions")
 	}
 }
 
@@ -613,6 +616,18 @@ func BenchmarkMultishotHandleCQE(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		benchmarkMultishotHandleCQESink = sub.HandleCQE(cqe)
+	}
+}
+
+func BenchmarkMultishotCancelRetirement(b *testing.B) {
+	pool := NewContextPools(1)
+	sub := &MultishotSubscription{ring: &Uring{ctxPools: pool}}
+	b.ReportAllocs()
+	for b.Loop() {
+		sub.ext.Store(pool.Extended())
+		sub.state.Store(uint32(SubscriptionStopped))
+		ctx := sub.cancel.prepare(sub)
+		cancelCQEHandler(nil, nil, &ioUringCqe{userData: ctx.Raw()})
 	}
 }
 

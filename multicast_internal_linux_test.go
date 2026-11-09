@@ -28,11 +28,14 @@ func assertFixedSendSQE(t *testing.T, sqe *ioUringSqe, bufIndex int, addr uint64
 	if sqe.opcode != IORING_OP_SEND {
 		t.Fatalf("opcode = %d, want %d", sqe.opcode, IORING_OP_SEND)
 	}
-	if sqe.ioprio != IORING_RECVSEND_FIXED_BUF {
-		t.Fatalf("ioprio = %d, want %d", sqe.ioprio, IORING_RECVSEND_FIXED_BUF)
+	if sqe.ioprio != 0 {
+		t.Fatalf("ioprio = %d, want 0", sqe.ioprio)
 	}
-	if sqe.bufIndex != uint16(bufIndex) {
-		t.Fatalf("bufIndex = %d, want %d", sqe.bufIndex, bufIndex)
+	if sqe.bufIndex != 0 {
+		t.Fatalf("bufIndex = %d, want 0", sqe.bufIndex)
+	}
+	if group := SQEContext(sqe.userData).BufGroup(); group != uint16(bufIndex) {
+		t.Fatalf("context buffer = %d, want %d", group, bufIndex)
 	}
 	if sqe.off != 0 {
 		t.Fatalf("off = %d, want 0", sqe.off)
@@ -79,7 +82,7 @@ func TestMulticastUsesOffsetWindowForUserBuffers(t *testing.T) {
 		length = 7
 	)
 
-	if err := ring.Multicast(PackDirect(0, 0, 0, 0), testSendTargets{fds: []iofd.FD{11}}, -1, payload, offset, length); err != nil {
+	if _, err := ring.Multicast(PackDirect(0, 0, 0, 0), testSendTargets{fds: []iofd.FD{11}}, -1, payload, offset, length); err != nil {
 		t.Fatalf("Multicast: %v", err)
 	}
 
@@ -103,7 +106,7 @@ func TestMulticastAllowsZeroLengthTailForUserBuffers(t *testing.T) {
 	ring := newStartedSharedTestRing(t)
 	payload := []byte("0123456789abcdef")
 
-	if err := ring.Multicast(PackDirect(0, 0, 0, 0), testSendTargets{fds: []iofd.FD{11}}, -1, payload, int64(len(payload)), 0); err != nil {
+	if _, err := ring.Multicast(PackDirect(0, 0, 0, 0), testSendTargets{fds: []iofd.FD{11}}, -1, payload, int64(len(payload)), 0); err != nil {
 		t.Fatalf("Multicast: %v", err)
 	}
 
@@ -135,21 +138,21 @@ func TestMulticastCopyPathsUseFixedSendEncoding(t *testing.T) {
 	targets := testSendTargets{fds: []iofd.FD{12}}
 
 	t.Run("Multicast", func(t *testing.T) {
-		if err := ring.Multicast(PackDirect(0, 0, 0, 0), targets, bufIndex, nil, offset, length); err != nil {
+		if _, err := ring.Multicast(PackDirect(0, 0, 0, 0), targets, bufIndex, nil, offset, length); err != nil {
 			t.Fatalf("Multicast: %v", err)
 		}
 		assertFixedSendSQE(t, lastSubmittedSQE(t, ring), bufIndex, wantAddr, length)
 	})
 
-	t.Run("MulticastZeroCopy fallback", func(t *testing.T) {
-		if err := ring.MulticastZeroCopy(PackDirect(0, 0, 0, 0), targets, bufIndex, offset, length); err != nil {
+	t.Run("MulticastZeroCopy small payload", func(t *testing.T) {
+		if _, err := ring.MulticastZeroCopy(PackDirect(0, 0, 0, 0), targets, bufIndex, offset, length); err != nil {
 			t.Fatalf("MulticastZeroCopy: %v", err)
 		}
 		assertFixedSendSQE(t, lastSubmittedSQE(t, ring), bufIndex, wantAddr, length)
 	})
 }
 
-func TestMulticastUsesZeroCopyForLargeRegisteredPayloads(t *testing.T) {
+func TestMulticastSelectsZeroCopyForLargeRegisteredPayloads(t *testing.T) {
 	ring := newStartedSharedTestRing(t)
 	if ring.RegisteredBufferCount() < 1 {
 		t.Skip("need a registered buffer")
@@ -167,13 +170,13 @@ func TestMulticastUsesZeroCopyForLargeRegisteredPayloads(t *testing.T) {
 	wantAddr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(buf)))) + uint64(offset)
 	targets := testSendTargets{fds: []iofd.FD{21, 22, 23, 24, 25, 26, 27, 28}}
 
-	if err := ring.Multicast(PackDirect(0, 0, 0, 0), targets, bufIndex, nil, offset, length, WithFlags(IOSQE_IO_LINK)); err != nil {
+	if _, err := ring.Multicast(PackDirect(0, 0, 0, 0), targets, bufIndex, nil, offset, length, WithFlags(IOSQE_IO_LINK)); err != nil {
 		t.Fatalf("Multicast: %v", err)
 	}
 
 	sqe := lastSubmittedSQE(t, ring)
-	if sqe.flags != IOSQE_IO_LINK|ring.writeLikeOpFlags {
-		t.Fatalf("flags = %d, want %d", sqe.flags, IOSQE_IO_LINK|ring.writeLikeOpFlags)
+	if sqe.flags != IOSQE_IO_LINK {
+		t.Fatalf("flags = %d, want %d", sqe.flags, IOSQE_IO_LINK)
 	}
 	if sqe.fd != int32(targets.fds[len(targets.fds)-1]) {
 		t.Fatalf("fd = %d, want %d", sqe.fd, targets.fds[len(targets.fds)-1])
@@ -181,7 +184,7 @@ func TestMulticastUsesZeroCopyForLargeRegisteredPayloads(t *testing.T) {
 	assertZeroCopyFixedSendSQE(t, sqe, bufIndex, wantAddr, length)
 }
 
-func TestMulticastZeroCopyUsesZeroCopyAboveThreshold(t *testing.T) {
+func TestMulticastZeroCopySelectsCopyForSmallPayloads(t *testing.T) {
 	ring := newStartedSharedTestRing(t)
 	if ring.RegisteredBufferCount() < 1 {
 		t.Skip("need a registered buffer")
@@ -190,7 +193,7 @@ func TestMulticastZeroCopyUsesZeroCopyAboveThreshold(t *testing.T) {
 	const (
 		bufIndex = 0
 		offset   = int64(32)
-		length   = 1024
+		length   = 1
 	)
 	buf := ring.RegisteredBuffer(bufIndex)
 	if len(buf) < int(offset)+length {
@@ -199,16 +202,16 @@ func TestMulticastZeroCopyUsesZeroCopyAboveThreshold(t *testing.T) {
 	wantAddr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(buf)))) + uint64(offset)
 	targets := testSendTargets{fds: []iofd.FD{31, 32, 33, 34}}
 
-	if err := ring.MulticastZeroCopy(PackDirect(0, 0, 0, 0), targets, bufIndex, offset, length, WithFlags(IOSQE_IO_DRAIN)); err != nil {
+	if _, err := ring.MulticastZeroCopy(PackDirect(0, 0, 0, 0), targets, bufIndex, offset, length, WithFlags(IOSQE_IO_DRAIN)); err != nil {
 		t.Fatalf("MulticastZeroCopy: %v", err)
 	}
 
 	sqe := lastSubmittedSQE(t, ring)
-	if sqe.flags != IOSQE_IO_DRAIN|ring.writeLikeOpFlags {
-		t.Fatalf("flags = %d, want %d", sqe.flags, IOSQE_IO_DRAIN|ring.writeLikeOpFlags)
+	if sqe.flags != IOSQE_IO_DRAIN {
+		t.Fatalf("flags = %d, want %d", sqe.flags, IOSQE_IO_DRAIN)
 	}
 	if sqe.fd != int32(targets.fds[len(targets.fds)-1]) {
 		t.Fatalf("fd = %d, want %d", sqe.fd, targets.fds[len(targets.fds)-1])
 	}
-	assertZeroCopyFixedSendSQE(t, sqe, bufIndex, wantAddr, length)
+	assertFixedSendSQE(t, sqe, bufIndex, wantAddr, length)
 }

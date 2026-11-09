@@ -328,7 +328,7 @@ func benchmarkPublicPerformanceZeroCopyIO(b *testing.B, payloadSize, destination
 
 	for i := 0; i < b.N; i++ {
 		ctx := uring.PackDirect(uring.IORING_OP_SEND_ZC, 0, uint16(i), 0)
-		if err := ring.MulticastZeroCopy(ctx, targets, 0, 0, payloadSize); err != nil {
+		if _, err := ring.MulticastZeroCopy(ctx, targets, 0, 0, payloadSize); err != nil {
 			b.Fatalf("MulticastZeroCopy: %v", err)
 		}
 		benchmarkPublicPerformanceInt32Sink ^= waitPublicPerformanceZeroCopyCQEs(
@@ -434,58 +434,51 @@ func waitPublicPerformanceDirectCQEs(b *testing.B, ring *uring.Uring, cqes []uri
 
 func waitPublicPerformanceZeroCopyCQEs(b *testing.B, ring *uring.Uring, cqes []uring.DirectCQE, want int, wantRes int32) int32 {
 	b.Helper()
-
-	var (
-		backoff           iox.Backoff
-		deadline          time.Time
-		seenOps           int
-		seenNotifications int
-		res               int32
-	)
-	for seenOps < want || seenNotifications < want {
+	var backoff iox.Backoff
+	deadline := time.Now().Add(time.Second)
+	seenOps, released := 0, 0
+	var res, failedResult int32
+	failed, unsupported := false, false
+	for seenOps < want || released < want {
 		n, err := ring.WaitDirect(cqes)
-		switch {
-		case err == nil:
-		case err == iox.ErrWouldBlock:
-		default:
+		if err != nil && err != iox.ErrWouldBlock {
 			b.Fatalf("Wait: %v", err)
 		}
 		if n == 0 {
-			if deadline.IsZero() {
-				deadline = time.Now().Add(time.Second)
-			}
 			if time.Now().After(deadline) {
-				b.Fatal("timeout waiting for zero-copy completion")
+				b.Fatal("timeout waiting for multicast completion and release")
 			}
 			backoff.Wait()
 			continue
 		}
-
 		backoff.Reset()
-		for i := 0; i < n && (seenOps < want || seenNotifications < want); i++ {
+		for i := range n {
 			cqe := &cqes[i]
-			switch cqe.Op {
-			case uring.IORING_OP_SEND_ZC:
-				if cqe.IsNotification() {
-					seenNotifications++
-					res ^= cqe.Res
-					continue
-				}
-				if cqe.Res == -int32(uring.EOPNOTSUPP) {
-					b.Skip("zero-copy send not supported for this benchmark target")
-				}
-				if cqe.Res < 0 {
-					b.Fatalf("zero-copy completion failed: %v", uring.CompletionError(cqe.Res))
-				}
-				if cqe.Res != wantRes {
-					b.Fatalf("zero-copy completion result = %d, want %d", cqe.Res, wantRes)
-				}
-				res ^= cqe.Res
-				seenOps++
-			case uring.IORING_OP_SEND:
-				b.Skip("zero-copy benchmark used non-zero-copy send fallback")
+			if cqe.Op != uring.IORING_OP_SEND && cqe.Op != uring.IORING_OP_SEND_ZC {
+				b.Fatalf("unexpected opcode %d", cqe.Op)
 			}
+			if cqe.IsNotification() {
+				released++
+				continue
+			}
+			seenOps++
+			if !cqe.HasMore() {
+				released++
+			}
+			if cqe.Res == -int32(uring.EOPNOTSUPP) {
+				unsupported = true
+			} else if cqe.Res != wantRes {
+				failed = true
+				failedResult = cqe.Res
+			}
+			res ^= cqe.Res
 		}
+	}
+	if failed {
+		b.Fatalf("multicast completion result = %d, want %d", failedResult, wantRes)
+	}
+	if unsupported {
+		b.Skip("zero-copy send not supported for this benchmark target")
 	}
 	return res
 }

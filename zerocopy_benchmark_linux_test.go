@@ -196,15 +196,15 @@ func benchmarkZeroCopySend(b *testing.B, payloadSize int) {
 	b.ResetTimer()
 	b.SetBytes(int64(payloadSize))
 
-	eopnotsupp := false
 	for i := 0; i < b.N; i++ {
 		ctx := uring.PackDirect(uring.IORING_OP_SEND_ZC, 0, uint16(i), int32(fd))
-		err := ring.MulticastZeroCopy(ctx, targets, 0, 0, payloadSize)
+		_, err := ring.MulticastZeroCopy(ctx, targets, 0, 0, payloadSize)
 		if err != nil {
 			b.Fatalf("MulticastZeroCopy: %v", err)
 		}
 
-		// Wait for both CQEs (operation + notification)
+		// Drain data and release evidence for the automatically selected path.
+		var result int32
 		opDone := false
 		notifDone := false
 		deadline := time.Now().Add(time.Second)
@@ -218,26 +218,32 @@ func benchmarkZeroCopySend(b *testing.B, payloadSize int) {
 				bo.Wait()
 				continue
 			}
+			bo.Reset()
 			for j := 0; j < n; j++ {
 				cqe := &cqes[j]
 				op := cqe.Op()
-				// Handle both SEND_ZC (zero-copy path) and WRITE_FIXED (fallback path)
-				if op == uring.IORING_OP_SEND_ZC {
+				// A terminal data CQE needs no later notification.
+				if op == uring.IORING_OP_SEND_ZC || op == uring.IORING_OP_SEND {
 					if cqe.IsNotification() {
 						notifDone = true
 					} else {
 						opDone = true
-						if cqe.Res == -int32(uring.EOPNOTSUPP) && !eopnotsupp {
-							eopnotsupp = true
-							b.Log("EOPNOTSUPP - zero-copy not supported on loopback")
+						if !cqe.HasMore() {
+							notifDone = true
 						}
+						result = cqe.Res
 					}
-				} else if op == uring.IORING_OP_WRITE_FIXED {
-					// writeFixed path: single CQE, no notification
-					opDone = true
-					notifDone = true
 				}
 			}
+		}
+		if !opDone || !notifDone {
+			b.Fatal("zero-copy data or release completion timed out")
+		}
+		if result == -int32(uring.EOPNOTSUPP) {
+			b.Skip("zero-copy unsupported by the benchmark socket")
+		}
+		if result != int32(payloadSize) {
+			b.Fatalf("send result=%d, want %d", result, payloadSize)
 		}
 	}
 }
@@ -360,7 +366,10 @@ func measureNormalSend(t *testing.T, payloadSize, iterations int) int64 {
 		completed := false
 		deadline := time.Now().Add(time.Second)
 		for time.Now().Before(deadline) {
-			n, _ := ring.Wait(cqes)
+			n, err := ring.Wait(cqes)
+			if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+				t.Fatalf("Wait: %v", err)
+			}
 			if n > 0 {
 				b.Reset()
 				completed = true
@@ -407,20 +416,23 @@ func measureZeroCopySend(t *testing.T, payloadSize, iterations int) int64 {
 	targets := &singleTarget{fd: fds[1]}
 
 	start := time.Now()
-	eopnotsupp := false
 	b := iox.Backoff{}
 	for i := 0; i < iterations; i++ {
 		ctx := uring.PackDirect(uring.IORING_OP_SEND_ZC, 0, uint16(i), int32(fds[1]))
-		err := ring.MulticastZeroCopy(ctx, targets, 0, 0, payloadSize)
+		_, err := ring.MulticastZeroCopy(ctx, targets, 0, 0, payloadSize)
 		if err != nil {
 			t.Fatalf("MulticastZeroCopy: %v", err)
 		}
 
+		var result int32
 		opDone := false
 		notifDone := false
 		deadline := time.Now().Add(time.Second)
 		for time.Now().Before(deadline) && (!opDone || !notifDone) {
-			n, _ := ring.Wait(cqes)
+			n, err := ring.Wait(cqes)
+			if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+				t.Fatalf("Wait: %v", err)
+			}
 			if n == 0 {
 				b.Wait()
 				continue
@@ -429,34 +441,31 @@ func measureZeroCopySend(t *testing.T, payloadSize, iterations int) int64 {
 			for j := 0; j < n; j++ {
 				cqe := &cqes[j]
 				op := cqe.Op()
-				// Handle both SEND_ZC (zero-copy path) and WRITE_FIXED (fallback path)
-				if op == uring.IORING_OP_SEND_ZC {
+				// A terminal data CQE needs no later notification.
+				if op == uring.IORING_OP_SEND_ZC || op == uring.IORING_OP_SEND {
 					if cqe.IsNotification() {
 						notifDone = true
 					} else {
 						opDone = true
-						if cqe.Res == -int32(uring.EOPNOTSUPP) {
-							eopnotsupp = true
-							notifDone = true // Skip notification wait
+						if !cqe.HasMore() {
+							notifDone = true
 						}
+						result = cqe.Res
 					}
-				} else if op == uring.IORING_OP_WRITE_FIXED {
-					// writeFixed path: single CQE, no notification
-					opDone = true
-					notifDone = true
 				}
 			}
 		}
 		if !opDone || !notifDone {
-			t.Skip("skipping comparison test: zero-copy completion did not arrive in time")
+			t.Fatal("zero-copy data or release completion timed out")
+		}
+		if result == -int32(uring.EOPNOTSUPP) {
+			t.Skip("zero-copy is unsupported by this socket; no performance comparison")
+		}
+		if result != int32(payloadSize) {
+			t.Fatalf("send result=%d, want %d", result, payloadSize)
 		}
 	}
 	elapsed := time.Since(start)
-
-	if eopnotsupp {
-		t.Log("EOPNOTSUPP - returning inflated time for comparison")
-		return elapsed.Nanoseconds()/int64(iterations) + 1000000 // Add 1ms penalty
-	}
 
 	return elapsed.Nanoseconds() / int64(iterations)
 }
@@ -550,7 +559,10 @@ func measureNormalMultiSend(t *testing.T, payloadSize, numDest, iterations int) 
 		deadline := time.Now().Add(time.Second)
 		b := iox.Backoff{}
 		for time.Now().Before(deadline) && completed < numDest {
-			n, _ := ring.Wait(cqes)
+			n, err := ring.Wait(cqes)
+			if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+				t.Fatalf("Wait: %v", err)
+			}
 			if n == 0 {
 				b.Wait()
 				continue
@@ -616,50 +628,58 @@ func measureZeroCopyMultiSend(t *testing.T, payloadSize, numDest, iterations int
 	targets := &multiTargets{fds: writers}
 
 	start := time.Now()
-	eopnotsupp := false
 	b := iox.Backoff{}
 	for iter := 0; iter < iterations; iter++ {
 		ctx := uring.PackDirect(uring.IORING_OP_SEND_ZC, 0, uint16(iter), 0)
-		err := ring.MulticastZeroCopy(ctx, targets, 0, 0, payloadSize)
-		if err != nil {
-			t.Fatalf("MulticastZeroCopy: %v", err)
-		}
+		accepted, submitErr := ring.MulticastZeroCopy(ctx, targets, 0, 0, payloadSize)
 
-		// Wait for all operation completions (notifications may come later)
-		completed := 0
+		// Drain the accepted prefix's data and release observations before reuse.
+		completed, released := 0, 0
+		unsupported, badResult := false, false
 		deadline := time.Now().Add(time.Second)
-		for time.Now().Before(deadline) && completed < numDest {
-			n, _ := ring.Wait(cqes)
+		for time.Now().Before(deadline) && (completed < accepted || released < accepted) {
+			n, err := ring.Wait(cqes)
+			if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+				t.Fatalf("Wait: %v", err)
+			}
 			if n == 0 {
 				b.Wait()
 				continue
 			}
 			b.Reset()
-			for j := 0; j < n; j++ {
-				cqe := &cqes[j]
-				op := cqe.Op()
-				// Handle both SEND_ZC (zero-copy path) and WRITE_FIXED (fallback path)
-				if op == uring.IORING_OP_SEND_ZC && !cqe.IsNotification() {
-					completed++
-					if cqe.Res == -int32(uring.EOPNOTSUPP) {
-						eopnotsupp = true
-					}
-				} else if op == uring.IORING_OP_WRITE_FIXED {
-					// writeFixed path: single CQE per destination
-					completed++
+			for _, cqe := range cqes[:n] {
+				if cqe.Op() != uring.IORING_OP_SEND_ZC && cqe.Op() != uring.IORING_OP_SEND {
+					t.Fatalf("unexpected opcode %d", cqe.Op())
+				}
+				if cqe.IsNotification() {
+					released++
+					continue
+				}
+				completed++
+				if !cqe.HasMore() {
+					released++
+				}
+				if cqe.Res == -int32(uring.EOPNOTSUPP) {
+					unsupported = true
+				} else if cqe.Res != int32(payloadSize) {
+					badResult = true
 				}
 			}
 		}
-		if completed < numDest {
-			t.Skipf("skipping comparison test: received %d/%d zero-copy completions", completed, numDest)
+		if completed != accepted || released != accepted {
+			t.Fatalf("incomplete zero-copy batch: data=%d release=%d accepted=%d", completed, released, accepted)
+		}
+		if submitErr != nil || accepted != numDest {
+			t.Fatalf("MulticastZeroCopy: accepted=%d err=%v", accepted, submitErr)
+		}
+		if badResult {
+			t.Fatal("zero-copy batch returned a short send or unexpected error")
+		}
+		if unsupported {
+			t.Skip("zero-copy is unsupported by these sockets; no performance comparison")
 		}
 	}
 	elapsed := time.Since(start)
-
-	if eopnotsupp {
-		t.Log("EOPNOTSUPP - returning inflated time")
-		return elapsed.Nanoseconds()/int64(iterations) + 1000000
-	}
 
 	return elapsed.Nanoseconds() / int64(iterations)
 }

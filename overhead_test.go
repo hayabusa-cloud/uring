@@ -110,9 +110,9 @@ func TestZeroCopyNotificationOverhead(t *testing.T) {
 	targets := &singleTarget{fd: fds[1]}
 
 	// Submit a single zero-copy send to measure CQE pattern
-	// Note: Data must be >= 1536 bytes to trigger zero-copy path (threshold for single target)
+	// This payload exceeds the single-target zero-copy threshold.
 	ctx := uring.PackDirect(uring.IORING_OP_SEND_ZC, 0, 0, int32(fds[1]))
-	err = ring.MulticastZeroCopy(ctx, targets, 0, 0, 2048)
+	_, err = ring.MulticastZeroCopy(ctx, targets, 0, 0, 2048)
 	if err != nil {
 		t.Fatalf("MulticastZeroCopy: %v", err)
 	}
@@ -127,7 +127,10 @@ func TestZeroCopyNotificationOverhead(t *testing.T) {
 	deadline := time.Now().Add(3 * time.Second)
 	b := iox.Backoff{}
 	for time.Now().Before(deadline) && (!opReceived || !notifReceived) {
-		n, _ := ring.Wait(cqes)
+		n, err := ring.Wait(cqes)
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+			t.Fatalf("Wait: %v", err)
+		}
 		for i := 0; i < n; i++ {
 			cqe := &cqes[i]
 			if cqe.Op() == uring.IORING_OP_SEND_ZC {

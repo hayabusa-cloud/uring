@@ -225,6 +225,7 @@ type ZCRXReceiver struct {
 	state    atomic.Uint32
 	ext      *ExtSQE
 	userData atomic.Uint64 // for async cancel
+	cancel   cancelRequest
 }
 
 const (
@@ -235,8 +236,8 @@ const (
 	zcrxStateStopped
 )
 
-var zcrxAsyncCancelByUserData = func(ring *Uring, userData uint64) error {
-	return ring.asyncCancelByUserData(userData)
+var zcrxAsyncCancelByUserData = func(ring *Uring, ctx SQEContext, userData uint64) error {
+	return ring.asyncCancel(ctx, userData)
 }
 
 // NewZCRXReceiver creates a ZCRX receiver.
@@ -428,7 +429,7 @@ func (r *ZCRXReceiver) handleCQE(view CQEView, rawCqe *ioUringCqe) {
 	}
 }
 
-// finish retires the receiver, runs OnStopped, returns ext, and then publishes Stopped.
+// finish observes the original terminal CQE. Cancellation has its own lifetime.
 func (r *ZCRXReceiver) finish(ext *ExtSQE) {
 	for {
 		state := r.state.Load()
@@ -439,31 +440,48 @@ func (r *ZCRXReceiver) finish(ext *ExtSQE) {
 			break
 		}
 	}
-	r.ext = nil
+	r.ext = ext
 	r.userData.Store(0)
 	if r.handler != nil {
 		r.handler.OnStopped()
 	}
-	if ext != nil {
-		r.pool.PutExtended(ext)
-	}
-	r.state.CompareAndSwap(zcrxStateRetiring, zcrxStateStopped)
+	r.retire()
 }
 
 // Stop requests cancellation of the active multishot receive.
 // Leaves the receiver active if cancel submission fails.
+// Dispatch the cancellation CQE through its extended handler as well as the
+// original receive CQEs. Stopped stays false until both lifetimes end.
 func (r *ZCRXReceiver) Stop() error {
 	if !r.state.CompareAndSwap(zcrxStateActive, zcrxStateStopping) {
 		return nil
 	}
 	userData := r.userData.Load()
 	if userData != 0 {
-		if err := zcrxAsyncCancelByUserData(r.ring, userData); err != nil {
+		if err := zcrxAsyncCancelByUserData(r.ring, r.cancel.prepare(r), userData); err != nil {
+			r.cancel.complete()
 			r.state.CompareAndSwap(zcrxStateStopping, zcrxStateActive)
 			return err
 		}
 	}
 	return nil
+}
+
+func (r *ZCRXReceiver) finishCancellation() {
+	if r.cancel.complete() {
+		r.retire()
+	}
+}
+
+func (r *ZCRXReceiver) retire() {
+	if r.state.Load() != zcrxStateRetiring || r.cancel.pending.Load() {
+		return
+	}
+	if r.ext != nil {
+		r.pool.PutExtended(r.ext)
+		r.ext = nil
+	}
+	r.state.Store(zcrxStateStopped)
 }
 
 // Stopped reports whether terminal retirement is complete.

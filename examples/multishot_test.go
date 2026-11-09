@@ -7,6 +7,7 @@
 package examples_test
 
 import (
+	"errors"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -200,13 +201,14 @@ func TestMultishotLifecycle(t *testing.T) {
 	t.Log("  5. sub.Cancel() -> IORING_OP_ASYNC_CANCEL")
 	t.Log("  6. Final CQE received (F_MORE=false)")
 	t.Log("  7. handler.OnMultishotStop(err, cancelled) called")
-	t.Log("  8. ExtSQE returned to pool")
+	t.Log("  8. Dispatch any queued cancellation CQE, independently of the original terminal CQE")
+	t.Log("  9. ExtSQE returns to its pool after both observations and cancel submission finish")
 	t.Log("-----------------------------------------------------")
 	t.Log("")
 	t.Log("State transitions:")
 	t.Log("  SubscriptionActive -> SubscriptionCancelling (user cancel)")
 	t.Log("  SubscriptionActive -> SubscriptionStopped (kernel stop)")
-	t.Log("  SubscriptionCancelling -> SubscriptionStopped (after cancel CQE)")
+	t.Log("  SubscriptionCancelling -> SubscriptionStopped (after original terminal CQE)")
 }
 
 // TestMultishotHandlerControl demonstrates handler-controlled stopping.
@@ -268,15 +270,35 @@ func TestMultishotHandlerControl(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	b := iox.Backoff{}
 
-	for sub.Active() && time.Now().Before(deadline) {
-		n, _ := ring.Wait(cqes)
+	cancelSubmitted, cancelDone := false, false
+	for (sub.Active() || (cancelSubmitted && !cancelDone)) && time.Now().Before(deadline) {
+		n, err := ring.Wait(cqes)
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+			t.Fatalf("Wait: %v", err)
+		}
+		if n == 0 {
+			b.Wait()
+			continue
+		}
+		b.Reset()
 		for i := range n {
-			keep := dispatchSimplifiedMultishotCQE(handler, cqes[i])
-			if !keep {
-				break
+			// Read borrowed context facts before dispatch can retire the context.
+			if cqes[i].Op() == uring.IORING_OP_ASYNC_CANCEL {
+				if cancelDone {
+					t.Fatal("duplicate cancellation completion")
+				}
+				cancelDone = true
+			}
+			if !sub.HandleCQE(cqes[i]) {
+				t.Fatal("unhandled multishot completion")
+			}
+			if sub.State() == uring.SubscriptionCancelling {
+				cancelSubmitted = true
 			}
 		}
-		b.Wait()
+	}
+	if sub.Active() || !cancelSubmitted || !cancelDone {
+		t.Fatalf("incomplete shutdown: state=%v cancel=%v/%v", sub.State(), cancelSubmitted, cancelDone)
 	}
 
 	accepted := handler.count.Load()

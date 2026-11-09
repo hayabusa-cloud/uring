@@ -528,7 +528,7 @@ func (ur *ioUring) send(sqeCtx SQEContext, ioprio uint16, p []byte, offset uint6
 	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_SEND), ioprio, 0, addr, n, 0)
 }
 
-// sendFixed submits SEND with a registered buffer.
+// sendFixed submits ordinary SEND from registered buffer storage.
 func (ur *ioUring) sendFixed(sqeCtx SQEContext, bufIndex int, offset uint64, n int, msgFlags uint32) error {
 	if bufIndex < 0 || bufIndex >= len(ur.bufs) {
 		return ErrInvalidParam
@@ -539,7 +539,8 @@ func (ur *ioUring) sendFixed(sqeCtx SQEContext, bufIndex int, offset uint64, n i
 	}
 	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(buf)))) + offset
 	ctx := sqeCtx.WithOp(IORING_OP_SEND).WithBufGroup(uint16(bufIndex))
-	return ur.submitPacked9(ctx, IORING_RECVSEND_FIXED_BUF, 0, addr, n, msgFlags, 0, 0)
+	// Ordinary SEND imports the address; FIXED_BUF is only valid for SEND_ZC.
+	return ur.submitPacked6(ctx, 0, 0, addr, n, msgFlags)
 }
 
 // receive submits a receive operation with MSG_WAITALL semantics.

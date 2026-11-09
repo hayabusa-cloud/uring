@@ -470,6 +470,9 @@ func TestSignedKernelCarrierDomainsRejectOutOfRange(t *testing.T) {
 		})
 	}
 
+	if err := (&ZCTracker{}).SendZC(0, payload, nil); !errors.Is(err, ErrInvalidParam) {
+		t.Fatalf("ZCTracker.SendZC error = %v, want %v", err, ErrInvalidParam)
+	}
 }
 
 func TestSharedSubmitInvalidInputDoesNotPoisonRing(t *testing.T) {

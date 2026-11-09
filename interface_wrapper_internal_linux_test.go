@@ -2750,3 +2750,21 @@ func TestZCRXExportFailureReturnsInvalidFD(t *testing.T) {
 		t.Fatalf("ZCRXExport fd = %d, want %d", fd, iofd.InvalidFD)
 	}
 }
+
+func TestZCTrackerSendZCRejectsOversizedSignedInt32(t *testing.T) {
+	ring := newWrapperSyntheticSubmitRing(t, 8)
+	pool := NewContextPools(1)
+
+	tracker := NewZCTracker(ring, pool)
+	payload := mappedTestSlice[byte](t, oversizedSignedInt32(t))
+	err := tracker.SendZC(iofd.FD(11), payload, nil)
+	if !errors.Is(err, ErrInvalidParam) {
+		t.Fatalf("SendZC oversized len error = %v, want %v", err, ErrInvalidParam)
+	}
+	if got := pool.ExtendedAvailable(); got != 1 {
+		t.Fatalf("available ExtSQE after oversized len = %d, want 1", got)
+	}
+	if got := ring.ioUring.sqCount(); got != 0 {
+		t.Fatalf("submitted SQEs after oversized len = %d, want 0", got)
+	}
+}
