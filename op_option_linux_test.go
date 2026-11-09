@@ -38,10 +38,11 @@ func TestUringOpOptionApply(t *testing.T) {
 		uring.WithTimeoutFlags(43),
 		uring.WithSpliceFlags(47),
 		uring.WithFsyncDataSync(),
+		uring.WithUringCmdFlags(53),
 	)
 
-	if opt.FileIndex != 42 {
-		t.Fatalf("FileIndex: got %d, want 42", opt.FileIndex)
+	if opt.FileIndex == nil || *opt.FileIndex != 42 {
+		t.Fatalf("FileIndex: got %v, want pointer to 42", opt.FileIndex)
 	}
 	if opt.Flags != 7 {
 		t.Fatalf("Flags: got %d, want 7", opt.Flags)
@@ -88,6 +89,9 @@ func TestUringOpOptionApply(t *testing.T) {
 	if opt.FsyncFlags != 1 {
 		t.Fatalf("FsyncFlags: got %d, want 1", opt.FsyncFlags)
 	}
+	if opt.UringCmdFlags != 53 {
+		t.Fatalf("UringCmdFlags: got %d, want 53", opt.UringCmdFlags)
+	}
 }
 
 func TestWithFileIndex(t *testing.T) {
@@ -95,8 +99,8 @@ func TestWithFileIndex(t *testing.T) {
 	fn := uring.WithFileIndex(123)
 	fn(opt)
 
-	if opt.FileIndex != 123 {
-		t.Errorf("FileIndex: got %d, want 123", opt.FileIndex)
+	if opt.FileIndex == nil || *opt.FileIndex != 123 {
+		t.Errorf("FileIndex: got %v, want pointer to 123", opt.FileIndex)
 	}
 }
 
@@ -175,6 +179,16 @@ func TestFieldSpecificOptionHelpers(t *testing.T) {
 				t.Helper()
 				if opt.SpliceFlags != 12 {
 					t.Fatalf("SpliceFlags: got %d, want 12", opt.SpliceFlags)
+				}
+			},
+		},
+		{
+			name:  "uring command flags",
+			apply: uring.WithUringCmdFlags(uring.IORING_URING_CMD_FIXED),
+			check: func(t *testing.T, opt *uring.OpOption) {
+				t.Helper()
+				if opt.UringCmdFlags != uring.IORING_URING_CMD_FIXED {
+					t.Fatalf("UringCmdFlags: got %d, want %d", opt.UringCmdFlags, uring.IORING_URING_CMD_FIXED)
 				}
 			},
 		},

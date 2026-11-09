@@ -278,7 +278,7 @@ func (slot submitSlot) inlineCmdData128() []byte {
 	if slot.sqe128 == nil {
 		return nil
 	}
-	return unsafe.Slice((*byte)(unsafe.Pointer(&slot.sqe128.pad[0])), uringCmd128DataMax)
+	return unsafe.Slice((*byte)(unsafe.Pointer(&slot.sqe128.pad[0])), uringCmdInlineDataMax)
 }
 
 func sqeBytesFromFlags(flags uint32) int {

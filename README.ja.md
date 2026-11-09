@@ -148,11 +148,17 @@ for {
 | ポーリング    | `PollAdd`, `PollRemove`, `PollUpdate`, `PollAddLevel`, `PollAddMultishot`, `PollAddMultishotLevel`                                                                  |
 | 非同期      | `EpollWait`, `FutexWait`, `FutexWake`, `FutexWaitV`, `Waitid`                                                                                                       |
 | リングメッセージ | `MsgRing`, `MsgRingFD`, `FixedFdInstall`, `FilesUpdate`                                                                                                             |
-| コマンド     | `UringCmd`, `UringCmd128`, `Nop`, `Nop128`                                                                                                                          |
+| コマンド     | `UringCmd`, `UringCmdInline`, `UringCmd128`, `Nop`, `Nop128`                                                                                                        |
+
+`UringCmdInline` は最大 80 バイトを通常の `IORING_OP_URING_CMD` SQE 内へコピーし、`Options.SQE128` を必要とします。別個の `IORING_OP_URING_CMD128` opcode のサポートは必要ありません。
+
+`WithUringCmdFlags` は `uring_cmd_flags` union を設定します。`IORING_URING_CMD_FIXED` では `sqeCtx.WithBufGroup` に登録済みバッファ index を指定します。`IORING_URING_CMD_MULTISHOT` では `IOSQE_BUFFER_SELECT` も指定し、同じ context field を provided-buffer group として使用します。この 2 つの flag は同時に指定できません。
 
 `Nop128` と `UringCmd128` は `Options.SQE128` 付きで作成したリングと、対応する opcode のカーネルサポートの両方を必要とします。いずれかが欠ける場合は `ErrNotSupported` を返します。
 
 `Uring.Close` は指定したファイルディスクリプタに `IORING_OP_CLOSE` を発行します。リング自体の破棄ではありません。
+
+`PollAddLevel` と `PollAddMultishotLevel` は常に `ErrNotSupported` を返します。Linux io_uring は `IORING_OP_POLL_ADD` でレベルフラグを受け付けません。
 
 ## コンテキスト伝達
 
@@ -445,7 +451,7 @@ ring.PutExtSQE(ext)
 
 ### デッドライン合成
 
-`LinkTimeout` は `IOSQE_IO_LINK` チェーンを通じて直前の SQE にデッドラインを付与します。操作とタイムアウトが競合し、一方が完了するともう一方はキャンセルされます。
+`LinkTimeout` は `IOSQE_IO_LINK` チェーンを通じて直前の SQE に期限を付与します。期限が切れるとリンク先の操作のキャンセルを試みますが、その操作はすでに完了している場合があります。両方の CQE の結果を確認してください。タイムアウトだけでは、操作がキャンセルされたとは判断できません。
 
 ```go
 recvCtx := uring.ForFD(fd).
@@ -462,7 +468,7 @@ if err := ring.LinkTimeout(timeoutCtx, 5*time.Second); err != nil {
 }
 ```
 
-呼び出し側ランタイムは両方の結果を処理します。受信成功はタイムアウトをキャンセルし、タイムアウト発火は受信をキャンセルします。いずれも CQE を生成するため、ディスパッチループで観察する必要があります。
+リンクする SQE は連続して投入し、この一組の投入を他の投入・待機呼び出しと直列化してください。操作自身の完了までバッファとコンテキストを保持し、終了処理の前に両方の CQE を処理してください。
 
 ## TCP の使用パターン
 

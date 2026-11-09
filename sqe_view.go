@@ -108,7 +108,8 @@ func (v SQEView) RawFD() int32 {
 // Interpretation depends on the operation:
 //   - For read/write: file offset
 //   - For accept: sockaddr length pointer
-//   - For timeout: count or flags
+//   - For timeout: completion count, or repeat count for multishot
+//   - For socket: socket type
 //
 //go:nosplit
 func (v SQEView) Off() uint64 {
@@ -119,7 +120,7 @@ func (v SQEView) Off() uint64 {
 // Interpretation depends on the operation:
 //   - For read/write: buffer address
 //   - For accept: sockaddr pointer
-//   - For socket: protocol
+//   - For timeout: timespec pointer
 //
 //go:nosplit
 func (v SQEView) Addr() uint64 {
@@ -129,8 +130,8 @@ func (v SQEView) Addr() uint64 {
 // Len returns the length field.
 // Interpretation depends on the operation:
 //   - For read/write: buffer length
-//   - For accept: file flags
-//   - For socket: socket type
+//   - For accept: zero
+//   - For socket: protocol
 //
 //go:nosplit
 func (v SQEView) Len() uint32 {
@@ -145,6 +146,7 @@ func (v SQEView) Len() uint32 {
 //   - For accept: accept flags
 //   - For open: open flags
 //   - For send/recv: msg flags
+//   - For uring commands: IORING_URING_CMD_* flags
 //
 //go:nosplit
 func (v SQEView) UFlags() uint32 {

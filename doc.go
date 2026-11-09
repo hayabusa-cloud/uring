@@ -280,7 +280,7 @@
 //
 // File operations:
 //   - [Uring.Read], [Uring.Write], [Uring.ReadV], [Uring.WriteV]
-//   - [Uring.ReadFixed], [Uring.WriteFixed], [Uring.ReadvFixed], [Uring.WritevFixed] with registered buffers
+//   - [Uring.ReadFixed], [Uring.WriteFixed], [Uring.ReadvFixed], [Uring.WritevFixed] with registered-buffer ranges
 //   - [Uring.OpenAt], [Uring.Close], [Uring.Sync], [Uring.Fallocate], [Uring.FTruncate]
 //   - [Uring.Statx], [Uring.RenameAt], [Uring.UnlinkAt], [Uring.MkdirAt], [Uring.SymlinkAt], [Uring.LinkAt]
 //   - [Uring.FGetXattr], [Uring.FSetXattr], [Uring.GetXattr], [Uring.SetXattr]
@@ -296,8 +296,8 @@
 //   - [Uring.EpollWait], [Uring.FutexWait], [Uring.FutexWake], [Uring.FutexWaitV], [Uring.Waitid]
 //   - [Uring.MsgRing], [Uring.MsgRingFD]
 //   - [Uring.FixedFdInstall], [Uring.FilesUpdate]
-//   - [Uring.UringCmd]
-//   - [Uring.Nop]
+//   - [Uring.UringCmd], [Uring.UringCmdInline], [Uring.UringCmd128]
+//   - [Uring.Nop], [Uring.Nop128]
 //
 // Registration:
 //   - Files: [Uring.RegisterFiles], [Uring.RegisterFilesSparse], [Uring.RegisterFilesUpdate], [Uring.UnregisterFiles], [Uring.RegisteredFileCount]

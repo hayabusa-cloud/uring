@@ -68,8 +68,8 @@ type Options struct {
 	// IORING_SETUP_NO_SQARRAY to reduce ring memory in the direct-index submit path.
 	IndirectSubmissionQueue bool
 	// SQE128 requests 128-byte SQE slots for the ring. This is required for
-	// Nop128 and UringCmd128. When false, the ring keeps the default 64-byte SQE
-	// layout.
+	// UringCmdInline, Nop128, and UringCmd128. When false, the ring keeps the
+	// default 64-byte SQE layout.
 	SQE128 bool
 	// HybridPolling enables hybrid I/O polling mode (IORING_SETUP_HYBRID_IOPOLL).
 	// This delays polling to reduce CPU usage while maintaining low latency.
@@ -497,10 +497,15 @@ func (ur *Uring) RingFD() iofd.FD {
 
 // SocketRaw creates a socket using io_uring.
 // The fd field in sqeCtx is ignored (will be set to domain by the kernel).
+// WithFileIndex selects direct-descriptor creation through the same checked
+// zero-based target domain as SocketDirect.
 func (ur *Uring) SocketRaw(sqeCtx SQEContext, domain, typ, proto int, options ...OpOptionFunc) error {
 	flags, fileIndex := ur.socketOptions(options)
 	ctx := sqeCtx.OrFlags(flags)
-	return ur.socket(ctx, domain, typ, proto, fileIndex)
+	if fileIndex != nil {
+		return ur.socketDirect(ctx, domain, typ, proto, *fileIndex)
+	}
+	return ur.socket(ctx, domain, typ, proto)
 }
 
 // TCP4Socket creates a TCP IPv4 socket.
@@ -551,6 +556,9 @@ func (ur *Uring) UnixSocket(sqeCtx SQEContext, options ...OpOptionFunc) error {
 // SocketDirect creates a socket directly into a registered file table slot.
 // The fileIndex specifies which slot to use (0-based), or use IORING_FILE_INDEX_ALLOC
 // for auto-allocation (the allocated index is returned in CQE res).
+// IORING_FILE_INDEX_ALLOC-1 is not a valid explicit slot because the kernel
+// encoding reserves the next value for auto-allocation.
+// SOCK_CLOEXEC is not supported for direct descriptors.
 // Requires registered files via RegisterFiles or RegisterFilesSparse.
 func (ur *Uring) SocketDirect(sqeCtx SQEContext, domain, typ, proto int, fileIndex uint32, options ...OpOptionFunc) error {
 	flags, _ := ur.socketOptions(options)
@@ -645,6 +653,8 @@ func (ur *Uring) SubmitAcceptMultishot(sqeCtx SQEContext, options ...OpOptionFun
 // AcceptDirect accepts a connection directly into a registered file table slot.
 // The fileIndex specifies which slot to use (0-based), or use IORING_FILE_INDEX_ALLOC
 // for auto-allocation (the allocated index is returned in CQE res).
+// IORING_FILE_INDEX_ALLOC-1 is not a valid explicit slot because the kernel
+// encoding reserves the next value for auto-allocation.
 // SOCK_CLOEXEC is not supported with direct accept.
 // Requires registered files via RegisterFiles or RegisterFilesSparse.
 func (ur *Uring) AcceptDirect(sqeCtx SQEContext, fileIndex uint32, options ...OpOptionFunc) error {
@@ -655,7 +665,7 @@ func (ur *Uring) AcceptDirect(sqeCtx SQEContext, fileIndex uint32, options ...Op
 
 // SubmitAcceptDirectMultishot submits the raw kernel multishot accept-direct opcode.
 // Each accepted connection uses the next available slot from auto-allocation.
-// Requires IORING_FILE_INDEX_ALLOC as fileIndex for auto-allocation.
+// fileIndex must be IORING_FILE_INDEX_ALLOC.
 func (ur *Uring) SubmitAcceptDirectMultishot(sqeCtx SQEContext, fileIndex uint32, options ...OpOptionFunc) error {
 	flags, ioprio := ur.acceptOptions(options)
 	ctx := sqeCtx.OrFlags(flags)
@@ -669,34 +679,59 @@ func (ur *Uring) Connect(sqeCtx SQEContext, remote Addr, options ...OpOptionFunc
 	return ur.connect(ctx, AddrToSockaddr(remote))
 }
 
-// Receive performs a socket receive operation with MSG_WAITALL semantics.
-// If b is nil, it uses buffer selection from the kernel-provided buffer ring.
-// If b is non-nil, caller must keep b valid until the operation completes.
+// Receive performs a socket receive operation.
+// If b is nil, it uses kernel buffer selection without MSG_WAITALL.
+// If b is non-nil, it uses MSG_WAITALL, and caller must keep b valid until the
+// operation completes.
+// WithOffset without WithN receives into the remaining buffer range.
 func (ur *Uring) Receive(sqeCtx SQEContext, pollFD PollFd, b []byte, options ...OpOptionFunc) error {
-	ctx := sqeCtx.WithFD(iofd.FD(pollFD.Fd()))
+	return ur.ReceiveFD(sqeCtx, iofd.FD(pollFD.Fd()), b, options...)
+}
+
+// ReceiveFD performs a socket receive operation using an iofd.FD value instead
+// of a PollFd interface. The fd value is encoded verbatim; when sqeCtx carries
+// IOSQE_FIXED_FILE, it denotes a registered-file index. If b is nil, ReceiveFD
+// uses kernel buffer selection without MSG_WAITALL. If b is non-nil, it uses
+// MSG_WAITALL, and caller must keep b valid until the operation completes.
+// WithOffset without WithN receives into the remaining buffer range.
+func (ur *Uring) ReceiveFD(sqeCtx SQEContext, fd iofd.FD, b []byte, options ...OpOptionFunc) error {
+	ctx := sqeCtx.WithFD(fd)
 	if b == nil {
-		flags, ioprio, bufSize, bufGroup := ur.receiveWithBufferSelectOptions(pollFD, options)
+		flags, ioprio, bufSize, bufGroup := ur.receiveWithBufferSelectFDOptions(fd, options)
 		ctx = ctx.OrFlags(flags | ur.readLikeOpFlags)
 		return ur.receiveWithBufferSelect(ctx, ioprio, bufSize, bufGroup)
 	}
 	flags, ioprio, offset, n := ur.receiveOptions(b, options)
+	if offset < 0 {
+		return ErrInvalidParam
+	}
 	ctx = ctx.OrFlags(flags | ur.readLikeOpFlags)
 	return ur.receive(ctx, ioprio, b, uint64(offset), n)
 }
 
 // SubmitReceiveMultishot submits the raw kernel multishot receive opcode.
 // For the managed subscription helper, use [Uring.ReceiveMultishot].
-// If b is non-nil, caller must keep b valid until the operation completes.
+// b must be nil because multishot receive requires kernel buffer selection.
+// WithReadBufferSize selects the buffer group and the per-completion length cap.
+// A zero size leaves the cap uncapped and selects the default-size buffer group.
 func (ur *Uring) SubmitReceiveMultishot(sqeCtx SQEContext, pollFD PollFd, b []byte, options ...OpOptionFunc) error {
-	ctx := sqeCtx.WithFD(iofd.FD(pollFD.Fd()))
-	if b == nil {
-		flags, ioprio, bufSize, bufGroup := ur.receiveWithBufferSelectOptions(pollFD, options)
-		ctx = ctx.OrFlags(flags | ur.readLikeOpFlags)
-		return ur.receiveWithBufferSelect(ctx, ioprio|IORING_RECV_MULTISHOT, bufSize, bufGroup)
+	return ur.SubmitReceiveMultishotFD(sqeCtx, iofd.FD(pollFD.Fd()), b, options...)
+}
+
+// SubmitReceiveMultishotFD submits the raw kernel multishot receive opcode using
+// an iofd.FD value instead of a PollFd interface. The fd value is encoded
+// verbatim; when sqeCtx carries IOSQE_FIXED_FILE, it denotes a registered-file
+// index. b must be nil because multishot receive requires kernel buffer selection.
+// WithReadBufferSize selects the buffer group and the per-completion length cap;
+// zero leaves the cap uncapped and selects the default-size buffer group.
+func (ur *Uring) SubmitReceiveMultishotFD(sqeCtx SQEContext, fd iofd.FD, b []byte, options ...OpOptionFunc) error {
+	if b != nil {
+		return ErrInvalidParam
 	}
-	flags, ioprio, offset, n := ur.receiveOptions(b, options)
+	ctx := sqeCtx.WithFD(fd)
+	flags, ioprio, bufSize, bufGroup := ur.receiveWithBufferSelectFDOptions(fd, options)
 	ctx = ctx.OrFlags(flags | ur.readLikeOpFlags)
-	return ur.receive(ctx, ioprio|IORING_RECV_MULTISHOT, b, uint64(offset), n)
+	return ur.receiveWithBufferSelect(ctx, ioprio|IORING_RECV_MULTISHOT, bufSize, bufGroup)
 }
 
 // ReceiveBundle performs a bundle receive operation.
@@ -732,9 +767,21 @@ func (ur *Uring) BundleIterator(cqe CQEView, group uint16) (BundleIterator, bool
 
 // Send writes data to a socket.
 // Caller must keep p valid until the operation completes.
+// WithOffset without WithN sends the remaining payload range.
 func (ur *Uring) Send(sqeCtx SQEContext, pollFD PollFd, p []byte, options ...OpOptionFunc) error {
+	return ur.SendFD(sqeCtx, iofd.FD(pollFD.Fd()), p, options...)
+}
+
+// SendFD writes data using an iofd.FD value instead of a PollFd interface. The
+// fd value is encoded verbatim; when sqeCtx carries IOSQE_FIXED_FILE, it denotes
+// a registered-file index. Caller must keep p valid until the operation
+// completes. WithOffset without WithN sends the remaining payload range.
+func (ur *Uring) SendFD(sqeCtx SQEContext, fd iofd.FD, p []byte, options ...OpOptionFunc) error {
 	flags, ioprio, offset, n := ur.sendOptions(p, options)
-	ctx := sqeCtx.WithFD(iofd.FD(pollFD.Fd())).OrFlags(flags | ur.writeLikeOpFlags)
+	if offset < 0 {
+		return ErrInvalidParam
+	}
+	ctx := sqeCtx.WithFD(fd).OrFlags(flags | ur.writeLikeOpFlags)
 	return ur.send(ctx, ioprio, p, uint64(offset), n)
 }
 
@@ -952,7 +999,9 @@ func (ur *Uring) Timeout(sqeCtx SQEContext, d time.Duration, options ...OpOption
 	return ur.timeout(ctx, cnt, &Timespec{Sec: nano / int64(time.Second), Nsec: nano % int64(time.Second)}, int(timeoutFlags))
 }
 
-// Shutdown gracefully closes a socket.
+// Shutdown submits a socket shutdown for the directions selected by how.
+// Use [SHUT_RD] for reads, [SHUT_WR] for writes, or [SHUT_RDWR] for both.
+// The socket descriptor remains open.
 func (ur *Uring) Shutdown(sqeCtx SQEContext, how int, options ...OpOptionFunc) error {
 	flags := ur.shutdownOptions(options)
 	ctx := sqeCtx.OrFlags(flags)
@@ -976,32 +1025,40 @@ func (ur *Uring) Close(sqeCtx SQEContext, options ...OpOptionFunc) error {
 
 // Read performs a read operation.
 // Caller must keep b valid until the operation completes.
+// WithOffset(-1) uses and advances the file's current position.
 func (ur *Uring) Read(sqeCtx SQEContext, b []byte, options ...OpOptionFunc) error {
 	flags, ioprio, offset, n := ur.readOptions(b, options)
+	if offset < -1 {
+		return ErrInvalidParam
+	}
 	ctx := sqeCtx.OrFlags(flags | ur.readLikeOpFlags)
 	return ur.read(ctx, ioprio, b, uint64(offset), n)
 }
 
 // Write performs a write operation.
 // Caller must keep b valid until the operation completes.
+// WithOffset(-1) uses and advances the file's current position.
 func (ur *Uring) Write(sqeCtx SQEContext, b []byte, options ...OpOptionFunc) error {
 	flags, ioprio, offset, n := ur.writeOptions(b, options)
+	if offset < -1 {
+		return ErrInvalidParam
+	}
 	ctx := sqeCtx.OrFlags(flags | ur.writeLikeOpFlags)
 	return ur.write(ctx, ioprio, b, uint64(offset), n)
 }
 
-// Splice transfers data between file descriptors.
-func (ur *Uring) Splice(sqeCtx SQEContext, fdIn int, n int, options ...OpOptionFunc) error {
+// Splice submits a transfer of up to n bytes between file descriptors.
+func (ur *Uring) Splice(sqeCtx SQEContext, fdIn iofd.FD, n int, options ...OpOptionFunc) error {
 	flags, _, spliceFlags := ur.spliceOptions(options)
 	ctx := sqeCtx.OrFlags(flags)
-	return ur.splice(ctx, fdIn, nil, nil, n, int(spliceFlags))
+	return ur.splice(ctx, fdIn, nil, nil, n, spliceFlags)
 }
 
-// Tee duplicates data between pipes.
-func (ur *Uring) Tee(sqeCtx SQEContext, fdIn int, length int, options ...OpOptionFunc) error {
+// Tee submits a duplication of up to length bytes between pipes.
+func (ur *Uring) Tee(sqeCtx SQEContext, fdIn iofd.FD, length int, options ...OpOptionFunc) error {
 	flags, _, spliceFlags := ur.teeOptions(options)
 	ctx := sqeCtx.OrFlags(flags)
-	return ur.tee(ctx, fdIn, length, int(spliceFlags))
+	return ur.tee(ctx, fdIn, length, spliceFlags)
 }
 
 // Sync performs a file sync operation.
@@ -1010,7 +1067,8 @@ func (ur *Uring) Sync(sqeCtx SQEContext, options ...OpOptionFunc) error {
 	return ur.fsync(sqeCtx.OrFlags(flags), fsyncFlags)
 }
 
-// ReadV performs a vectored read operation.
+// ReadV submits a vectored read with file offset zero.
+// Only [OpOption.Flags] is used.
 // Caller must keep iovs and their backing buffers valid until the operation completes.
 func (ur *Uring) ReadV(sqeCtx SQEContext, iovs [][]byte, options ...OpOptionFunc) error {
 	flags := ur.operationOptions(options)
@@ -1018,7 +1076,8 @@ func (ur *Uring) ReadV(sqeCtx SQEContext, iovs [][]byte, options ...OpOptionFunc
 	return ur.readv(ctx, iovs)
 }
 
-// WriteV performs a vectored write operation.
+// WriteV submits a vectored write with file offset zero.
+// Only [OpOption.Flags] is used.
 // Caller must keep iovs and their backing buffers valid until the operation completes.
 func (ur *Uring) WriteV(sqeCtx SQEContext, iovs [][]byte, options ...OpOptionFunc) error {
 	flags := ur.operationOptions(options)
@@ -1027,28 +1086,42 @@ func (ur *Uring) WriteV(sqeCtx SQEContext, iovs [][]byte, options ...OpOptionFun
 }
 
 // ReadFixed performs a read with a registered (fixed) buffer.
+// WithOffset(-1) uses and advances the file's current position.
 func (ur *Uring) ReadFixed(sqeCtx SQEContext, bufIndex int, options ...OpOptionFunc) ([]byte, error) {
+	if bufIndex < 0 || bufIndex >= len(ur.ioUring.bufs) {
+		return nil, ErrInvalidParam
+	}
 	flags, offset, n := ur.readFixedOptions(bufIndex, options)
+	if offset < -1 {
+		return nil, ErrInvalidParam
+	}
 	ctx := sqeCtx.OrFlags(flags | ur.readLikeOpFlags)
 	return ur.readFixed(ctx, bufIndex, uint64(offset), n)
 }
 
-// WriteFixed performs a write with a registered (fixed) buffer.
+// WriteFixed submits a write of up to n bytes from a registered buffer.
+// WithOffset(-1) uses and advances the file's current position.
 func (ur *Uring) WriteFixed(sqeCtx SQEContext, bufIndex int, n int, options ...OpOptionFunc) error {
 	flags, offset := ur.writeFixedOptions(options)
+	if offset < -1 {
+		return ErrInvalidParam
+	}
 	ctx := sqeCtx.OrFlags(flags | ur.writeLikeOpFlags)
 	return ur.writeFixed(ctx, bufIndex, uint64(offset), n)
 }
 
 // OpenAt opens a file at the given path relative to a directory fd.
-func (ur *Uring) OpenAt(sqeCtx SQEContext, pathname string, openFlags int, mode uint32, options ...OpOptionFunc) error {
+func (ur *Uring) OpenAt(sqeCtx SQEContext, pathname string, openFlags uint32, mode uint32, options ...OpOptionFunc) error {
 	flags := ur.openAtOptions(options)
 	ctx := sqeCtx.OrFlags(flags)
 	return ur.openAt(ctx, pathname, openFlags, mode)
 }
 
 // FileAdvise provides advice about file access patterns.
-func (ur *Uring) FileAdvise(sqeCtx SQEContext, offset int64, length int, advice int, options ...OpOptionFunc) error {
+func (ur *Uring) FileAdvise(sqeCtx SQEContext, offset int64, length int, advice uint32, options ...OpOptionFunc) error {
+	if offset < 0 {
+		return ErrInvalidParam
+	}
 	flags := ur.operationOptions(options)
 	ctx := sqeCtx.OrFlags(flags)
 	return ur.fadvise(ctx, uint64(offset), length, advice)
@@ -1066,25 +1139,27 @@ func (ur *Uring) SendMsg(sqeCtx SQEContext, pollFD PollFd, buffers [][]byte, oob
 	return ur.sendmsg(ctx, ioprio, buffers, oob, sa)
 }
 
-// RecvMsg receives a message with control data.
-// Caller must keep buffers and oob valid until the operation completes.
-func (ur *Uring) RecvMsg(sqeCtx SQEContext, pollFD PollFd, buffers [][]byte, oob []byte, options ...OpOptionFunc) error {
+// RecvMsg receives a message through the caller-owned message header.
+// Caller must keep msg and all memory it references valid until the operation
+// completes.
+func (ur *Uring) RecvMsg(sqeCtx SQEContext, pollFD PollFd, msg *Msghdr, options ...OpOptionFunc) error {
 	flags, ioprio := ur.recvmsgOptions(options)
 	ctx := sqeCtx.WithFD(iofd.FD(pollFD.Fd())).OrFlags(flags | ur.readLikeOpFlags)
-	return ur.recvmsg(ctx, ioprio, buffers, oob)
+	return ur.recvmsg(ctx, ioprio, msg)
 }
 
 // PollAdd adds a file descriptor to the poll set.
+// Events must fit the kernel's unsigned 32-bit poll mask.
 func (ur *Uring) PollAdd(sqeCtx SQEContext, events int, options ...OpOptionFunc) error {
 	flags := ur.pollAddOptions(options)
 	ctx := sqeCtx.OrFlags(flags)
 	return ur.pollAdd(ctx, 0, events)
 }
 
-// PollRemove removes a file descriptor from the poll set.
-func (ur *Uring) PollRemove(sqeCtx SQEContext, options ...OpOptionFunc) error {
+// PollRemove removes a poll request matched by the original SQE user_data.
+func (ur *Uring) PollRemove(sqeCtx SQEContext, targetUserData uint64, options ...OpOptionFunc) error {
 	flags := ur.pollRemoveOptions(options)
-	return ur.pollRemove(sqeCtx.OrFlags(flags))
+	return ur.pollRemove(sqeCtx.OrFlags(flags), targetUserData)
 }
 
 // PollAddMultishot adds a persistent poll request that generates multiple CQEs.
@@ -1092,27 +1167,23 @@ func (ur *Uring) PollRemove(sqeCtx SQEContext, options ...OpOptionFunc) error {
 // automatically re-arms and continues generating CQEs until cancelled.
 // Each CQE has IORING_CQE_F_MORE set while poll continues; the final CQE
 // has !IORING_CQE_F_MORE when poll terminates or is cancelled.
+// Events must fit the kernel's unsigned 32-bit poll mask.
 func (ur *Uring) PollAddMultishot(sqeCtx SQEContext, events int, options ...OpOptionFunc) error {
 	flags := ur.pollAddOptions(options)
 	ctx := sqeCtx.OrFlags(flags)
 	return ur.pollAdd(ctx, IORING_POLL_ADD_MULTI, events)
 }
 
-// PollAddLevel adds a level-triggered poll request.
-// Unlike edge-triggered poll which fires once when state changes,
-// level-triggered poll fires continuously while the condition is true.
+// PollAddLevel returns ErrNotSupported because the Linux io_uring poll ABI
+// does not admit IORING_POLL_ADD_LEVEL in a POLL_ADD submission.
 func (ur *Uring) PollAddLevel(sqeCtx SQEContext, events int, options ...OpOptionFunc) error {
-	flags := ur.pollAddOptions(options)
-	ctx := sqeCtx.OrFlags(flags)
-	return ur.pollAdd(ctx, IORING_POLL_ADD_LEVEL, events)
+	return ErrNotSupported
 }
 
-// PollAddMultishotLevel combines multishot and level-triggered modes.
-// This creates a persistent, level-triggered poll subscription.
+// PollAddMultishotLevel returns ErrNotSupported because the Linux io_uring
+// poll ABI does not admit IORING_POLL_ADD_LEVEL in a POLL_ADD submission.
 func (ur *Uring) PollAddMultishotLevel(sqeCtx SQEContext, events int, options ...OpOptionFunc) error {
-	flags := ur.pollAddOptions(options)
-	ctx := sqeCtx.OrFlags(flags)
-	return ur.pollAdd(ctx, IORING_POLL_ADD_MULTI|IORING_POLL_ADD_LEVEL, events)
+	return ErrNotSupported
 }
 
 // PollUpdate modifies an existing poll request in-place without cancellation.
@@ -1126,11 +1197,14 @@ func (ur *Uring) PollAddMultishotLevel(sqeCtx SQEContext, events int, options ..
 //   - updateFlags: Combination of:
 //     IORING_POLL_UPDATE_EVENTS - update the poll event mask
 //     IORING_POLL_UPDATE_USER_DATA - update the userData
-//     IORING_POLL_ADD_MULTI - make the updated poll multishot
 //
 // The poll is located by matching oldUserData. If no matching poll is found,
-// the operation returns -ENOENT. If updateFlags is 0 (or only ADD_MULTI without
-// UPDATE_EVENTS or UPDATE_USER_DATA), the operation behaves as PollRemove.
+// the operation returns -ENOENT. Zero updateFlags with zero newUserData and
+// newEvents behaves as PollRemove. IORING_POLL_ADD_MULTI is not valid for
+// PollUpdate because Linux preserves the existing shot mode; remove the poll
+// and submit PollAddMultishot to change it. Fields without their corresponding
+// update flag must be zero. Invalid update shapes return ErrInvalidParam before
+// submission.
 func (ur *Uring) PollUpdate(sqeCtx SQEContext, oldUserData, newUserData uint64, newEvents, updateFlags int, options ...OpOptionFunc) error {
 	flags := ur.operationOptions(options)
 	ctx := sqeCtx.OrFlags(flags)
@@ -1199,37 +1273,47 @@ func (ur *Uring) AsyncCancelOpcode(sqeCtx SQEContext, opcode uint8, cancelAll bo
 	return ur.asyncCancelExt(ctx, 0, opcode, cancelFlags)
 }
 
-// AsyncCancelAny cancels any one pending operation.
-// Returns 0 on success, -ENOENT if no operations pending.
+// AsyncCancelAny submits cancellation without filtering by request identity.
+// It may cancel multiple pending operations. The cancellation CQE reports the
+// matched count or a negative errno; each original operation has its own CQE.
 func (ur *Uring) AsyncCancelAny(sqeCtx SQEContext, options ...OpOptionFunc) error {
 	flags := ur.asyncCancelOptions(options)
 	ctx := sqeCtx.OrFlags(flags)
 	return ur.asyncCancelExt(ctx, 0, 0, IORING_ASYNC_CANCEL_ANY)
 }
 
-// AsyncCancelAll cancels all pending operations.
-// Returns the count of cancelled operations.
+// AsyncCancelAll submits a cancellation request for all pending operations.
+// The cancellation CQE reports the matched count or a negative errno.
+// Each original operation still has its own completion.
 func (ur *Uring) AsyncCancelAll(sqeCtx SQEContext, options ...OpOptionFunc) error {
 	flags := ur.asyncCancelOptions(options)
 	ctx := sqeCtx.OrFlags(flags)
 	return ur.asyncCancelExt(ctx, 0, 0, IORING_ASYNC_CANCEL_ALL|IORING_ASYNC_CANCEL_ANY)
 }
 
-// Fallocate allocates space for a file.
+// Fallocate allocates a positive-length file range.
 func (ur *Uring) Fallocate(sqeCtx SQEContext, mode uint32, offset int64, length int64, options ...OpOptionFunc) error {
+	if offset < 0 || length <= 0 {
+		return ErrInvalidParam
+	}
 	flags := ur.operationOptions(options)
 	ctx := sqeCtx.OrFlags(flags)
 	return ur.fAllocate(ctx, mode, uint64(offset), length)
 }
 
 // SyncFileRange syncs a file range to storage.
-func (ur *Uring) SyncFileRange(sqeCtx SQEContext, offset int64, length int, syncFlags int, options ...OpOptionFunc) error {
+func (ur *Uring) SyncFileRange(sqeCtx SQEContext, offset int64, length int, syncFlags uint32, options ...OpOptionFunc) error {
+	if offset < 0 {
+		return ErrInvalidParam
+	}
 	flags := ur.operationOptions(options)
 	ctx := sqeCtx.OrFlags(flags)
 	return ur.syncFileRange(ctx, uint64(offset), length, syncFlags)
 }
 
-// LinkTimeout creates a linked timeout operation.
+// LinkTimeout submits a deadline for the preceding IOSQE_IO_LINK chain.
+// Expiry attempts cancellation; the linked operation may already have completed.
+// Caller must observe both the operation and timeout CQEs before retirement.
 func (ur *Uring) LinkTimeout(sqeCtx SQEContext, d time.Duration, options ...OpOptionFunc) error {
 	flags, timeoutFlags := ur.linkTimeoutOptions(options)
 	ctx := sqeCtx.OrFlags(flags)
@@ -1244,11 +1328,12 @@ func (ur *Uring) LinkTimeout(sqeCtx SQEContext, d time.Duration, options ...OpOp
 // ReceiveZeroCopy performs a zero-copy receive operation.
 // Supported Linux 6.18+ kernels provide the opcode; the operation still requires
 // a registered ZCRX interface queue. zcrxIfqIdx is the queue index returned by
-// RegisterZCRXIfq.
+// RegisterZCRXIfq. ReceiveZeroCopy always enables IORING_RECV_MULTISHOT;
+// WithIOPrio may additionally request IORING_RECVSEND_POLL_FIRST.
 func (ur *Uring) ReceiveZeroCopy(sqeCtx SQEContext, pollFD PollFd, n int, zcrxIfqIdx uint32, options ...OpOptionFunc) error {
 	flags, ioprio, _, _ := ur.receiveOptions(nil, options)
 	ctx := sqeCtx.WithFD(iofd.FD(pollFD.Fd())).OrFlags(flags | ur.readLikeOpFlags)
-	return ur.receiveZeroCopy(ctx, ioprio, n, zcrxIfqIdx)
+	return ur.receiveZeroCopy(ctx, ioprio|IORING_RECV_MULTISHOT, n, zcrxIfqIdx)
 }
 
 // EpollWait performs an epoll_wait operation via io_uring.
@@ -1261,23 +1346,35 @@ func (ur *Uring) EpollWait(sqeCtx SQEContext, events []EpollEvent, timeout int32
 	}
 	flags := ur.operationOptions(options)
 	ctx := sqeCtx.OrFlags(flags)
-	return ur.epollWait(ctx, &events[0], len(events), timeout)
+	return ur.epollWait(ctx, events, timeout)
 }
 
-// ReadvFixed performs a vectored read using registered buffers.
-// All buffer indices must refer to previously registered buffers.
-func (ur *Uring) ReadvFixed(sqeCtx SQEContext, offset int64, bufIndices []int, options ...OpOptionFunc) error {
+// ReadvFixed performs a vectored read into ranges of one registered buffer.
+// bufIndex selects the registered buffer, and every iov must be a nonempty
+// subslice of RegisteredBuffer(bufIndex).
+// An offset of -1 uses and advances the file's current position.
+func (ur *Uring) ReadvFixed(sqeCtx SQEContext, offset int64, bufIndex int, iovs [][]byte, options ...OpOptionFunc) error {
+	if offset < -1 || bufIndex < 0 || bufIndex >= len(ur.ioUring.bufs) ||
+		len(iovs) < 1 || len(iovs) > maxIovecs {
+		return ErrInvalidParam
+	}
 	flags := ur.operationOptions(options)
 	ctx := sqeCtx.OrFlags(flags | ur.readLikeOpFlags)
-	return ur.readvFixed(ctx, uint64(offset), bufIndices)
+	return ur.readvFixed(ctx, uint64(offset), bufIndex, iovs)
 }
 
-// WritevFixed performs a vectored write using registered buffers.
-// All buffer indices must refer to previously registered buffers.
-func (ur *Uring) WritevFixed(sqeCtx SQEContext, offset int64, bufIndices []int, lengths []int, options ...OpOptionFunc) error {
+// WritevFixed performs a vectored write from ranges of one registered buffer.
+// bufIndex selects the registered buffer, and every iov must be a nonempty
+// subslice of RegisteredBuffer(bufIndex).
+// An offset of -1 uses and advances the file's current position.
+func (ur *Uring) WritevFixed(sqeCtx SQEContext, offset int64, bufIndex int, iovs [][]byte, options ...OpOptionFunc) error {
+	if offset < -1 || bufIndex < 0 || bufIndex >= len(ur.ioUring.bufs) ||
+		len(iovs) < 1 || len(iovs) > maxIovecs {
+		return ErrInvalidParam
+	}
 	flags := ur.operationOptions(options)
 	ctx := sqeCtx.OrFlags(flags | ur.writeLikeOpFlags)
-	return ur.writevFixed(ctx, uint64(offset), bufIndices, lengths)
+	return ur.writevFixed(ctx, uint64(offset), bufIndex, iovs)
 }
 
 // Pipe creates a pipe using io_uring.
@@ -1619,14 +1716,14 @@ func (ur *Uring) ZCRXExport(zcrxID uint32) (iofd.FD, error) {
 
 // FSetXattr sets an extended attribute on a file descriptor.
 // Caller must keep value valid until the operation completes.
-func (ur *Uring) FSetXattr(sqeCtx SQEContext, name string, value []byte, flags int, options ...OpOptionFunc) error {
+func (ur *Uring) FSetXattr(sqeCtx SQEContext, name string, value []byte, flags uint32, options ...OpOptionFunc) error {
 	opFlags := ur.operationOptions(options)
 	return ur.ioUring.fsetxattr(sqeCtx.OrFlags(opFlags), name, value, flags)
 }
 
 // SetXattr sets an extended attribute on a path.
 // Caller must keep value valid until the operation completes.
-func (ur *Uring) SetXattr(sqeCtx SQEContext, path, name string, value []byte, flags int, options ...OpOptionFunc) error {
+func (ur *Uring) SetXattr(sqeCtx SQEContext, path, name string, value []byte, flags uint32, options ...OpOptionFunc) error {
 	opFlags := ur.operationOptions(options)
 	return ur.ioUring.setxattr(sqeCtx.OrFlags(opFlags), path, name, value, flags)
 }
@@ -1650,19 +1747,20 @@ func (ur *Uring) GetXattr(sqeCtx SQEContext, path, name string, value []byte, op
 // ========================================
 
 // Statx gets file status with extended information.
-func (ur *Uring) Statx(sqeCtx SQEContext, path string, flags, mask int, stat *Statx, options ...OpOptionFunc) error {
+// Caller must keep stat valid until the operation completes.
+func (ur *Uring) Statx(sqeCtx SQEContext, path string, flags, mask uint32, stat *Statx, options ...OpOptionFunc) error {
 	opFlags := ur.statxOptions(options)
 	return ur.ioUring.statx(sqeCtx.OrFlags(opFlags), path, flags, mask, stat)
 }
 
 // RenameAt renames a file at a path.
-func (ur *Uring) RenameAt(sqeCtx SQEContext, oldPath, newPath string, flags int, options ...OpOptionFunc) error {
+func (ur *Uring) RenameAt(sqeCtx SQEContext, oldPath, newPath string, flags uint32, options ...OpOptionFunc) error {
 	opFlags := ur.renameAtOptions(options)
 	return ur.ioUring.renameAt(sqeCtx.OrFlags(opFlags), oldPath, newPath, flags)
 }
 
 // UnlinkAt removes a file or directory.
-func (ur *Uring) UnlinkAt(sqeCtx SQEContext, path string, flags int, options ...OpOptionFunc) error {
+func (ur *Uring) UnlinkAt(sqeCtx SQEContext, path string, flags uint32, options ...OpOptionFunc) error {
 	opFlags := ur.unlinkAtOptions(options)
 	return ur.ioUring.unlinkAt(sqeCtx.OrFlags(opFlags), path, flags)
 }
@@ -1680,7 +1778,7 @@ func (ur *Uring) SymlinkAt(sqeCtx SQEContext, target, linkpath string, options .
 }
 
 // LinkAt creates a hard link.
-func (ur *Uring) LinkAt(sqeCtx SQEContext, oldDirfd int, oldPath, newPath string, flags int, options ...OpOptionFunc) error {
+func (ur *Uring) LinkAt(sqeCtx SQEContext, oldDirfd iofd.FD, oldPath, newPath string, flags uint32, options ...OpOptionFunc) error {
 	opFlags := ur.linkAtOptions(options)
 	return ur.ioUring.linkAt(sqeCtx.OrFlags(opFlags), oldDirfd, oldPath, newPath, flags)
 }
@@ -1696,7 +1794,8 @@ func (ur *Uring) FTruncate(sqeCtx SQEContext, length int64, options ...OpOptionF
 // ========================================
 
 // FutexWait submits an async futex wait operation.
-// Waits until the value at addr matches val, using the specified mask and flags.
+// It waits only if the value at addr equals val; a mismatch completes with -EAGAIN.
+// A matching wait completes after a wake, cancellation, or error.
 // Caller must keep addr valid until the operation completes.
 func (ur *Uring) FutexWait(sqeCtx SQEContext, addr *uint32, val uint64, mask uint64, flags uint32, options ...OpOptionFunc) error {
 	opFlags := ur.operationOptions(options)
@@ -1713,7 +1812,7 @@ func (ur *Uring) FutexWake(sqeCtx SQEContext, addr *uint32, val uint64, mask uin
 
 // FutexWaitV submits a vectored futex wait operation.
 // Waits on multiple futexes simultaneously. The waitv pointer should point to
-// a struct futex_waitv array with count elements.
+// a struct futex_waitv array with 1 through 128 elements. flags must be zero.
 // Caller must keep waitv valid until the operation completes.
 func (ur *Uring) FutexWaitV(sqeCtx SQEContext, waitv unsafe.Pointer, count uint32, flags uint32, options ...OpOptionFunc) error {
 	opFlags := ur.operationOptions(options)
@@ -1725,7 +1824,9 @@ func (ur *Uring) FutexWaitV(sqeCtx SQEContext, waitv unsafe.Pointer, count uint3
 // ========================================
 
 // Waitid waits for a process to change state asynchronously.
-// idtype specifies which id to wait for (P_PID, P_PGID, P_ALL).
+// idtype specifies which id to wait for (P_ALL, P_PID, P_PGID, P_PIDFD).
+// options must contain at least one of WEXITED, WSTOPPED, or WCONTINUED and
+// may contain only waitid option flags supported by Linux.
 // The siginfo_t result is written to infop.
 // Caller must keep infop valid until the operation completes.
 func (ur *Uring) Waitid(sqeCtx SQEContext, idtype, id int, infop unsafe.Pointer, options int, opts ...OpOptionFunc) error {
@@ -1739,7 +1840,8 @@ func (ur *Uring) Waitid(sqeCtx SQEContext, idtype, id int, infop unsafe.Pointer,
 
 // FixedFdInstall installs a fixed (registered) file descriptor into the
 // normal file descriptor table. Returns the new fd in the CQE result.
-// The fixedIndex is the index in the registered files table.
+// The fixedIndex is a non-negative index in the registered files table and
+// must fit in int32. flags may be zero or IORING_FIXED_FD_NO_CLOEXEC.
 func (ur *Uring) FixedFdInstall(sqeCtx SQEContext, fixedIndex int, flags uint32, options ...OpOptionFunc) error {
 	opFlags := ur.operationOptions(options)
 	ctx := sqeCtx.OrFlags(opFlags | IOSQE_FIXED_FILE)
@@ -1748,7 +1850,10 @@ func (ur *Uring) FixedFdInstall(sqeCtx SQEContext, fixedIndex int, flags uint32,
 
 // FilesUpdate updates registered files at the specified offset.
 // The fds slice contains the new file descriptors to register.
-// Use -1 to unregister a slot.
+// Use -1 to unregister a slot. offset must fit in uint32; math.MaxUint32 is
+// preserved as IORING_FILE_INDEX_ALLOC.
+// Caller must keep fds reachable, address-stable, and unmodified until the
+// operation completes. Allocation mode writes the allocated indexes into fds.
 func (ur *Uring) FilesUpdate(sqeCtx SQEContext, fds []int32, offset int, options ...OpOptionFunc) error {
 	flags := ur.operationOptions(options)
 	return ur.ioUring.filesUpdate(sqeCtx.OrFlags(flags), fds, offset)
@@ -1773,7 +1878,8 @@ func (ur *Uring) MsgRing(sqeCtx SQEContext, userData int64, result int32, option
 // Parameters:
 //   - sqeCtx: Context with target ring's FD (from RingFD())
 //   - srcFD: Fixed file index in the source ring (this ring)
-//   - dstSlot: Fixed file slot in the target ring to install the FD
+//   - dstSlot: Fixed file slot in the target ring, or IORING_FILE_INDEX_ALLOC
+//     to allocate a free target slot and return its index in the target CQE
 //   - userData: Value passed to the target ring's CQE
 //   - skipCQE: If true, no CQE is posted to the target ring
 //
@@ -1791,14 +1897,23 @@ func (ur *Uring) MsgRingFD(sqeCtx SQEContext, srcFD uint32, dstSlot uint32, user
 // Passthrough Commands
 // ========================================
 
-// UringCmd submits a generic passthrough command.
-// The cmdOp specifies the command operation, and cmdData provides optional data.
+// UringCmd submits a generic passthrough command. It encodes cmdData through
+// sqe.addr and sqe.len; use UringCmdInline for drivers that consume sqe.cmd.
 // The submission path retains cmdData until the kernel consumes the SQE. Because the
 // kernel driver may hold cmdData asynchronously until the CQE is posted, caller
 // must keep cmdData valid until the completion is reaped.
 func (ur *Uring) UringCmd(sqeCtx SQEContext, cmdOp uint32, cmdData []byte, options ...OpOptionFunc) error {
-	flags := ur.operationOptions(options)
-	return ur.ioUring.uringCmd(sqeCtx.OrFlags(flags), cmdOp, cmdData)
+	flags, cmdFlags := ur.uringCmdOptions(options)
+	return ur.ioUring.uringCmd(sqeCtx.OrFlags(flags), cmdOp, cmdData, cmdFlags)
+}
+
+// UringCmdInline submits an ordinary IORING_OP_URING_CMD operation with up to
+// 80 bytes copied into the SQE command area. It requires a ring created with
+// Options.SQE128; otherwise it returns ErrNotSupported. It does not retain
+// cmdData or require support for the separate IORING_OP_URING_CMD128 opcode.
+func (ur *Uring) UringCmdInline(sqeCtx SQEContext, cmdOp uint32, cmdData []byte, options ...OpOptionFunc) error {
+	flags, cmdFlags := ur.uringCmdOptions(options)
+	return ur.ioUring.uringCmdInline(sqeCtx.OrFlags(flags), cmdOp, cmdData, cmdFlags)
 }
 
 // Nop128 submits a 128-byte NOP operation.
@@ -1809,10 +1924,10 @@ func (ur *Uring) Nop128(sqeCtx SQEContext, options ...OpOptionFunc) error {
 	return ur.ioUring.nop128(sqeCtx.OrFlags(flags))
 }
 
-// UringCmd128 submits a 128-byte passthrough command.
+// UringCmd128 submits the separate IORING_OP_URING_CMD128 operation.
 // It provides up to 80 bytes of inline command data inside the SQE and requires
 // a ring created with Options.SQE128; otherwise it returns ErrNotSupported.
 func (ur *Uring) UringCmd128(sqeCtx SQEContext, cmdOp uint32, cmdData []byte, options ...OpOptionFunc) error {
-	flags := ur.operationOptions(options)
-	return ur.ioUring.uringCmd128(sqeCtx.OrFlags(flags), cmdOp, cmdData)
+	flags, cmdFlags := ur.uringCmdOptions(options)
+	return ur.ioUring.uringCmd128(sqeCtx.OrFlags(flags), cmdOp, cmdData, cmdFlags)
 }

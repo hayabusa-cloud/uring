@@ -29,8 +29,8 @@ const (
 )
 
 // ListenerHandler receives completion events during listener creation (darwin stub).
-// The bool-return callbacks are authoritative control-flow hooks: returning true
-// advances to the next setup phase, while false aborts before submitting it.
+// The caller invokes these callbacks and advances setup with the Prepare helpers.
+// A true result permits the next phase; false tells the caller to abort setup.
 type ListenerHandler interface {
 	// OnSocketCreated reports that socket creation succeeded. Return true to
 	// continue listener setup or false to abort it.

@@ -6,6 +6,8 @@
 
 package uring
 
+import "math"
+
 var defaultOptions = Options{
 	Entries:                 EntriesMedium,
 	LockedBufferMem:         registerBufferDefaultMem,
@@ -45,6 +47,15 @@ func (ur *Uring) operationOptions(opts []OpOptionFunc) (flags uint8) {
 	opt := defaultUringOpOption
 	opt.Apply(opts...)
 	return opt.Flags
+}
+
+func (ur *Uring) uringCmdOptions(opts []OpOptionFunc) (flags uint8, cmdFlags uint32) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone, 0
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+	return opt.Flags, opt.UringCmdFlags
 }
 
 func (ur *Uring) readFixedOptions(bufIndex int, opts []OpOptionFunc) (flags uint8, offset int64, n int) {
@@ -204,12 +215,29 @@ func (ur *Uring) writeOptions(b []byte, opts []OpOptionFunc) (flags uint8, iopri
 	return ur.streamOptions(b, opts)
 }
 
+func (ur *Uring) socketPayloadOptions(b []byte, opts []OpOptionFunc) (flags uint8, ioprio uint16, offset int64, n int) {
+	if len(opts) < 1 {
+		return uringOpFlagsNone, uringOpIOPrioNone, 0, len(b)
+	}
+	opt := defaultUringOpOption
+	opt.Apply(opts...)
+
+	n = len(b)
+	if opt.N != nil {
+		n = *opt.N
+	} else if opt.Offset >= 0 && opt.Offset <= int64(len(b)) {
+		n -= int(opt.Offset)
+	}
+
+	return opt.Flags, opt.IOPrio, opt.Offset, n
+}
+
 func (ur *Uring) sendOptions(b []byte, opts []OpOptionFunc) (flags uint8, ioprio uint16, offset int64, n int) {
-	return ur.streamOptions(b, opts)
+	return ur.socketPayloadOptions(b, opts)
 }
 
 func (ur *Uring) receiveOptions(b []byte, opts []OpOptionFunc) (flags uint8, ioprio uint16, offset int64, n int) {
-	return ur.streamOptions(b, opts)
+	return ur.socketPayloadOptions(b, opts)
 }
 
 func (ur *Uring) spliceOptions(opts []OpOptionFunc) (flags uint8, n int, spliceFlags uint32) {
@@ -327,12 +355,15 @@ func (ur *Uring) receiveWithBufferSelectOptions(f PollFd, opts []OpOptionFunc) (
 	}
 	opt := defaultUringOpOption
 	opt.Apply(opts...)
+	if opt.ReadBufferSize <= 0 || opt.ReadBufferSize > math.MaxInt32 {
+		return opt.Flags, opt.IOPrio, opt.ReadBufferSize, 0
+	}
 	return opt.Flags, opt.IOPrio, opt.ReadBufferSize, ur.getBufferGid(f, opt.ReadBufferSize)
 }
 
-func (ur *Uring) socketOptions(opts []OpOptionFunc) (flags uint8, i uint32) {
+func (ur *Uring) socketOptions(opts []OpOptionFunc) (flags uint8, fileIndex *uint32) {
 	if len(opts) < 1 {
-		return uringOpFlagsNone, 0
+		return uringOpFlagsNone, nil
 	}
 	opt := defaultUringOpOption
 	opt.Apply(opts...)

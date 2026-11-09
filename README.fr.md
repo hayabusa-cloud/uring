@@ -148,11 +148,17 @@ Opérations :
 | Poll | `PollAdd`, `PollRemove`, `PollUpdate`, `PollAddLevel`, `PollAddMultishot`, `PollAddMultishotLevel` |
 | Async | `EpollWait`, `FutexWait`, `FutexWake`, `FutexWaitV`, `Waitid` |
 | Ring msg | `MsgRing`, `MsgRingFD`, `FixedFdInstall`, `FilesUpdate` |
-| Cmd | `UringCmd`, `UringCmd128`, `Nop`, `Nop128` |
+| Cmd | `UringCmd`, `UringCmdInline`, `UringCmd128`, `Nop`, `Nop128` |
+
+`UringCmdInline` copie jusqu'à 80 octets dans un SQE `IORING_OP_URING_CMD` ordinaire et requiert `Options.SQE128` ; il ne requiert pas la prise en charge de l'opcode distinct `IORING_OP_URING_CMD128`.
+
+`WithUringCmdFlags` écrit l'union `uring_cmd_flags`. Pour `IORING_URING_CMD_FIXED`, définissez l'index du tampon enregistré avec `sqeCtx.WithBufGroup` ; pour `IORING_URING_CMD_MULTISHOT`, définissez aussi `IOSQE_BUFFER_SELECT` et utilisez le même champ de contexte comme groupe de tampons fournis. Ces deux indicateurs sont mutuellement exclusifs.
 
 `Nop128` et `UringCmd128` nécessitent un ring créé avec `Options.SQE128` et la prise en charge par le noyau des opcodes correspondants. Sans ces deux conditions, ces méthodes renvoient `ErrNotSupported`.
 
 `Uring.Close` soumet un `IORING_OP_CLOSE` pour un descripteur de fichier cible. Il ne s'agit pas d'une méthode de destruction du ring.
+
+`PollAddLevel` et `PollAddMultishotLevel` renvoient toujours `ErrNotSupported` ; io_uring sous Linux n'admet pas l'indicateur de niveau pour `IORING_OP_POLL_ADD`.
 
 ## Transport du contexte
 
@@ -445,7 +451,7 @@ On maintient les racines de pointeurs Go actives accessibles en dehors de `UserD
 
 ### Composition de délais
 
-`LinkTimeout` attache un délai au SQE précédent via une chaîne `IOSQE_IO_LINK`. L'opération et le délai entrent en concurrence : l'un aboutit, l'autre est annulé.
+`LinkTimeout` attache une échéance au SQE précédent via une chaîne `IOSQE_IO_LINK`. À expiration, il tente d'annuler l'opération liée, qui peut déjà être terminée. Examinez les deux résultats de CQE ; l'expiration ne prouve pas que l'opération a été annulée.
 
 ```go
 recvCtx := uring.ForFD(fd).
@@ -462,7 +468,7 @@ if err := ring.LinkTimeout(timeoutCtx, 5*time.Second); err != nil {
 }
 ```
 
-La couche d'exécution côté appelant gère les deux issues : une réception réussie annule le délai, et un délai déclenché annule la réception. Les deux produisent des CQE que la boucle de distribution doit observer.
+Soumettez les SQE liés de façon contiguë, en sérialisant la paire avec les autres appels de soumission et d'attente. Gardez les tampons et le contexte de l'opération jusqu'à sa propre complétion, et traitez les deux CQE avant la fermeture.
 
 ## Parcours TCP courants
 

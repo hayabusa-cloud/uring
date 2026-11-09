@@ -10,6 +10,7 @@ import (
 	"unsafe"
 
 	"code.hybscloud.com/iobuf"
+	"code.hybscloud.com/iofd"
 )
 
 func newUringProvideBuffers(size, n int) *uringProvideBuffers {
@@ -75,7 +76,11 @@ func (g *uringProvideBuffers) provide(ur *ioUring, flags uint8, group uint16, da
 }
 
 func (g *uringProvideBuffers) bufGroup(f PollFd) uint16 {
-	return uint16(f.Fd()&g.gMask) + g.gidOffset
+	return g.bufGroupFD(iofd.FD(f.Fd()))
+}
+
+func (g *uringProvideBuffers) bufGroupFD(fd iofd.FD) uint16 {
+	return uint16(int(fd)&g.gMask) + g.gidOffset
 }
 
 func (g *uringProvideBuffers) buf(bufGroup bufferGroupIndex, bufIndex uint32) []byte {
@@ -361,7 +366,11 @@ func (g *uringProvideBufferGroups) provide(ur *ioUring, flags uint8, group uint1
 }
 
 func (g *uringProvideBufferGroups) bufGroup(f PollFd) uint16 {
-	offset := uint16(f.Fd() & g.scaleMask)
+	return g.bufGroupFD(iofd.FD(f.Fd()))
+}
+
+func (g *uringProvideBufferGroups) bufGroupFD(fd iofd.FD) uint16 {
+	offset := uint16(int(fd) & g.scaleMask)
 	return bufferGroupIndexEnd*offset + bufferGroupIndexMedium + g.gidOffset
 }
 
@@ -407,7 +416,11 @@ func (g *uringProvideBufferGroups) maxEnabledTierIndex() int {
 }
 
 func (g *uringProvideBufferGroups) bufGroupBySize(f PollFd, size int) uint16 {
-	offset := uint16(f.Fd() & g.scaleMask)
+	return g.bufGroupBySizeFD(iofd.FD(f.Fd()), size)
+}
+
+func (g *uringProvideBufferGroups) bufGroupBySizeFD(fd iofd.FD, size int) uint16 {
+	offset := uint16(int(fd) & g.scaleMask)
 	switch {
 	case size <= BufferSizePico && g.cfg.PicoNum > 0:
 		return bufferGroupIndexEnd*offset + bufferGroupIndexPico + g.gidOffset

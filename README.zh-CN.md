@@ -148,11 +148,17 @@ for {
 | 轮询 | `PollAdd`, `PollRemove`, `PollUpdate`, `PollAddLevel`, `PollAddMultishot`, `PollAddMultishotLevel` |
 | 异步 | `EpollWait`, `FutexWait`, `FutexWake`, `FutexWaitV`, `Waitid` |
 | 环消息 | `MsgRing`, `MsgRingFD`, `FixedFdInstall`, `FilesUpdate` |
-| 命令 | `UringCmd`, `UringCmd128`, `Nop`, `Nop128` |
+| 命令 | `UringCmd`, `UringCmdInline`, `UringCmd128`, `Nop`, `Nop128` |
+
+`UringCmdInline` 将最多 80 字节复制到普通 `IORING_OP_URING_CMD` SQE 中，并要求使用 `Options.SQE128`；它不要求内核支持独立的 `IORING_OP_URING_CMD128` opcode。
+
+`WithUringCmdFlags` 用于设置 `uring_cmd_flags` union。使用 `IORING_URING_CMD_FIXED` 时，通过 `sqeCtx.WithBufGroup` 指定注册缓冲区索引；使用 `IORING_URING_CMD_MULTISHOT` 时，还必须设置 `IOSQE_BUFFER_SELECT`，并将同一 context field 用作 provided-buffer group。这两个 flag 不能同时使用。
 
 `Nop128` 和 `UringCmd128` 需要以 `Options.SQE128` 创建的 ring，且内核须声明支持相应 opcode，否则返回 `ErrNotSupported`。
 
 `Uring.Close` 提交的是针对目标文件描述符的 `IORING_OP_CLOSE` 操作，而非 ring 本身的销毁方法。
+
+`PollAddLevel` 和 `PollAddMultishotLevel` 始终返回 `ErrNotSupported`；Linux io_uring 不允许 `IORING_OP_POLL_ADD` 使用 level 标志。
 
 ## 上下文传递
 
@@ -445,7 +451,7 @@ ring.PutExtSQE(ext)
 
 ### 截止时间组合
 
-`LinkTimeout` 通过 `IOSQE_IO_LINK` 链将截止时间附加到前一个 SQE 上。操作与超时互相竞争：一方完成，另一方被取消。
+`LinkTimeout` 通过 `IOSQE_IO_LINK` 链将截止时间附加到前一个 SQE 上。到期时会尝试取消关联操作，但该操作可能已经完成。必须检查两条 CQE 的结果；超时本身不能证明操作已被取消。
 
 ```go
 recvCtx := uring.ForFD(fd).
@@ -462,7 +468,7 @@ if err := ring.LinkTimeout(timeoutCtx, 5*time.Second); err != nil {
 }
 ```
 
-调用方运行时需同时处理两种结果：接收成功会取消超时，超时触发会取消接收。两者均产生 CQE，分发循环必须观察处理。
+连续提交关联的 SQE，并将这对提交与其他提交和等待调用串行化。保留操作的缓冲区和上下文，直到该操作自身完成；结束前必须处理两条 CQE。
 
 ## TCP 使用模式
 

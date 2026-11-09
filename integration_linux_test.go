@@ -143,13 +143,6 @@ func TestUringIntrospection(t *testing.T) {
 }
 
 func TestUringTimeoutCycle(t *testing.T) {
-	// Skip under race detection - io_uring timeout completions are unreliable
-	// in WSL2 when race detector overhead is present. The kernel delivers the
-	// timeout CQE but the polling loop may miss it due to timing changes.
-	if raceEnabled {
-		t.Skip("skipping: io_uring timeout unreliable with race detector in WSL2")
-	}
-
 	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
 		opt.NotifySucceed = true // Request a CQE for every successful operation.
 		opt.MultiIssuers = true  // Exercise the shared-submit configuration.
@@ -160,8 +153,7 @@ func TestUringTimeoutCycle(t *testing.T) {
 	mustStartRing(t, ring)
 
 	ctx := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, 0, 0)
-	start := time.Now()
-	if err := ring.Timeout(ctx, 20*time.Millisecond); err != nil {
+	if err := ring.Timeout(ctx, 20*time.Millisecond, uring.WithCount(0)); err != nil {
 		t.Fatalf("Timeout: %v", err)
 	}
 
@@ -169,11 +161,9 @@ func TestUringTimeoutCycle(t *testing.T) {
 	if !ok {
 		t.Fatal("Timeout operation did not complete")
 	}
-	elapsed := time.Since(start)
-	if elapsed < 15*time.Millisecond {
-		t.Errorf("Timeout completed too fast: %v", elapsed)
+	if ev.Res != -int32(zcall.ETIME) {
+		t.Fatalf("timeout result = %d, want -ETIME", ev.Res)
 	}
-	_ = ev
 }
 
 // TestTimeoutUpdate validates the IORING_TIMEOUT_UPDATE flag.
@@ -207,7 +197,10 @@ func TestTimeoutUpdate(t *testing.T) {
 
 	updateFound := false
 	for i := 0; i < 10; i++ {
-		n, _ := ring.Wait(cqes)
+		n, err := ring.Wait(cqes)
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+			t.Fatalf("Wait: %v", err)
+		}
 		for j := 0; j < n; j++ {
 			op := cqes[j].Op()
 			res := cqes[j].Res
@@ -751,8 +744,8 @@ func TestUringPipe(t *testing.T) {
 	}
 	mustStartRing(t, ring)
 
-	// Buffer for the two file descriptors (read end, write end)
-	var fds [2]iofd.FD
+	// Buffer for the two file descriptors (read end, write end).
+	fds := [2]iofd.FD{iofd.InvalidFD, iofd.InvalidFD}
 
 	ctx := uring.PackDirect(uring.IORING_OP_PIPE, 0, 0, 0)
 	if err := ring.Pipe(ctx, &fds, 0); err != nil {
@@ -767,9 +760,13 @@ func TestUringPipe(t *testing.T) {
 		t.Errorf("Pipe creation failed: %d", ev.Res)
 	} else {
 		t.Logf("Pipe created: read_fd=%d, write_fd=%d", fds[0], fds[1])
-		// Verify we got valid file descriptors
-		if fds[0] <= 0 || fds[1] <= 0 {
+		if !fds[0].Valid() || !fds[1].Valid() {
 			t.Errorf("Invalid file descriptors: read=%d, write=%d", fds[0], fds[1])
+		}
+		for i := range fds {
+			if err := fds[i].Close(); err != nil {
+				t.Errorf("Close pipe descriptor %d: %v", i, err)
+			}
 		}
 	}
 }
@@ -1872,6 +1869,12 @@ func TestSQE128HelpersRequireWideRing(t *testing.T) {
 	if !errors.Is(err, uring.ErrNotSupported) {
 		t.Fatalf("UringCmd128: got %v, want ErrNotSupported", err)
 	}
+
+	inlineCmdCtx := uring.PackDirect(uring.IORING_OP_URING_CMD, 0, 3, 0)
+	err = ring.UringCmdInline(inlineCmdCtx, 0, nil)
+	if !errors.Is(err, uring.ErrNotSupported) {
+		t.Fatalf("UringCmdInline: got %v, want ErrNotSupported", err)
+	}
 	t.Log("128-byte SQE helpers correctly reject non-SQE128 rings")
 }
 
@@ -2045,7 +2048,10 @@ func TestAsyncCancelExtended(t *testing.T) {
 		t.Log("Submitted AsyncCancelAny")
 
 		// Collect CQEs
-		n, _ := ring.Wait(cqes)
+		n, err := ring.Wait(cqes)
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+			t.Fatalf("Wait: %v", err)
+		}
 		t.Logf("Got %d CQEs", n)
 		for i := 0; i < n; i++ {
 			t.Logf("CQE %d: op=%d res=%d", i, cqes[i].Op(), cqes[i].Res)
@@ -2066,7 +2072,10 @@ func TestAsyncCancelExtended(t *testing.T) {
 		t.Log("Submitted AsyncCancelFD")
 
 		// Collect CQEs
-		n, _ := ring.Wait(cqes)
+		n, err := ring.Wait(cqes)
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+			t.Fatalf("Wait: %v", err)
+		}
 		t.Logf("Got %d CQEs", n)
 		for i := 0; i < n; i++ {
 			t.Logf("CQE %d: op=%d res=%d", i, cqes[i].Op(), cqes[i].Res)
@@ -2087,7 +2096,10 @@ func TestAsyncCancelExtended(t *testing.T) {
 		t.Log("Submitted AsyncCancelOpcode")
 
 		// Collect CQEs
-		n, _ := ring.Wait(cqes)
+		n, err := ring.Wait(cqes)
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+			t.Fatalf("Wait: %v", err)
+		}
 		t.Logf("Got %d CQEs", n)
 		for i := 0; i < n; i++ {
 			t.Logf("CQE %d: op=%d res=%d", i, cqes[i].Op(), cqes[i].Res)
@@ -2194,16 +2206,14 @@ func TestPollAddMultishot(t *testing.T) {
 
 	// Cancel the poll
 	cancelCtx := uring.PackDirect(uring.IORING_OP_POLL_REMOVE, 0, 1, int32(readFD))
-	if err := ring.PollRemove(cancelCtx); err != nil {
+	if err := ring.PollRemove(cancelCtx, pollCtx.Raw()); err != nil {
 		t.Logf("PollRemove: %v (may already be cancelled)", err)
 	}
 
 	t.Log("Poll multishot test complete")
 }
 
-// TestPollModes validates different poll mode APIs exist.
-// This test verifies that the poll mode functions can be called.
-// It exercises the public poll-mode surface on the Linux 6.18+ baseline.
+// TestPollModes validates the public response for unsupported level poll modes.
 func TestPollModes(t *testing.T) {
 	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
 		opt.Entries = uring.EntriesSmall
@@ -2223,28 +2233,19 @@ func TestPollModes(t *testing.T) {
 	defer zcall.Close(readFD)
 	defer zcall.Close(writeFD)
 
-	// Test PollAddLevel API exists and can be called
+	// Linux defines the level flag but does not admit it in POLL_ADD.
 	t.Run("LevelAPI", func(t *testing.T) {
 		ctx := uring.PackDirect(uring.IORING_OP_POLL_ADD, 0, 1, int32(readFD))
-		err := ring.PollAddLevel(ctx, uring.EPOLLIN)
-		// Just verify we can call the function
-		// EINVAL indicates that the current host rejected the operation
-		t.Logf("PollAddLevel submit: %v", err)
-
-		// Drain any CQEs
-		cqes := make([]uring.CQEView, 8)
-		ring.Wait(cqes)
+		if err := ring.PollAddLevel(ctx, uring.EPOLLIN); !errors.Is(err, uring.ErrNotSupported) {
+			t.Fatalf("PollAddLevel: got %v, want %v", err, uring.ErrNotSupported)
+		}
 	})
 
-	// Test PollAddMultishotLevel API exists
 	t.Run("MultishotLevelAPI", func(t *testing.T) {
 		ctx := uring.PackDirect(uring.IORING_OP_POLL_ADD, 0, 2, int32(readFD))
-		err := ring.PollAddMultishotLevel(ctx, uring.EPOLLIN)
-		t.Logf("PollAddMultishotLevel submit: %v", err)
-
-		// Drain any CQEs
-		cqes := make([]uring.CQEView, 8)
-		ring.Wait(cqes)
+		if err := ring.PollAddMultishotLevel(ctx, uring.EPOLLIN); !errors.Is(err, uring.ErrNotSupported) {
+			t.Fatalf("PollAddMultishotLevel: got %v, want %v", err, uring.ErrNotSupported)
+		}
 	})
 
 	// Verify poll mode constants exist
@@ -2293,7 +2294,7 @@ func TestPollUpdate(t *testing.T) {
 	// Submit PollUpdate to change userData
 	updateCtx := uring.PackDirect(uring.IORING_OP_POLL_REMOVE, 0, 1, int32(readFD))
 	oldUserData := pollCtx.Raw() // The packed userData of the original poll
-	updateFlags := uring.IORING_POLL_UPDATE_USER_DATA | uring.IORING_POLL_ADD_MULTI
+	updateFlags := uring.IORING_POLL_UPDATE_USER_DATA
 	if err := ring.PollUpdate(updateCtx, oldUserData, updatedUserData, 0, updateFlags); err != nil {
 		t.Fatalf("PollUpdate: %v", err)
 	}
@@ -2559,6 +2560,105 @@ func TestUringReadFixedCycle(t *testing.T) {
 	}
 }
 
+func TestUringWritevFixedCycle(t *testing.T) {
+	ring := newTestRing(t, testTwoRegisteredBuffersOptions, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
+		opt.NotifySucceed = true
+		opt.MultiIssuers = true
+	})
+
+	if ring.RegisteredBufferCount() < 2 {
+		t.Skip("WritevFixed requires two registered buffers")
+	}
+
+	f, err := os.CreateTemp("", "uring_writevfixed_*")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+
+	const bufIndex = 1
+	buf := ring.RegisteredBuffer(bufIndex)
+	iovs := [][]byte{buf[:5], buf[16:21], buf[32:37]}
+	copy(iovs[0], "AAAAA")
+	copy(iovs[1], "BBBBB")
+	copy(iovs[2], "CCCCC")
+
+	ctx := uring.PackDirect(uring.IORING_OP_WRITEV_FIXED, 0, 0, int32(f.Fd()))
+	if err := ring.WritevFixed(ctx, 0, bufIndex, iovs); err != nil {
+		t.Fatalf("WritevFixed: %v", err)
+	}
+
+	ev, ok := waitForOp(t, ring, uring.IORING_OP_WRITEV_FIXED, 5*time.Second)
+	if !ok {
+		t.Fatal("WritevFixed did not complete")
+	}
+	if ev.Res < 0 {
+		t.Fatalf("WritevFixed failed: %d", ev.Res)
+	}
+	if ev.Res != 15 {
+		t.Fatalf("WritevFixed result = %d, want 15", ev.Res)
+	}
+
+	if _, err := f.Seek(0, 0); err != nil {
+		t.Fatalf("Seek: %v", err)
+	}
+	got := make([]byte, 15)
+	if _, err := f.Read(got); err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if string(got) != "AAAAABBBBBCCCCC" {
+		t.Fatalf("file content = %q, want %q", got, "AAAAABBBBBCCCCC")
+	}
+}
+
+func TestUringReadvFixedCycle(t *testing.T) {
+	ring := newTestRing(t, testTwoRegisteredBuffersOptions, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesSmall
+		opt.NotifySucceed = true
+		opt.MultiIssuers = true
+	})
+
+	if ring.RegisteredBufferCount() < 2 {
+		t.Skip("ReadvFixed requires two registered buffers")
+	}
+
+	f, err := os.CreateTemp("", "uring_readvfixed_*")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+
+	const data = "AAAAABBBBBCCCCC"
+	if _, err := f.WriteString(data); err != nil {
+		t.Fatalf("WriteString: %v", err)
+	}
+
+	const bufIndex = 1
+	buf := ring.RegisteredBuffer(bufIndex)
+	iovs := [][]byte{buf[:5], buf[16:21], buf[32:37]}
+	ctx := uring.PackDirect(uring.IORING_OP_READV_FIXED, 0, 0, int32(f.Fd()))
+	if err := ring.ReadvFixed(ctx, 0, bufIndex, iovs); err != nil {
+		t.Fatalf("ReadvFixed: %v", err)
+	}
+
+	ev, ok := waitForOp(t, ring, uring.IORING_OP_READV_FIXED, 5*time.Second)
+	if !ok {
+		t.Fatal("ReadvFixed did not complete")
+	}
+	if ev.Res < 0 {
+		t.Fatalf("ReadvFixed failed: %d", ev.Res)
+	}
+	if ev.Res != int32(len(data)) {
+		t.Fatalf("ReadvFixed result = %d, want %d", ev.Res, len(data))
+	}
+	if string(iovs[0])+string(iovs[1])+string(iovs[2]) != data {
+		t.Fatalf("ReadvFixed data = %q%q%q, want %q", iovs[0], iovs[1], iovs[2], data)
+	}
+}
+
 // =============================================================================
 // Fsync / Fallocate / FTruncate / SyncFileRange
 // =============================================================================
@@ -2743,7 +2843,7 @@ func TestUringSpliceCycle(t *testing.T) {
 	// file → pipe
 	srcFD := int32(srcFile.Fd())
 	ctx1 := uring.PackDirect(uring.IORING_OP_SPLICE, 0, 0, pipeWrite)
-	if err := ring.Splice(ctx1, int(srcFD), len(testData)); err != nil {
+	if err := ring.Splice(ctx1, iofd.FD(srcFD), len(testData)); err != nil {
 		t.Fatalf("Splice file→pipe: %v", err)
 	}
 
@@ -2758,7 +2858,7 @@ func TestUringSpliceCycle(t *testing.T) {
 	// pipe → file
 	dstFD := int32(dstFile.Fd())
 	ctx2 := uring.PackDirect(uring.IORING_OP_SPLICE, 0, 0, dstFD)
-	if err := ring.Splice(ctx2, int(pipeRead), int(ev1.Res)); err != nil {
+	if err := ring.Splice(ctx2, iofd.FD(pipeRead), int(ev1.Res)); err != nil {
 		t.Fatalf("Splice pipe→file: %v", err)
 	}
 
@@ -2805,7 +2905,7 @@ func TestUringTeeCycle(t *testing.T) {
 
 	// Tee: srcPipe[0] → dstPipe[1]
 	ctx := uring.PackDirect(uring.IORING_OP_TEE, 0, 0, dstPipe[1])
-	if err := ring.Tee(ctx, int(srcPipe[0]), len(testData)); err != nil {
+	if err := ring.Tee(ctx, iofd.FD(srcPipe[0]), len(testData)); err != nil {
 		t.Fatalf("Tee: %v", err)
 	}
 

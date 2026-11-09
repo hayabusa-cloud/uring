@@ -9,6 +9,8 @@ package uring
 import (
 	"math"
 	"unsafe"
+
+	"code.hybscloud.com/iofd"
 )
 
 // io_uring operation codes for API compatibility.
@@ -81,6 +83,13 @@ const (
 	ioUringOpLast
 )
 
+// URING_CMD operation flags mirror Linux for API compatibility.
+const (
+	IORING_URING_CMD_FIXED = 1 << iota
+	IORING_URING_CMD_MULTISHOT
+	IORING_URING_CMD_MASK = IORING_URING_CMD_FIXED | IORING_URING_CMD_MULTISHOT
+)
+
 // Timeout clock and behavior flags mirror Linux IORING_TIMEOUT_* constants.
 // Defined here so darwin build stubs share the same named constants.
 const (
@@ -113,10 +122,14 @@ const (
 	IORING_SEND_VECTORIZED      = 1 << 5 // Vectorized send
 )
 
+// Notification CQE usage flags for zero-copy operations.
+const IORING_NOTIF_USAGE_ZC_COPIED = 1 << 31
+
 // Internal flags
 const (
 	uringOpFlagsNone  uint8  = 0
 	uringOpIOPrioNone uint16 = 0
+	maxIovecs                = 1024 // Linux UIO_MAXIOV compatibility limit.
 )
 
 // nop submits a no-op operation.
@@ -130,12 +143,18 @@ func (ur *ioUring) nop(sqeCtx SQEContext) error {
 
 // readv performs vectored read.
 func (ur *ioUring) readv(sqeCtx SQEContext, iovs [][]byte) error {
+	if iovs == nil || len(iovs) < 1 || len(iovs) > maxIovecs {
+		return ErrInvalidParam
+	}
 	addr, n := ioVecFromBytesSlice(iovs)
 	return ur.submitPacked3(sqeCtx.WithOp(IORING_OP_READV), 0, uint64(uintptr(addr)), n)
 }
 
 // writev performs vectored write.
 func (ur *ioUring) writev(sqeCtx SQEContext, iovs [][]byte) error {
+	if iovs == nil || len(iovs) < 1 || len(iovs) > maxIovecs {
+		return ErrInvalidParam
+	}
 	addr, n := ioVecFromBytesSlice(iovs)
 	return ur.submitPacked3(sqeCtx.WithOp(IORING_OP_WRITEV), 0, uint64(uintptr(addr)), n)
 }
@@ -178,31 +197,53 @@ func (ur *ioUring) writeFixed(sqeCtx SQEContext, bufIndex int, offset uint64, n 
 
 // pollAdd adds a file descriptor to poll.
 func (ur *ioUring) pollAdd(sqeCtx SQEContext, ioprio uint16, events int) error {
+	if events < 0 || uint64(events) > math.MaxUint32 {
+		return ErrInvalidParam
+	}
 	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_POLL_ADD), ioprio, 0, 0, 0, uint32(events))
 }
 
-// pollRemove removes a poll request.
-func (ur *ioUring) pollRemove(sqeCtx SQEContext) error {
+// pollRemove removes a poll request matched by original user_data.
+func (ur *ioUring) pollRemove(sqeCtx SQEContext, targetUserData uint64) error {
 	return ur.submitPacked(sqeCtx.WithOp(IORING_OP_POLL_REMOVE), func(e *ioUringSqe) {
 		e.opcode = IORING_OP_POLL_REMOVE
 		e.flags = sqeCtx.Flags()
 		e.fd = sqeCtx.FD()
+		e.addr = targetUserData
 	})
 }
 
 // pollUpdate modifies an existing poll request in-place.
 func (ur *ioUring) pollUpdate(sqeCtx SQEContext, oldUserData, newUserData uint64, newEvents, updateFlags int) error {
+	const updateMask = IORING_POLL_UPDATE_EVENTS | IORING_POLL_UPDATE_USER_DATA
+	updateEvents := updateFlags&IORING_POLL_UPDATE_EVENTS != 0
+	updateUserData := updateFlags&IORING_POLL_UPDATE_USER_DATA != 0
+
+	if newEvents < 0 || uint64(newEvents) > math.MaxUint32 ||
+		updateFlags < 0 || uint64(updateFlags) > math.MaxUint32 ||
+		updateFlags & ^updateMask != 0 ||
+		(!updateUserData && newUserData != 0) || (!updateEvents && newEvents != 0) {
+		return ErrInvalidParam
+	}
 	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_POLL_REMOVE), 0, newUserData, oldUserData, updateFlags, uint32(newEvents))
 }
 
 // syncFileRange syncs a file range.
-func (ur *ioUring) syncFileRange(sqeCtx SQEContext, offset uint64, n int, uflags int) error {
-	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_SYNC_FILE_RANGE), 0, offset, 0, n, uint32(uflags))
+func (ur *ioUring) syncFileRange(sqeCtx SQEContext, offset uint64, n int, uflags uint32) error {
+	if n < 0 || uint(n) > math.MaxUint32 {
+		return ErrInvalidParam
+	}
+	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_SYNC_FILE_RANGE), 0, offset, 0, n, uflags)
 }
 
 // sendmsg sends a message with control data.
 func (ur *ioUring) sendmsg(sqeCtx SQEContext, ioprio uint16, buffers [][]byte, oob []byte, to Sockaddr) error {
-	saPtr, saN, err := unsafe.Pointer(uintptr(0)), 0, error(nil)
+	if len(buffers) > maxIovecs {
+		return ErrInvalidParam
+	}
+	var saPtr unsafe.Pointer
+	saN := 0
+	var err error
 	if to != nil {
 		saPtr, saN, err = sockaddr(to)
 		if err != nil {
@@ -226,28 +267,23 @@ func (ur *ioUring) sendmsg(sqeCtx SQEContext, ioprio uint16, buffers [][]byte, o
 	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_SENDMSG), ioprio, 0, msgAddr, 1, 0)
 }
 
-// recvmsg receives a message with control data.
-func (ur *ioUring) recvmsg(sqeCtx SQEContext, ioprio uint16, buffers [][]byte, oob []byte) error {
-	from := RawSockaddrAny{}
-	addr, n := ioVecFromBytesSlice(buffers)
-	msg := Msghdr{
-		Name:       (*byte)(unsafe.Pointer(&from)),
-		Namelen:    uint32(SizeofSockaddrAny),
-		Iov:        (*IoVec)(unsafe.Pointer(addr)),
-		Iovlen:     uint64(n),
-		Control:    nil,
-		Controllen: 0,
+// recvmsg receives a message through caller-owned completion-lived metadata.
+func (ur *ioUring) recvmsg(sqeCtx SQEContext, ioprio uint16, msg *Msghdr) error {
+	if msg == nil || msg.Iovlen > maxIovecs ||
+		(msg.Iovlen != 0 && msg.Iov == nil) ||
+		(msg.Controllen != 0 && msg.Control == nil) ||
+		(msg.Namelen != 0 && msg.Name == nil) {
+		return ErrInvalidParam
 	}
-	if len(oob) > 0 {
-		msg.Control = &oob[0]
-		msg.Controllen = uint64(len(oob))
-	}
-	msgAddr := uint64(uintptr(unsafe.Pointer(&msg)))
+	msgAddr := uint64(uintptr(unsafe.Pointer(msg)))
 	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_RECVMSG), ioprio, 0, msgAddr, 1, MSG_WAITALL)
 }
 
 // timeout submits a timeout operation.
 func (ur *ioUring) timeout(sqeCtx SQEContext, cnt int, ts *Timespec, uflags int) error {
+	if cnt < 0 || uint64(cnt) > math.MaxUint32 {
+		return ErrInvalidParam
+	}
 	addr := uint64(uintptr(unsafe.Pointer(ts)))
 	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_TIMEOUT), 0, uint64(cnt), addr, 1, uint32(uflags))
 }
@@ -295,17 +331,20 @@ func (ur *ioUring) connect(sqeCtx SQEContext, sa Sockaddr) error {
 
 // fAllocate allocates file space.
 func (ur *ioUring) fAllocate(sqeCtx SQEContext, mode uint32, off uint64, length int64) error {
+	if length <= 0 {
+		return ErrInvalidParam
+	}
 	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_FALLOCATE), 0, off, uint64(length), int(mode), 0)
 }
 
 // openAt opens a file.
-func (ur *ioUring) openAt(sqeCtx SQEContext, pathname string, openFlags int, mode uint32) error {
+func (ur *ioUring) openAt(sqeCtx SQEContext, pathname string, openFlags uint32, mode uint32) error {
 	pathPtr, err := bytePtrFromString(pathname)
 	if err != nil {
 		return err
 	}
 	addr := uint64(uintptr(unsafe.Pointer(pathPtr)))
-	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_OPENAT), 0, 0, addr, int(mode), uint32(openFlags))
+	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_OPENAT), 0, 0, addr, int(mode), openFlags)
 }
 
 // close closes a file descriptor.
@@ -348,8 +387,11 @@ func (ur *ioUring) write(sqeCtx SQEContext, ioprio uint16, b []byte, off uint64,
 }
 
 // fadvise provides file advice.
-func (ur *ioUring) fadvise(sqeCtx SQEContext, off uint64, n int, advice int) error {
-	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_FADVISE), 0, off, 0, n, uint32(advice))
+func (ur *ioUring) fadvise(sqeCtx SQEContext, off uint64, n int, advice uint32) error {
+	if n < 0 || uint(n) > math.MaxUint32 {
+		return ErrInvalidParam
+	}
+	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_FADVISE), 0, off, 0, n, advice)
 }
 
 // send sends data on a socket.
@@ -371,16 +413,22 @@ func (ur *ioUring) receive(sqeCtx SQEContext, ioprio uint16, b []byte, off uint6
 	start := int(off)
 	payload := b[start : start+n]
 	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(payload))))
-	return ur.submitPacked6WithPayload(sqeCtx.WithOp(IORING_OP_RECV), payload, ioprio, 0, addr, n, 0)
+	return ur.submitPacked6WithPayload(sqeCtx.WithOp(IORING_OP_RECV), payload, ioprio, 0, addr, n, MSG_WAITALL)
 }
 
 // receiveWithBufferSelect receives with kernel buffer selection.
 func (ur *ioUring) receiveWithBufferSelect(sqeCtx SQEContext, ioprio uint16, bufSize int, bufGroup uint16) error {
+	if bufSize <= 0 || bufSize > math.MaxInt32 {
+		return ErrInvalidParam
+	}
 	return ErrNotSupported
 }
 
 // splice transfers data between file descriptors.
-func (ur *ioUring) splice(sqeCtx SQEContext, fdIn int, offIn, offOut *int64, n int, uflags int) error {
+func (ur *ioUring) splice(sqeCtx SQEContext, fdIn iofd.FD, offIn, offOut *int64, n int, uflags uint32) error {
+	if n < 0 || uint(n) > math.MaxUint32 {
+		return ErrInvalidParam
+	}
 	var offInVal, offOutVal uint64
 	if offIn != nil {
 		offInVal = uint64(uintptr(unsafe.Pointer(offIn)))
@@ -388,7 +436,7 @@ func (ur *ioUring) splice(sqeCtx SQEContext, fdIn int, offIn, offOut *int64, n i
 	if offOut != nil {
 		offOutVal = uint64(uintptr(unsafe.Pointer(offOut)))
 	}
-	return ur.submitPacked9(sqeCtx.WithOp(IORING_OP_SPLICE), 0, offOutVal, offInVal, n, uint32(uflags), 0, int32(fdIn))
+	return ur.submitPacked9(sqeCtx.WithOp(IORING_OP_SPLICE), 0, offOutVal, offInVal, n, uflags, 0, int32(fdIn))
 }
 
 // provideBuffers provides buffers to the kernel.
@@ -397,32 +445,44 @@ func (ur *ioUring) provideBuffers(sqeCtx SQEContext, nbufs int, bid int, ptr uns
 }
 
 // tee duplicates data between pipes.
-func (ur *ioUring) tee(sqeCtx SQEContext, fdIn int, length int, uflags int) error {
-	return ur.submitPacked9(sqeCtx.WithOp(IORING_OP_TEE), 0, 0, 0, length, uint32(uflags), 0, int32(fdIn))
+func (ur *ioUring) tee(sqeCtx SQEContext, fdIn iofd.FD, length int, uflags uint32) error {
+	if length < 0 || uint(length) > math.MaxUint32 {
+		return ErrInvalidParam
+	}
+	return ur.submitPacked9(sqeCtx.WithOp(IORING_OP_TEE), 0, 0, 0, length, uflags, 0, int32(fdIn))
 }
 
 // shutdown shuts down a socket.
 func (ur *ioUring) shutdown(sqeCtx SQEContext, how int) error {
+	if how != SHUT_RD && how != SHUT_WR && how != SHUT_RDWR {
+		return ErrInvalidParam
+	}
 	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_SHUTDOWN), 0, 0, 0, how, 0)
 }
 
 // socket creates a socket.
-func (ur *ioUring) socket(sqeCtx SQEContext, domain, typ, proto int, fileIndex uint32) error {
-	return ur.submitPacked9(sqeCtx.WithOp(IORING_OP_SOCKET), 0, uint64(typ)|uint64(proto)<<32, 0, domain, fileIndex, 0, 0)
+func (ur *ioUring) socket(sqeCtx SQEContext, domain, typ, proto int) error {
+	if domain < 0 || domain > math.MaxInt32 || typ < 0 || typ > math.MaxInt32 || proto < 0 || proto > math.MaxInt32 {
+		return ErrInvalidParam
+	}
+	return ur.submitPacked9(sqeCtx.WithOp(IORING_OP_SOCKET), 0, uint64(typ)|uint64(proto)<<32, 0, domain, 0, 0, 0)
 }
 
 // socketDirect creates a socket directly into a registered file table slot (Darwin stub).
 func (ur *ioUring) socketDirect(sqeCtx SQEContext, domain, typ, proto int, fileIndex uint32) error {
+	if domain < 0 || domain > math.MaxInt32 || typ < 0 || typ > math.MaxInt32 || proto < 0 || proto > math.MaxInt32 {
+		return ErrInvalidParam
+	}
 	return ErrNotSupported
 }
 
 // sendZeroCopy sends with zero-copy.
 func (ur *ioUring) sendZeroCopy(sqeCtx SQEContext, b []byte, off uint64, n int, uflags int) error {
-	if b == nil || len(b) < 1 {
+	if len(b) < 1 || n < 0 || n > math.MaxInt32 || off > uint64(len(b)) || uint64(n) > uint64(len(b))-off {
 		return ErrInvalidParam
 	}
-	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(b))))
-	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_SEND_ZC), 0, off, addr, n, uint32(uflags))
+	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(b)))) + off
+	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_SEND_ZC), 0, 0, addr, n, uint32(uflags))
 }
 
 // sendFixed sends with a registered buffer.
@@ -447,7 +507,7 @@ func (ur *ioUring) sendZeroCopyFixed(sqeCtx SQEContext, bufIndex int, off uint64
 		return ErrInvalidParam
 	}
 	buf := ur.bufs[bufIndex]
-	if n < 0 || off > uint64(len(buf)) || uint64(n) > uint64(len(buf))-off {
+	if n < 0 || n > math.MaxInt32 || off > uint64(len(buf)) || uint64(n) > uint64(len(buf))-off {
 		return ErrInvalidParam
 	}
 	addr := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(buf)))) + off
@@ -467,36 +527,54 @@ func (ur *ioUring) bind(sqeCtx SQEContext, sa Sockaddr) error {
 
 // listen starts listening on a socket.
 func (ur *ioUring) listen(sqeCtx SQEContext, backlog int) error {
+	if backlog < 0 || backlog > math.MaxInt32 {
+		return ErrInvalidParam
+	}
 	return ur.submitPacked6(sqeCtx.WithOp(IORING_OP_LISTEN), 0, 0, 0, backlog, 0)
 }
 
 // readWithBufferSelect performs read with kernel buffer selection.
 func (ur *ioUring) readWithBufferSelect(sqeCtx SQEContext, n int, bgid uint16) error {
+	if n <= 0 || uint(n) > math.MaxUint32 {
+		return ErrInvalidParam
+	}
 	return ErrNotSupported
 }
 
 // pipe creates a pipe using io_uring (Darwin stub).
-func (ur *ioUring) pipe(sqeCtx SQEContext, fds *[2]int32, flags uint32) error {
+func (ur *ioUring) pipe(sqeCtx SQEContext, fds *[2]iofd.FD, flags uint32) error {
 	return ErrNotSupported
 }
 
 // fsetxattr sets an extended attribute on a file descriptor (Darwin stub).
-func (ur *ioUring) fsetxattr(sqeCtx SQEContext, name string, value []byte, flags int) error {
+func (ur *ioUring) fsetxattr(sqeCtx SQEContext, name string, value []byte, flags uint32) error {
+	if uint(len(value)) > math.MaxUint32 {
+		return ErrInvalidParam
+	}
 	return ErrNotSupported
 }
 
 // setxattr sets an extended attribute on a path (Darwin stub).
-func (ur *ioUring) setxattr(sqeCtx SQEContext, path, name string, value []byte, flags int) error {
+func (ur *ioUring) setxattr(sqeCtx SQEContext, path, name string, value []byte, flags uint32) error {
+	if uint(len(value)) > math.MaxUint32 {
+		return ErrInvalidParam
+	}
 	return ErrNotSupported
 }
 
 // fgetxattr gets an extended attribute from a file descriptor (Darwin stub).
 func (ur *ioUring) fgetxattr(sqeCtx SQEContext, name string, value []byte) error {
+	if uint(len(value)) > math.MaxUint32 {
+		return ErrInvalidParam
+	}
 	return ErrNotSupported
 }
 
 // getxattr gets an extended attribute from a path (Darwin stub).
 func (ur *ioUring) getxattr(sqeCtx SQEContext, path, name string, value []byte) error {
+	if uint(len(value)) > math.MaxUint32 {
+		return ErrInvalidParam
+	}
 	return ErrNotSupported
 }
 
@@ -527,11 +605,22 @@ func (ur *ioUring) fixedFdInstall(sqeCtx SQEContext, fixedIndex int, flags uint3
 
 // filesUpdate updates registered files (Darwin stub).
 func (ur *ioUring) filesUpdate(sqeCtx SQEContext, fds []int32, offset int) error {
+	if len(fds) == 0 || uint(len(fds)) > math.MaxUint32 || offset < 0 {
+		return ErrInvalidParam
+	}
 	return ErrNotSupported
 }
 
 // uringCmd submits a generic uring command (Darwin stub).
-func (ur *ioUring) uringCmd(sqeCtx SQEContext, cmdOp uint32, cmdData []byte) error {
+func (ur *ioUring) uringCmd(sqeCtx SQEContext, cmdOp uint32, cmdData []byte, cmdFlags uint32) error {
+	if uint(len(cmdData)) > math.MaxUint32 {
+		return ErrInvalidParam
+	}
+	return ErrNotSupported
+}
+
+// uringCmdInline submits an ordinary uring command with inline data (Darwin stub).
+func (ur *ioUring) uringCmdInline(sqeCtx SQEContext, cmdOp uint32, cmdData []byte, cmdFlags uint32) error {
 	return ErrNotSupported
 }
 
@@ -541,7 +630,7 @@ func (ur *ioUring) nop128(sqeCtx SQEContext) error {
 }
 
 // uringCmd128 submits a 128-byte uring command (Darwin stub).
-func (ur *ioUring) uringCmd128(sqeCtx SQEContext, cmdOp uint32, cmdData []byte) error {
+func (ur *ioUring) uringCmd128(sqeCtx SQEContext, cmdOp uint32, cmdData []byte, cmdFlags uint32) error {
 	return ErrNotSupported
 }
 
@@ -554,6 +643,3 @@ func (ur *ioUring) msgRing(sqeCtx SQEContext, userData int64, res int32) error {
 func (ur *ioUring) msgRingFD(sqeCtx SQEContext, srcFD uint32, dstSlot uint32, userData int64, flags uint32) error {
 	return ErrNotSupported
 }
-
-// Notification CQE usage flags for zero-copy operations.
-const IORING_NOTIF_USAGE_ZC_COPIED = 1 << 31

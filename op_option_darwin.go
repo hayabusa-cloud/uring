@@ -13,13 +13,12 @@ import (
 	"time"
 )
 
-// OpOption represents configuration options for Uring operations.
-// Each operation's extraction method reads only the fields it needs,
-// so unused fields for a given operation are safely ignored.
+// OpOption holds per-operation configuration.
+// Each operation reads only the fields it uses, and ignores the rest.
 type OpOption struct {
 	Flags           uint8
 	IOPrio          uint16
-	FileIndex       uint32
+	FileIndex       *uint32
 	Personality     uint16
 	Backlog         int
 	ReadBufferSize  int
@@ -27,18 +26,27 @@ type OpOption struct {
 	Duration        time.Duration
 	FileMode        os.FileMode
 	Fadvise         int
-	Offset          int64
-	N               *int
-	Count           int
+	Offset          int64 // File position or socket-buffer byte offset; see [WithOffset].
+	N               *int  // Optional byte limit; nil uses the operation's default. See [WithN].
+	Count           int   // Timeout completion count; values must fit uint32.
 	TimeoutFlags    uint32
 	SpliceFlags     uint32
 	FsyncFlags      uint32
+	UringCmdFlags   uint32
 }
 
-// OpOptionFunc is a type that defines a functional option for configuring a OpOption.
+// OpOptionFunc configures an [OpOption].
 type OpOptionFunc func(opt *OpOption)
 
-// Apply applies the given option functions to the OpOption.
+// I/O priority class constants for WithIOPrioClass.
+const (
+	IOPrioClassNone = 0
+	IOPrioClassRT   = 1
+	IOPrioClassBE   = 2
+	IOPrioClassIDLE = 3
+)
+
+// Apply applies option functions in order.
 func (uo *OpOption) Apply(opts ...OpOptionFunc) {
 	for _, f := range opts {
 		f(uo)
@@ -48,7 +56,7 @@ func (uo *OpOption) Apply(opts ...OpOptionFunc) {
 var defaultUringOpOption = OpOption{
 	Flags:           0,
 	IOPrio:          0,
-	FileIndex:       0,
+	FileIndex:       nil,
 	Personality:     0,
 	Backlog:         defaultBacklog,
 	ReadBufferSize:  bufferSizeDefault,
@@ -58,10 +66,11 @@ var defaultUringOpOption = OpOption{
 	Count:           1,
 }
 
-// WithFileIndex sets the file index for direct descriptor operations.
+// WithFileIndex makes SocketRaw request a direct descriptor. Direct descriptors
+// are not supported by the Darwin backend.
 func WithFileIndex(idx uint32) OpOptionFunc {
 	return func(opt *OpOption) {
-		opt.FileIndex = idx
+		opt.FileIndex = &idx
 	}
 }
 
@@ -100,14 +109,24 @@ func WithBacklog(n int) OpOptionFunc {
 	}
 }
 
-// WithOffset sets the file offset.
+// WithOffset sets the file position or buffer offset used by an operation.
+// [Uring.Read], [Uring.Write], [Uring.ReadFixed], and [Uring.WriteFixed] use a
+// file offset; -1 uses and advances the file's current position.
+// [Uring.Send], [Uring.SendFD], [Uring.Receive], and [Uring.ReceiveFD] use a
+// nonnegative byte offset within the supplied buffer. Receive operations
+// with buffer selection ignore this option.
 func WithOffset(offset int64) OpOptionFunc {
 	return func(opt *OpOption) {
 		opt.Offset = offset
 	}
 }
 
-// WithN sets the size limit.
+// WithN sets the byte limit for operations that use it.
+// [Uring.Read], [Uring.Write], and [Uring.ReadFixed] cap it at the buffer length.
+// [Uring.Send], [Uring.SendFD], [Uring.Receive], and [Uring.ReceiveFD] require
+// it to fit the supplied buffer after [WithOffset]. Receive operations with
+// buffer selection use [WithReadBufferSize] instead.
+// [Uring.WriteFixed], [Uring.Splice], and [Uring.Tee] use their explicit lengths.
 func WithN(n int) OpOptionFunc {
 	return func(opt *OpOption) {
 		opt.N = &n
@@ -135,7 +154,8 @@ func WithFadvise(advice int) OpOptionFunc {
 	}
 }
 
-// WithCount sets the completion count.
+// WithCount sets the timeout completion count.
+// Values must be in the inclusive uint32 domain.
 func WithCount(cnt int) OpOptionFunc {
 	return func(opt *OpOption) {
 		opt.Count = cnt
@@ -212,10 +232,10 @@ func WithFsyncDataSync() OpOptionFunc {
 	}
 }
 
-// I/O priority class constants for WithIOPrioClass.
-const (
-	IOPrioClassNone = 0
-	IOPrioClassRT   = 1
-	IOPrioClassBE   = 2
-	IOPrioClassIDLE = 3
-)
+// WithUringCmdFlags sets Linux URING_CMD behavior flags for API parity.
+// IORING_URING_CMD_FIXED and IORING_URING_CMD_MULTISHOT are mutually exclusive.
+func WithUringCmdFlags(flags uint32) OpOptionFunc {
+	return func(opt *OpOption) {
+		opt.UringCmdFlags = flags
+	}
+}

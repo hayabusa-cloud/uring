@@ -35,9 +35,10 @@ type submitKeepAlive struct {
 type submitKeepAliveExt struct {
 	next *submitKeepAliveExt
 
-	msg          Msghdr
-	recvSockaddr RawSockaddrAny
-	epollEvent   EpollEvent
+	msg             Msghdr
+	recvMsg         *Msghdr
+	epollCtlEvent   EpollEvent
+	epollWaitEvents []EpollEvent
 
 	path1Inline [submitKeepAlivePathInline]byte
 	path2Inline [submitKeepAlivePathInline]byte
@@ -62,6 +63,13 @@ func (k *submitKeepAlive) retainSockaddr(sa Sockaddr) {
 	}
 	k.active = true
 	k.sockaddrArg = sa
+}
+
+func (k *submitKeepAlive) retainEpollWaitEvents(ur *ioUring, events []EpollEvent) {
+	if len(events) == 0 {
+		return
+	}
+	k.ensureExt(ur).epollWaitEvents = events
 }
 
 func (k *submitKeepAlive) ensureExt(ur *ioUring) *submitKeepAliveExt {
@@ -154,6 +162,9 @@ func (ext *submitKeepAliveExt) writePath(dst *[]byte, inline []byte, s string) (
 
 func (ext *submitKeepAliveExt) resetForReuse() {
 	ext.msg = Msghdr{}
+	ext.recvMsg = nil
+	ext.epollCtlEvent = EpollEvent{}
+	ext.epollWaitEvents = nil
 	ext.openHow = nil
 	ext.statx = nil
 	ext.next = nil

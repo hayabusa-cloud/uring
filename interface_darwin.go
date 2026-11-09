@@ -395,11 +395,15 @@ func (ur *Uring) MsgRingFD(sqeCtx SQEContext, srcFD uint32, dstSlot uint32, user
 	return ErrNotSupported
 }
 
-// SocketRaw creates a socket using io_uring.
+// SocketRaw creates a socket using io_uring. WithFileIndex requests a direct
+// descriptor, which the Darwin backend does not support.
 func (ur *Uring) SocketRaw(sqeCtx SQEContext, domain, typ, proto int, options ...OpOptionFunc) error {
 	flags, fileIndex := ur.socketOptions(options)
 	ctx := sqeCtx.OrFlags(flags)
-	return ur.socket(ctx, domain, typ, proto, fileIndex)
+	if fileIndex != nil {
+		return ur.socketDirect(ctx, domain, typ, proto, *fileIndex)
+	}
+	return ur.socket(ctx, domain, typ, proto)
 }
 
 // TCP4Socket creates a TCP IPv4 socket.
@@ -563,8 +567,17 @@ func (ur *Uring) Connect(sqeCtx SQEContext, remote Addr, options ...OpOptionFunc
 // Receive performs a socket receive operation.
 // On Darwin, b must be non-nil because kernel buffer selection is unsupported.
 // Caller must keep b valid until the operation completes.
+// WithOffset without WithN receives into the remaining buffer range.
 func (ur *Uring) Receive(sqeCtx SQEContext, pollFD PollFd, b []byte, options ...OpOptionFunc) error {
-	ctx := sqeCtx.WithFD(iofd.FD(pollFD.Fd()))
+	return ur.ReceiveFD(sqeCtx, iofd.FD(pollFD.Fd()), b, options...)
+}
+
+// ReceiveFD performs a socket receive operation using an iofd.FD value instead
+// of a PollFd interface. On Darwin, b must be non-nil because kernel buffer
+// selection is unsupported, and IOSQE_FIXED_FILE is unsupported for receive.
+// Caller must keep b valid until the operation completes.
+func (ur *Uring) ReceiveFD(sqeCtx SQEContext, fd iofd.FD, b []byte, options ...OpOptionFunc) error {
+	ctx := sqeCtx.WithFD(fd)
 	if b == nil {
 		return ErrNotSupported
 	}
@@ -581,29 +594,42 @@ func (ur *Uring) Receive(sqeCtx SQEContext, pollFD PollFd, b []byte, options ...
 
 // SubmitReceiveMultishot submits the raw kernel multishot receive opcode.
 // For the managed subscription helper, use [Uring.ReceiveMultishot].
-// On Darwin, b must be non-nil because kernel buffer selection is unsupported.
-// Caller must keep b valid until the operation completes.
+// b must be nil because multishot receive requires kernel buffer selection.
+// Darwin does not support that operation.
 func (ur *Uring) SubmitReceiveMultishot(sqeCtx SQEContext, pollFD PollFd, b []byte, options ...OpOptionFunc) error {
-	ctx := sqeCtx.WithFD(iofd.FD(pollFD.Fd()))
-	if b == nil {
-		return ErrNotSupported
-	}
-	if len(b) < 1 {
+	return ur.SubmitReceiveMultishotFD(sqeCtx, iofd.FD(pollFD.Fd()), b, options...)
+}
+
+// SubmitReceiveMultishotFD reports the Darwin multishot receive boundary for an
+// iofd.FD value. b must be nil; Darwin does not support the kernel
+// buffer-selection operation required by multishot receive.
+func (ur *Uring) SubmitReceiveMultishotFD(sqeCtx SQEContext, fd iofd.FD, b []byte, options ...OpOptionFunc) error {
+	if b != nil {
 		return ErrInvalidParam
 	}
-	flags, ioprio, offset, n := ur.receiveOptions(b, options)
-	ctx = ctx.OrFlags(flags | ur.readLikeOpFlags)
-	return ur.receive(ctx, ioprio|IORING_RECV_MULTISHOT, b, uint64(offset), n)
+	_ = sqeCtx
+	_ = fd
+	_ = options
+	return ErrNotSupported
 }
 
 // Send writes data to a socket.
 // Caller must keep p valid until the operation completes.
+// WithOffset without WithN sends the remaining payload range.
 func (ur *Uring) Send(sqeCtx SQEContext, pollFD PollFd, p []byte, options ...OpOptionFunc) error {
+	return ur.SendFD(sqeCtx, iofd.FD(pollFD.Fd()), p, options...)
+}
+
+// SendFD writes data using an iofd.FD value instead of a PollFd interface. The
+// fd value is encoded verbatim. On Darwin, IOSQE_FIXED_FILE is unsupported for
+// send. Caller must keep p valid until the operation completes. WithOffset
+// without WithN sends the remaining payload range.
+func (ur *Uring) SendFD(sqeCtx SQEContext, fd iofd.FD, p []byte, options ...OpOptionFunc) error {
 	flags, ioprio, offset, n := ur.sendOptions(p, options)
 	if offset < 0 {
 		return ErrInvalidParam
 	}
-	ctx := sqeCtx.WithFD(iofd.FD(pollFD.Fd())).OrFlags(flags | ur.writeLikeOpFlags)
+	ctx := sqeCtx.WithFD(fd).OrFlags(flags | ur.writeLikeOpFlags)
 	return ur.send(ctx, ioprio, p, uint64(offset), n)
 }
 
@@ -712,7 +738,9 @@ func (ur *Uring) Timeout(sqeCtx SQEContext, d time.Duration, options ...OpOption
 	return ur.timeout(ctx, cnt, &Timespec{Sec: nano / int64(time.Second), Nsec: nano % int64(time.Second)}, int(timeoutFlags))
 }
 
-// Shutdown gracefully closes a socket.
+// Shutdown submits a socket shutdown for the directions selected by how.
+// Use [SHUT_RD] for reads, [SHUT_WR] for writes, or [SHUT_RDWR] for both.
+// The socket descriptor remains open.
 func (ur *Uring) Shutdown(sqeCtx SQEContext, how int, options ...OpOptionFunc) error {
 	flags := ur.operationOptions(options)
 	ctx := sqeCtx.OrFlags(flags)
@@ -764,18 +792,20 @@ func (ur *Uring) Write(sqeCtx SQEContext, b []byte, options ...OpOptionFunc) err
 	return ur.write(ctx, ioprio, b, uint64(offset), n)
 }
 
-// Splice transfers data between file descriptors.
-func (ur *Uring) Splice(sqeCtx SQEContext, fdIn int, n int, options ...OpOptionFunc) error {
+// Splice submits a transfer of up to n bytes between file descriptors.
+// The Darwin backend completes this request with -ENOSYS.
+func (ur *Uring) Splice(sqeCtx SQEContext, fdIn iofd.FD, n int, options ...OpOptionFunc) error {
 	flags, _, spliceFlags := ur.spliceOptions(options)
 	ctx := sqeCtx.OrFlags(flags)
-	return ur.splice(ctx, fdIn, nil, nil, n, int(spliceFlags))
+	return ur.splice(ctx, fdIn, nil, nil, n, spliceFlags)
 }
 
-// Tee duplicates data between pipes.
-func (ur *Uring) Tee(sqeCtx SQEContext, fdIn int, length int, options ...OpOptionFunc) error {
+// Tee submits a duplication of up to length bytes between pipes.
+// The Darwin backend completes this request with -ENOSYS.
+func (ur *Uring) Tee(sqeCtx SQEContext, fdIn iofd.FD, length int, options ...OpOptionFunc) error {
 	flags, _, spliceFlags := ur.teeOptions(options)
 	ctx := sqeCtx.OrFlags(flags)
-	return ur.tee(ctx, fdIn, length, int(spliceFlags))
+	return ur.tee(ctx, fdIn, length, spliceFlags)
 }
 
 // Sync performs a file sync operation.
@@ -784,7 +814,9 @@ func (ur *Uring) Sync(sqeCtx SQEContext, options ...OpOptionFunc) error {
 	return ur.fsync(sqeCtx.OrFlags(flags), fsyncFlags)
 }
 
-// ReadV performs a vectored read operation.
+// ReadV submits a vectored read with file offset zero.
+// Only [OpOption.Flags] is used.
+// The Darwin backend completes this request with -ENOSYS.
 // Caller must keep iovs and their backing buffers valid until the operation completes.
 func (ur *Uring) ReadV(sqeCtx SQEContext, iovs [][]byte, options ...OpOptionFunc) error {
 	flags := ur.operationOptions(options)
@@ -792,7 +824,9 @@ func (ur *Uring) ReadV(sqeCtx SQEContext, iovs [][]byte, options ...OpOptionFunc
 	return ur.readv(ctx, iovs)
 }
 
-// WriteV performs a vectored write operation.
+// WriteV submits a vectored write with file offset zero.
+// Only [OpOption.Flags] is used.
+// The Darwin backend completes this request with -ENOSYS.
 // Caller must keep iovs and their backing buffers valid until the operation completes.
 func (ur *Uring) WriteV(sqeCtx SQEContext, iovs [][]byte, options ...OpOptionFunc) error {
 	flags := ur.operationOptions(options)
@@ -826,14 +860,17 @@ func (ur *Uring) WriteFixed(sqeCtx SQEContext, bufIndex int, n int, options ...O
 }
 
 // OpenAt opens a file.
-func (ur *Uring) OpenAt(sqeCtx SQEContext, pathname string, openFlags int, mode uint32, options ...OpOptionFunc) error {
+func (ur *Uring) OpenAt(sqeCtx SQEContext, pathname string, openFlags uint32, mode uint32, options ...OpOptionFunc) error {
 	flags := ur.operationOptions(options)
 	ctx := sqeCtx.OrFlags(flags)
 	return ur.openAt(ctx, pathname, openFlags, mode)
 }
 
 // FileAdvise provides advice about file access patterns.
-func (ur *Uring) FileAdvise(sqeCtx SQEContext, offset int64, length int, advice int, options ...OpOptionFunc) error {
+func (ur *Uring) FileAdvise(sqeCtx SQEContext, offset int64, length int, advice uint32, options ...OpOptionFunc) error {
+	if offset < 0 {
+		return ErrInvalidParam
+	}
 	flags := ur.operationOptions(options)
 	ctx := sqeCtx.OrFlags(flags)
 	return ur.fadvise(ctx, uint64(offset), length, advice)
@@ -851,25 +888,26 @@ func (ur *Uring) SendMsg(sqeCtx SQEContext, pollFD PollFd, buffers [][]byte, oob
 	return ur.sendmsg(ctx, ioprio, buffers, oob, sa)
 }
 
-// RecvMsg receives a message with control data.
-// Caller must keep buffers and oob valid until the operation completes.
-func (ur *Uring) RecvMsg(sqeCtx SQEContext, pollFD PollFd, buffers [][]byte, oob []byte, options ...OpOptionFunc) error {
+// RecvMsg receives a message through the caller-owned message header.
+// Caller must keep msg and all memory it references valid until the operation
+// completes.
+func (ur *Uring) RecvMsg(sqeCtx SQEContext, pollFD PollFd, msg *Msghdr, options ...OpOptionFunc) error {
 	flags, ioprio := ur.recvmsgOptions(options)
 	ctx := sqeCtx.WithFD(iofd.FD(pollFD.Fd())).OrFlags(flags | ur.readLikeOpFlags)
-	return ur.recvmsg(ctx, ioprio, buffers, oob)
+	return ur.recvmsg(ctx, ioprio, msg)
 }
 
 // PollAdd adds a file descriptor to the poll set.
 func (ur *Uring) PollAdd(sqeCtx SQEContext, events int, options ...OpOptionFunc) error {
-	flags := ur.operationOptions(options)
+	flags := ur.pollAddOptions(options)
 	ctx := sqeCtx.OrFlags(flags)
 	return ur.pollAdd(ctx, 0, events)
 }
 
-// PollRemove removes a file descriptor from the poll set.
-func (ur *Uring) PollRemove(sqeCtx SQEContext, options ...OpOptionFunc) error {
-	flags := ur.operationOptions(options)
-	return ur.pollRemove(sqeCtx.OrFlags(flags))
+// PollRemove removes a poll request matched by the original SQE user_data.
+func (ur *Uring) PollRemove(sqeCtx SQEContext, targetUserData uint64, options ...OpOptionFunc) error {
+	flags := ur.pollRemoveOptions(options)
+	return ur.pollRemove(sqeCtx.OrFlags(flags), targetUserData)
 }
 
 // PollAddMultishot adds a persistent poll request that generates multiple CQEs.
@@ -929,7 +967,9 @@ func (ur *Uring) AsyncCancelOpcode(sqeCtx SQEContext, opcode uint8, cancelAll bo
 	return ErrNotSupported
 }
 
-// AsyncCancelAny cancels any one pending operation.
+// AsyncCancelAny submits cancellation without filtering by request identity.
+// It may cancel multiple pending operations. The cancellation CQE reports the
+// matched count or a negative errno; each original operation has its own CQE.
 // Darwin stub returns ErrNotSupported.
 func (ur *Uring) AsyncCancelAny(sqeCtx SQEContext, options ...OpOptionFunc) error {
 	return ErrNotSupported
@@ -941,15 +981,21 @@ func (ur *Uring) AsyncCancelAll(sqeCtx SQEContext, options ...OpOptionFunc) erro
 	return ErrNotSupported
 }
 
-// Fallocate allocates space for a file.
+// Fallocate allocates a positive-length file range.
 func (ur *Uring) Fallocate(sqeCtx SQEContext, mode uint32, offset int64, length int64, options ...OpOptionFunc) error {
+	if offset < 0 || length <= 0 {
+		return ErrInvalidParam
+	}
 	flags := ur.operationOptions(options)
 	ctx := sqeCtx.OrFlags(flags)
 	return ur.fAllocate(ctx, mode, uint64(offset), length)
 }
 
 // SyncFileRange syncs a file range to storage.
-func (ur *Uring) SyncFileRange(sqeCtx SQEContext, offset int64, length int, syncFlags int, options ...OpOptionFunc) error {
+func (ur *Uring) SyncFileRange(sqeCtx SQEContext, offset int64, length int, syncFlags uint32, options ...OpOptionFunc) error {
+	if offset < 0 {
+		return ErrInvalidParam
+	}
 	flags := ur.operationOptions(options)
 	ctx := sqeCtx.OrFlags(flags)
 	return ur.syncFileRange(ctx, uint64(offset), length, syncFlags)
@@ -982,33 +1028,28 @@ func (ur *Uring) BundleIterator(cqe CQEView, group uint16) (BundleIterator, bool
 	return result0, result1
 }
 
-// ReceiveZeroCopy is unavailable on Darwin.
+// ReceiveZeroCopy reports that zero-copy receive is unavailable on Darwin.
 func (ur *Uring) ReceiveZeroCopy(sqeCtx SQEContext, pollFD PollFd, n int, zcrxIfqIdx uint32, options ...OpOptionFunc) error {
-
 	return ErrNotSupported
 }
 
-// EpollWait is unavailable on Darwin.
+// EpollWait reports that io_uring epoll wait is unavailable on Darwin.
 func (ur *Uring) EpollWait(sqeCtx SQEContext, events []EpollEvent, timeout int32, options ...OpOptionFunc) error {
-
 	return ErrNotSupported
 }
 
-// ReadvFixed is unavailable on Darwin.
-func (ur *Uring) ReadvFixed(sqeCtx SQEContext, offset int64, bufIndices []int, options ...OpOptionFunc) error {
-
+// ReadvFixed reports that fixed-buffer vectored reads are unavailable on Darwin.
+func (ur *Uring) ReadvFixed(sqeCtx SQEContext, offset int64, bufIndex int, iovs [][]byte, options ...OpOptionFunc) error {
 	return ErrNotSupported
 }
 
-// WritevFixed is unavailable on Darwin.
-func (ur *Uring) WritevFixed(sqeCtx SQEContext, offset int64, bufIndices []int, lengths []int, options ...OpOptionFunc) error {
-
+// WritevFixed reports that fixed-buffer vectored writes are unavailable on Darwin.
+func (ur *Uring) WritevFixed(sqeCtx SQEContext, offset int64, bufIndex int, iovs [][]byte, options ...OpOptionFunc) error {
 	return ErrNotSupported
 }
 
-// Pipe is unavailable on Darwin.
+// Pipe reports that io_uring pipe creation is unavailable on Darwin.
 func (ur *Uring) Pipe(sqeCtx SQEContext, fds *[2]iofd.FD, pipeFlags uint32, options ...OpOptionFunc) error {
-
 	return ErrNotSupported
 }
 
@@ -1115,122 +1156,107 @@ func (ur *Uring) ZCRXExport(zcrxID uint32) (iofd.FD, error) {
 	return iofd.InvalidFD, ErrNotSupported
 }
 
-// FSetXattr is unavailable on Darwin.
-func (ur *Uring) FSetXattr(sqeCtx SQEContext, name string, value []byte, flags int, options ...OpOptionFunc) error {
-
+// FSetXattr reports that io_uring extended-attribute operations are unavailable on Darwin.
+func (ur *Uring) FSetXattr(sqeCtx SQEContext, name string, value []byte, flags uint32, options ...OpOptionFunc) error {
 	return ErrNotSupported
 }
 
-// SetXattr is unavailable on Darwin.
-func (ur *Uring) SetXattr(sqeCtx SQEContext, path, name string, value []byte, flags int, options ...OpOptionFunc) error {
-
+// SetXattr reports that io_uring extended-attribute operations are unavailable on Darwin.
+func (ur *Uring) SetXattr(sqeCtx SQEContext, path, name string, value []byte, flags uint32, options ...OpOptionFunc) error {
 	return ErrNotSupported
 }
 
-// FGetXattr is unavailable on Darwin.
+// FGetXattr reports that io_uring extended-attribute operations are unavailable on Darwin.
 func (ur *Uring) FGetXattr(sqeCtx SQEContext, name string, value []byte, options ...OpOptionFunc) error {
-
 	return ErrNotSupported
 }
 
-// GetXattr is unavailable on Darwin.
+// GetXattr reports that io_uring extended-attribute operations are unavailable on Darwin.
 func (ur *Uring) GetXattr(sqeCtx SQEContext, path, name string, value []byte, options ...OpOptionFunc) error {
-
 	return ErrNotSupported
 }
 
-// Statx is unavailable on Darwin.
-func (ur *Uring) Statx(sqeCtx SQEContext, path string, flags, mask int, stat *Statx, options ...OpOptionFunc) error {
-
+// Statx reports that io_uring statx is unavailable on Darwin.
+func (ur *Uring) Statx(sqeCtx SQEContext, path string, flags, mask uint32, stat *Statx, options ...OpOptionFunc) error {
 	return ErrNotSupported
 }
 
-// RenameAt is unavailable on Darwin.
-func (ur *Uring) RenameAt(sqeCtx SQEContext, oldPath, newPath string, flags int, options ...OpOptionFunc) error {
-
+// RenameAt reports that io_uring path operations are unavailable on Darwin.
+func (ur *Uring) RenameAt(sqeCtx SQEContext, oldPath, newPath string, flags uint32, options ...OpOptionFunc) error {
 	return ErrNotSupported
 }
 
-// UnlinkAt is unavailable on Darwin.
-func (ur *Uring) UnlinkAt(sqeCtx SQEContext, path string, flags int, options ...OpOptionFunc) error {
-
+// UnlinkAt reports that io_uring path operations are unavailable on Darwin.
+func (ur *Uring) UnlinkAt(sqeCtx SQEContext, path string, flags uint32, options ...OpOptionFunc) error {
 	return ErrNotSupported
 }
 
-// MkdirAt is unavailable on Darwin.
+// MkdirAt reports that io_uring path operations are unavailable on Darwin.
 func (ur *Uring) MkdirAt(sqeCtx SQEContext, path string, mode uint32, options ...OpOptionFunc) error {
-
 	return ErrNotSupported
 }
 
-// SymlinkAt is unavailable on Darwin.
+// SymlinkAt reports that io_uring path operations are unavailable on Darwin.
 func (ur *Uring) SymlinkAt(sqeCtx SQEContext, target, linkpath string, options ...OpOptionFunc) error {
-
 	return ErrNotSupported
 }
 
-// LinkAt is unavailable on Darwin.
-func (ur *Uring) LinkAt(sqeCtx SQEContext, oldDirfd int, oldPath, newPath string, flags int, options ...OpOptionFunc) error {
-
+// LinkAt reports that io_uring path operations are unavailable on Darwin.
+func (ur *Uring) LinkAt(sqeCtx SQEContext, oldDirfd iofd.FD, oldPath, newPath string, flags uint32, options ...OpOptionFunc) error {
 	return ErrNotSupported
 }
 
-// FTruncate is unavailable on Darwin.
+// FTruncate reports that io_uring file truncation is unavailable on Darwin.
 func (ur *Uring) FTruncate(sqeCtx SQEContext, length int64, options ...OpOptionFunc) error {
-
 	return ErrNotSupported
 }
 
-// FutexWait is unavailable on Darwin.
+// FutexWait reports that io_uring futex operations are unavailable on Darwin.
 func (ur *Uring) FutexWait(sqeCtx SQEContext, addr *uint32, val uint64, mask uint64, flags uint32, options ...OpOptionFunc) error {
-
 	return ErrNotSupported
 }
 
-// FutexWake is unavailable on Darwin.
+// FutexWake reports that io_uring futex operations are unavailable on Darwin.
 func (ur *Uring) FutexWake(sqeCtx SQEContext, addr *uint32, val uint64, mask uint64, flags uint32, options ...OpOptionFunc) error {
-
 	return ErrNotSupported
 }
 
-// FutexWaitV is unavailable on Darwin.
+// FutexWaitV reports that io_uring futex operations are unavailable on Darwin.
 func (ur *Uring) FutexWaitV(sqeCtx SQEContext, waitv unsafe.Pointer, count uint32, flags uint32, options ...OpOptionFunc) error {
-
 	return ErrNotSupported
 }
 
-// Waitid is unavailable on Darwin.
+// Waitid reports that io_uring process waits are unavailable on Darwin.
 func (ur *Uring) Waitid(sqeCtx SQEContext, idtype, id int, infop unsafe.Pointer, options int, opts ...OpOptionFunc) error {
-
 	return ErrNotSupported
 }
 
-// FixedFdInstall is unavailable on Darwin.
+// FixedFdInstall reports that io_uring fixed-descriptor installation is unavailable on Darwin.
 func (ur *Uring) FixedFdInstall(sqeCtx SQEContext, fixedIndex int, flags uint32, options ...OpOptionFunc) error {
-
 	return ErrNotSupported
 }
 
-// FilesUpdate is unavailable on Darwin.
+// FilesUpdate reports that io_uring fixed-file updates are unavailable on Darwin.
 func (ur *Uring) FilesUpdate(sqeCtx SQEContext, fds []int32, offset int, options ...OpOptionFunc) error {
-
 	return ErrNotSupported
 }
 
-// UringCmd is unavailable on Darwin.
+// UringCmd reports that io_uring passthrough commands are unavailable on Darwin.
 func (ur *Uring) UringCmd(sqeCtx SQEContext, cmdOp uint32, cmdData []byte, options ...OpOptionFunc) error {
-
 	return ErrNotSupported
 }
 
-// Nop128 is unavailable on Darwin.
+// UringCmdInline reports that io_uring inline passthrough commands are unavailable on Darwin.
+func (ur *Uring) UringCmdInline(sqeCtx SQEContext, cmdOp uint32, cmdData []byte, options ...OpOptionFunc) error {
+	return ErrNotSupported
+}
+
+// Nop128 reports that 128-byte SQEs are unavailable on Darwin.
 func (ur *Uring) Nop128(sqeCtx SQEContext, options ...OpOptionFunc) error {
-
 	return ErrNotSupported
 }
 
-// UringCmd128 is unavailable on Darwin.
+// UringCmd128 reports that 128-byte SQEs are unavailable on Darwin.
 func (ur *Uring) UringCmd128(sqeCtx SQEContext, cmdOp uint32, cmdData []byte, options ...OpOptionFunc) error {
-
 	return ErrNotSupported
 }

@@ -148,11 +148,17 @@ Operations:
 | Poll | `PollAdd`, `PollRemove`, `PollUpdate`, `PollAddLevel`, `PollAddMultishot`, `PollAddMultishotLevel` |
 | Async | `EpollWait`, `FutexWait`, `FutexWake`, `FutexWaitV`, `Waitid` |
 | Ring msg | `MsgRing`, `MsgRingFD`, `FixedFdInstall`, `FilesUpdate` |
-| Cmd | `UringCmd`, `UringCmd128`, `Nop`, `Nop128` |
+| Cmd | `UringCmd`, `UringCmdInline`, `UringCmd128`, `Nop`, `Nop128` |
+
+`UringCmdInline` copies up to 80 bytes into an ordinary `IORING_OP_URING_CMD` SQE and requires `Options.SQE128`; it does not require support for the separate `IORING_OP_URING_CMD128` opcode.
+
+`WithUringCmdFlags` writes the `uring_cmd_flags` union. For `IORING_URING_CMD_FIXED`, set the registered-buffer index with `sqeCtx.WithBufGroup`; for `IORING_URING_CMD_MULTISHOT`, also set `IOSQE_BUFFER_SELECT` and use the same context field as the provided-buffer group. The two flags are mutually exclusive.
 
 `Nop128` and `UringCmd128` require a ring created with `Options.SQE128` and kernel support for the corresponding opcodes. Without both, they return `ErrNotSupported`.
 
 `Uring.Close` submits `IORING_OP_CLOSE` for a target file descriptor. It is not a ring teardown method.
+
+`PollAddLevel` and `PollAddMultishotLevel` always return `ErrNotSupported`; Linux io_uring does not admit the level flag for `IORING_OP_POLL_ADD`.
 
 ## Context transport
 
@@ -445,7 +451,7 @@ Keep live Go pointer roots reachable outside `UserData`. The GC does not trace t
 
 ### Deadline composition
 
-`LinkTimeout` attaches a deadline to the preceding SQE through an `IOSQE_IO_LINK` chain. The operation and the timeout race: exactly one completes, and the other is cancelled.
+`LinkTimeout` attaches a deadline to the preceding SQE through an `IOSQE_IO_LINK` chain. Expiry attempts to cancel the linked operation, which may already have completed. Inspect both CQE results; a timeout does not prove that the operation was cancelled.
 
 ```go
 recvCtx := uring.ForFD(fd).
@@ -462,7 +468,7 @@ if err := ring.LinkTimeout(timeoutCtx, 5*time.Second); err != nil {
 }
 ```
 
-The caller-side runtime handles both outcomes: a successful receive cancels the timeout, and a fired timeout cancels the receive. Both produce CQEs that the dispatch loop must observe.
+Submit the linked SQEs contiguously, serializing the pair with other submit and wait calls. Keep the operation's buffers and context live until its own completion, and drain both CQEs before teardown.
 
 ## TCP usage patterns
 

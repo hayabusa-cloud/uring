@@ -148,11 +148,17 @@ Operaciones:
 | Poll | `PollAdd`, `PollRemove`, `PollUpdate`, `PollAddLevel`, `PollAddMultishot`, `PollAddMultishotLevel` |
 | Async | `EpollWait`, `FutexWait`, `FutexWake`, `FutexWaitV`, `Waitid` |
 | Ring msg | `MsgRing`, `MsgRingFD`, `FixedFdInstall`, `FilesUpdate` |
-| Cmd | `UringCmd`, `UringCmd128`, `Nop`, `Nop128` |
+| Cmd | `UringCmd`, `UringCmdInline`, `UringCmd128`, `Nop`, `Nop128` |
+
+`UringCmdInline` copia hasta 80 bytes en una SQE ordinaria `IORING_OP_URING_CMD` y requiere `Options.SQE128`; no requiere compatibilidad con el opcode separado `IORING_OP_URING_CMD128`.
+
+`WithUringCmdFlags` escribe la unión `uring_cmd_flags`. Para `IORING_URING_CMD_FIXED`, establezca el índice del búfer registrado con `sqeCtx.WithBufGroup`; para `IORING_URING_CMD_MULTISHOT`, establezca también `IOSQE_BUFFER_SELECT` y use el mismo campo de contexto como grupo de búferes proporcionados. Los dos flags son mutuamente excluyentes.
 
 `Nop128` y `UringCmd128` requieren un ring creado con `Options.SQE128` y soporte del kernel para los opcodes correspondientes. Sin ambos, devuelven `ErrNotSupported`.
 
 `Uring.Close` envía `IORING_OP_CLOSE` sobre un descriptor de archivo destino. No es un método de desmontaje del ring.
+
+`PollAddLevel` y `PollAddMultishotLevel` siempre devuelven `ErrNotSupported`; io_uring de Linux no admite el indicador de nivel para `IORING_OP_POLL_ADD`.
 
 ## Transporte de contexto
 
@@ -445,7 +451,7 @@ Mantenga las raíces de punteros Go activas accesibles fuera de `UserData`. El G
 
 ### Composición de plazos
 
-`LinkTimeout` adjunta un plazo al SQE anterior a través de una cadena `IOSQE_IO_LINK`. La operación y el tiempo de espera compiten: exactamente uno se completa y el otro se cancela.
+`LinkTimeout` adjunta un plazo al SQE anterior mediante una cadena `IOSQE_IO_LINK`. Al vencer, intenta cancelar la operación enlazada, que puede haber terminado ya. Examine ambos resultados de CQE; el vencimiento no demuestra que la operación se haya cancelado.
 
 ```go
 recvCtx := uring.ForFD(fd).
@@ -462,7 +468,7 @@ if err := ring.LinkTimeout(timeoutCtx, 5*time.Second); err != nil {
 }
 ```
 
-La capa de ejecución del llamador maneja ambos resultados: una recepción exitosa cancela el tiempo de espera, y un tiempo de espera disparado cancela la recepción. Ambos producen CQEs que el bucle de despacho debe observar.
+Envíe los SQE enlazados de forma contigua, serializando el par con las demás llamadas de envío y espera. Mantenga los búferes y el contexto de la operación hasta su propia finalización, y procese ambas CQE antes del cierre.
 
 ## Patrones de uso en TCP
 

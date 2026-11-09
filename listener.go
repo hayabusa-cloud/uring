@@ -8,6 +8,7 @@ package uring
 
 import (
 	"errors"
+	"math"
 	"net"
 	"sync/atomic"
 	"unsafe"
@@ -33,8 +34,8 @@ const (
 )
 
 // ListenerHandler receives completion events during listener setup.
-// The bool-return callbacks are authoritative control-flow hooks: returning true
-// advances to the next setup phase, while false aborts before submitting it.
+// The caller invokes these callbacks and advances setup with the Prepare helpers.
+// A true result permits the next phase; false tells the caller to abort setup.
 type ListenerHandler interface {
 	// OnSocketCreated reports that socket creation succeeded. Return true to
 	// continue listener setup or false to abort it.
@@ -135,6 +136,9 @@ func DecodeListenerCQE(cqe CQEView) (ListenerStep, bool) {
 //
 // A nil handler is normalized to [NoopListenerHandler].
 func PrepareListenerSocket(ext *ExtSQE, domain, sockType, proto int, sa Sockaddr, backlog int, handler ListenerHandler) error {
+	if domain < 0 || domain > math.MaxUint16 || sockType < 0 || sockType > math.MaxInt32 || proto < 0 || proto > math.MaxInt32 || backlog < 0 || backlog > math.MaxInt32 {
+		return ErrInvalidParam
+	}
 	ctx := listenerInitCtx(ext, handler)
 	ctx.Data.State = ListenerStateSocket
 	ctx.Data.Domain = uint16(domain)
@@ -186,8 +190,6 @@ func SetListenerReady(ext *ExtSQE) {
 	ctx := asListenerCtx(ext)
 	ctx.Data.State = ListenerStateReady
 }
-
-// ListenerManager is a thin convenience for initial SOCKET submission.
 
 // ListenerManager provides convenience methods for starting async listener
 // creation. It prepares the initial SOCKET SQE and submits it.
@@ -263,8 +265,6 @@ func (m *ListenerManager) startSocket(domain, sockType, proto int, sa Sockaddr, 
 	return op, nil
 }
 
-// ListenerOp is a thin handle for a listener creation in progress.
-
 // ListenerOp is a handle to a listener creation operation.
 // The caller drives the setup state machine; ListenerOp holds the listener FD
 // and provides convenience methods around it.
@@ -324,6 +324,8 @@ func (op *ListenerOp) Close() {
 // AcceptMultishot starts a multishot accept subscription on a ready listener.
 // Options are forwarded to [Uring.AcceptMultishot].
 // Returns ErrNotReady until the listener FD is set and valid.
+// Caller must complete bind and listen before calling; FD validity alone does
+// not establish that the socket is listening.
 func (op *ListenerOp) AcceptMultishot(handler MultishotHandler, options ...OpOptionFunc) (*MultishotSubscription, error) {
 	fd := op.FD()
 	if fd < 0 {
