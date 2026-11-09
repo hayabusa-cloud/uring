@@ -147,7 +147,7 @@ const (
 	IORING_REGISTER_CLONE_BUFFERS    = zcall.IORING_REGISTER_CLONE_BUFFERS // Clone buffers from another ring
 	IORING_REGISTER_SEND_MSG_RING    = zcall.IORING_REGISTER_SEND_MSG_RING // Send MSG_RING without ring
 	IORING_REGISTER_ZCRX_IFQ         = zcall.IORING_REGISTER_ZCRX_IFQ      // Register ZCRX interface queue
-	IORING_REGISTER_RESIZE_RINGS     = zcall.IORING_REGISTER_RESIZE_RINGS  // Resize CQ ring
+	IORING_REGISTER_RESIZE_RINGS     = zcall.IORING_REGISTER_RESIZE_RINGS  // Resize SQ and CQ rings
 	IORING_REGISTER_MEM_REGION       = zcall.IORING_REGISTER_MEM_REGION    // Memory region setup (6.13+)
 	IORING_REGISTER_QUERY            = zcall.IORING_REGISTER_QUERY         // Query ring state (6.18+)
 	IORING_REGISTER_ZCRX_CTRL        = zcall.IORING_REGISTER_ZCRX_CTRL     // ZCRX control operations (6.19+)
@@ -1774,23 +1774,15 @@ func (ur *ioUring) cloneBuffers(clone *CloneBuffers) error {
 // Resize Rings Methods
 // ========================================
 
-// resizeRings asks the kernel to resize the SQ and CQ rings of an io_uring
-// instance without recreating it.
+// resizeRings replaces the SQ/CQ mappings while preserving pending entries
+// and their submission storage.
 //
-// Requirements:
-//   - The ring must not use SQPOLL mode
-//   - The ring must not be in CQ overflow condition
-//   - newSQSize and newCQSize must be power-of-two values
+// The kernel requires DEFER_TASKRUN and no pending CQ overflow. Requested
+// sizes are rounded up to powers of two and clamped to kernel limits. A zero
+// SQ size keeps the current size; a zero CQ size selects twice the resulting SQ.
 //
-// The kernel copies pending SQ and CQ entries during resize. The request may
-// still fail with EINVAL on hosts that do not accept the requested resize.
-// If newSQSize is 0, the current SQ size is reused in the kernel request so
-// callers can resize only the CQ ring (and newCQSize still defaults to 2×SQ
-// when left at 0).
-// If newCQSize is 0, it defaults to 2×newSQSize.
-// A post-register remap failure is terminal: the ring is closed because the
-// kernel has already committed the resize and userspace can no longer trust the
-// stale mappings safely.
+// A post-register remap failure closes the ring: the kernel has committed the
+// resize, so the old userspace mappings can no longer drive it.
 func (ur *ioUring) resizeRings(newSQSize, newCQSize uint32) error {
 	ur.lockSubmitState()
 	defer ur.unlockSubmitState()
@@ -1799,6 +1791,8 @@ func (ur *ioUring) resizeRings(newSQSize, newCQSize uint32) error {
 	if newSQSize == 0 {
 		newSQSize = ur.params.sqEntries
 	}
+	// Linux accepts only resize-control flags here. It inherits and returns
+	// immutable layout flags such as SQE128 and CQE32.
 	params := ioUringParams{
 		sqEntries: newSQSize,
 		cqEntries: newCQSize,
@@ -1816,33 +1810,83 @@ func (ur *ioUring) resizeRings(newSQSize, newCQSize uint32) error {
 	}
 	oldKeepAliveHead := ur.submit.keepAliveHead
 	oldKeepAlive := ur.submit.keepAlive
+	oldSQ := ur.sq
+	oldCQ := ur.cq
 	oldRingPtr := ur.sq.ringPtr
 	oldRingMapSz := ur.ringMapSz()
 	oldSqesPtr := ur.sq.sqesPtr
 	oldSqeMapSz := ur.sq.sqeMapSz
-	if ur.params.flags&IORING_SETUP_SQE128 != 0 {
-		params.flags |= IORING_SETUP_SQE128
-	}
 
 	_, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_REGISTER_RESIZE_RINGS, unsafe.Pointer(&params), 1)
 	if errno != 0 {
 		return errFromErrno(errno)
 	}
 
-	zcall.Munmap(oldSqesPtr, oldSqeMapSz)
-	zcall.Munmap(oldRingPtr, oldRingMapSz)
+	// Pending entries remain readable through the old mappings until relocation.
+	defer zcall.Munmap(oldSqesPtr, oldSqeMapSz)
+	defer zcall.Munmap(oldRingPtr, oldRingMapSz)
 	ur.clearRingViews()
 	if err := ur.remapRings(&params); err != nil {
 		return ur.closeAfterFatalResize(fmt.Errorf("remap resized rings: %w", err))
 	}
+	// Registration freezes the old CQ. Preserve complete entries, including
+	// CQE32 payloads that older kernels copy in 16-byte units during resize.
+	cqHead := atomic.LoadUint32(oldCQ.kHead)
+	cqTail := atomic.LoadUint32(oldCQ.kTail)
+	for idx := cqHead; idx != cqTail; idx++ {
+		src := int(idx&*oldCQ.kRingMask) * oldCQ.cqeStride
+		dst := int(idx&*ur.cq.kRingMask) * ur.cq.cqeStride
+		copy(ur.cq.cqes[dst:dst+ur.cq.cqeStride], oldCQ.cqes[src:src+oldCQ.cqeStride])
+	}
 
-	if len(oldKeepAlive) != int(params.sqEntries) {
-		newKeepAlive := make([]submitKeepAlive, int(params.sqEntries))
-		newMask := params.sqEntries - 1
-		for idx := oldKeepAliveHead; idx != oldTail; idx++ {
-			newKeepAlive[idx&newMask] = oldKeepAlive[idx&oldMask]
+	resizedSQ := len(oldKeepAlive) != int(params.sqEntries)
+	if resizedSQ {
+		ur.submit.keepAlive = make([]submitKeepAlive, int(params.sqEntries))
+	}
+	newMask := params.sqEntries - 1
+	for idx := oldKeepAliveHead; idx != oldTail; idx++ {
+		oldIndex, newIndex := idx&oldMask, idx&newMask
+		sqe := ur.sq.sqeAt(newIndex)
+		// Reconstruct complete entries: older kernels copy only 64-byte units
+		// during resize, including on SQE128 rings.
+		if params.flags&IORING_SETUP_SQE128 != 0 {
+			*ur.sq.sqe128At(newIndex) = *oldSQ.sqe128At(oldIndex)
+		} else {
+			*sqe = *oldSQ.sqeAt(oldIndex)
 		}
-		ur.submit.keepAlive = newKeepAlive
+		if params.flags&IORING_SETUP_NO_SQARRAY == 0 {
+			ur.sq.array[newIndex] = newIndex
+		}
+		if !resizedSQ {
+			continue
+		}
+		keep := &ur.submit.keepAlive[newIndex]
+		*keep = oldKeepAlive[oldIndex]
+		// Iovec slices and ext pointers retain their original backing. Inline
+		// timespecs have only integer SQE addresses, so rebase those addresses.
+		oldAddr := uint64(uintptr(unsafe.Pointer(&oldKeepAlive[oldIndex].timespec)))
+		newAddr := uint64(uintptr(unsafe.Pointer(&keep.timespec)))
+		switch sqe.opcode {
+		case IORING_OP_TIMEOUT, IORING_OP_LINK_TIMEOUT:
+			if sqe.addr != oldAddr {
+				continue
+			}
+			sqe.addr = newAddr
+		case IORING_OP_TIMEOUT_REMOVE:
+			if sqe.uflags&IORING_TIMEOUT_UPDATE_MASK == 0 || sqe.off != oldAddr {
+				continue
+			}
+			sqe.off = newAddr
+		default:
+			continue
+		}
+		ctx := SQEContextFromRaw(sqe.userData)
+		switch ctx.Mode() {
+		case CtxModeIndirect:
+			ctx.IndirectSQE().ioUringSqe = *sqe
+		case CtxModeExtended:
+			ctx.ExtSQE().SQE = *sqe
+		}
 	}
 
 	ur.params.sqEntries = params.sqEntries

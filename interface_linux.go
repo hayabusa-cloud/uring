@@ -136,7 +136,8 @@ func New(options ...OptionFunc) (*Uring, error) {
 	return &ret, nil
 }
 
-// Features reports per-ring sizing and metadata returned at creation time.
+// Features reports the current ring geometry and user_data byte order.
+// ResizeRings updates SQEntries and CQEntries after a successful resize.
 type Features struct {
 	// SQEntries is the actual number of SQ entries allocated by the kernel.
 	SQEntries int
@@ -194,7 +195,7 @@ type Uring struct {
 	buffersPool *RegisterBufferPool
 
 	// ctxPools provides lock-free pools for IndirectSQE and ExtSQE contexts.
-	// Capacity matches SQ entries for natural backpressure.
+	// Each pool keeps its initial capacity when the SQ and CQ rings are resized.
 	ctxPools *ContextPools
 
 	readLikeOpFlags  uint8
@@ -1555,19 +1556,22 @@ func (ur *Uring) cloneBuffersFrom(src *Uring, srcRegisteredRingIdx uint32, regis
 // ========================================
 
 // ResizeRings resizes the SQ and CQ rings of this io_uring instance.
-// On single-issuer rings it is not safe for concurrent use with submit,
-// Wait, WaitDirect, WaitExtended, or Stop; caller must serialize those operations.
-// This allows dynamic adjustment of ring sizes without recreating the ring.
+// Pending submissions and completions are preserved. SQE/CQE entry widths and
+// context-pool capacities are unchanged. The caller must serialize resize with
+// submissions, Wait, WaitDirect, WaitExtended, and Stop.
 //
 // Requirements:
-//   - The ring must be created with IORING_SETUP_DEFER_TASKRUN flag
+//   - MultiIssuers must be false so New requests IORING_SETUP_DEFER_TASKRUN
+//   - The caller must remain locked to one OS thread from before New through Stop
 //   - The ring must not be in CQ overflow condition
-//   - Sizes must be power-of-two values
 //
 // Parameters:
 //   - newSQSize: New SQ ring size (0 keeps the current SQ size)
-//   - newCQSize: New CQ ring size (0 defaults to 2×newSQSize)
+//   - newCQSize: New CQ ring size (0 defaults to twice the resulting SQ size)
 //
+// Nonzero sizes are rounded up to powers of two and clamped to kernel limits.
+// The resulting CQ size must be at least the resulting SQ size.
+// If remapping fails after the kernel commits the resize, the ring is closed.
 // Supported on Linux 6.18+.
 func (ur *Uring) ResizeRings(newSQSize, newCQSize uint32) error {
 	if err := ur.resizeRings(newSQSize, newCQSize); err != nil {

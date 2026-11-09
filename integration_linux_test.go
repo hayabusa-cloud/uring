@@ -780,40 +780,86 @@ func TestResizeRings(t *testing.T) {
 		t.Skip("ResizeRings is not reliable on WSL2 kernels")
 	}
 
-	// Create a single-issuer ring (has DEFER_TASKRUN by default)
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall // 512 entries
-		// Single issuer mode is default, which sets DEFER_TASKRUN
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	mustStartRing(t, ring)
-	logRingDiagnostics(t, "ResizeRings/start", ring)
+	for _, tt := range []struct {
+		name     string
+		sqe128   bool
+		sqeBytes int
+	}{
+		{name: "SQE64", sqeBytes: 64},
+		{name: "SQE128", sqe128: true, sqeBytes: 128},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			runtime.LockOSThread()
+			defer runtime.UnlockOSThread()
 
-	// Try to resize to larger CQ ring
-	err = ring.ResizeRings(0, 2048) // Keep SQ, grow CQ to 2048
-	if err != nil {
-		logRingDiagnostics(t, "ResizeRings/failure", ring)
-		t.Fatalf("ResizeRings: %v (requested newSQ=%d newCQ=%d)", err, 0, 2048)
-	}
-	logRingDiagnostics(t, "ResizeRings/after", ring)
+			// Resize requires the explicit pinned single-issuer configuration.
+			ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
+				opt.Entries = uring.EntriesSmall
+				opt.MultiIssuers = false
+				opt.SQE128 = tt.sqe128
+			})
+			if tt.sqe128 && errors.Is(err, uring.ErrNotSupported) {
+				t.Skip("SQE128 ring setup not supported on this kernel")
+			}
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			if err := ring.Start(); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			defer func() {
+				if err := ring.Stop(); err != nil {
+					t.Errorf("Stop: %v", err)
+				}
+			}()
+			if got := ring.Features.SQEBytes; got != tt.sqeBytes {
+				t.Fatalf("SQEBytes = %d, want %d", got, tt.sqeBytes)
+			}
+			logRingDiagnostics(t, t.Name()+"/start", ring)
 
-	// Verify the ring still works after resize
-	ctx := uring.PackDirect(uring.IORING_OP_NOP, 0, 0, 0)
-	if err := ring.Nop(ctx); err != nil {
-		t.Fatalf("Nop after resize: %v", err)
-	}
+			if err := ring.ResizeRings(0, 2048); err != nil {
+				logRingDiagnostics(t, t.Name()+"/failure", ring)
+				t.Fatalf("ResizeRings: %v (requested newSQ=%d newCQ=%d)", err, 0, 2048)
+			}
+			logRingDiagnostics(t, t.Name()+"/after", ring)
+			if got := ring.Features.SQEBytes; got != tt.sqeBytes {
+				t.Fatalf("SQEBytes after resize = %d, want %d", got, tt.sqeBytes)
+			}
 
-	ev, ok := waitForOp(t, ring, uring.IORING_OP_NOP, time.Second)
-	if !ok {
-		t.Fatal("NOP did not complete after resize")
-	}
-	if ev.Res < 0 {
-		t.Errorf("NOP failed after resize: %d", ev.Res)
-	}
+			ctx := uring.PackDirect(uring.IORING_OP_NOP, 0, 0, 0)
+			if err := ring.Nop(ctx); err != nil {
+				t.Fatalf("Nop after resize: %v", err)
+			}
 
-	t.Log("ResizeRings succeeded - ring functional after CQ resize to 2048")
+			ev, ok := waitForOp(t, ring, uring.IORING_OP_NOP, time.Second)
+			if !ok {
+				t.Fatal("NOP did not complete after resize")
+			}
+			if ev.Res < 0 {
+				t.Errorf("NOP failed after resize: %d", ev.Res)
+			}
+
+			// Check wide-command admission without requiring a command device.
+			ctx = uring.PackDirect(uring.IORING_OP_URING_CMD, 0, 0, -1)
+			var command [80]byte
+			err = ring.UringCmdInline(ctx, 0, command[:])
+			if !tt.sqe128 {
+				if !errors.Is(err, uring.ErrNotSupported) {
+					t.Fatalf("UringCmdInline on SQE64 after resize: %v, want ErrNotSupported", err)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("UringCmdInline on SQE128 after resize: %v", err)
+				}
+				ev, ok = waitForOp(t, ring, uring.IORING_OP_URING_CMD, time.Second)
+				if !ok || ev.Res != -int32(zcall.EBADF) {
+					t.Fatalf("inline command after resize: completed=%t result=%d, want EBADF", ok, ev.Res)
+				}
+			}
+
+			t.Log("ResizeRings succeeded - ring functional after CQ resize to 2048")
+		})
+	}
 }
 
 // TestBufRingMMAP tests kernel-allocated buffer ring registration.

@@ -107,7 +107,7 @@ func New(options ...OptionFunc) (*Uring, error) {
 	return &ret, nil
 }
 
-// Features reports per-ring sizing and metadata returned at creation time.
+// Features reports the stub's queue geometry and user_data byte order.
 type Features struct {
 	SQEntries         int
 	CQEntries         int
@@ -1031,9 +1031,8 @@ func (ur *Uring) CloneBuffersFromRegistered(src *Uring, srcRegisteredRingIdx uin
 	return ErrNotSupported
 }
 
-// ResizeRings is unavailable on Darwin.
+// ResizeRings reports that io_uring ring resizing is unavailable on Darwin.
 func (ur *Uring) ResizeRings(newSQSize, newCQSize uint32) error {
-
 	return ErrNotSupported
 }
 
