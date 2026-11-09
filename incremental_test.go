@@ -7,6 +7,7 @@
 package uring_test
 
 import (
+	"bytes"
 	"errors"
 	"net"
 	"sync/atomic"
@@ -26,12 +27,14 @@ type testIncHandler struct {
 	totalBytes   atomic.Int32
 	lastHasMore  atomic.Bool
 	lastErr      atomic.Value // stores error
+	received     []byte
 }
 
 func (h *testIncHandler) OnData(buf []byte, hasMore bool) {
 	h.dataCount.Add(1)
 	h.totalBytes.Add(int32(len(buf)))
 	h.lastHasMore.Store(hasMore)
+	h.received = append(h.received, buf...)
 }
 
 func (h *testIncHandler) OnComplete() {
@@ -41,6 +44,27 @@ func (h *testIncHandler) OnComplete() {
 func (h *testIncHandler) OnError(err error) {
 	h.errorCall.Add(1)
 	h.lastErr.Store(err)
+}
+
+func newIncrementalTestReceiver(t *testing.T, ring *uring.Uring, pool *uring.ContextPools, bufSize, entries int) (*uring.IncrementalReceiver, []byte) {
+	t.Helper()
+
+	const groupID uint16 = 60000
+	backing := make([]byte, entries*bufSize)
+	bufRing, err := ring.RegisterBufRingIncremental(entries, groupID)
+	if err != nil {
+		t.Fatalf("RegisterBufRingIncremental: %v", err)
+	}
+	for i := range entries {
+		buf := backing[i*bufSize : (i+1)*bufSize]
+		if err := bufRing.Add(buf, uint16(i), i); err != nil {
+			t.Fatalf("BufferRing.Add(%d): %v", i, err)
+		}
+	}
+	if err := bufRing.Advance(entries); err != nil {
+		t.Fatalf("BufferRing.Advance: %v", err)
+	}
+	return uring.NewIncrementalReceiver(ring, pool, groupID, bufSize, backing, entries), backing
 }
 
 // TestIncrementalReceiverBasic tests basic incremental receive functionality.
@@ -55,12 +79,9 @@ func TestIncrementalReceiverBasic(t *testing.T) {
 
 	pool := uring.NewContextPools(int(uring.EntriesSmall))
 
-	// Create buffer backing for incremental receive
 	const bufCount = 4
 	const bufSize = 1024
-	bufBacking := make([]byte, bufCount*bufSize)
-
-	receiver := uring.NewIncrementalReceiver(ring, pool, 0, bufSize, bufBacking, bufCount)
+	receiver, _ := newIncrementalTestReceiver(t, ring, pool, bufSize, bufCount)
 	if receiver == nil {
 		t.Fatal("NewIncrementalReceiver returned nil")
 	}
@@ -104,7 +125,7 @@ func TestIncrementalReceiverBasic(t *testing.T) {
 	// Submit incremental recv
 	err = receiver.Recv(iofd.FD(serverFile.Fd()), handler)
 	if err != nil {
-		t.Skipf("incremental black-box test does not provision IOU_PBUF_RING_INC buffers: %v", err)
+		t.Fatalf("Recv: %v", err)
 	}
 
 	// Wait for completion
@@ -135,12 +156,18 @@ func TestIncrementalReceiverBasic(t *testing.T) {
 		b.Wait()
 	}
 
-	if handler.errorCall.Load() > 0 && handler.dataCount.Load() == 0 && handler.completeCall.Load() == 0 {
+	if handler.errorCall.Load() != 0 {
 		lastErr, _ := handler.lastErr.Load().(error)
-		t.Skipf("incremental black-box test hit the unconfigured buffer-ring path: %v", lastErr)
+		t.Fatalf("incremental receive error: %v", lastErr)
 	}
-	if handler.completeCall.Load() == 0 && handler.errorCall.Load() == 0 {
-		t.Skip("no incremental callbacks observed in black-box test; receive semantics are covered in incremental_internal_test")
+	if handler.completeCall.Load() != 1 {
+		t.Fatalf("complete calls = %d, want 1", handler.completeCall.Load())
+	}
+	if handler.dataCount.Load() != 1 {
+		t.Fatalf("data calls = %d, want 1", handler.dataCount.Load())
+	}
+	if !bytes.Equal(handler.received, testData) {
+		t.Fatalf("received data = %q, want %q", handler.received, testData)
 	}
 
 	// Report results
@@ -166,9 +193,7 @@ func TestIncrementalReceiverPoolExhaustion(t *testing.T) {
 
 	const bufCount = 4
 	const bufSize = 256
-	bufBacking := make([]byte, bufCount*bufSize)
-
-	receiver := uring.NewIncrementalReceiver(ring, pool, 0, bufSize, bufBacking, bufCount)
+	receiver, _ := newIncrementalTestReceiver(t, ring, pool, bufSize, bufCount)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -197,18 +222,23 @@ func TestIncrementalReceiverPoolExhaustion(t *testing.T) {
 
 	handler := &testIncHandler{}
 
-	// Exhaust the pool
-	for i := 0; i < 2; i++ {
-		err := receiver.Recv(iofd.FD(serverFile.Fd()), handler)
-		if err != nil {
-			t.Logf("Recv[%d]: %v", i, err)
+	// Exhaust the pool without creating live kernel requests.
+	held := make([]*uring.ExtSQE, 0, 2)
+	for range 2 {
+		ext := pool.Extended()
+		if ext == nil {
+			t.Fatal("Extended returned nil before pool was exhausted")
 		}
+		held = append(held, ext)
 	}
 
-	// Next recv should return ErrWouldBlock
+	// Recv should return ErrWouldBlock and leave the receiver reusable.
 	err = receiver.Recv(iofd.FD(serverFile.Fd()), handler)
 	if !errors.Is(err, iox.ErrWouldBlock) {
 		t.Errorf("expected ErrWouldBlock when pool exhausted, got: %v", err)
+	}
+	for _, ext := range held {
+		pool.PutExtended(ext)
 	}
 }
 
@@ -226,9 +256,7 @@ func TestIncrementalReceiverHandlerOrder(t *testing.T) {
 
 	const bufCount = 4
 	const bufSize = 1024
-	bufBacking := make([]byte, bufCount*bufSize)
-
-	receiver := uring.NewIncrementalReceiver(ring, pool, 0, bufSize, bufBacking, bufCount)
+	receiver, _ := newIncrementalTestReceiver(t, ring, pool, bufSize, bufCount)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -283,12 +311,13 @@ func TestIncrementalReceiverHandlerOrder(t *testing.T) {
 	// Send data
 	go func() {
 		time.Sleep(50 * time.Millisecond)
-		clientConn.Write([]byte("order test"))
+		_, _ = clientConn.Write([]byte("order test"))
+		_ = clientConn.Close()
 	}()
 
 	err = receiver.Recv(iofd.FD(serverFile.Fd()), orderHandler)
 	if err != nil {
-		t.Skipf("incremental black-box test does not provision IOU_PBUF_RING_INC buffers: %v", err)
+		t.Fatalf("Recv: %v", err)
 	}
 
 	cqes := make([]uring.CQEView, 16)
@@ -314,10 +343,10 @@ func TestIncrementalReceiverHandlerOrder(t *testing.T) {
 	}
 
 	if len(callOrder) == 0 {
-		t.Skip("no incremental callbacks observed in black-box test; handler lifecycle is covered in incremental_internal_test")
+		t.Fatal("no incremental callbacks observed")
 	}
 	if len(callOrder) == 1 && callOrder[0] == "error" {
-		t.Skip("incremental black-box test hit the unconfigured buffer-ring path")
+		t.Fatal("incremental receive returned only an error callback")
 	}
 
 	// Verify order: data should come before complete.

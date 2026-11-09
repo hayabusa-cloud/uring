@@ -18,6 +18,13 @@ type dummyPollFd int
 
 func (d dummyPollFd) Fd() int { return int(d) }
 
+func TestDarwinBundleCountAvoidsIntegerOverflow(t *testing.T) {
+	cqe := uring.CQEView{Res: 2}
+	if got := cqe.BundleCount(int(^uint(0) >> 1)); got != 1 {
+		t.Fatalf("BundleCount = %d, want 1", got)
+	}
+}
+
 func TestDarwinReadWriteRejectEmptyBuffer(t *testing.T) {
 	var ring uring.Uring
 	var ctx uring.SQEContext

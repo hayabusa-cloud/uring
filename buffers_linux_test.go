@@ -865,7 +865,6 @@ func TestBufferRingsBundleIteratorRecycle(t *testing.T) {
 	const (
 		bufSize   = 16
 		ringCount = 4
-		gidOffset = 11
 		group     = 11
 	)
 
@@ -880,6 +879,9 @@ func TestBufferRingsBundleIteratorRecycle(t *testing.T) {
 		masks:   []uintptr{ringCount - 1},
 		sizes:   []int{bufSize},
 		buffers: [][]byte{backing},
+		gids:    []uint16{group},
+		nextIDs: [][]uint16{{1, 2, 3, 0}},
+		lastIDs: []uint16{3},
 	}
 
 	cqe := CQEView{
@@ -887,23 +889,26 @@ func TestBufferRingsBundleIteratorRecycle(t *testing.T) {
 		Flags: 0 << IORING_CQE_BUFFER_SHIFT,
 	}
 
-	if _, ok := rings.bundleIterator(cqe, -1, gidOffset, group); ok {
-		t.Fatal("bundleIterator accepted a negative ring index")
+	if _, ok := rings.bundleIterator(cqe, group-1); ok {
+		t.Fatal("bundleIterator accepted an unregistered group")
 	}
 
-	iter, ok := rings.bundleIterator(cqe, 0, gidOffset, group)
+	iter, ok := rings.bundleIterator(cqe, group)
 	if !ok {
 		t.Fatal("bundleIterator returned false for a valid buffer ring")
 	}
-	if iter.gidOffset != gidOffset || iter.group != group {
-		t.Fatalf("iterator captured (%d, %d), want (%d, %d)", iter.gidOffset, iter.group, gidOffset, group)
+	if iter.recycleOwner != rings || iter.ringIndex != 0 || iter.group != group {
+		t.Fatalf("iterator recycle identity = (%p, %d, %d), want (%p, 0, %d)",
+			iter.recycleOwner, iter.ringIndex, iter.group, rings, group)
 	}
 
 	ur := &Uring{
 		ioUring:     &ioUring{},
 		bufferRings: rings,
 	}
-	iter.Recycle(ur)
+	if err := iter.Recycle(ur); err != nil {
+		t.Fatalf("Recycle: %v", err)
+	}
 
 	if rings.counts[0] != 0 {
 		t.Fatalf("counts after Recycle = %d, want 0", rings.counts[0])
@@ -920,6 +925,86 @@ func TestBufferRingsBundleIteratorRecycle(t *testing.T) {
 	}
 	if slots[1].addr != wantAddr1 || slots[1].len != bufSize || slots[1].bid != 1 {
 		t.Fatalf("slot 1 = {addr:%d len:%d bid:%d}, want {addr:%d len:%d bid:%d}", slots[1].addr, slots[1].len, slots[1].bid, wantAddr1, bufSize, 1)
+	}
+}
+
+func TestBufferRingsBundleIteratorSparseGroupIdentity(t *testing.T) {
+	const (
+		bufSize     = 16
+		ringEntries = 4
+		targetGroup = 12
+		targetIndex = 7
+	)
+	gids := []uint16{0, 1, 2, 3, 4, 5, 6, targetGroup}
+	slots := make([][ringEntries]ioUringBuf, len(gids))
+	rings := &uringBufferRings{
+		rings:   make([]*ioUringBufRing, len(gids)),
+		gids:    gids,
+		locks:   make([]spin.Lock, len(gids)),
+		counts:  make([]uintptr, len(gids)),
+		masks:   make([]uintptr, len(gids)),
+		sizes:   make([]int, len(gids)),
+		buffers: make([][]byte, len(gids)),
+		nextIDs: make([][]uint16, len(gids)),
+		lastIDs: make([]uint16, len(gids)),
+	}
+	for i := range gids {
+		rings.nextIDs[i] = []uint16{1, 2, 3, 0}
+		rings.lastIDs[i] = 3
+		rings.rings[i] = (*ioUringBufRing)(unsafe.Pointer(&slots[i][0]))
+		rings.masks[i] = ringEntries - 1
+		rings.sizes[i] = bufSize
+		rings.buffers[i] = make([]byte, ringEntries*bufSize)
+		rings.buffers[i][0] = byte(0x80 + i)
+	}
+
+	ur := &Uring{
+		ioUring:     &ioUring{},
+		Options:     &Options{},
+		bufferRings: rings,
+	}
+	cqe := CQEView{Res: bufSize}
+
+	allocs := testing.AllocsPerRun(1000, func() {
+		if _, ok := ur.BundleIterator(cqe, targetGroup); !ok {
+			panic("registered sparse group not found")
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("BundleIterator sparse lookup allocations = %v, want 0", allocs)
+	}
+
+	iter, ok := ur.BundleIterator(cqe, targetGroup)
+	if !ok {
+		t.Fatal("BundleIterator returned false for registered sparse group")
+	}
+	if iter.ringIndex != targetIndex || iter.recycleOwner != rings || iter.group != targetGroup {
+		t.Fatalf("iterator recycle identity = (%d, %p, %d), want (%d, %p, %d)",
+			iter.ringIndex, iter.recycleOwner, iter.group, targetIndex, rings, targetGroup)
+	}
+	if got := iter.Buffer(0)[0]; got != 0x80+targetIndex {
+		t.Fatalf("sparse group backing marker = %#x, want %#x", got, 0x80+targetIndex)
+	}
+	foreign := &Uring{ioUring: &ioUring{}, bufferRings: newUringBufferRings()}
+	if err := iter.Recycle(foreign); !errors.Is(err, ErrInvalidParam) {
+		t.Fatalf("Recycle foreign ring = %v, want %v", err, ErrInvalidParam)
+	}
+	if err := iter.Recycle(ur); err != nil {
+		t.Fatalf("Recycle sparse group: %v", err)
+	}
+
+	for i := range gids {
+		wantTail := uint16(0)
+		if i == targetIndex {
+			wantTail = 1
+		}
+		if got := rings.rings[i].tail; got != wantTail {
+			t.Fatalf("ring %d tail = %d, want %d", i, got, wantTail)
+		}
+	}
+	wantAddr := uint64(uintptr(unsafe.Pointer(&rings.buffers[targetIndex][0])))
+	if got := slots[targetIndex][0].addr; got != wantAddr {
+		t.Fatalf("recycled address = %d, want %d", got, wantAddr)
 	}
 }
 

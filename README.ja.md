@@ -124,12 +124,13 @@ for {
 | `ListenerOp`          | リスナー作成操作のハンドル。FD の保持と accept ヘルパーを提供            |
 | `BundleIterator`      | バンドル受信で消費されたバッファの走査                             |
 | `IncrementalReceiver` | インクリメンタル buffer-ring 受信の管理（`IOU_PBUF_RING_INC`） |
+| `BufferRing`          | 明示的に登録する不透明な提供バッファリング。`Add` で準備し、`Advance` で公開 |
 | `ZCTracker`           | ゼロコピー送信の通知とフォールバックのライフサイクルを追跡              |
 | `ContextPools`        | indirect・extended 発行コンテキストのプール                  |
 | `ZCRXReceiver`        | NIC RX キューからのゼロコピー受信ライフサイクルの管理                  |
 | `ZCRXConfig`          | ZCRX 受信インスタンスの設定                                |
 | `ZCRXHandler`         | ZCRX のデータ・エラー・シャットダウンに対するコールバックインターフェース         |
-| `ZCRXBuffer`          | 配送済みゼロコピー受信ビュー。解放時にカーネルが自動補充                    |
+| `ZCRXBuffer`          | 配送済みゼロコピー受信ビュー。呼び出し側が補充キュー経由で返却する              |
 
 操作メソッド:
 
@@ -240,7 +241,7 @@ for i := 0; i < n; i++ {
 
 ## バッファ供給
 
-`uring` には実用上 3 つのバッファ経路があります。登録バッファはリング開始時に固定され、固定バッファのファイル I/O で使います。提供バッファリングではカーネルが受信バッファを選び、選択されたバッファ ID を CQE に返します。バンドル受信は 1 つの CQE で連続した論理バッファ範囲を消費し、その範囲を `BundleIterator` で公開します。
+`uring` には実用上 3 つのバッファ経路があります。登録バッファはリング開始時に固定され、固定バッファのファイル I/O で使います。提供バッファリングではカーネルが受信バッファを選び、選択されたバッファ ID を CQE に返します。バンドル受信は公開順にバッファを消費します。再利用後は ID の数値順と一致するとは限りません。`Uring.BundleIterator` は実際の順序を保持します。単独の `NewBundleIterator` には、リングサイズを法とする連続した ID 順の公開が必要です。
 
 - `ReadBufferSize`・`ReadBufferNum` による固定サイズの提供バッファ
 - `MultiSizeBuffer` によるマルチサイズバッファグループ
@@ -261,6 +262,38 @@ ring, err := uring.New(func(o *uring.Options) {
 cfg, scale := uring.BufferConfigForBudget(256 * uring.MiB)
 fmt.Printf("buffer tiers=%+v scale=%d\n", cfg, scale)
 ```
+
+明示的なインクリメンタルリングは空の状態で初期化されます。`Start` の後、設定済みの提供バッファグループが使用していないグループ ID を選び、各バッキングスライスを準備してからバッチを公開します。
+
+```go
+const (
+    groupID = 60000
+    entries = 8
+    bufSize = 4096
+)
+
+backing := make([]byte, entries*bufSize)
+bufRing, err := ring.RegisterBufRingIncremental(entries, groupID)
+if err != nil {
+    return err
+}
+for i := range entries {
+    buf := backing[i*bufSize : (i+1)*bufSize]
+    if err := bufRing.Add(buf, uint16(i), i); err != nil {
+        return err
+    }
+}
+if err := bufRing.Advance(entries); err != nil {
+    return err
+}
+
+pool := uring.NewContextPools(entries)
+receiver := uring.NewIncrementalReceiver(ring, pool, groupID, bufSize, backing, entries)
+```
+
+`BufferRing.Add` はエントリを準備し、`BufferRing.Advance` はそれらを公開して所有権をカーネルへ移します。`backing` を到達可能な状態に保ってください。この receiver の CQE は、CQ の順序で一度ずつ直列に処理します。receiver はバッファ ID ごとに独立したオフセットを保持します。
+
+`IORING_CQE_F_BUF_MORE` は、リクエスト完了後も選択されたバッファをカーネルが保持していることを示します。`IORING_CQE_F_BUFFER` があり、`IORING_CQE_F_BUF_MORE` がない CQE を受け取り、借用中のアクセスがすべて終了してからバッファを再公開してください。結果がゼロまたは負でもバッファが返却されることがあります。buffer-ring の破棄は `Uring.Stop` が担当します。
 
 固定バッファ I/O は登録済みバッファをインデックスで参照します。返されるスライスはリング所有のメモリなので、固定操作が完了するまで有効に保ってください。
 
@@ -290,7 +323,7 @@ if cqe.HasBuffer() {
 }
 ```
 
-バンドル受信は同じ提供バッファストレージを使いますが、1 つの CQE で複数のバッファを消費することがあります。イテレータを処理したら、消費したスロットを回収してください。
+バンドル受信は同じ提供バッファストレージを使いますが、1 つの CQE で複数のバッファを消費することがあります。イテレータを処理したら、消費したスロットを回収してください。`Recycle` はイテレータのすべてのコピーを通じて正確に 1 回だけ呼び出し、返った後は生成されたバッファを読み取らないでください。
 
 ```go
 if err := ring.ReceiveBundle(recvCtx, &socketFD, uring.WithReadBufferSize(uring.BufferSizeSmall)); err != nil {
@@ -301,7 +334,9 @@ if it, ok := ring.BundleIterator(cqe, cqe.BufGroup()); ok {
     for buf := range it.All() {
         handle(buf)
     }
-    it.Recycle(ring)
+    if err := it.Recycle(ring); err != nil {
+        return err
+    }
 }
 ```
 
@@ -546,10 +581,10 @@ if err := ring.Receive(recvCtx, &clientFD, buf); err != nil {
 
 ### ライフサイクル
 
-1. CQE32 対応リング上で `NewZCRXReceiver` を生成する。コンストラクタが ZCRX インターフェースキューの登録、補充領域のマッピング、補充リングの準備を行う。
+1. CQE32 対応リング上で `NewZCRXReceiver` を生成する。コンストラクタが ZCRX インターフェースキューを登録し、受信領域をマッピングして、空の補充リングを初期化する。初期受信バッファは Linux が供給し、補充リングは配送済みバッファの返却に使う。
 2. `Start` を呼び出し、リング上で拡張 `RECV_ZC` 操作を発行する。
 3. CQE のディスパッチ経路で ZCRX 完了が `ZCRXHandler` に届く。
-    - `OnData`: NIC マップ領域を指す `ZCRXBuffer` を受け取る。処理後に `Release` を呼んでカーネルにスロットを返却する。ベストエフォートでの停止を要求するには `false` を返す。
+    - `OnData`: NIC マップ領域を指す `ZCRXBuffer` を受け取る。処理後に `Release` を呼び、補充エントリの公開に成功するとスロットがカーネルに返却される。`iox.ErrWouldBlock` が返った場合はバッファを保持し、後で CQE 経路上で解放を再試行する。長さゼロの EOF バッファには補充用の識別情報がなく、エントリを公開せずに解放される。ベストエフォートでの停止を要求するには `false` を返す。
     - `OnError`: CQE エラーを受け取る。ベストエフォートでの停止を要求するには `false` を返す。
     - `OnStopped`: 状態が `Stopped` に移行する直前に一度だけ呼ばれる。
 4. `Stop` を呼び出して非同期キャンセルを発行する。レシーバは `Stopping` → `Retiring` → `Stopped` と遷移する。

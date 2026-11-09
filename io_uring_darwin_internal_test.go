@@ -448,6 +448,79 @@ func TestDarwinNewUringProvideBuffersRoundsAndPartitionsCount(t *testing.T) {
 	}
 }
 
+func TestDarwinRegisterFilesRejectsInvalidCountDomains(t *testing.T) {
+	t.Run("register empty", func(t *testing.T) {
+		ur := &ioUring{}
+		if err := ur.registerFiles(nil); err != ErrInvalidParam {
+			t.Fatalf("registerFiles empty error = %v, want %v", err, ErrInvalidParam)
+		}
+		if len(ur.files) != 0 {
+			t.Fatalf("registered file table len = %d, want 0", len(ur.files))
+		}
+	})
+
+	t.Run("register oversized", func(t *testing.T) {
+		ur := &ioUring{}
+		if err := ur.registerFiles(mappedTestSlice[int32](t, oversizedLen32(t))); err != ErrInvalidParam {
+			t.Fatalf("registerFiles oversized error = %v, want %v", err, ErrInvalidParam)
+		}
+		if len(ur.files) != 0 {
+			t.Fatalf("registered file table len = %d, want 0", len(ur.files))
+		}
+	})
+
+	t.Run("update empty", func(t *testing.T) {
+		ur := &ioUring{files: []int32{10, 11}}
+		if _, err := ur.registerFilesUpdate(1, nil); err != ErrInvalidParam {
+			t.Fatalf("registerFilesUpdate empty error = %v, want %v", err, ErrInvalidParam)
+		}
+		if ur.files[0] != 10 || ur.files[1] != 11 {
+			t.Fatalf("registered file table = %v, want [10 11]", ur.files)
+		}
+	})
+
+	t.Run("update oversized", func(t *testing.T) {
+		ur := &ioUring{files: []int32{10, 11}}
+		if _, err := ur.registerFilesUpdate(1, mappedTestSlice[int32](t, oversizedLen32(t))); err != ErrInvalidParam {
+			t.Fatalf("registerFilesUpdate oversized error = %v, want %v", err, ErrInvalidParam)
+		}
+		if ur.files[0] != 10 || ur.files[1] != 11 {
+			t.Fatalf("registered file table = %v, want [10 11]", ur.files)
+		}
+	})
+
+	t.Run("update beyond remaining table", func(t *testing.T) {
+		ur := &ioUring{files: []int32{10, 11}}
+		if _, err := ur.registerFilesUpdate(1, []int32{20, 21}); err != ErrInvalidParam {
+			t.Fatalf("registerFilesUpdate overrun error = %v, want %v", err, ErrInvalidParam)
+		}
+		if ur.files[0] != 10 || ur.files[1] != 11 {
+			t.Fatalf("registered file table = %v, want [10 11]", ur.files)
+		}
+	})
+
+	t.Run("update rejects skip sentinel", func(t *testing.T) {
+		ur := &ioUring{files: []int32{10, 11}}
+		if updated, err := ur.registerFilesUpdate(0, []int32{-2}); updated != 0 || err != ErrInvalidParam {
+			t.Fatalf("registerFilesUpdate(-2) = (%d, %v), want (0, %v)", updated, err, ErrInvalidParam)
+		}
+		if ur.files[0] != 10 || ur.files[1] != 11 {
+			t.Fatalf("registered file table = %v, want [10 11]", ur.files)
+		}
+	})
+
+	t.Run("update reports completion", func(t *testing.T) {
+		ur := &ioUring{files: []int32{10, 11}}
+		updated, err := ur.registerFilesUpdate(0, []int32{20, -1})
+		if err != nil || updated != 2 {
+			t.Fatalf("registerFilesUpdate = (%d, %v), want (2, nil)", updated, err)
+		}
+		if ur.files[0] != 20 || ur.files[1] != -1 {
+			t.Fatalf("registered file table = %v, want [20 -1]", ur.files)
+		}
+	})
+}
+
 func TestDarwinStopJoinsWorkersBeforeClearingState(t *testing.T) {
 	for iteration := range 32 {
 		ur, err := newIoUring(1)

@@ -124,12 +124,13 @@ for {
 | `ListenerOp`          | Gestionnaire d'une opération de création d'écouteur avec FD et auxiliaires accept                            |
 | `BundleIterator`      | Itère sur les tampons consommés lors d'une réception groupée                                                 |
 | `IncrementalReceiver` | Gère les réceptions incrémentales de buffer-ring (`IOU_PBUF_RING_INC`)                                       |
+| `BufferRing`          | Anneau opaque de tampons fournis enregistré explicitement ; `Add` prépare et `Advance` publie               |
 | `ZCTracker`           | Suit le cycle de vie des notifications et du repli de l'envoi sans copie                                     |
 | `ContextPools`        | Pools pour contextes de soumission indirects et étendus                                                      |
 | `ZCRXReceiver`        | Cycle de vie de réception sans copie sur une file RX de NIC                                                  |
 | `ZCRXConfig`          | Configuration d'une instance de réception ZCRX                                                               |
 | `ZCRXHandler`         | Interface de rappel pour données, erreurs et arrêt ZCRX                                                      |
-| `ZCRXBuffer`          | Vue de réception sans copie livrée, avec remplissage par le noyau à la libération                            |
+| `ZCRXBuffer`          | Vue de réception sans copie, restituée par l'appelant via la file de remplissage                             |
 
 Opérations :
 
@@ -240,7 +241,7 @@ for i := 0; i < n; i++ {
 
 ## Fourniture de tampons
 
-`uring` propose trois chemins pratiques pour les tampons. Les tampons enregistrés sont épinglés au démarrage du ring et servent aux I/O fichier sur tampon fixe. Les anneaux de tampons fournis laissent le noyau choisir un tampon de réception et renvoyer son ID dans le CQE. Les réceptions groupées consomment une plage logique contiguë de tampons fournis et l'exposent via `BundleIterator`.
+`uring` propose trois chemins pratiques pour les tampons. Les tampons enregistrés sont épinglés au démarrage du ring et servent aux I/O fichier sur tampon fixe. Les anneaux de tampons fournis laissent le noyau choisir un tampon de réception et renvoyer son ID dans le CQE. Les réceptions groupées suivent l'ordre de publication, qui peut différer de l'ordre numérique des ID après recyclage. `Uring.BundleIterator` conserve cet ordre. Le constructeur autonome `NewBundleIterator` exige des ID consécutifs modulo la taille du ring.
 
 - des tampons fournis de taille fixe via `ReadBufferSize` et `ReadBufferNum`
 - des groupes de tampons multi-tailles via `MultiSizeBuffer`
@@ -261,6 +262,38 @@ On utilise `OptionsForBudget` pour partir d'un budget mémoire explicite, et `Bu
 cfg, scale := uring.BufferConfigForBudget(256 * uring.MiB)
 fmt.Printf("buffer tiers=%+v scale=%d\n", cfg, scale)
 ```
+
+Les anneaux incrémentaux explicites sont initialisés vides. Après `Start`, choisissez un ID de groupe inutilisé par les groupes de tampons fournis configurés, préparez chaque tranche du stockage, puis publiez le lot :
+
+```go
+const (
+    groupID = 60000
+    entries = 8
+    bufSize = 4096
+)
+
+backing := make([]byte, entries*bufSize)
+bufRing, err := ring.RegisterBufRingIncremental(entries, groupID)
+if err != nil {
+    return err
+}
+for i := range entries {
+    buf := backing[i*bufSize : (i+1)*bufSize]
+    if err := bufRing.Add(buf, uint16(i), i); err != nil {
+        return err
+    }
+}
+if err := bufRing.Advance(entries); err != nil {
+    return err
+}
+
+pool := uring.NewContextPools(entries)
+receiver := uring.NewIncrementalReceiver(ring, pool, groupID, bufSize, backing, entries)
+```
+
+`BufferRing.Add` prépare les entrées ; `BufferRing.Advance` les publie et transfère leur propriété au noyau. Gardez `backing` accessible. Traitez les CQE de ce récepteur une seule fois, en série et dans l'ordre de la CQ ; le récepteur conserve un décalage indépendant pour chaque identifiant de tampon.
+
+`IORING_CQE_F_BUF_MORE` indique que le noyau conserve le tampon sélectionné même après la fin de la requête. Ne le recyclez qu'après une CQE indiquant `IORING_CQE_F_BUFFER` sans `IORING_CQE_F_BUF_MORE` et la fin de tout accès emprunté. Un résultat nul ou négatif peut aussi rendre un tampon. `Uring.Stop` assure la destruction du buffer-ring.
 
 L'I/O sur tampon fixe utilise un tampon enregistré par index. La tranche renvoyée appartient au ring ; gardez-la vivante jusqu'à la complétion de l'opération fixe :
 
@@ -290,7 +323,7 @@ if cqe.HasBuffer() {
 }
 ```
 
-Les réceptions groupées utilisent le même stockage de tampons fournis, mais peuvent consommer plusieurs tampons avec un seul CQE. Traitez l'itérateur, puis recyclez les slots consommés :
+Les réceptions groupées utilisent le même stockage de tampons fournis, mais peuvent consommer plusieurs tampons avec un seul CQE. Traitez l'itérateur, puis recyclez les slots consommés. Appelez `Recycle` exactement une fois pour l'ensemble des copies d'un itérateur ; après son retour, ne lisez plus les tampons produits :
 
 ```go
 if err := ring.ReceiveBundle(recvCtx, &socketFD, uring.WithReadBufferSize(uring.BufferSizeSmall)); err != nil {
@@ -301,7 +334,9 @@ if it, ok := ring.BundleIterator(cqe, cqe.BufGroup()); ok {
     for buf := range it.All() {
         handle(buf)
     }
-    it.Recycle(ring)
+    if err := it.Recycle(ring); err != nil {
+        return err
+    }
 }
 ```
 
@@ -546,10 +581,10 @@ On réutilise la boucle `Wait` décrite dans la section cycle de vie du ring apr
 
 ### Cycle de vie
 
-1. Avec un ring compatible CQE32, on crée le récepteur via `NewZCRXReceiver`. Le constructeur enregistre la file d'interface ZCRX, mappe la zone de remplissage et prépare le ring de remplissage.
+1. Avec un ring compatible CQE32, on crée le récepteur via `NewZCRXReceiver`. Le constructeur enregistre la file d'interface ZCRX, mappe la zone de réception et initialise un ring de remplissage vide. Linux fournit les buffers de réception initiaux ; le ring de remplissage restitue les buffers livrés.
 2. Appelez `Start` pour soumettre l'opération étendue `RECV_ZC` sur le ring.
 3. Sur le chemin de distribution des CQE, les complétions ZCRX sont acheminées vers le `ZCRXHandler` :
-    - `OnData` livre un `ZCRXBuffer` pointant vers la zone mappée par la NIC. On appelle `Release` une fois le traitement terminé pour restituer le slot au noyau. Renvoyer `false` demande un arrêt au mieux.
+    - `OnData` livre un `ZCRXBuffer` pointant vers la zone mappée par la NIC. Appelez `Release` après traitement ; la publication réussie dans la file de remplissage restitue le slot au noyau. Si la méthode renvoie `iox.ErrWouldBlock`, conservez le tampon et réessayez la libération plus tard sur le chemin des CQE. Un tampon EOF de longueur nulle n'a pas d'identité de remplissage et se libère sans publier d'entrée. Renvoyer `false` demande un arrêt au mieux.
     - `OnError` livre les erreurs CQE. Renvoyer `false` demande un arrêt au mieux.
     - `OnStopped` s'exécute une fois lors du retrait terminal avant que l'état ne devienne `Stopped`.
 4. On appelle `Stop` pour soumettre une annulation asynchrone. Le récepteur transite par `Stopping` → `Retiring` → `Stopped`.

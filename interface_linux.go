@@ -12,6 +12,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -734,10 +735,10 @@ func (ur *Uring) SubmitReceiveMultishotFD(sqeCtx SQEContext, fd iofd.FD, b []byt
 	return ur.receiveWithBufferSelect(ctx, ioprio|IORING_RECV_MULTISHOT, bufSize, bufGroup)
 }
 
-// ReceiveBundle performs a bundle receive operation.
-// Grabs multiple contiguous buffers from the buffer group in a single operation.
-// The CQE result contains bytes received; use BundleBuffers() to get buffer range.
-// Always uses buffer selection from the kernel-provided buffer ring.
+// ReceiveBundle submits a receive that can consume multiple provided buffers
+// in publication order. A nil return means the request was queued.
+// A successful CQE reports the total bytes received; use [Uring.BundleIterator]
+// to visit the consumed buffers.
 func (ur *Uring) ReceiveBundle(sqeCtx SQEContext, pollFD PollFd, options ...OpOptionFunc) error {
 	ctx := sqeCtx.WithFD(iofd.FD(pollFD.Fd()))
 	flags, ioprio, bufSize, bufGroup := ur.receiveWithBufferSelectOptions(pollFD, options)
@@ -746,7 +747,10 @@ func (ur *Uring) ReceiveBundle(sqeCtx SQEContext, pollFD PollFd, options ...OpOp
 }
 
 // SubmitReceiveBundleMultishot submits the raw kernel multishot bundle receive opcode.
-// It combines multishot with bundle reception for high-throughput raw CQE flows.
+// Each data CQE describes one bundle; IORING_CQE_F_MORE indicates that further
+// completions may follow for the request.
+// WithReadBufferSize selects the buffer group and the per-completion length cap.
+// A zero size leaves the cap uncapped and selects the default-size buffer group.
 func (ur *Uring) SubmitReceiveBundleMultishot(sqeCtx SQEContext, pollFD PollFd, options ...OpOptionFunc) error {
 	ctx := sqeCtx.WithFD(iofd.FD(pollFD.Fd()))
 	flags, ioprio, bufSize, bufGroup := ur.receiveWithBufferSelectOptions(pollFD, options)
@@ -754,15 +758,18 @@ func (ur *Uring) SubmitReceiveBundleMultishot(sqeCtx SQEContext, pollFD PollFd, 
 	return ur.receiveBundle(ctx, ioprio|IORING_RECV_MULTISHOT, bufSize, bufGroup)
 }
 
-// BundleIterator constructs a BundleIterator for the given CQE and buffer group.
-// The group parameter is the group ID as used during buffer ring registration.
-// Returns a zero BundleIterator and false if the group is not registered or the CQE has no data.
+// BundleIterator constructs an iterator for one bundle receive CQE from a
+// package-managed buffer group. The group must match the receive's registered
+// group ID. It returns a zero BundleIterator and false if the group is not
+// package-managed or the CQE has no data.
 //
 // The returned iterator borrows ring-owned backing memory. Process the buffers
-// before calling Recycle, and call Recycle from a single goroutine without
-// racing other buffer-ring recycle/advance activity on the same Uring.
+// before calling Recycle. Call Recycle exactly once across all copies of the
+// iterator, then do not read the yielded buffers. Recycle must run from a single
+// goroutine without racing other buffer-ring recycle/advance activity on the
+// same Uring.
 func (ur *Uring) BundleIterator(cqe CQEView, group uint16) (BundleIterator, bool) {
-	return ur.bufferRings.bundleIterator(cqe, int(group)-ur.ReadBufferGidOffset, uint16(ur.ReadBufferGidOffset), group)
+	return ur.bufferRings.bundleIterator(cqe, group)
 }
 
 // Send writes data to a socket.
@@ -1395,10 +1402,34 @@ func (ur *Uring) Pipe(sqeCtx SQEContext, fds *[2]iofd.FD, pipeFlags uint32, opti
 
 // RegisterZCRXIfq registers a zero-copy receive interface queue.
 // region must describe the refill-ring memory (IORING_MEM_REGION_TYPE_USER).
-// rxBufLen is the desired receive buffer chunk size; 0 means page size.
-// Returns the ZCRX instance ID and kernel-reported refill ring offsets on success.
-// Requires the Linux 6.18+ baseline and ZCRX-capable network hardware.
-func (ur *Uring) RegisterZCRXIfq(ifIdx, ifRxq uint32, rqEntries uint32, area *ZCRXAreaReg, region *RegionDesc, rxBufLen uint32) (uint32, ZCRXOffsets, error) {
+// rqEntries is the requested refill queue size; the returned RqEntries is the
+// effective kernel value.
+// rxBufLen is the desired receive buffer chunk size; zero requests the system
+// page size. A nonzero rxBufLen must be a
+// power of two no smaller than the system page size and requires
+// ZCRX_FEATURE_RX_PAGE_SIZE. The method queries that capability before
+// registration and does not silently fall back to a zero request.
+// Requires the Linux 6.18+ baseline and ZCRX-capable network hardware;
+// nonzero rxBufLen requires the Linux 7.0 capability or a backport.
+func (ur *Uring) RegisterZCRXIfq(ifIdx, ifRxq uint32, rqEntries uint32, area *ZCRXAreaReg, region *RegionDesc, rxBufLen uint32) (ZCRXIfqRegistration, error) {
+	if rxBufLen != 0 {
+		pageSize := uint32(os.Getpagesize())
+		if rxBufLen < pageSize || rxBufLen&(rxBufLen-1) != 0 {
+			return ZCRXIfqRegistration{}, ErrInvalidParam
+		}
+		query, err := ur.QueryZCRX()
+		if err != nil {
+			return ZCRXIfqRegistration{}, err
+		}
+		return ur.registerZCRXIfqWithFeatures(ifIdx, ifRxq, rqEntries, area, region, rxBufLen, query.Features)
+	}
+	return ur.registerZCRXIfqWithFeatures(ifIdx, ifRxq, rqEntries, area, region, 0, 0)
+}
+
+func (ur *Uring) registerZCRXIfqWithFeatures(ifIdx, ifRxq uint32, rqEntries uint32, area *ZCRXAreaReg, region *RegionDesc, rxBufLen, features uint32) (ZCRXIfqRegistration, error) {
+	if rxBufLen != 0 && features&ZCRX_FEATURE_RX_PAGE_SIZE == 0 {
+		return ZCRXIfqRegistration{}, ErrNotSupported
+	}
 	reg := ZCRXIfqReg{
 		IfIdx:     ifIdx,
 		IfRxq:     ifRxq,
@@ -1409,9 +1440,22 @@ func (ur *Uring) RegisterZCRXIfq(ifIdx, ifRxq uint32, rqEntries uint32, area *ZC
 	}
 	err := ur.registerZCRXIfq(&reg)
 	if err != nil {
-		return 0, ZCRXOffsets{}, err
+		return ZCRXIfqRegistration{}, err
 	}
-	return reg.ZcrxID, reg.Offsets, nil
+	return zcrxIfqRegistrationResult(&reg), nil
+}
+
+func zcrxIfqRegistrationResult(reg *ZCRXIfqReg) ZCRXIfqRegistration {
+	effectiveRxBufLen := reg.RxBufLen
+	if effectiveRxBufLen == 0 {
+		effectiveRxBufLen = uint32(os.Getpagesize())
+	}
+	return ZCRXIfqRegistration{
+		ID:        reg.ZcrxID,
+		RqEntries: reg.RqEntries,
+		Offsets:   reg.Offsets,
+		RxBufLen:  effectiveRxBufLen,
+	}
 }
 
 // ZCRXFlushRQ flushes the ZCRX refill queue.
@@ -1431,43 +1475,49 @@ func (ur *Uring) ZCRXFlushRQ(zcrxID uint32) error {
 // RegisterBufRingMMAP registers a buffer ring with kernel-allocated memory.
 // The kernel allocates the ring memory and the application uses mmap to access it.
 // entries must be between 1 and 32768; non-power-of-two values round up.
-// Returns the buffer ring for adding buffers.
-func (ur *Uring) RegisterBufRingMMAP(entries int, groupID uint16) (*ioUringBufRing, error) {
-	r, backing, mmapSize, err := ur.registerBufRingWithFlags(entries, groupID, IOU_PBUF_RING_MMAP)
-	if err != nil {
-		return nil, err
-	}
-	ur.trackRegisteredBufRing(groupID, backing, unsafe.Pointer(r), mmapSize)
-	return r, nil
+// The returned BufferRing is initialized and empty; populate it with Add and
+// publish staged buffers with Advance.
+func (ur *Uring) RegisterBufRingMMAP(entries int, groupID uint16) (*BufferRing, error) {
+	return ur.registerBufferRing(entries, groupID, IOU_PBUF_RING_MMAP)
 }
 
 // RegisterBufRingIncremental registers a buffer ring in incremental consumption mode.
 // In this mode, buffers can be partially consumed across multiple completions.
-// The CQE will have IORING_CQE_F_BUF_MORE set if more data remains.
+// IORING_CQE_F_BUF_MORE reports that the selected buffer remains kernel-owned.
 // entries follows the same range and rounding contract as RegisterBufRingMMAP.
-func (ur *Uring) RegisterBufRingIncremental(entries int, groupID uint16) (*ioUringBufRing, error) {
-	r, backing, mmapSize, err := ur.registerBufRingWithFlags(entries, groupID, IOU_PBUF_RING_INC)
-	if err != nil {
-		return nil, err
-	}
-	ur.trackRegisteredBufRing(groupID, backing, nil, mmapSize)
-	return r, nil
+// The returned BufferRing is initialized and empty; populate it with Add and
+// publish staged buffers with Advance before submitting buffer-select I/O.
+func (ur *Uring) RegisterBufRingIncremental(entries int, groupID uint16) (*BufferRing, error) {
+	return ur.registerBufferRing(entries, groupID, IOU_PBUF_RING_INC)
 }
 
 // RegisterBufRingWithFlags registers a buffer ring with specified flags.
 // Flags can be combined: IOU_PBUF_RING_MMAP | IOU_PBUF_RING_INC
 // entries must be between 1 and 32768; non-power-of-two values round up.
-func (ur *Uring) RegisterBufRingWithFlags(entries int, groupID uint16, flags uint16) (*ioUringBufRing, error) {
+// The returned BufferRing is initialized and empty; populate it with Add and
+// publish staged buffers with Advance.
+func (ur *Uring) RegisterBufRingWithFlags(entries int, groupID uint16, flags uint16) (*BufferRing, error) {
+	return ur.registerBufferRing(entries, groupID, flags)
+}
+
+func (ur *Uring) registerBufferRing(entries int, groupID uint16, flags uint16) (*BufferRing, error) {
 	r, backing, mmapSize, err := ur.registerBufRingWithFlags(entries, groupID, flags)
 	if err != nil {
 		return nil, err
 	}
+	ur.bufRingInit(r)
 	var mmapPtr unsafe.Pointer
 	if mmapSize != 0 {
 		mmapPtr = unsafe.Pointer(r)
 	}
 	ur.trackRegisteredBufRing(groupID, backing, mmapPtr, mmapSize)
-	return r, nil
+	entries = roundToPowerOf2(entries)
+	return &BufferRing{
+		ring:    ur.ioUring,
+		bufRing: r,
+		entries: entries,
+		mask:    uintptr(entries - 1),
+	}, nil
 }
 
 // ========================================
@@ -1476,6 +1526,7 @@ func (ur *Uring) RegisterBufRingWithFlags(entries int, groupID uint16, flags uin
 
 // RegisterFiles registers file descriptors for use with IOSQE_FIXED_FILE flag.
 // Registered files bypass per-operation fget/fput kernel calls.
+// fds must have between 1 and 2^32-1 entries.
 //
 // Once registered, use the file index (0-based) instead of the fd in SQEs,
 // and set the IOSQE_FIXED_FILE flag.
@@ -1496,12 +1547,21 @@ func (ur *Uring) RegisterFilesSparse(count uint32) error {
 	return ur.registerFilesSparse(count)
 }
 
-// RegisterFilesUpdate updates registered files at the specified offset.
+// RegisterFilesUpdate updates registered files at the specified offset and
+// returns the number of entries processed by the kernel.
 // Use -1 to clear a slot, or a valid fd to set it.
+// fds must have between 1 and 2^32-1 entries. The update range must fit
+// within the registered file table.
+// A nil error does not imply full completion: Linux can return a positive
+// partial count after a later descriptor fails. Full completion requires
+// updated == len(fds). When Linux stops after clearing a destination slot,
+// the first entry excluded from updated is empty; this also occurs on a
+// first-entry EBADF or ENOMEM failure. Values below -1 are rejected; the raw
+// IORING_REGISTER_FILES_SKIP sentinel is not part of this method's domain.
 //
 // This allows dynamic management of registered files without
 // unregistering and re-registering the entire table.
-func (ur *Uring) RegisterFilesUpdate(offset uint32, fds []int32) error {
+func (ur *Uring) RegisterFilesUpdate(offset uint32, fds []int32) (int, error) {
 	return ur.registerFilesUpdate(offset, fds)
 }
 
@@ -1518,12 +1578,12 @@ func (ur *Uring) RegisteredFileCount() int {
 }
 
 // ========================================
-// Query Interface (Linux 6.19+)
+// Query Interface (Linux 6.18+)
 // ========================================
 
 // QueryOpcodes queries the kernel for supported io_uring operations.
 // Returns detailed information about supported opcodes, features, and flags.
-// Requires kernel 6.19+.
+// Requires the Linux 6.18+ baseline.
 func (ur *Uring) QueryOpcodes() (*QueryOpcode, error) {
 	return ur.queryOpcodes()
 }
@@ -1543,12 +1603,12 @@ func (ur *Uring) QuerySCQ() (*QuerySCQ, error) {
 }
 
 // ========================================
-// Memory Region Support (Linux 6.19+)
+// Memory Region Support (Linux 6.13+)
 // ========================================
 
 // RegisterMemRegion registers a memory region with the io_uring ring.
 // Memory regions enable shared access between user space and kernel.
-// Requires kernel 6.19+.
+// Requires kernel 6.13+.
 func (ur *Uring) RegisterMemRegion(region *RegionDesc, flags uint64) error {
 	reg := MemRegionReg{
 		RegionUptr: uint64(uintptr(unsafe.Pointer(region))),
@@ -1558,7 +1618,7 @@ func (ur *Uring) RegisterMemRegion(region *RegionDesc, flags uint64) error {
 }
 
 // ========================================
-// NAPI Support (Linux 6.19+)
+// NAPI Support (Linux 6.9+; static tracking requires Linux 6.13+)
 // ========================================
 
 // RegisterNAPI enables NAPI busy polling for network operations.
@@ -1569,7 +1629,7 @@ func (ur *Uring) RegisterMemRegion(region *RegionDesc, flags uint64) error {
 //   - preferBusyPoll: if true, prefer busy poll over sleeping
 //   - strategy: IO_URING_NAPI_TRACKING_* strategy
 //
-// Requires kernel 6.19+.
+// Requires kernel 6.9+.
 func (ur *Uring) RegisterNAPI(busyPollTimeout uint32, preferBusyPoll bool, strategy uint32) error {
 	prefer := uint8(0)
 	if preferBusyPoll {
@@ -1586,7 +1646,7 @@ func (ur *Uring) RegisterNAPI(busyPollTimeout uint32, preferBusyPoll bool, strat
 
 // NAPIAddStaticID adds a NAPI ID for static tracking mode.
 // Use this when IO_URING_NAPI_TRACKING_STATIC is enabled.
-// Requires kernel 6.19+.
+// Requires kernel 6.13+.
 func (ur *Uring) NAPIAddStaticID(napiID uint32) error {
 	napi := NapiReg{
 		Opcode:  IO_URING_NAPI_STATIC_ADD_ID,
@@ -1597,7 +1657,7 @@ func (ur *Uring) NAPIAddStaticID(napiID uint32) error {
 
 // NAPIDelStaticID removes a NAPI ID from static tracking.
 // Use this when IO_URING_NAPI_TRACKING_STATIC is enabled.
-// Requires kernel 6.19+.
+// Requires kernel 6.13+.
 func (ur *Uring) NAPIDelStaticID(napiID uint32) error {
 	napi := NapiReg{
 		Opcode:  IO_URING_NAPI_STATIC_DEL_ID,
@@ -1612,51 +1672,88 @@ func (ur *Uring) UnregisterNAPI() error {
 }
 
 // ========================================
-// Clone Buffers (Linux 6.19+)
+// Clone Buffers (Linux 6.12+; offsets and replacement require Linux 6.13+)
 // ========================================
 
 // CloneBuffers clones registered buffers from another io_uring ring.
 // This enables buffer sharing between multiple rings.
 //
+// The source ring is also the userspace witness for the cloned buffer views.
+// On success, the destination's registered-buffer accessors correspond to the
+// cloned kernel table.
+//
 // Parameters:
-//   - srcFD: source ring file descriptor
+//   - src: source ring and registered-buffer view witness
 //   - srcOff: source buffer offset
 //   - dstOff: destination buffer offset
 //   - count: number of buffers to clone
 //   - replace: if true, replace existing buffers at destination offset
 //
-// Requires kernel 6.19+.
-func (ur *Uring) CloneBuffers(srcFD int, srcOff, dstOff, count uint32, replace bool) error {
-	flags := uint32(0)
-	if replace {
-		flags |= IORING_REGISTER_DST_REPLACE
-	}
-	clone := CloneBuffers{
-		SrcFD:  uint32(srcFD),
-		Flags:  flags,
-		SrcOff: srcOff,
-		DstOff: dstOff,
-		Nr:     count,
-	}
-	return ur.cloneBuffers(&clone)
+// A zero count clones the complete source table and requires both offsets to
+// be zero. Whole-table cloning requires Linux 6.12+; nonzero offsets or
+// replacement require Linux 6.13+.
+func (ur *Uring) CloneBuffers(src *Uring, srcOff, dstOff, count uint32, replace bool) error {
+	return ur.cloneBuffersFrom(src, 0, false, srcOff, dstOff, count, replace)
 }
 
-// CloneBuffersFromRegistered clones buffers from a registered ring.
-// The source ring must be registered with IORING_REGISTER_RING_FDS.
-// Requires kernel 6.19+.
-func (ur *Uring) CloneBuffersFromRegistered(srcRegisteredIdx int, srcOff, dstOff, count uint32, replace bool) error {
-	flags := uint32(IORING_REGISTER_SRC_REGISTERED)
+// CloneBuffersFromRegistered clones buffers from src through a task-registered
+// ring index. src is the userspace buffer-view witness. srcRegisteredRingIdx
+// must identify src in the current Linux task's IORING_REGISTER_RING_FDS table.
+// Because that table is task-local, the caller must keep source registration,
+// this call, and source unregistration on the same OS thread.
+//
+// Whole-table cloning requires Linux 6.12+; nonzero offsets or replacement
+// require Linux 6.13+.
+func (ur *Uring) CloneBuffersFromRegistered(src *Uring, srcRegisteredRingIdx uint32, srcOff, dstOff, count uint32, replace bool) error {
+	return ur.cloneBuffersFrom(src, srcRegisteredRingIdx, true, srcOff, dstOff, count, replace)
+}
+
+func (ur *Uring) cloneBuffersFrom(src *Uring, srcRegisteredRingIdx uint32, registered bool, srcOff, dstOff, count uint32, replace bool) error {
+	if src == nil || src.ioUring == nil {
+		return ErrInvalidParam
+	}
+	if len(src.bufs) == 0 {
+		return ErrNotFound
+	}
+
+	effectiveCount := count
+	if count == 0 {
+		if srcOff != 0 || dstOff != 0 {
+			return ErrInvalidParam
+		}
+		effectiveCount = uint32(len(src.bufs))
+	} else if uint64(srcOff)+uint64(count) > uint64(len(src.bufs)) {
+		return ErrInvalidParam
+	}
+
+	flags := uint32(0)
+	srcFD := uint32(src.ringFd)
+	if registered {
+		flags |= IORING_REGISTER_SRC_REGISTERED
+		srcFD = srcRegisteredRingIdx
+	}
 	if replace {
 		flags |= IORING_REGISTER_DST_REPLACE
 	}
 	clone := CloneBuffers{
-		SrcFD:  uint32(srcRegisteredIdx),
+		SrcFD:  srcFD,
 		Flags:  flags,
 		SrcOff: srcOff,
 		DstOff: dstOff,
 		Nr:     count,
 	}
-	return ur.cloneBuffers(&clone)
+	if err := ur.cloneBuffers(&clone); err != nil {
+		return err
+	}
+
+	srcStart := int(srcOff)
+	dstStart := int(dstOff)
+	dstEnd := dstStart + int(effectiveCount)
+	buffers := make([][]byte, max(dstEnd, len(ur.bufs)))
+	copy(buffers, ur.bufs)
+	copy(buffers[dstStart:dstEnd], src.bufs[srcStart:srcStart+int(effectiveCount)])
+	ur.bufs = buffers
+	return nil
 }
 
 // ========================================

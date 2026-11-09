@@ -890,7 +890,7 @@ func TestRegisterBufRingRejectsInvalidEntries(t *testing.T) {
 	}
 }
 
-// TestQueryOpcodes tests the io_uring query interface (Linux 6.19+).
+// TestQueryOpcodes tests the baseline io_uring opcode query interface.
 // This allows querying kernel capabilities at runtime.
 func TestQueryOpcodes(t *testing.T) {
 	ring, err := uring.New(testMinimalBufferOptions)
@@ -902,8 +902,10 @@ func TestQueryOpcodes(t *testing.T) {
 	// Query supported opcodes
 	info, err := ring.QueryOpcodes()
 	if err != nil {
-		// EINVAL or ENOSYS expected on kernel < 6.19
-		t.Skipf("QueryOpcodes not supported: %v (requires kernel 6.19+)", err)
+		t.Fatalf("QueryOpcodes (Linux 6.18+ baseline): %v", err)
+	}
+	if info.ResultSize == 0 {
+		t.Fatal("QueryOpcodes result size = 0, want kernel-reported query data")
 	}
 
 	t.Logf("Query interface available:")
@@ -1006,9 +1008,12 @@ func TestRegisterFilesSparse(t *testing.T) {
 	fd := int32(f.Fd())
 
 	// Test update at slot 0
-	err = ring.RegisterFilesUpdate(0, []int32{fd})
+	updated, err := ring.RegisterFilesUpdate(0, []int32{fd})
 	if err != nil {
 		t.Fatalf("RegisterFilesUpdate: %v", err)
+	}
+	if updated != 1 {
+		t.Fatalf("RegisterFilesUpdate updated = %d, want 1", updated)
 	}
 
 	// Unregister
@@ -1756,7 +1761,7 @@ func TestMsgRingFD(t *testing.T) {
 	t.Log("MSG_RING_FD cross-ring FD transfer test passed")
 }
 
-// TestNAPIRegistration tests NAPI busy polling registration (Linux 6.19+).
+// TestNAPIRegistration tests NAPI busy polling registration (Linux 6.9+).
 // NAPI provides ultra-low latency network packet processing.
 func TestNAPIRegistration(t *testing.T) {
 	ring, err := uring.New(testMinimalBufferOptions)
@@ -1766,7 +1771,7 @@ func TestNAPIRegistration(t *testing.T) {
 	mustStartRing(t, ring)
 
 	// Try to register NAPI with dynamic tracking
-	// This will fail on kernels < 6.19 with ENOSYS or EINVAL
+	// Registration can still fail when the host or NIC does not support it.
 	err = ring.RegisterNAPI(
 		100,   // 100µs busy poll timeout
 		false, // don't prefer busy poll
@@ -1775,10 +1780,10 @@ func TestNAPIRegistration(t *testing.T) {
 	if err != nil {
 		// Check for unsupported operation
 		if errors.Is(err, uring.ErrNotSupported) {
-			t.Skip("NAPI not supported (requires kernel 6.19+)")
+			t.Skip("NAPI not supported on this host")
 		}
 		// EINVAL also indicates not supported on this system
-		t.Logf("RegisterNAPI: %v (may require kernel 6.19+ or compatible NIC)", err)
+		t.Logf("RegisterNAPI: %v (may require host or NIC support)", err)
 		t.Skip("NAPI registration failed - may not be supported")
 	}
 
@@ -1787,7 +1792,7 @@ func TestNAPIRegistration(t *testing.T) {
 	// Unregister
 	err = ring.UnregisterNAPI()
 	if err != nil {
-		t.Logf("UnregisterNAPI: %v", err)
+		t.Fatalf("UnregisterNAPI: %v", err)
 	}
 	t.Log("NAPI registration test passed")
 }

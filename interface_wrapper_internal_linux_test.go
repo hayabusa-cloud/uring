@@ -10,6 +10,7 @@ import (
 	"errors"
 	"math"
 	"net"
+	"os"
 	"runtime"
 	"sync/atomic"
 	"testing"
@@ -1085,9 +1086,11 @@ func TestBundleIteratorWrapperUsesRegisteredGroup(t *testing.T) {
 
 	rings := newUringBufferRings()
 	rings.rings = []*ioUringBufRing{new(ioUringBufRing)}
+	rings.gids = []uint16{groupID}
 	rings.buffers = [][]byte{backing}
 	rings.sizes = []int{bufSize}
 	rings.masks = []uintptr{bufCount - 1}
+	rings.nextIDs = [][]uint16{{1, 2, 3, 0}}
 
 	ring := &Uring{
 		Options:     &Options{ReadBufferGidOffset: groupID},
@@ -1103,11 +1106,9 @@ func TestBundleIteratorWrapperUsesRegisteredGroup(t *testing.T) {
 	if !ok {
 		t.Fatal("BundleIterator returned false")
 	}
-	if iter.gidOffset != groupID {
-		t.Fatalf("gidOffset = %d, want %d", iter.gidOffset, groupID)
-	}
-	if iter.group != groupID {
-		t.Fatalf("group = %d, want %d", iter.group, groupID)
+	if iter.recycleOwner != rings || iter.ringIndex != 0 || iter.group != groupID {
+		t.Fatalf("recycle identity = (%p, %d, %d), want (%p, 0, %d)",
+			iter.recycleOwner, iter.ringIndex, iter.group, rings, groupID)
 	}
 	if iter.Count() != 2 {
 		t.Fatalf("Count = %d, want 2", iter.Count())
@@ -1974,6 +1975,8 @@ func newRegistrationFailureTestRing() *Uring {
 
 func TestAdvancedRegistrationWrappersReturnKernelErrors(t *testing.T) {
 	ring := newRegistrationFailureTestRing()
+	cloneSource := newRegistrationFailureTestRing()
+	cloneSource.bufs = [][]byte{[]byte("source")}
 	area := ZCRXAreaReg{}
 	region := RegionDesc{}
 
@@ -1984,27 +1987,13 @@ func TestAdvancedRegistrationWrappersReturnKernelErrors(t *testing.T) {
 		{
 			name: "RegisterZCRXIfq",
 			call: func() error {
-				_, _, err := ring.RegisterZCRXIfq(1, 2, 4, &area, &region, 0)
+				_, err := ring.RegisterZCRXIfq(1, 2, 4, &area, &region, 0)
 				return err
 			},
 		},
 		{
 			name: "ZCRXFlushRQ",
 			call: func() error { return ring.ZCRXFlushRQ(1) },
-		},
-		{
-			name: "QueryZCRX",
-			call: func() error {
-				_, err := ring.QueryZCRX()
-				return err
-			},
-		},
-		{
-			name: "QuerySCQ",
-			call: func() error {
-				_, err := ring.QuerySCQ()
-				return err
-			},
 		},
 		{
 			name: "RegisterMemRegion",
@@ -2028,11 +2017,13 @@ func TestAdvancedRegistrationWrappersReturnKernelErrors(t *testing.T) {
 		},
 		{
 			name: "CloneBuffers",
-			call: func() error { return ring.CloneBuffers(-1, 1, 2, 3, true) },
+			call: func() error { return ring.CloneBuffers(cloneSource, 0, 0, 1, true) },
 		},
 		{
 			name: "CloneBuffersFromRegistered",
-			call: func() error { return ring.CloneBuffersFromRegistered(5, 1, 2, 3, true) },
+			call: func() error {
+				return ring.CloneBuffersFromRegistered(cloneSource, math.MaxUint32, 0, 0, 1, true)
+			},
 		},
 		{
 			name: "ZCRXExport",
@@ -2049,6 +2040,50 @@ func TestAdvancedRegistrationWrappersReturnKernelErrors(t *testing.T) {
 				t.Fatal("error = nil, want kernel error from invalid ring fd")
 			}
 		})
+	}
+}
+
+func TestRegisterZCRXIfqRequiresAdvertisedRxBufferLength(t *testing.T) {
+	ring := newRegistrationFailureTestRing()
+	area := ZCRXAreaReg{}
+	region := RegionDesc{}
+
+	if _, err := ring.RegisterZCRXIfq(1, 2, 4, &area, &region, uint32(os.Getpagesize()+1)); !errors.Is(err, ErrInvalidParam) {
+		t.Fatalf("RegisterZCRXIfq non-power-of-two error = %v, want %v", err, ErrInvalidParam)
+	}
+
+	pageSize := uint32(os.Getpagesize())
+	if _, err := ring.registerZCRXIfqWithFeatures(1, 2, 4, &area, &region, pageSize, 0); !errors.Is(err, ErrNotSupported) {
+		t.Fatalf("registerZCRXIfqWithFeatures without capability error = %v, want %v", err, ErrNotSupported)
+	}
+	if _, err := ring.registerZCRXIfqWithFeatures(1, 2, 4, &area, &region, pageSize, ZCRX_FEATURE_RX_PAGE_SIZE); err == nil || errors.Is(err, ErrNotSupported) {
+		t.Fatalf("registerZCRXIfqWithFeatures with capability error = %v, want a kernel registration error", err)
+	}
+}
+
+func TestZCRXIfqRegistrationResultPreservesKernelMutations(t *testing.T) {
+	reg := ZCRXIfqReg{
+		RqEntries: 3,
+		Offsets: ZCRXOffsets{
+			Head: 64,
+			Tail: 128,
+			Rqes: 256,
+		},
+		ZcrxID:   17,
+		RxBufLen: 8192,
+	}
+
+	// Linux replaces the requested cardinality with the effective value.
+	reg.RqEntries = 4
+	got := zcrxIfqRegistrationResult(&reg)
+	want := ZCRXIfqRegistration{
+		ID:        17,
+		RqEntries: 4,
+		Offsets:   reg.Offsets,
+		RxBufLen:  8192,
+	}
+	if got != want {
+		t.Fatalf("registration result = %+v, want %+v", got, want)
 	}
 }
 

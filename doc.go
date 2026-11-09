@@ -204,11 +204,21 @@
 // # Buffer Groups
 //
 // Buffer groups enable kernel-side buffer selection for receive operations.
-// The kernel picks an available buffer from the group at completion time;
-// userspace does not select or assign buffers per receive. The package exposes
+// The kernel selects a published buffer while processing the receive and
+// reports its ID in the CQE. Selection can precede completion; userspace does
+// not select or assign buffers per receive. The package exposes
 // three practical buffer-management paths: registered fixed buffers for
 // fixed-buffer file I/O, provided buffers selected by the kernel, and bundle
-// receives over contiguous ranges of provided buffers.
+// receives over buffers in publication order. IDs need not remain numerically
+// consecutive after recycling; Uring.BundleIterator retains the actual order.
+// NewBundleIterator requires a caller-maintained consecutive-ID layout.
+//
+// [IncrementalReceiver] tracks a separate offset for each buffer ID in an
+// IOU_PBUF_RING_INC group. Dispatch its CQEs once, serially in CQ order.
+// IORING_CQE_F_BUF_MORE retains the selected buffer for further consumption,
+// independently of request completion. A CQE with IORING_CQE_F_BUFFER and
+// without IORING_CQE_F_BUF_MORE returns that buffer, even for a zero or negative
+// result. Finish borrowed payload access before republishing the buffer.
 //
 //	opts := uring.OptionsForBudget(256 * uring.MiB)
 //	ring, err := uring.New(func(opt *uring.Options) {
@@ -247,7 +257,9 @@
 //	}
 //
 // Bundle receives may consume more than one provided buffer in one CQE.
-// Process the iterator and then recycle the consumed slots.
+// Process the iterator and then recycle the consumed slots. Call Recycle
+// exactly once across all copies of an iterator; after it returns, do not read
+// the yielded buffers.
 //
 //	if err := ring.ReceiveBundle(recvCtx, &socketFD, uring.WithReadBufferSize(uring.BufferSizeSmall)); err != nil {
 //	    return err
@@ -257,7 +269,9 @@
 //	    for buf := range it.All() {
 //	        handle(buf)
 //	    }
-//	    it.Recycle(ring)
+//	    if err := it.Recycle(ring); err != nil {
+//	        return err
+//	    }
 //	}
 //
 // # Supported Operations
@@ -301,7 +315,7 @@
 //
 // Registration:
 //   - Files: [Uring.RegisterFiles], [Uring.RegisterFilesSparse], [Uring.RegisterFilesUpdate], [Uring.UnregisterFiles], [Uring.RegisteredFileCount]
-//   - Buffers: [Uring.RegisterBufRingMMAP], [Uring.RegisterBufRingIncremental], [Uring.RegisterBufRingWithFlags], [Uring.RegisteredBuffer], [Uring.RegisteredBufferCount]
+//   - Buffers: [Uring.RegisterBufRingMMAP], [Uring.RegisterBufRingIncremental], [Uring.RegisterBufRingWithFlags], [BufferRing.Add], [BufferRing.Advance], [Uring.RegisteredBuffer], [Uring.RegisteredBufferCount]
 //   - Buffer cloning: [Uring.CloneBuffers], [Uring.CloneBuffersFromRegistered]
 //   - Memory: [Uring.RegisterMemRegion]
 //   - NAPI: [Uring.RegisterNAPI], [Uring.UnregisterNAPI], [Uring.NAPIAddStaticID], [Uring.NAPIDelStaticID]

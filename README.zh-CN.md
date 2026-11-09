@@ -124,12 +124,13 @@ for {
 | `ListenerOp`          | 监听器创建操作的句柄，持有 FD 并提供 accept 辅助方法 |
 | `BundleIterator`      | 遍历 bundle 接收中消耗的缓冲区              |
 | `IncrementalReceiver` | 管理增量缓冲区环接收（`IOU_PBUF_RING_INC`）  |
+| `BufferRing`          | 显式注册的不透明提供缓冲区环；`Add` 暂存，`Advance` 发布 |
 | `ZCTracker`           | 跟踪零拷贝发送的通知与回退生命周期              |
 | `ContextPools`        | Indirect 与 extended 提交上下文的对象池    |
 | `ZCRXReceiver`        | NIC RX 队列零拷贝接收的生命周期管理            |
 | `ZCRXConfig`          | ZCRX 接收实例的配置                     |
 | `ZCRXHandler`         | ZCRX 数据、错误及关闭的回调接口               |
-| `ZCRXBuffer`          | 已交付的零拷贝接收视图，释放时内核自动回填            |
+| `ZCRXBuffer`          | 已交付的零拷贝接收视图，由调用方通过回填队列归还        |
 
 操作一览：
 
@@ -240,7 +241,7 @@ for i := 0; i < n; i++ {
 
 ## 缓冲区供给
 
-`uring` 提供三类常用缓冲区路径：注册缓冲区在 ring 启动时固定并用于固定缓冲区文件 I/O；提供缓冲区环让内核在接收完成时选择缓冲区，并在 CQE 中返回缓冲区 ID；捆绑接收可以在一个 CQE 中消耗一段连续的逻辑缓冲区范围，并通过 `BundleIterator` 暴露该范围。
+`uring` 提供三类常用缓冲区路径：注册缓冲区在 ring 启动时固定并用于固定缓冲区文件 I/O；提供缓冲区环让内核选择接收缓冲区，并在 CQE 中返回缓冲区 ID；捆绑接收按发布顺序消耗缓冲区，回收后该顺序可能不同于 ID 的数值顺序。`Uring.BundleIterator` 保留实际顺序；独立的 `NewBundleIterator` 要求按环大小取模后连续的 ID 顺序发布。
 
 - 通过 `ReadBufferSize` 与 `ReadBufferNum` 配置固定尺寸的提供缓冲区
 - 通过 `MultiSizeBuffer` 启用多尺寸缓冲区组
@@ -261,6 +262,38 @@ ring, err := uring.New(func(o *uring.Options) {
 cfg, scale := uring.BufferConfigForBudget(256 * uring.MiB)
 fmt.Printf("buffer tiers=%+v scale=%d\n", cfg, scale)
 ```
+
+显式增量 ring 初始化为空。`Start` 之后，选择一个未被已配置提供缓冲区组使用的组 ID，暂存每个后备切片，然后发布该批次：
+
+```go
+const (
+    groupID = 60000
+    entries = 8
+    bufSize = 4096
+)
+
+backing := make([]byte, entries*bufSize)
+bufRing, err := ring.RegisterBufRingIncremental(entries, groupID)
+if err != nil {
+    return err
+}
+for i := range entries {
+    buf := backing[i*bufSize : (i+1)*bufSize]
+    if err := bufRing.Add(buf, uint16(i), i); err != nil {
+        return err
+    }
+}
+if err := bufRing.Advance(entries); err != nil {
+    return err
+}
+
+pool := uring.NewContextPools(entries)
+receiver := uring.NewIncrementalReceiver(ring, pool, groupID, bufSize, backing, entries)
+```
+
+`BufferRing.Add` 暂存条目；`BufferRing.Advance` 发布条目并将所有权转移给内核。保持 `backing` 可达。按 CQ 顺序串行处理此 receiver 的 CQE，每条仅处理一次；receiver 为每个缓冲区 ID 独立维护偏移量。
+
+`IORING_CQE_F_BUF_MORE` 表示内核在请求完成后仍保留所选缓冲区。只有 CQE 包含 `IORING_CQE_F_BUFFER`、不含 `IORING_CQE_F_BUF_MORE`，且所有借用访问均已结束时，才能重新发布该缓冲区。零或负的结果也可能归还缓冲区。buffer-ring 的销毁由 `Uring.Stop` 负责。
 
 Fixed-buffer I/O 通过索引使用注册缓冲区。返回的切片属于 ring 内存；在 fixed 操作完成前保持其有效：
 
@@ -290,7 +323,7 @@ if cqe.HasBuffer() {
 }
 ```
 
-捆绑接收使用同一套提供缓冲区存储，但一个 CQE 可能消耗多个缓冲区。处理迭代器后，将消耗的槽位回收：
+捆绑接收使用同一套提供缓冲区存储，但一个 CQE 可能消耗多个缓冲区。处理迭代器后，将消耗的槽位回收。在迭代器的所有副本中，`Recycle` 只能调用一次；调用返回后，不得再读取已生成的缓冲区：
 
 ```go
 if err := ring.ReceiveBundle(recvCtx, &socketFD, uring.WithReadBufferSize(uring.BufferSizeSmall)); err != nil {
@@ -301,7 +334,9 @@ if it, ok := ring.BundleIterator(cqe, cqe.BufGroup()); ok {
     for buf := range it.All() {
         handle(buf)
     }
-    it.Recycle(ring)
+    if err := it.Recycle(ring); err != nil {
+        return err
+    }
 }
 ```
 
@@ -546,10 +581,10 @@ if err := ring.Receive(recvCtx, &clientFD, buf); err != nil {
 
 ### 生命周期
 
-1. 在支持 CQE32 的 ring 上调用 `NewZCRXReceiver` 创建接收器。构造器会注册 ZCRX 接口队列、映射补充区域并准备补充 ring。
+1. 在支持 CQE32 的 ring 上调用 `NewZCRXReceiver` 创建接收器。构造器会注册 ZCRX 接口队列、映射接收区域并初始化空的补充 ring。Linux 提供初始接收缓冲区；补充 ring 用于归还已交付的缓冲区。
 2. 调用 `Start`，在 ring 上提交扩展 `RECV_ZC` 操作。
 3. CQE 分发时，ZCRX 完成事件路由至 `ZCRXHandler`：
-   - `OnData` 交付指向 NIC 映射区域的 `ZCRXBuffer`，处理完毕后调用 `Release` 将槽位回填给内核；返回 `false` 请求尽力停止。
+   - `OnData` 交付指向 NIC 映射区域的 `ZCRXBuffer`。处理完毕后调用 `Release`，成功发布回填条目后才将槽位归还内核。若返回 `iox.ErrWouldBlock`，调用方必须保留缓冲区，稍后在 CQE 路径上重试释放。零长度 EOF 缓冲区没有回填标识，释放时不发布回填条目。返回 `false` 请求尽力停止。
    - `OnError` 交付 CQE 错误；返回 `false` 请求尽力停止。
    - `OnStopped` 在进入 `Stopped` 前的终态退出阶段被调用一次。
 4. 调用 `Stop` 提交异步取消，接收器依次经历 `Stopping` → `Retiring` → `Stopped`。

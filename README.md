@@ -124,12 +124,13 @@ for {
 | `ListenerOp` | Handle to a listener creation operation with FD and accept helpers |
 | `BundleIterator` | Iterates over buffers consumed in a bundle receive |
 | `IncrementalReceiver` | Manages incremental buffer-ring receives (`IOU_PBUF_RING_INC`) |
+| `BufferRing` | Opaque explicitly registered provided-buffer ring; `Add` stages and `Advance` publishes |
 | `ZCTracker` | Tracks zero-copy send notification and fallback lifecycle |
 | `ContextPools` | Pools for indirect and extended submission contexts |
 | `ZCRXReceiver` | Zero-copy receive lifecycle over a NIC RX queue |
 | `ZCRXConfig` | Configuration for a ZCRX receive instance |
 | `ZCRXHandler` | Callback interface for ZCRX data, errors, and shutdown |
-| `ZCRXBuffer` | Delivered zero-copy receive view with kernel refill on release |
+| `ZCRXBuffer` | Delivered zero-copy receive view with caller-managed refill release |
 
 Operations:
 
@@ -240,7 +241,7 @@ for i := 0; i < n; i++ {
 
 ## Buffer provisioning
 
-`uring` has three practical buffer paths. Registered buffers are pinned during ring setup and used by fixed-buffer file I/O. Provided buffer rings let the kernel choose a receive buffer and report the selected buffer ID in the CQE. Bundle receives consume a contiguous logical range of provided buffers and expose that range through `BundleIterator`.
+`uring` has three practical buffer paths. Registered buffers are pinned during ring setup and used by fixed-buffer file I/O. Provided buffer rings let the kernel choose a receive buffer and report the selected buffer ID in the CQE. Bundle receives consume buffers in publication order, which can differ from numeric ID order after recycling. `Uring.BundleIterator` preserves that order. The standalone `NewBundleIterator` requires consecutive IDs modulo the ring size.
 
 - fixed-size provided buffers through `ReadBufferSize` and `ReadBufferNum`
 - multi-size buffer groups through `MultiSizeBuffer`
@@ -261,6 +262,38 @@ Use `OptionsForBudget` to start from an explicit memory budget, or `BufferConfig
 cfg, scale := uring.BufferConfigForBudget(256 * uring.MiB)
 fmt.Printf("buffer tiers=%+v scale=%d\n", cfg, scale)
 ```
+
+Explicit incremental rings are initialized empty. After `Start`, choose a group ID not used by the configured provided-buffer groups, stage each backing slice, then publish the batch:
+
+```go
+const (
+    groupID = 60000
+    entries = 8
+    bufSize = 4096
+)
+
+backing := make([]byte, entries*bufSize)
+bufRing, err := ring.RegisterBufRingIncremental(entries, groupID)
+if err != nil {
+    return err
+}
+for i := range entries {
+    buf := backing[i*bufSize : (i+1)*bufSize]
+    if err := bufRing.Add(buf, uint16(i), i); err != nil {
+        return err
+    }
+}
+if err := bufRing.Advance(entries); err != nil {
+    return err
+}
+
+pool := uring.NewContextPools(entries)
+receiver := uring.NewIncrementalReceiver(ring, pool, groupID, bufSize, backing, entries)
+```
+
+`BufferRing.Add` stages entries; `BufferRing.Advance` publishes them and transfers ownership to the kernel. Keep `backing` reachable. Dispatch this receiver's CQEs once, serially in CQ order; it tracks offsets independently for each buffer ID.
+
+`IORING_CQE_F_BUF_MORE` retains the selected buffer even after the request completes. Recycle only after a CQE reports `IORING_CQE_F_BUFFER` without `IORING_CQE_F_BUF_MORE` and borrowed access has ended. A zero or negative result can also return a buffer. `Uring.Stop` owns buffer-ring teardown.
 
 Fixed-buffer I/O uses a registered buffer by index. The returned slice is ring-owned memory; keep it live until the fixed operation completes:
 
@@ -290,7 +323,7 @@ if cqe.HasBuffer() {
 }
 ```
 
-Bundle receives use the same provided-buffer storage but may consume more than one buffer in a single CQE. Process the iterator, then recycle the consumed slots:
+Bundle receives use the same provided-buffer storage but may consume more than one buffer in a single CQE. Process the iterator, then recycle the consumed slots. Call `Recycle` exactly once across all copies of an iterator; after it returns, do not read the yielded buffers:
 
 ```go
 if err := ring.ReceiveBundle(recvCtx, &socketFD, uring.WithReadBufferSize(uring.BufferSizeSmall)); err != nil {
@@ -301,7 +334,9 @@ if it, ok := ring.BundleIterator(cqe, cqe.BufGroup()); ok {
     for buf := range it.All() {
         handle(buf)
     }
-    it.Recycle(ring)
+    if err := it.Recycle(ring); err != nil {
+        return err
+    }
 }
 ```
 
@@ -546,10 +581,10 @@ After each submit, reuse the `Wait` loop from the ring lifecycle section to obse
 
 ### Lifecycle
 
-1. With a CQE32-enabled ring, create the receiver with `NewZCRXReceiver`. The constructor registers the ZCRX interface queue, maps the refill area, and prepares the refill ring.
+1. With a CQE32-enabled ring, create the receiver with `NewZCRXReceiver`. The constructor registers the ZCRX interface queue, maps the receive area, and initializes an empty refill ring. Linux supplies the initial receive buffers; the refill ring returns delivered buffers.
 2. Call `Start` to submit the extended `RECV_ZC` operation.
 3. On the CQE dispatch path, ZCRX completions route to the `ZCRXHandler`:
-    - `OnData` delivers a `ZCRXBuffer` pointing into the NIC-mapped area. Call `Release` when done to return the slot to the kernel. Return `false` to request a best-effort stop.
+    - `OnData` delivers a `ZCRXBuffer` pointing into the NIC-mapped area. Call `Release` when done; successful refill publication returns the slot to the kernel. If it returns `iox.ErrWouldBlock`, retain the buffer and retry release later on the CQE path. A zero-length EOF buffer has no refill identity and releases without a refill entry. Return `false` to request a best-effort stop.
     - `OnError` delivers CQE errors. Return `false` to request a best-effort stop.
     - `OnStopped` fires once during terminal retirement, before the state reaches `Stopped`.
 4. Call `Stop` to submit an async cancel. The receiver transitions through `Stopping` → `Retiring` → `Stopped`.

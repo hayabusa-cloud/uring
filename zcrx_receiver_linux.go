@@ -8,6 +8,7 @@ package uring
 
 import (
 	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -52,17 +53,17 @@ func (c *ZCRXConfig) validate() error {
 	if c.IfName == "" {
 		return ErrInvalidParam
 	}
-	if c.RxQueue < 0 {
+	if c.RxQueue < 0 || uint(c.RxQueue) > math.MaxUint32 {
 		return ErrInvalidParam
 	}
 	if c.AreaSize < 0 {
 		return ErrInvalidParam
 	}
-	if c.RqEntries <= 0 || c.RqEntries&(c.RqEntries-1) != 0 {
+	if c.RqEntries <= 0 || uint(c.RqEntries) > math.MaxUint32 || c.RqEntries&(c.RqEntries-1) != 0 {
 		return ErrInvalidParam
 	}
 	pageSize := int(iobuf.PageSize)
-	if c.ChunkSize <= 0 || c.ChunkSize&(c.ChunkSize-1) != 0 || c.ChunkSize%pageSize != 0 {
+	if c.ChunkSize <= 0 || uint(c.ChunkSize) > math.MaxUint32 || c.ChunkSize&(c.ChunkSize-1) != 0 || c.ChunkSize%pageSize != 0 {
 		return ErrInvalidParam
 	}
 	return nil
@@ -81,7 +82,7 @@ type ZCRXHandler interface {
 }
 
 // ZCRXBuffer wraps a delivered ZCRX receive view.
-// Payload memory is kernel-owned until Release returns nil.
+// The caller owns the delivered view until Release returns nil.
 // After a successful release, the buffer must not be reused.
 type ZCRXBuffer struct {
 	data     []byte
@@ -92,7 +93,7 @@ type ZCRXBuffer struct {
 	released atomic.Bool
 }
 
-// Bytes returns the received data. Valid until Release.
+// Bytes returns the received data. Valid until Release returns nil.
 //
 //go:nosplit
 func (b *ZCRXBuffer) Bytes() []byte {
@@ -107,7 +108,9 @@ func (b *ZCRXBuffer) Len() int {
 }
 
 // Release returns the buffer to the kernel via the refill queue.
-// Call on the CQE path. Returns iox.ErrWouldBlock when the refill ring is full.
+// Call on the CQE path. If the refill ring is full, it returns iox.ErrWouldBlock
+// and preserves the buffer for the caller to retry. A zero-length EOF buffer
+// has no refill identity and is released without publishing a refill entry.
 func (b *ZCRXBuffer) Release() error {
 	if !b.released.CompareAndSwap(false, true) {
 		return nil
@@ -147,6 +150,17 @@ type zcrxRefillQ struct {
 	mask    uint32
 }
 
+func newZCRXRefillQ(rqRingPtr unsafe.Pointer, registration ZCRXIfqRegistration) *zcrxRefillQ {
+	entries := registration.RqEntries
+	return &zcrxRefillQ{
+		kHead:   (*uint32)(unsafe.Add(rqRingPtr, uintptr(registration.Offsets.Head))),
+		kTail:   (*uint32)(unsafe.Add(rqRingPtr, uintptr(registration.Offsets.Tail))),
+		rqes:    unsafe.Slice((*ZCRXRqe)(unsafe.Add(rqRingPtr, uintptr(registration.Offsets.Rqes))), int(entries)),
+		entries: entries,
+		mask:    entries - 1,
+	}
+}
+
 // push returns one buffer slot to the kernel.
 func (q *zcrxRefillQ) push(offset, token uint64, length int) error {
 	head := atomic.LoadUint32(q.kHead)
@@ -161,18 +175,6 @@ func (q *zcrxRefillQ) push(offset, token uint64, length int) error {
 	dwcas.BarrierRelease()
 	atomic.StoreUint32(q.kTail, q.tail)
 	return nil
-}
-
-// seed pre-fills the refill queue with initial area chunks.
-func (q *zcrxRefillQ) seed(areaSize int, chunkSize int, token uint64) {
-	if areaSize <= 0 || chunkSize <= 0 {
-		return
-	}
-	for offset := 0; offset+chunkSize <= areaSize; offset += chunkSize {
-		if q.push(uint64(offset), token, chunkSize) != nil {
-			return
-		}
-	}
 }
 
 // available returns free producer slots.
@@ -238,8 +240,10 @@ var zcrxAsyncCancelByUserData = func(ring *Uring, userData uint64) error {
 }
 
 // NewZCRXReceiver creates a ZCRX receiver.
+// The refill queue starts empty; ZCRXBuffer.Release returns delivered buffers to the kernel.
 // Returns ErrNotSupported if ZCRX is unavailable.
 func NewZCRXReceiver(ring *Uring, pool *ContextPools, cfg ZCRXConfig) (*ZCRXReceiver, error) {
+	requestedChunkSize := cfg.ChunkSize
 	cfg.defaults()
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -289,13 +293,18 @@ func NewZCRXReceiver(ring *Uring, pool *ContextPools, cfg ZCRXConfig) (*ZCRXRece
 		Flags:    IORING_MEM_REGION_TYPE_USER,
 	}
 
-	zcrxID, offsets, err := ring.RegisterZCRXIfq(
+	rxBufLen := uint32(0)
+	if requestedChunkSize != 0 {
+		rxBufLen = uint32(cfg.ChunkSize)
+	}
+	registration, err := ring.registerZCRXIfqWithFeatures(
 		ifIndex,
 		uint32(cfg.RxQueue),
 		uint32(cfg.RqEntries),
 		&areaReg,
 		&regionDesc,
-		uint32(cfg.ChunkSize),
+		rxBufLen,
+		query.Features,
 	)
 	if err != nil {
 		munmapRing(rqRingPtr, rqRingSize)
@@ -303,23 +312,17 @@ func NewZCRXReceiver(ring *Uring, pool *ContextPools, cfg ZCRXConfig) (*ZCRXRece
 		return nil, err
 	}
 
-	rq := &zcrxRefillQ{
-		kHead:   (*uint32)(unsafe.Add(rqRingPtr, uintptr(offsets.Head))),
-		kTail:   (*uint32)(unsafe.Add(rqRingPtr, uintptr(offsets.Tail))),
-		rqes:    unsafe.Slice((*ZCRXRqe)(unsafe.Add(rqRingPtr, uintptr(offsets.Rqes))), cfg.RqEntries),
-		entries: uint32(cfg.RqEntries),
-		mask:    uint32(cfg.RqEntries - 1),
-	}
-	rq.seed(cfg.AreaSize, cfg.ChunkSize, areaReg.RqAreaToken)
+	rq := newZCRXRefillQ(rqRingPtr, registration)
+	effectiveChunkSize := int(registration.RxBufLen)
 	return &ZCRXReceiver{
 		ring:   ring,
 		pool:   pool,
-		zcrxID: zcrxID,
+		zcrxID: registration.ID,
 		area: zcrxArea{
 			ptr:       areaPtr,
 			size:      cfg.AreaSize,
 			token:     areaReg.RqAreaToken,
-			chunkSize: cfg.ChunkSize,
+			chunkSize: effectiveChunkSize,
 			rq:        rq,
 			ringPtr:   rqRingPtr,
 			ringSize:  rqRingSize,
@@ -350,13 +353,6 @@ func (r *ZCRXReceiver) Start(fd iofd.FD, handler ZCRXHandler) error {
 	ctx := CastUserData[zcrxCtx](ext)
 	ctx.Fn = zcrxCQEHandler
 	extAnchors(ext).owner = r
-	if err := r.ring.ZCRXFlushRQ(r.zcrxID); err != nil {
-		r.state.Store(zcrxStateIdle)
-		r.ext = nil
-		r.userData.Store(0)
-		r.pool.PutExtended(ext)
-		return err
-	}
 
 	ext.SQE = ioUringSqe{}
 	ext.SQE.opcode = IORING_OP_RECV_ZC
@@ -619,7 +615,7 @@ func munmapRing(ptr unsafe.Pointer, size int) {
 // Embed to override selectively.
 type NoopZCRXHandler struct{}
 
-// OnData releases the buffer and continues.
+// OnData releases the buffer and returns false if release would block.
 func (NoopZCRXHandler) OnData(buf *ZCRXBuffer) bool {
 	return buf.Release() == nil
 }

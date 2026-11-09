@@ -6,6 +6,19 @@
 
 package uring
 
+// BufferRing is an unsupported provided-buffer ring handle on Darwin.
+type BufferRing struct{}
+
+// Add reports that explicit provided-buffer rings are unavailable on Darwin.
+func (r *BufferRing) Add(buf []byte, bid uint16, offset int) error {
+	return ErrNotSupported
+}
+
+// Advance reports that explicit provided-buffer rings are unavailable on Darwin.
+func (r *BufferRing) Advance(count int) error {
+	return ErrNotSupported
+}
+
 // uringBufferRings manages buffer rings for io_uring buffer selection.
 // On Darwin, this is a simplified implementation since there are no kernel buffer rings.
 type uringBufferRings struct {

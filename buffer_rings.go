@@ -11,6 +11,8 @@ package uring
 import (
 	"errors"
 	"fmt"
+	"math"
+	"slices"
 	"sync/atomic"
 	"unsafe"
 
@@ -18,6 +20,52 @@ import (
 	"code.hybscloud.com/spin"
 	"code.hybscloud.com/zcall"
 )
+
+// BufferRing is an opaque handle to an explicitly registered provided-buffer
+// ring. Registration returns an initialized empty ring; Add stages buffers and
+// Advance publishes them to the kernel. The handle is owned by its Uring and
+// remains valid only until Uring.Stop.
+//
+// Each Add records the buffer address and does not retain the buffer. Caller
+// must keep every added buffer's backing storage reachable and at the same
+// address from the Add call until a completion returns ownership or Uring.Stop
+// tears down the ring. Ownership transfers to the kernel on Advance; do not
+// mutate or reuse a published buffer while the kernel owns it. Add and Advance
+// are not safe for concurrent use.
+type BufferRing struct {
+	ring    *ioUring
+	bufRing *ioUringBufRing
+	entries int
+	mask    uintptr
+}
+
+// Add stages buf at offset from the current unpublished tail with buffer ID
+// bid. offset must be in [0, entries), and len(buf) must be in
+// [1, math.MaxUint32]. Add records buf's address but does not retain buf or
+// transfer ownership. Caller must keep its backing storage reachable and at
+// the same address from this call until a completion returns ownership or
+// Uring.Stop tears down the ring; a later Advance transfers ownership.
+func (r *BufferRing) Add(buf []byte, bid uint16, offset int) error {
+	if len(buf) < 1 || uint64(len(buf)) > math.MaxUint32 || offset < 0 || offset >= r.entries {
+		return ErrInvalidParam
+	}
+	r.ring.bufRingAdd(r.bufRing, uintptr(unsafe.Pointer(unsafe.SliceData(buf))), len(buf), bid, r.mask, uintptr(offset))
+	return nil
+}
+
+// Advance publishes count previously added buffers and transfers their
+// ownership to the kernel. count must be in [0, entries].
+func (r *BufferRing) Advance(count int) error {
+	if count < 0 || count > r.entries {
+		return ErrInvalidParam
+	}
+	if count == 0 {
+		return nil
+	}
+	dwcas.BarrierRelease()
+	r.ring.bufRingAdvance(r.bufRing, count)
+	return nil
+}
 
 func newUringBufferRings() *uringBufferRings {
 	ret := uringBufferRings{
@@ -50,8 +98,10 @@ type uringBufferRings struct {
 	locks    []spin.Lock
 	counts   []uintptr
 	masks    []uintptr
-	sizes    []int    // per-group buffer size
-	buffers  [][]byte // per-group buffer memory (GC-safe)
+	sizes    []int      // per-group buffer size
+	buffers  [][]byte   // per-group buffer memory (GC-safe)
+	nextIDs  [][]uint16 // publication successor for each buffer ID
+	lastIDs  []uint16   // last published buffer in each group
 }
 
 func (rings *uringBufferRings) appendGroup(br *ioUringBufRing, gid uint16, n int) {
@@ -60,6 +110,12 @@ func (rings *uringBufferRings) appendGroup(br *ioUringBufRing, gid uint16, n int
 	rings.counts = append(rings.counts, uintptr(n))
 	rings.masks = append(rings.masks, uintptr(n-1))
 	rings.gids = append(rings.gids, gid)
+	next := make([]uint16, n)
+	for i := range next {
+		next[i] = uint16((i + 1) & (n - 1))
+	}
+	rings.nextIDs = append(rings.nextIDs, next)
+	rings.lastIDs = append(rings.lastIDs, uint16(n-1))
 }
 
 func (rings *uringBufferRings) registerBuffers(ur *ioUring, b *uringProvideBuffers) error {
@@ -221,15 +277,15 @@ func (rings *uringBufferRings) registerGroup(ur *ioUring, entries int, gid uint1
 	return r, nil
 }
 
-// provide adds a buffer to the ring at the next available slot.
+// provide adds a buffer to the dense ring index at the next available slot.
 // Uses FAA to get unique offset, allowing concurrent provide() calls.
 //
 // Caller contract: Must not be called concurrently with advance().
 // The br.tail field is read without synchronization for slot calculation.
-func (rings *uringBufferRings) provide(ur *ioUring, gidOffset, group uint16, addr unsafe.Pointer, size int, index uint32) {
-	br := rings.rings[group-gidOffset]
-	offset := atomic.AddUintptr(&rings.counts[group-gidOffset], 1)
-	ur.bufRingAdd(br, uintptr(addr), size, uint16(index), rings.masks[group-gidOffset], offset-1)
+func (rings *uringBufferRings) provide(ur *ioUring, ringIndex int, addr unsafe.Pointer, size int, bufferID uint32) {
+	br := rings.rings[ringIndex]
+	offset := atomic.AddUintptr(&rings.counts[ringIndex], 1)
+	ur.bufRingAdd(br, uintptr(addr), size, uint16(bufferID), rings.masks[ringIndex], offset-1)
 }
 
 // advance commits pending buffers by updating the kernel-visible tail.
@@ -243,6 +299,17 @@ func (rings *uringBufferRings) advance(ur *ioUring) {
 			break
 		}
 		rings.locks[i].Lock()
+		// A bundle follows published descriptors, whose IDs need not be
+		// consecutive after recycling. Preserve that order independently of
+		// descriptor slots, which later publications can overwrite.
+		last := rings.lastIDs[i]
+		for offset := range rings.counts[i] {
+			index := (uintptr(r.tail) + offset) & rings.masks[i]
+			buf := (*ioUringBuf)(unsafe.Add(unsafe.Pointer(r), index*ioUringBufSize))
+			rings.nextIDs[i][last] = buf.bid
+			last = buf.bid
+		}
+		rings.lastIDs[i] = last
 		// Release barrier ensures buffer writes are visible to kernel before tail update
 		dwcas.BarrierRelease()
 		ur.bufRingAdvance(r, int(rings.counts[i]))
@@ -275,14 +342,16 @@ func (rings *uringBufferRings) reset() {
 	rings.masks = nil
 	rings.sizes = nil
 	rings.buffers = nil
+	rings.nextIDs = nil
+	rings.lastIDs = nil
 }
 
-// bundleIterator constructs a BundleIterator from a CQE and the internal index
-// of the buffer ring group. The index is the position in the rings slice
-// (i.e., group - gidOffset). gidOffset and group are captured in the
-// iterator for use by Recycle.
-func (rings *uringBufferRings) bundleIterator(cqe CQEView, index int, gidOffset, group uint16) (BundleIterator, bool) {
-	if index < 0 || index >= len(rings.rings) {
+// bundleIterator constructs a BundleIterator from a CQE and the exact
+// registered group ID. gids is sorted in registration order, while the
+// parallel ring storage is dense even when group IDs are sparse.
+func (rings *uringBufferRings) bundleIterator(cqe CQEView, group uint16) (BundleIterator, bool) {
+	index, ok := slices.BinarySearch(rings.gids, group)
+	if !ok || index >= len(rings.rings) {
 		return BundleIterator{}, false
 	}
 	it, ok := newBundleIterator(
@@ -292,7 +361,9 @@ func (rings *uringBufferRings) bundleIterator(cqe CQEView, index int, gidOffset,
 		uint16(rings.masks[index]),
 	)
 	if ok {
-		it.gidOffset = gidOffset
+		it.nextIDs = rings.nextIDs[index]
+		it.recycleOwner = rings
+		it.ringIndex = index
 		it.group = group
 	}
 	return it, ok

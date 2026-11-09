@@ -1280,6 +1280,260 @@ func TestVectorSubmitAcceptsMaxIovecs(t *testing.T) {
 	}
 }
 
+func TestRegisterFilesRejectsInvalidCountDomains(t *testing.T) {
+	t.Run("register oversized", func(t *testing.T) {
+		ur := &ioUring{ringFd: -1}
+		if err := ur.registerFiles(mappedTestSlice[int32](t, oversizedLen32(t))); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("registerFiles oversized error = %v, want %v", err, ErrInvalidParam)
+		}
+		if len(ur.files) != 0 {
+			t.Fatalf("registered file table len = %d, want 0", len(ur.files))
+		}
+	})
+
+	t.Run("update oversized", func(t *testing.T) {
+		ur := &ioUring{ringFd: -1, files: []int32{10, 11}}
+		before := append([]int32(nil), ur.files...)
+		if _, err := ur.registerFilesUpdate(1, mappedTestSlice[int32](t, oversizedLen32(t))); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("registerFilesUpdate oversized error = %v, want %v", err, ErrInvalidParam)
+		}
+		if len(ur.files) != len(before) {
+			t.Fatalf("registered file table len = %d, want %d", len(ur.files), len(before))
+		}
+		for i := range before {
+			if ur.files[i] != before[i] {
+				t.Fatalf("registered file table[%d] = %d, want %d", i, ur.files[i], before[i])
+			}
+		}
+	})
+
+	t.Run("update beyond remaining table", func(t *testing.T) {
+		ur := &ioUring{ringFd: -1, files: []int32{10, 11}}
+		before := append([]int32(nil), ur.files...)
+		if _, err := ur.registerFilesUpdate(1, []int32{20, 21}); !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("registerFilesUpdate overrun error = %v, want %v", err, ErrInvalidParam)
+		}
+		for i := range before {
+			if ur.files[i] != before[i] {
+				t.Fatalf("registered file table[%d] = %d, want %d", i, ur.files[i], before[i])
+			}
+		}
+	})
+
+	t.Run("update rejects skip sentinel", func(t *testing.T) {
+		ur := &ioUring{ringFd: -1, files: []int32{10, 11}}
+		if updated, err := ur.registerFilesUpdate(0, []int32{-2}); updated != 0 || !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("registerFilesUpdate(-2) = (%d, %v), want (0, %v)", updated, err, ErrInvalidParam)
+		}
+		if ur.files[0] != 10 || ur.files[1] != 11 {
+			t.Fatalf("registered file table = %v, want [10 11]", ur.files)
+		}
+	})
+}
+
+func TestRegisterFilesUpdatePreservesPartialProgress(t *testing.T) {
+	ur := newTestIoUring(t)
+	f, err := os.Open("/dev/null")
+	if err != nil {
+		t.Fatalf("open /dev/null: %v", err)
+	}
+	defer f.Close()
+
+	fd := int32(f.Fd())
+	if err := ur.registerFiles([]int32{fd, fd}); err != nil {
+		t.Fatalf("registerFiles: %v", err)
+	}
+	updated, err := ur.registerFilesUpdate(0, []int32{fd, math.MaxInt32})
+	if err != nil {
+		t.Fatalf("registerFilesUpdate: %v", err)
+	}
+	if updated != 1 {
+		t.Fatalf("updated = %d, want 1", updated)
+	}
+	if ur.files[0] != fd || ur.files[1] != -1 {
+		t.Fatalf("registered file table = %v, want [%d -1]", ur.files, fd)
+	}
+	runtime.KeepAlive(f)
+}
+
+func TestRegisterFilesUpdatePreservesFirstFailureClear(t *testing.T) {
+	ur := newTestIoUring(t)
+	f, err := os.Open("/dev/null")
+	if err != nil {
+		t.Fatalf("open /dev/null: %v", err)
+	}
+	defer f.Close()
+
+	fd := int32(f.Fd())
+	if err := ur.registerFiles([]int32{fd}); err != nil {
+		t.Fatalf("registerFiles: %v", err)
+	}
+	updated, err := ur.registerFilesUpdate(0, []int32{math.MaxInt32})
+	if updated != 0 || !errors.Is(err, zcall.Errno(zcall.EBADF)) {
+		t.Fatalf("registerFilesUpdate = (%d, %v), want (0, EBADF)", updated, err)
+	}
+	if ur.files[0] != -1 {
+		t.Fatalf("registered file table = %v, want [-1]", ur.files)
+	}
+	runtime.KeepAlive(f)
+}
+
+func TestCloneBuffersPublishesExactViews(t *testing.T) {
+	t.Run("task-registered source", func(t *testing.T) {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+
+		src := newTestIoUring(t)
+		dst := newTestIoUring(t)
+		const bufferSize = 1 << 12
+		backing := make([]byte, 2*bufferSize)
+		if err := src.registerBuffers(unsafe.Pointer(unsafe.SliceData(backing)), 2, bufferSize); err != nil {
+			t.Fatalf("register source buffers: %v", err)
+		}
+
+		type ioUringRsrcUpdate struct {
+			offset uint32
+			resv   uint32
+			data   uint64
+		}
+		registration := ioUringRsrcUpdate{
+			offset: math.MaxUint32,
+			data:   uint64(src.ringFd),
+		}
+		result, errno := zcall.IoUringRegister(
+			uintptr(src.ringFd),
+			IORING_REGISTER_RING_FDS,
+			unsafe.Pointer(&registration),
+			1,
+		)
+		if errno != 0 {
+			t.Fatalf("register source ring: %v", errFromErrno(errno))
+		}
+		if result != 1 {
+			t.Fatalf("register source ring result = %d, want 1", result)
+		}
+		defer func() {
+			unregistration := ioUringRsrcUpdate{offset: registration.offset}
+			result, errno := zcall.IoUringRegister(
+				uintptr(src.ringFd),
+				IORING_UNREGISTER_RING_FDS,
+				unsafe.Pointer(&unregistration),
+				1,
+			)
+			if errno != 0 {
+				t.Errorf("unregister source ring: %v", errFromErrno(errno))
+			} else if result != 1 {
+				t.Errorf("unregister source ring result = %d, want 1", result)
+			}
+		}()
+
+		srcRing := &Uring{ioUring: src}
+		dstRing := &Uring{ioUring: dst}
+		if err := dstRing.CloneBuffersFromRegistered(srcRing, registration.offset, 0, 0, 0, false); err != nil {
+			t.Fatalf("CloneBuffersFromRegistered: %v", err)
+		}
+		if dstRing.RegisteredBufferCount() != 2 {
+			t.Fatalf("destination buffer count = %d, want 2", dstRing.RegisteredBufferCount())
+		}
+		for i := range 2 {
+			got, want := dstRing.RegisteredBuffer(i), srcRing.RegisteredBuffer(i)
+			if len(got) != len(want) || unsafe.SliceData(got) != unsafe.SliceData(want) {
+				t.Fatalf("destination buffer %d does not match task-registered source view", i)
+			}
+		}
+		runtime.KeepAlive(backing)
+	})
+
+	t.Run("whole table into empty destination", func(t *testing.T) {
+		src := newTestIoUring(t)
+		dst := newTestIoUring(t)
+		const bufferSize = 1 << 12
+		backing := make([]byte, 3*bufferSize)
+		if err := src.registerBuffers(unsafe.Pointer(unsafe.SliceData(backing)), 3, bufferSize); err != nil {
+			t.Fatalf("register source buffers: %v", err)
+		}
+
+		srcRing := &Uring{ioUring: src}
+		dstRing := &Uring{ioUring: dst}
+		if err := dstRing.CloneBuffers(srcRing, 0, 0, 0, false); err != nil {
+			t.Fatalf("CloneBuffers: %v", err)
+		}
+		if dstRing.RegisteredBufferCount() != 3 {
+			t.Fatalf("destination buffer count = %d, want 3", dstRing.RegisteredBufferCount())
+		}
+		for i := range 3 {
+			got, want := dstRing.RegisteredBuffer(i), srcRing.RegisteredBuffer(i)
+			if len(got) != len(want) || unsafe.SliceData(got) != unsafe.SliceData(want) {
+				t.Fatalf("destination buffer %d does not match source view", i)
+			}
+		}
+		runtime.KeepAlive(backing)
+	})
+
+	t.Run("replacement preserves outside range", func(t *testing.T) {
+		src := newTestIoUring(t)
+		dst := newTestIoUring(t)
+		const bufferSize = 1 << 12
+		srcBacking := make([]byte, 2*bufferSize)
+		dstBacking := make([]byte, 4*bufferSize)
+		if err := src.registerBuffers(unsafe.Pointer(unsafe.SliceData(srcBacking)), 2, bufferSize); err != nil {
+			t.Fatalf("register source buffers: %v", err)
+		}
+		if err := dst.registerBuffers(unsafe.Pointer(unsafe.SliceData(dstBacking)), 4, bufferSize); err != nil {
+			t.Fatalf("register destination buffers: %v", err)
+		}
+		beforeFirst, beforeLast := dst.bufs[0], dst.bufs[3]
+
+		srcRing := &Uring{ioUring: src}
+		dstRing := &Uring{ioUring: dst}
+		if err := dstRing.CloneBuffers(srcRing, 0, 1, 2, true); err != nil {
+			t.Fatalf("CloneBuffers replace: %v", err)
+		}
+		if unsafe.SliceData(dst.bufs[0]) != unsafe.SliceData(beforeFirst) ||
+			unsafe.SliceData(dst.bufs[3]) != unsafe.SliceData(beforeLast) {
+			t.Fatal("replacement changed a destination view outside the cloned range")
+		}
+		for i := range 2 {
+			if unsafe.SliceData(dst.bufs[i+1]) != unsafe.SliceData(src.bufs[i]) {
+				t.Fatalf("destination buffer %d does not match source buffer %d", i+1, i)
+			}
+		}
+		runtime.KeepAlive(srcBacking)
+		runtime.KeepAlive(dstBacking)
+	})
+}
+
+func TestQueryPreservesEntryFailureAndResultSizeLayout(t *testing.T) {
+	data := byte(0)
+	hdr := QueryHdr{
+		QueryData: uint64(uintptr(unsafe.Pointer(&data))),
+		QueryOp:   math.MaxUint32,
+		Size:      1,
+	}
+	if err := (&ioUring{ringFd: -1}).query(&hdr); !errors.Is(err, ErrNotSupported) {
+		t.Fatalf("query error = %v, want %v", err, ErrNotSupported)
+	}
+	if hdr.Result != -int32(EOPNOTSUPP) {
+		t.Fatalf("query result = %d, want -EOPNOTSUPP", hdr.Result)
+	}
+	if hdr.Size != 0 {
+		t.Fatalf("query result size = %d, want 0 for unsupported operation", hdr.Size)
+	}
+
+	if got := unsafe.Offsetof(QueryOpcode{}.ResultSize); got != 48 {
+		t.Fatalf("QueryOpcode kernel-data size = %d, want 48", got)
+	}
+	if got := unsafe.Offsetof(QueryZCRX{}.Features); got != 20 {
+		t.Fatalf("QueryZCRX Features offset = %d, want 20", got)
+	}
+	if got := unsafe.Offsetof(QueryZCRX{}.ResultSize); got != 40 {
+		t.Fatalf("QueryZCRX kernel-data size = %d, want 40", got)
+	}
+	if got := unsafe.Offsetof(QuerySCQ{}.ResultSize); got != 16 {
+		t.Fatalf("QuerySCQ kernel-data size = %d, want 16", got)
+	}
+}
+
 func TestSendZeroCopyEncodesSQE(t *testing.T) {
 	ring := newWrapperTestRing(t)
 
@@ -1827,6 +2081,26 @@ func TestRegisterBuffersAcceptsNonPowerOfTwoCount(t *testing.T) {
 		t.Fatalf("unregisterBuffers: %v", err)
 	}
 	runtime.KeepAlive(buffers)
+}
+
+func TestRegisterBuffersFailureDoesNotPublishState(t *testing.T) {
+	ur := &ioUring{ringFd: -1}
+	buffer := make([]byte, 1<<12)
+	addr := unsafe.Pointer(unsafe.SliceData(buffer))
+
+	for attempt := range 2 {
+		err := ur.registerBuffers(addr, 1, len(buffer))
+		if err == nil {
+			t.Fatalf("registerBuffers attempt %d succeeded with an invalid ring descriptor", attempt+1)
+		}
+		if errors.Is(err, ErrExists) {
+			t.Fatalf("registerBuffers attempt %d error = %v, want syscall failure", attempt+1, err)
+		}
+		if len(ur.bufs) != 0 {
+			t.Fatalf("registerBuffers attempt %d published %d buffers after failure, want 0", attempt+1, len(ur.bufs))
+		}
+	}
+	runtime.KeepAlive(buffer)
 }
 
 func TestNewIoUringRejectsEntriesOutsideSetupDomain(t *testing.T) {

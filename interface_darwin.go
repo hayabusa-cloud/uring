@@ -329,6 +329,7 @@ func (ur *Uring) RegisteredBufferCount() int {
 // ========================================
 
 // RegisterFiles registers file descriptors for use with IOSQE_FIXED_FILE flag.
+// fds must have between 1 and 2^32-1 entries.
 // On Darwin, only Close consumes registered-file slots; other fixed-file
 // submissions return ErrNotSupported.
 func (ur *Uring) RegisterFiles(fds []int32) error {
@@ -340,8 +341,11 @@ func (ur *Uring) RegisterFilesSparse(count uint32) error {
 	return ur.registerFilesSparse(count)
 }
 
-// RegisterFilesUpdate updates registered files at the specified offset.
-func (ur *Uring) RegisterFilesUpdate(offset uint32, fds []int32) error {
+// RegisterFilesUpdate updates registered files at the specified offset and
+// returns the number of entries processed.
+// fds must have between 1 and 2^32-1 entries. The update range must fit
+// within the registered file table.
+func (ur *Uring) RegisterFilesUpdate(offset uint32, fds []int32) (int, error) {
 	return ur.registerFilesUpdate(offset, fds)
 }
 
@@ -1009,23 +1013,19 @@ func (ur *Uring) LinkTimeout(sqeCtx SQEContext, d time.Duration, options ...OpOp
 	return ur.linkTimeout(ctx, &Timespec{Sec: nano / int64(time.Second), Nsec: nano % int64(time.Second)}, 0)
 }
 
-// ReceiveBundle is unavailable on Darwin.
+// ReceiveBundle reports that bundled receive is unavailable on Darwin.
 func (ur *Uring) ReceiveBundle(sqeCtx SQEContext, pollFD PollFd, options ...OpOptionFunc) error {
-
 	return ErrNotSupported
 }
 
-// SubmitReceiveBundleMultishot is unavailable on Darwin.
+// SubmitReceiveBundleMultishot reports that multishot bundled receive is unavailable on Darwin.
 func (ur *Uring) SubmitReceiveBundleMultishot(sqeCtx SQEContext, pollFD PollFd, options ...OpOptionFunc) error {
-
 	return ErrNotSupported
 }
 
-// BundleIterator is unavailable on Darwin.
+// BundleIterator reports that bundled receive buffers are unavailable on Darwin.
 func (ur *Uring) BundleIterator(cqe CQEView, group uint16) (BundleIterator, bool) {
-	var result0 BundleIterator
-	var result1 bool
-	return result0, result1
+	return BundleIterator{}, false
 }
 
 // ReceiveZeroCopy reports that zero-copy receive is unavailable on Darwin.
@@ -1053,94 +1053,78 @@ func (ur *Uring) Pipe(sqeCtx SQEContext, fds *[2]iofd.FD, pipeFlags uint32, opti
 	return ErrNotSupported
 }
 
-// RegisterZCRXIfq is unavailable on Darwin.
-func (ur *Uring) RegisterZCRXIfq(ifIdx, ifRxq uint32, rqEntries uint32, area *ZCRXAreaReg, region *RegionDesc, rxBufLen uint32) (uint32, ZCRXOffsets, error) {
-	var result0 uint32
-	var result1 ZCRXOffsets
-	return result0, result1, ErrNotSupported
+// RegisterZCRXIfq reports that ZCRX interface queues are unavailable on Darwin.
+func (ur *Uring) RegisterZCRXIfq(ifIdx, ifRxq uint32, rqEntries uint32, area *ZCRXAreaReg, region *RegionDesc, rxBufLen uint32) (ZCRXIfqRegistration, error) {
+	return ZCRXIfqRegistration{}, ErrNotSupported
 }
 
-// ZCRXFlushRQ is unavailable on Darwin.
+// ZCRXFlushRQ reports that ZCRX refill queues are unavailable on Darwin.
 func (ur *Uring) ZCRXFlushRQ(zcrxID uint32) error {
-
 	return ErrNotSupported
 }
 
-// RegisterBufRingMMAP is unavailable on Darwin.
-func (ur *Uring) RegisterBufRingMMAP(entries int, groupID uint16) (*ioUringBufRing, error) {
-	var result0 *ioUringBufRing
-	return result0, ErrNotSupported
+// RegisterBufRingMMAP reports that kernel-mapped provided-buffer rings are unavailable on Darwin.
+func (ur *Uring) RegisterBufRingMMAP(entries int, groupID uint16) (*BufferRing, error) {
+	return nil, ErrNotSupported
 }
 
-// RegisterBufRingIncremental is unavailable on Darwin.
-func (ur *Uring) RegisterBufRingIncremental(entries int, groupID uint16) (*ioUringBufRing, error) {
-	var result0 *ioUringBufRing
-	return result0, ErrNotSupported
+// RegisterBufRingIncremental reports that incremental provided-buffer rings are unavailable on Darwin.
+func (ur *Uring) RegisterBufRingIncremental(entries int, groupID uint16) (*BufferRing, error) {
+	return nil, ErrNotSupported
 }
 
-// RegisterBufRingWithFlags is unavailable on Darwin.
-func (ur *Uring) RegisterBufRingWithFlags(entries int, groupID uint16, flags uint16) (*ioUringBufRing, error) {
-	var result0 *ioUringBufRing
-	return result0, ErrNotSupported
+// RegisterBufRingWithFlags reports that explicit provided-buffer rings are unavailable on Darwin.
+func (ur *Uring) RegisterBufRingWithFlags(entries int, groupID uint16, flags uint16) (*BufferRing, error) {
+	return nil, ErrNotSupported
 }
 
-// QueryOpcodes is unavailable on Darwin.
+// QueryOpcodes reports that io_uring opcode queries are unavailable on Darwin.
 func (ur *Uring) QueryOpcodes() (*QueryOpcode, error) {
-	var result0 *QueryOpcode
-	return result0, ErrNotSupported
+	return nil, ErrNotSupported
 }
 
-// QueryZCRX is unavailable on Darwin.
+// QueryZCRX reports that ZCRX capability queries are unavailable on Darwin.
 func (ur *Uring) QueryZCRX() (*QueryZCRX, error) {
-	var result0 *QueryZCRX
-	return result0, ErrNotSupported
+	return nil, ErrNotSupported
 }
 
-// QuerySCQ is unavailable on Darwin.
+// QuerySCQ reports that io_uring shared-ring queries are unavailable on Darwin.
 func (ur *Uring) QuerySCQ() (*QuerySCQ, error) {
-	var result0 *QuerySCQ
-	return result0, ErrNotSupported
+	return nil, ErrNotSupported
 }
 
-// RegisterMemRegion is unavailable on Darwin.
+// RegisterMemRegion reports that io_uring memory regions are unavailable on Darwin.
 func (ur *Uring) RegisterMemRegion(region *RegionDesc, flags uint64) error {
-
 	return ErrNotSupported
 }
 
-// RegisterNAPI is unavailable on Darwin.
+// RegisterNAPI reports that io_uring NAPI polling is unavailable on Darwin.
 func (ur *Uring) RegisterNAPI(busyPollTimeout uint32, preferBusyPoll bool, strategy uint32) error {
-
 	return ErrNotSupported
 }
 
-// NAPIAddStaticID is unavailable on Darwin.
+// NAPIAddStaticID reports that io_uring NAPI polling is unavailable on Darwin.
 func (ur *Uring) NAPIAddStaticID(napiID uint32) error {
-
 	return ErrNotSupported
 }
 
-// NAPIDelStaticID is unavailable on Darwin.
+// NAPIDelStaticID reports that io_uring NAPI polling is unavailable on Darwin.
 func (ur *Uring) NAPIDelStaticID(napiID uint32) error {
-
 	return ErrNotSupported
 }
 
-// UnregisterNAPI is unavailable on Darwin.
+// UnregisterNAPI reports that io_uring NAPI polling is unavailable on Darwin.
 func (ur *Uring) UnregisterNAPI() error {
-
 	return ErrNotSupported
 }
 
-// CloneBuffers is unavailable on Darwin.
-func (ur *Uring) CloneBuffers(srcFD int, srcOff, dstOff, count uint32, replace bool) error {
-
+// CloneBuffers reports that cross-ring registered-buffer cloning is unavailable on Darwin.
+func (ur *Uring) CloneBuffers(src *Uring, srcOff, dstOff, count uint32, replace bool) error {
 	return ErrNotSupported
 }
 
-// CloneBuffersFromRegistered is unavailable on Darwin.
-func (ur *Uring) CloneBuffersFromRegistered(srcRegisteredIdx int, srcOff, dstOff, count uint32, replace bool) error {
-
+// CloneBuffersFromRegistered reports that registered-ring buffer cloning is unavailable on Darwin.
+func (ur *Uring) CloneBuffersFromRegistered(src *Uring, srcRegisteredRingIdx uint32, srcOff, dstOff, count uint32, replace bool) error {
 	return ErrNotSupported
 }
 
@@ -1150,9 +1134,8 @@ func (ur *Uring) ResizeRings(newSQSize, newCQSize uint32) error {
 	return ErrNotSupported
 }
 
-// ZCRXExport is unavailable on Darwin.
+// ZCRXExport reports that ZCRX export is unavailable on Darwin.
 func (ur *Uring) ZCRXExport(zcrxID uint32) (iofd.FD, error) {
-
 	return iofd.InvalidFD, ErrNotSupported
 }
 

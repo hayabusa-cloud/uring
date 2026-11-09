@@ -124,12 +124,13 @@ for {
 | `ListenerOp`          | Manejador de una operación de creación de escucha con FD y auxiliares de accept                                   |
 | `BundleIterator`      | Itera sobre búferes consumidos en una recepción agrupada                                                          |
 | `IncrementalReceiver` | Gestiona recepciones incrementales de buffer-ring (`IOU_PBUF_RING_INC`)                                           |
+| `BufferRing`          | Ring opaco de búferes provistos registrado explícitamente; `Add` prepara y `Advance` publica                     |
 | `ZCTracker`           | Rastrea el ciclo de vida de notificación y fallback del envío de copia cero                                      |
 | `ContextPools`        | Pools para contextos de envío indirectos y extendidos                                                             |
 | `ZCRXReceiver`        | Ciclo de vida de recepción de copia cero sobre una cola RX de NIC                                                 |
 | `ZCRXConfig`          | Configuración de una instancia de recepción ZCRX                                                                  |
 | `ZCRXHandler`         | Interfaz de devolución de llamada para datos, errores y cierre ZCRX                                               |
-| `ZCRXBuffer`          | Vista de recepción de copia cero entregada, con reposición del kernel al liberar                                  |
+| `ZCRXBuffer`          | Vista de recepción de copia cero con devolución gestionada por el llamador mediante la cola de reposición          |
 
 Operaciones:
 
@@ -240,7 +241,7 @@ Al completarse la operación, `CQEView` decodifica el modo de contexto correspon
 
 ## Provisión de búferes
 
-`uring` ofrece tres rutas prácticas para búferes. Los búferes registrados quedan fijados durante el arranque del ring y se usan con I/O de archivo con búfer fijo. Los anillos de búferes provistos permiten que el kernel elija un búfer de recepción y devuelva su ID en el CQE. Las recepciones agrupadas consumen un rango lógico contiguo de búferes provistos y lo exponen mediante `BundleIterator`.
+`uring` ofrece tres rutas prácticas para búferes. Los búferes registrados quedan fijados durante el arranque del ring y se usan con I/O de archivo con búfer fijo. Los anillos de búferes provistos permiten que el kernel elija un búfer de recepción y devuelva su ID en el CQE. Las recepciones agrupadas siguen el orden de publicación, que puede diferir del orden numérico de los ID después del reciclaje. `Uring.BundleIterator` conserva ese orden. El constructor independiente `NewBundleIterator` requiere ID consecutivos módulo el tamaño del ring.
 
 - búferes provistos de tamaño fijo mediante `ReadBufferSize` y `ReadBufferNum`
 - grupos de búferes de varios tamaños mediante `MultiSizeBuffer`
@@ -261,6 +262,38 @@ Utilice `OptionsForBudget` para partir de un presupuesto de memoria explícito, 
 cfg, scale := uring.BufferConfigForBudget(256 * uring.MiB)
 fmt.Printf("buffer tiers=%+v scale=%d\n", cfg, scale)
 ```
+
+Los rings incrementales explícitos se inicializan vacíos. Después de `Start`, elija un ID de grupo que no usen los grupos de búferes provistos configurados, prepare cada slice del almacenamiento y publique el lote:
+
+```go
+const (
+    groupID = 60000
+    entries = 8
+    bufSize = 4096
+)
+
+backing := make([]byte, entries*bufSize)
+bufRing, err := ring.RegisterBufRingIncremental(entries, groupID)
+if err != nil {
+    return err
+}
+for i := range entries {
+    buf := backing[i*bufSize : (i+1)*bufSize]
+    if err := bufRing.Add(buf, uint16(i), i); err != nil {
+        return err
+    }
+}
+if err := bufRing.Advance(entries); err != nil {
+    return err
+}
+
+pool := uring.NewContextPools(entries)
+receiver := uring.NewIncrementalReceiver(ring, pool, groupID, bufSize, backing, entries)
+```
+
+`BufferRing.Add` prepara las entradas; `BufferRing.Advance` las publica y transfiere su propiedad al kernel. Mantenga `backing` accesible. Procese las CQE de este receptor una sola vez y de forma serializada, en el orden de la CQ; el receptor mantiene un desplazamiento independiente para cada ID de búfer.
+
+`IORING_CQE_F_BUF_MORE` indica que el kernel retiene el búfer seleccionado incluso después de completar la solicitud. Recíclelo solo cuando una CQE indique `IORING_CQE_F_BUFFER` sin `IORING_CQE_F_BUF_MORE` y haya terminado el acceso prestado. Un resultado cero o negativo también puede devolver un búfer. `Uring.Stop` es responsable de desmontar el buffer-ring.
 
 El I/O con búfer fijo usa un búfer registrado por índice. La slice devuelta pertenece al ring; manténgala viva hasta que termine la operación fija:
 
@@ -290,7 +323,7 @@ if cqe.HasBuffer() {
 }
 ```
 
-Las recepciones agrupadas usan el mismo almacenamiento de búferes provistos, pero pueden consumir más de un búfer en un solo CQE. Procese el iterador y después recicle los slots consumidos:
+Las recepciones agrupadas usan el mismo almacenamiento de búferes provistos, pero pueden consumir más de un búfer en un solo CQE. Procese el iterador y después recicle los slots consumidos. Llame a `Recycle` exactamente una vez entre todas las copias de un iterador; después de que retorne, no lea los búferes producidos:
 
 ```go
 if err := ring.ReceiveBundle(recvCtx, &socketFD, uring.WithReadBufferSize(uring.BufferSizeSmall)); err != nil {
@@ -301,7 +334,9 @@ if it, ok := ring.BundleIterator(cqe, cqe.BufGroup()); ok {
     for buf := range it.All() {
         handle(buf)
     }
-    it.Recycle(ring)
+    if err := it.Recycle(ring); err != nil {
+        return err
+    }
 }
 ```
 
@@ -546,10 +581,10 @@ Reutilice el bucle `Wait` de la sección de ciclo de vida del ring tras cada env
 
 ### Ciclo de vida
 
-1. Con un ring habilitado para CQE32, cree el receptor con `NewZCRXReceiver`. El constructor registra la cola de interfaz ZCRX, mapea el área de reposición y prepara el ring de reposición.
+1. Con un ring habilitado para CQE32, cree el receptor con `NewZCRXReceiver`. El constructor registra la cola de interfaz ZCRX, mapea el área de recepción e inicializa un ring de reposición vacío. Linux proporciona los búferes de recepción iniciales; el ring de reposición devuelve los búferes entregados.
 2. Llame a `Start` para enviar la operación extendida `RECV_ZC` en el ring.
 3. En la ruta de despacho de CQE, los completados ZCRX se enrutan al `ZCRXHandler`:
-    - `OnData` entrega un `ZCRXBuffer` que apunta al área mapeada por la NIC. Llame a `Release` al terminar para reponer el slot ante el kernel. Devuelva `false` para solicitar una parada de mejor esfuerzo.
+    - `OnData` entrega un `ZCRXBuffer` que apunta al área mapeada por la NIC. Llame a `Release` al terminar; la publicación correcta en la cola de reposición devuelve el slot al kernel. Si devuelve `iox.ErrWouldBlock`, conserve el búfer y reintente la liberación más tarde en la ruta de CQE. Un búfer EOF de longitud cero no tiene identidad de reposición y se libera sin publicar una entrada. Devuelva `false` para solicitar una parada de mejor esfuerzo.
     - `OnError` entrega errores de CQE. Devuelva `false` para solicitar una parada de mejor esfuerzo.
     - `OnStopped` se ejecuta una vez durante la retirada terminal, antes de que el estado pase a `Stopped`.
 4. Llame a `Stop` para enviar un async cancel. El receptor transita por `Stopping` → `Retiring` → `Stopped`.
