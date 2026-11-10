@@ -60,6 +60,7 @@ La regla es simple: `code.hybscloud.com/uring` expone hechos del núcleo; las ca
 ```go
 ring, err := uring.New(func(o *uring.Options) {
     o.Entries = uring.EntriesMedium
+    o.NotifySucceed = true
 })
 if err != nil {
     return err

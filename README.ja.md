@@ -60,6 +60,7 @@ Debian 13 の安定版トラックが提供するカーネルは 6.12 です。`
 ```go
 ring, err := uring.New(func(o *uring.Options) {
     o.Entries = uring.EntriesMedium
+    o.NotifySucceed = true
 })
 if err != nil {
     return err

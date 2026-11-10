@@ -8,8 +8,8 @@ package examples_test
 
 import (
 	"errors"
-	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -22,29 +22,6 @@ const (
 	testLockedBufferMem   = uring.BufferSizeLarge
 	testProvidedBufferNum = 64
 )
-
-func TestMain(m *testing.M) {
-	ring, err := uring.New(testMinimalBufferOptions)
-	if err != nil {
-		if testRingUnavailable(err) {
-			fmt.Fprintf(os.Stderr, "skipping uring example tests: io_uring unavailable: %v\n", err)
-			os.Exit(0)
-		}
-		fmt.Fprintf(os.Stderr, "uring example test probe failed: %v\n", err)
-		os.Exit(1)
-	}
-	if err := ring.Stop(); err != nil {
-		fmt.Fprintf(os.Stderr, "uring example test probe cleanup failed: %v\n", err)
-		os.Exit(1)
-	}
-	os.Exit(m.Run())
-}
-
-func testRingUnavailable(err error) bool {
-	return errors.Is(err, uring.ErrPermission) ||
-		errors.Is(err, uring.ErrNotSupported) ||
-		errors.Is(err, uring.ErrNoMemory)
-}
 
 func testMinimalBufferOptions(opt *uring.Options) {
 	opt.LockedBufferMem = testLockedBufferMem
@@ -63,6 +40,20 @@ func mustStartRing(tb testing.TB, ring *uring.Uring) {
 			tb.Fatalf("Stop: %v", err)
 		}
 	})
+}
+
+func tempFile(t *testing.T) *os.File {
+	t.Helper()
+	f, err := os.Create(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := f.Close(); err != nil {
+			t.Errorf("Close temporary file: %v", err)
+		}
+	})
+	return f
 }
 
 func waitForOp(t *testing.T, ring *uring.Uring, op uint8, timeout time.Duration) (uring.CQEView, bool) {

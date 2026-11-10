@@ -9,214 +9,242 @@ package examples_test
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
+	"runtime"
 	"testing"
 	"time"
 
+	"code.hybscloud.com/iofd"
 	"code.hybscloud.com/iox"
 	"code.hybscloud.com/uring"
 )
 
-// TestFileWriteRead demonstrates basic file I/O using io_uring.
+// Submission accepts work; the CQE tells the caller how it finished:
 //
-// This example shows the fundamental io_uring pattern:
-//  1. Pack context with operation metadata
-//  2. Submit operation (non-blocking)
-//  3. Wait for completion
-//  4. Check result in CQE
+//  1. PackDirect -> Write -> Wait -> inspect write CQE
+//  2. ctx.WithOp -> Read  -> Wait -> inspect read CQE and bytes
 //
-// Key insight: io_uring separates submission from completion,
-// allowing batched submissions and async processing.
+// Keep each payload or destination valid until its completion. Wait may return
+// no CQEs yet; back off between attempts and reset the backoff after progress.
 func TestFileWriteRead(t *testing.T) {
-	ring, err := uring.New(
-		testMinimalBufferOptions,
-		func(opts *uring.Options) {
-			opts.Entries = uring.EntriesSmall
-			opts.NotifySucceed = true // Request a CQE for every successful operation.
-			opts.MultiIssuers = true  // Use the shared-submit configuration in this example.
-		},
-	)
+	ring, err := uring.New(func(opt *uring.Options) {
+		opt.Entries = uring.EntriesNano
+		opt.LockedBufferMem = uring.BufferSizeLarge
+		opt.ReadBufferNum = 64
+		opt.NotifySucceed = true // Successful writes must produce CQEs.
+	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	mustStartRing(t, ring)
-
-	// Create temp file
-	f, err := os.CreateTemp("", "uring_file_io_*")
-	if err != nil {
-		t.Fatalf("CreateTemp: %v", err)
+	if err := ring.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
 	}
-	defer os.Remove(f.Name())
-	defer f.Close()
-
-	fd := int32(f.Fd())
-	testData := []byte("Hello from io_uring file I/O!")
-
-	// === WRITE ===
-	// PackDirect creates zero-allocation context:
-	//   - op: IORING_OP_WRITE
-	//   - flags: 0 (none)
-	//   - bufGroup: 0 (not using buffer selection)
-	//   - fd: file descriptor
-	writeCtx := uring.PackDirect(uring.IORING_OP_WRITE, 0, 0, fd)
-	if err := ring.Write(writeCtx, testData); err != nil {
-		t.Fatalf("Write submit: %v", err)
-	}
-
-	// Wait for write completion
-	cqe, ok := waitForOp(t, ring, uring.IORING_OP_WRITE, time.Second)
-	if !ok {
-		t.Fatal("Write did not complete")
-	}
-	if err := cqe.Err(); err != nil {
-		t.Fatalf("Write failed: %v", err)
-	}
-	if int(cqe.Res) != len(testData) {
-		t.Errorf("Write: got %d bytes, want %d", cqe.Res, len(testData))
-	}
-	t.Logf("Write completed: %d bytes", cqe.Res)
-
-	// === READ ===
-	// Seek back to start
-	if _, err := f.Seek(0, 0); err != nil {
-		t.Fatalf("Seek: %v", err)
-	}
-
-	readBuf := make([]byte, len(testData))
-	readCtx := uring.PackDirect(uring.IORING_OP_READ, 0, 0, fd)
-	if err := ring.Read(readCtx, readBuf); err != nil {
-		t.Fatalf("Read submit: %v", err)
-	}
-
-	cqe, ok = waitForOp(t, ring, uring.IORING_OP_READ, time.Second)
-	if !ok {
-		t.Fatal("Read did not complete")
-	}
-	if err := cqe.Err(); err != nil {
-		t.Fatalf("Read failed: %v", err)
-	}
-	t.Logf("Read completed: %d bytes", cqe.Res)
-
-	// Verify data
-	if !bytes.Equal(readBuf, testData) {
-		t.Errorf("Data mismatch: got %q, want %q", readBuf, testData)
-	}
-}
-
-// TestBatchedFileOps demonstrates submitting multiple operations before waiting.
-//
-// io_uring's power comes from batching: submit many SQEs, then collect
-// completions together. This reduces syscall overhead.
-func TestBatchedFileOps(t *testing.T) {
-	ring, err := uring.New(
-		testMinimalBufferOptions,
-		func(opts *uring.Options) {
-			opts.Entries = uring.EntriesSmall
-			opts.NotifySucceed = true // Request a CQE for every successful operation.
-			opts.MultiIssuers = true  // Use the shared-submit configuration in this example.
-		},
-	)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	mustStartRing(t, ring)
-
-	// Create multiple temp files
-	const numFiles = 4
-	files := make([]*os.File, numFiles)
-	for i := range numFiles {
-		f, err := os.CreateTemp("", "uring_batch_*")
-		if err != nil {
-			t.Fatalf("CreateTemp[%d]: %v", i, err)
+	// Drain submitted requests before this deferred teardown.
+	defer func() {
+		if err := ring.Stop(); err != nil {
+			t.Errorf("Stop: %v", err)
 		}
-		files[i] = f
-		defer os.Remove(f.Name())
-		defer f.Close()
+	}()
+
+	f := tempFile(t)
+	payload := []byte("Hello, io_uring!")
+	// Zero flags add no submission modifiers; ordinary Write leaves BufGroup unused.
+	ctx := uring.PackDirect(uring.IORING_OP_WRITE, 0, 0, int32(f.Fd()))
+	// Write queues work; Wait submits it and reaps available completions.
+	if err := ring.Write(ctx, payload); err != nil {
+		t.Fatalf("Write: %v", err)
 	}
-
-	// Submit writes to ALL files before waiting
-	for i, f := range files {
-		data := []byte("File " + string('A'+byte(i)) + " data")
-		ctx := uring.PackDirect(uring.IORING_OP_WRITE, 0, 0, int32(f.Fd()))
-		if err := ring.Write(ctx, data); err != nil {
-			t.Fatalf("Write[%d] submit: %v", i, err)
-		}
-	}
-	t.Logf("Submitted %d writes", numFiles)
-
-	// Now collect all completions
-	cqes := make([]uring.CQEView, 16)
-	completed := 0
-	deadline := time.Now().Add(2 * time.Second)
-	b := iox.Backoff{}
-
-	for completed < numFiles && time.Now().Before(deadline) {
-		n, err := ring.Wait(cqes)
+	var cqes [1]uring.CQEView
+	var backoff iox.Backoff
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		n, err := ring.Wait(cqes[:])
 		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait: %v", err)
 		}
-		for i := 0; i < n; i++ {
-			if cqes[i].Op() == uring.IORING_OP_WRITE {
-				if err := cqes[i].Err(); err != nil {
-					t.Errorf("Write failed: %v", err)
-				}
-				completed++
-			}
+		if n > 0 {
+			backoff.Reset()
+			break
 		}
-		if n == 0 {
-			b.Wait()
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for write completion")
 		}
+		backoff.Wait()
+	}
+	cqe := cqes[0]
+	if cqe.Op() != uring.IORING_OP_WRITE || cqe.Res != int32(len(payload)) {
+		t.Fatalf("unexpected completion: opcode=%d result=%d error=%v", cqe.Op(), cqe.Res, cqe.Err())
 	}
 
-	if completed != numFiles {
-		t.Errorf("Only %d/%d writes completed", completed, numFiles)
+	// Start the read only after the write has completed.
+	buf := make([]byte, len(payload))
+	if err := ring.Read(ctx.WithOp(uring.IORING_OP_READ), buf); err != nil {
+		t.Fatalf("Read: %v", err)
 	}
-	t.Logf("All %d writes completed", completed)
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		n, err := ring.Wait(cqes[:])
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+			t.Fatalf("Wait: %v", err)
+		}
+		if n > 0 {
+			backoff.Reset()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for read completion")
+		}
+		backoff.Wait()
+	}
+	cqe = cqes[0]
+	if cqe.Op() != uring.IORING_OP_READ || cqe.Res != int32(len(payload)) {
+		t.Fatalf("unexpected completion: opcode=%d result=%d error=%v", cqe.Op(), cqe.Res, cqe.Err())
+	}
+	if !bytes.Equal(buf, payload) {
+		t.Fatalf("read %q, want %q", buf, payload)
+	}
 }
 
-// TestNopThroughput measures raw SQE submission throughput using NOP operations.
-//
-// NOP is useful for:
-//   - Benchmarking ring overhead without I/O
-//   - Synchronization points in linked chains
-//   - Testing ring setup and teardown
-func TestNopThroughput(t *testing.T) {
-	ring, err := uring.New(
-		testMinimalBufferOptions,
-		func(opts *uring.Options) {
-			opts.Entries = uring.EntriesMedium // 2048 entries
-		},
-	)
+// Queue independent writes before collecting their completions. Each request
+// carries an ID because CQEs need not arrive in submission order or one at a time.
+func TestBatchedFileOps(t *testing.T) {
+	ring, err := uring.New(func(opt *uring.Options) {
+		opt.Entries = uring.EntriesNano
+		opt.LockedBufferMem = uring.BufferSizeLarge
+		opt.ReadBufferNum = 64
+		opt.NotifySucceed = true
+	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	mustStartRing(t, ring)
-
-	const numOps = 1000
-	ctx := uring.PackDirect(uring.IORING_OP_NOP, 0, 0, 0)
-
-	start := time.Now()
-
-	// Submit all NOPs
-	submitted := 0
-	for i := 0; i < numOps; i++ {
-		if err := ring.Nop(ctx); err != nil {
-			if errors.Is(err, iox.ErrWouldBlock) {
-				// Ring full, drain some completions
-				drainCompletions(ring, 100)
-				i-- // Retry
-				continue
-			}
-			t.Fatalf("Nop[%d]: %v", i, err)
-		}
-		submitted++
+	if err := ring.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
 	}
+	// Drain submitted requests before this deferred teardown.
+	defer func() {
+		if err := ring.Stop(); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	}()
 
-	// Drain remaining completions
-	drainCompletions(ring, submitted)
+	var files [4]*os.File
+	var payloads [4][]byte
+	for i := range files {
+		files[i] = tempFile(t)
+		payloads[i] = fmt.Appendf(nil, "file %d", i)
+		ctx := uring.PackDirect(uring.IORING_OP_WRITE, 0, uint16(i), int32(files[i].Fd()))
+		if err := ring.Write(ctx, payloads[i]); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+	var seen [4]bool
+	var cqes [4]uring.CQEView
+	var backoff iox.Backoff
+	completed := 0
+	deadline := time.Now().Add(3 * time.Second)
+	for completed < len(files) {
+		n, err := ring.Wait(cqes[:])
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+			t.Fatalf("Wait: %v", err)
+		}
+		if n == 0 {
+			if time.Now().After(deadline) {
+				t.Fatal("timed out waiting for writes")
+			}
+			backoff.Wait()
+			continue
+		}
+		backoff.Reset()
+		// Process every returned CQE, even when several arrive together.
+		for _, cqe := range cqes[:n] {
+			i := int(cqe.BufGroup()) // Caller ID on an ordinary write.
+			if cqe.Op() != uring.IORING_OP_WRITE || i >= len(files) || seen[i] {
+				t.Fatalf("unexpected or duplicate completion: %+v", cqe)
+			}
+			if cqe.FD() != iofd.FD(files[i].Fd()) || cqe.Res != int32(len(payloads[i])) {
+				t.Fatalf("file %d: fd=%d result=%d error=%v", i, cqe.FD(), cqe.Res, cqe.Err())
+			}
+			seen[i] = true
+			completed++
+		}
+	}
+	// The caller retains every submitted payload until its completion.
+	runtime.KeepAlive(payloads)
+	for i, f := range files {
+		got := make([]byte, len(payloads[i]))
+		if _, err := f.ReadAt(got, 0); err != nil {
+			t.Fatalf("ReadAt: %v", err)
+		}
+		if !bytes.Equal(got, payloads[i]) {
+			t.Fatalf("file %d: got %q, want %q", i, got, payloads[i])
+		}
+	}
+}
 
-	elapsed := time.Since(start)
-	opsPerSec := float64(numOps) / elapsed.Seconds()
+// TestBatchedNops handles SQ saturation and accounts for every accepted request.
+// ErrWouldBlock leaves the current ID unsubmitted. Keep separate submitted and
+// completed counts so a retry cannot duplicate work already accepted by the ring.
+func TestBatchedNops(t *testing.T) {
+	ring, err := uring.New(func(opt *uring.Options) {
+		opt.Entries = uring.EntriesNano
+		opt.LockedBufferMem = uring.BufferSizeLarge
+		opt.ReadBufferNum = 64
+		opt.NotifySucceed = true
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := ring.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// Drain submitted requests before this deferred teardown.
+	defer func() {
+		if err := ring.Stop(); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	}()
 
-	t.Logf("Completed %d NOPs in %v (%.0f ops/sec)", numOps, elapsed, opsPerSec)
+	const count = 1000
+	var seen [count]bool
+	var cqes [32]uring.CQEView
+	var backoff iox.Backoff
+	submitted, completed := 0, 0
+	deadline := time.Now().Add(3 * time.Second)
+	for completed < count && time.Now().Before(deadline) {
+		for submitted < count {
+			ctx := uring.PackDirect(uring.IORING_OP_NOP, 0, uint16(submitted), 0)
+			err := ring.Nop(ctx)
+			if errors.Is(err, iox.ErrWouldBlock) {
+				break // Reap/submit progress before retrying this same ID.
+			}
+			if err != nil {
+				t.Fatalf("Nop %d: %v", submitted, err)
+			}
+			submitted++
+		}
+		n, err := ring.Wait(cqes[:])
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+			t.Fatalf("Wait: %v", err)
+		}
+		if n == 0 {
+			backoff.Wait()
+			continue
+		}
+		backoff.Reset()
+		for _, cqe := range cqes[:n] {
+			id := int(cqe.BufGroup())
+			if cqe.Op() != uring.IORING_OP_NOP || id >= submitted || seen[id] {
+				t.Fatalf("unexpected or duplicate NOP completion: %+v", cqe)
+			}
+			if cqe.Res != 0 {
+				t.Fatalf("NOP %d: result=%d error=%v", id, cqe.Res, cqe.Err())
+			}
+			seen[id] = true
+			completed++
+		}
+	}
+	if submitted != count || completed != submitted {
+		t.Fatalf("submitted=%d completed=%d, want %d", submitted, completed, count)
+	}
 }

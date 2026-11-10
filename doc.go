@@ -18,6 +18,7 @@
 //
 //	ring, err := uring.New(func(opt *uring.Options) {
 //	    opt.Entries = uring.EntriesMedium
+//	    opt.NotifySucceed = true
 //	})
 //	if err != nil {
 //	    return err

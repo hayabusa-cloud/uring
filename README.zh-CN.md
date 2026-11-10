@@ -60,6 +60,7 @@ Ring 创建可能返回 `ENOMEM`、`EPERM` 或 `ENOSYS`，分别对应 memlock �
 ```go
 ring, err := uring.New(func(o *uring.Options) {
     o.Entries = uring.EntriesMedium
+    o.NotifySucceed = true
 })
 if err != nil {
     return err
