@@ -117,8 +117,8 @@ for {
 | `CQEView` | Copied completion descriptor with decoded accessors and mode-sensitive borrowed targets |
 | `ListenerOp` | Handle to a listener creation operation with FD and accept helpers |
 | `BundleIterator` | Iterates over buffers consumed in a bundle receive |
-| `IncrementalReceiver` | Manages incremental buffer-ring receives (`IOU_PBUF_RING_INC`) |
 | `BufferRing` | Opaque explicitly registered provided-buffer ring; `Add` stages and `Advance` publishes |
+| `IncrementalReceiver` | Manages incremental buffer-ring receives (`IOU_PBUF_RING_INC`) |
 | `ZCTracker` | Tracks zero-copy send notification and fallback lifecycle |
 | `ContextPools` | Pools for indirect and extended submission contexts |
 | `ZCRXReceiver` | Zero-copy receive lifecycle over a NIC RX queue |
@@ -151,9 +151,9 @@ Operations:
 
 `Nop128` and `UringCmd128` require a ring created with `Options.SQE128` and kernel support for the corresponding opcodes. Without both, they return `ErrNotSupported`.
 
-`Uring.Close` submits `IORING_OP_CLOSE` for a target file descriptor. It is not a ring teardown method.
-
 `PollAddLevel` and `PollAddMultishotLevel` always return `ErrNotSupported`; Linux io_uring does not admit the level flag for `IORING_OP_POLL_ADD`.
+
+`Uring.Close` submits `IORING_OP_CLOSE` for a target file descriptor. It is not a ring teardown method.
 
 ## Context transport
 

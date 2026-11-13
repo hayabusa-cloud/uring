@@ -117,8 +117,8 @@ for {
 | `CQEView`             | Descripteur de complétion copié avec accesseurs décodés et cibles empruntées selon le mode                    |
 | `ListenerOp`          | Gestionnaire d'une opération de création d'écouteur avec FD et auxiliaires accept                            |
 | `BundleIterator`      | Itère sur les tampons consommés lors d'une réception groupée                                                 |
-| `IncrementalReceiver` | Gère les réceptions incrémentales de buffer-ring (`IOU_PBUF_RING_INC`)                                       |
 | `BufferRing`          | Anneau opaque de tampons fournis enregistré explicitement ; `Add` prépare et `Advance` publie               |
+| `IncrementalReceiver` | Gère les réceptions incrémentales de buffer-ring (`IOU_PBUF_RING_INC`)                                       |
 | `ZCTracker`           | Suit le cycle de vie des notifications et du repli de l'envoi sans copie                                     |
 | `ContextPools`        | Pools pour contextes de soumission indirects et étendus                                                      |
 | `ZCRXReceiver`        | Cycle de vie de réception sans copie sur une file RX de NIC                                                  |
@@ -151,9 +151,9 @@ Opérations :
 
 `Nop128` et `UringCmd128` nécessitent un ring créé avec `Options.SQE128` et la prise en charge par le noyau des opcodes correspondants. Sans ces deux conditions, ces méthodes renvoient `ErrNotSupported`.
 
-`Uring.Close` soumet un `IORING_OP_CLOSE` pour un descripteur de fichier cible. Il ne s'agit pas d'une méthode de destruction du ring.
-
 `PollAddLevel` et `PollAddMultishotLevel` renvoient toujours `ErrNotSupported` ; io_uring sous Linux n'admet pas l'indicateur de niveau pour `IORING_OP_POLL_ADD`.
+
+`Uring.Close` soumet un `IORING_OP_CLOSE` pour un descripteur de fichier cible. Il ne s'agit pas d'une méthode de destruction du ring.
 
 ## Transport du contexte
 

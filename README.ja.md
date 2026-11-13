@@ -117,8 +117,8 @@ for {
 | `CQEView`             | デコード済みアクセサを持つコピー済み完了記述子。モード依存の参照先は借用       |
 | `ListenerOp`          | リスナー作成操作のハンドル。FD の保持と accept ヘルパーを提供            |
 | `BundleIterator`      | バンドル受信で消費されたバッファの走査                             |
-| `IncrementalReceiver` | インクリメンタル buffer-ring 受信の管理（`IOU_PBUF_RING_INC`） |
 | `BufferRing`          | 明示的に登録する不透明な提供バッファリング。`Add` で準備し、`Advance` で公開 |
+| `IncrementalReceiver` | インクリメンタル buffer-ring 受信の管理（`IOU_PBUF_RING_INC`） |
 | `ZCTracker`           | ゼロコピー送信の通知とフォールバックのライフサイクルを追跡              |
 | `ContextPools`        | indirect・extended 発行コンテキストのプール                  |
 | `ZCRXReceiver`        | NIC RX キューからのゼロコピー受信ライフサイクルの管理                  |
@@ -151,9 +151,9 @@ for {
 
 `Nop128` と `UringCmd128` は `Options.SQE128` 付きで作成したリングと、対応する opcode のカーネルサポートの両方を必要とします。いずれかが欠ける場合は `ErrNotSupported` を返します。
 
-`Uring.Close` は指定したファイルディスクリプタに `IORING_OP_CLOSE` を発行します。リング自体の破棄ではありません。
-
 `PollAddLevel` と `PollAddMultishotLevel` は常に `ErrNotSupported` を返します。Linux io_uring は `IORING_OP_POLL_ADD` でレベルフラグを受け付けません。
+
+`Uring.Close` は指定したファイルディスクリプタに `IORING_OP_CLOSE` を発行します。リング自体の破棄ではありません。
 
 ## コンテキスト伝達
 

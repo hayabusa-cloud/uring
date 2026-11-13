@@ -117,8 +117,8 @@ for {
 | `CQEView`             | Descriptor copiado de completado con accesores decodificados y objetivos prestados según el modo                  |
 | `ListenerOp`          | Manejador de una operación de creación de escucha con FD y auxiliares de accept                                   |
 | `BundleIterator`      | Itera sobre búferes consumidos en una recepción agrupada                                                          |
-| `IncrementalReceiver` | Gestiona recepciones incrementales de buffer-ring (`IOU_PBUF_RING_INC`)                                           |
 | `BufferRing`          | Ring opaco de búferes provistos registrado explícitamente; `Add` prepara y `Advance` publica                     |
+| `IncrementalReceiver` | Gestiona recepciones incrementales de buffer-ring (`IOU_PBUF_RING_INC`)                                           |
 | `ZCTracker`           | Rastrea el ciclo de vida de notificación y fallback del envío de copia cero                                      |
 | `ContextPools`        | Pools para contextos de envío indirectos y extendidos                                                             |
 | `ZCRXReceiver`        | Ciclo de vida de recepción de copia cero sobre una cola RX de NIC                                                 |
@@ -151,9 +151,9 @@ Operaciones:
 
 `Nop128` y `UringCmd128` requieren un ring creado con `Options.SQE128` y soporte del kernel para los opcodes correspondientes. Sin ambos, devuelven `ErrNotSupported`.
 
-`Uring.Close` envía `IORING_OP_CLOSE` sobre un descriptor de archivo destino. No es un método de desmontaje del ring.
-
 `PollAddLevel` y `PollAddMultishotLevel` siempre devuelven `ErrNotSupported`; io_uring de Linux no admite el indicador de nivel para `IORING_OP_POLL_ADD`.
+
+`Uring.Close` envía `IORING_OP_CLOSE` sobre un descriptor de archivo destino. No es un método de desmontaje del ring.
 
 ## Transporte de contexto
 

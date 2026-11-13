@@ -55,7 +55,7 @@ const (
 	IORING_ENTER_REGISTERED_RING = zcall.IORING_ENTER_REGISTERED_RING
 	IORING_ENTER_ABS_TIMER       = zcall.IORING_ENTER_ABS_TIMER   // Absolute timeout
 	IORING_ENTER_EXT_ARG_REG     = zcall.IORING_ENTER_EXT_ARG_REG // Use registered wait region
-	IORING_ENTER_NO_IOWAIT       = zcall.IORING_ENTER_NO_IOWAIT   // Skip I/O wait
+	IORING_ENTER_NO_IOWAIT       = zcall.IORING_ENTER_NO_IOWAIT   // Skip I/O-wait accounting; may still block
 )
 
 const (
