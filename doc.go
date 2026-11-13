@@ -12,12 +12,14 @@
 // this boundary.
 //
 // A typical caller starts the ring, submits an operation, and then treats the
-// completion queue as the source of truth for kernel results. Semantic
-// no-progress conditions such as [iox.ErrWouldBlock] are classified through
-// [iox.Classify] instead of being treated as ordinary failures.
+// completion queue as the source of truth for kernel results. This example has
+// one outstanding read and uses [iox.Backoff] when no completion is available.
+// The file retains close ownership. The ring owns the registered buffer until
+// Stop; consume its bytes after completion and before reuse or ring teardown.
 //
 //	ring, err := uring.New(func(opt *uring.Options) {
 //	    opt.Entries = uring.EntriesMedium
+//	    opt.NotifySucceed = true
 //	})
 //	if err != nil {
 //	    return err
@@ -27,23 +29,18 @@
 //	}
 //	defer ring.Stop()
 //
-//	fd := iofd.NewFD(int(file.Fd()))
-//	buf := make([]byte, 4096)
+//	fd := iofd.FD(file.Fd()) // Borrowed; file owns Close.
+//	buf := ring.RegisteredBuffer(0)
 //	ctx := uring.PackDirect(uring.IORING_OP_READ, 0, 0, 0).WithFD(fd)
 //	if err := ring.Read(ctx, buf); err != nil {
 //	    return err
 //	}
 //
-//	cqes := make([]uring.CQEView, 64)
+//	var cqes [1]uring.CQEView // Only one request is outstanding.
 //	var backoff iox.Backoff
-//
 //	for {
-//	    n, err := ring.Wait(cqes)
-//	    switch iox.Classify(err) {
-//	    case iox.OutcomeWouldBlock:
-//	        backoff.Wait()
-//	        continue
-//	    case iox.OutcomeFailure:
+//	    n, err := ring.Wait(cqes[:])
+//	    if err != nil && !iox.IsWouldBlock(err) {
 //	        return err
 //	    }
 //	    if n == 0 {
@@ -52,17 +49,15 @@
 //	    }
 //
 //	    backoff.Reset()
-//	    for i := range n {
-//	        cqe := cqes[i]
-//	        if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
-//	            continue
-//	        }
-//	        if err := cqe.Err(); err != nil {
-//	            return fmt.Errorf("uring read failed: %w", err)
-//	        }
-//	        handle(buf[:int(cqe.Res)])
-//	        return nil
+//	    cqe := cqes[0]
+//	    if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
+//	        return fmt.Errorf("unexpected completion: op=%d fd=%d", cqe.Op(), cqe.FD())
 //	    }
+//	    if err := cqe.Err(); err != nil {
+//	        return fmt.Errorf("uring read failed: %w", err)
+//	    }
+//	    handle(buf[:int(cqe.Res)])
+//	    return nil
 //	}
 //
 // [Uring.SubmitAcceptMultishot], [Uring.SubmitReceiveMultishot], and
@@ -101,21 +96,19 @@
 //	}
 //	// Keep dispatching the original terminal CQE and any queued cancellation CQE.
 //
-// Listener setup advances with [DecodeListenerCQE], [PrepareListenerBind],
-// [PrepareListenerListen], and [SetListenerReady]. [ListenerManager] is a thin
-// convenience for the initial SOCKET submission and returns a [ListenerOp]. If
-// [ListenerOp.Close] races a pending listener setup CQE, drain that CQE before
-// the final Close that returns the pooled listener context.
+// [ListenerManager] submits the initial SOCKET and returns a [ListenerOp].
+// Route setup CQEs to [ListenerOp.HandleCQE] to invoke callbacks and submit
+// the next stage automatically:
 //
-//	pool := uring.NewContextPools(16)
-//	manager := uring.NewListenerManager(ring, pool)
+//	SOCKET -> OnSocketCreated -> BIND -> OnBound -> LISTEN -> OnListening
 //
-//	addr := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8080}
-//	op, err := manager.ListenTCP4(addr, 128, handler)
-//
-//	// Caller decodes CQEs and chains bind→listen via Prepare helpers
-//	// After LISTEN completes, start accepting:
-//	acceptSub, err := op.AcceptMultishot(acceptHandler)
+// OnListening establishes readiness to accept. If HandleCQE returns
+// [iox.ErrWouldBlock], drive the ring and retry the prepared SQE with
+// ring.SubmitExtended(PackExtended(op.Ext())); never replay the CQE or callback.
+// For manual advancement, use [DecodeListenerCQE], [PrepareListenerBind],
+// [PrepareListenerListen], and [SetListenerReady] instead. Serialize dispatch,
+// retry and Close. If Close is called while a setup CQE is pending, drain it
+// before the final Close that returns the pooled context.
 //
 // Extended-mode raw `UserData` is caller-beware storage. Prefer scalar payloads
 // there; if raw overlays or typed context views place Go pointers,
@@ -258,7 +251,7 @@
 // A registered fixed buffer is ring-owned memory addressed by index. Keep the
 // buffer live until the fixed operation completes.
 //
-//	fd := iofd.NewFD(int(file.Fd()))
+//	fd := iofd.FD(file.Fd()) // Borrowed; file owns Close.
 //	buf := ring.RegisteredBuffer(0)
 //	copy(buf, payload)
 //

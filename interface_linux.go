@@ -63,7 +63,8 @@ type Options struct {
 	// Stop; that requests SINGLE_ISSUER + DEFER_TASKRUN and removes shared-submit
 	// synchronization.
 	MultiIssuers bool
-	// NotifySucceed ensures CQEs are generated for all successful operations.
+	// NotifySucceed disables default CQE suppression on write-like operations.
+	// Explicit IOSQE_CQE_SKIP_SUCCESS flags still apply.
 	NotifySucceed bool
 	// IndirectSubmissionQueue enables the SQ array. When false, New requests
 	// IORING_SETUP_NO_SQARRAY to reduce ring memory in the direct-index submit path.

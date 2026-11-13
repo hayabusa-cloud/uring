@@ -8,9 +8,7 @@ package uring_test
 
 import (
 	"errors"
-	"fmt"
 	"net"
-	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
@@ -21,219 +19,173 @@ import (
 	"code.hybscloud.com/zcall"
 )
 
-const listenerExampleTimeout = 30 * time.Second
-
-// TestListenerWithAccept demonstrates combining ListenerManager with
-// multishot accept for a complete server setup.
+// ListenerManager submits SOCKET; route each CQE to HandleCQE for automatic setup:
 //
-// Architecture:
-//   - ListenerManager creates the listener socket via decode+prepare
-//   - After OnListening, start multishot accept
-//   - Single SQE submission handles multiple incoming connections
+//	SOCKET -> OnSocketCreated -> BIND -> OnBound -> LISTEN -> OnListening
+//
+// All callbacks run on this caller. After accepting the test clients, cancel
+// the subscription and dispatch both terminal and cancellation completions
+// before closing the listener and ring.
 func TestListenerWithAccept(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping listener with accept test in short mode (requires reliable networking)")
-	}
-	ring, err := uring.New(
-		testMinimalBufferOptions,
-		func(opts *uring.Options) {
-			opts.Entries = uring.EntriesMedium
-		},
-	)
+	ring, err := uring.New(func(opt *uring.Options) {
+		opt.Entries = uring.EntriesNano
+		opt.LockedBufferMem = uring.BufferSizeLarge
+		opt.ReadBufferNum = 64
+		opt.NotifySucceed = true
+	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	mustStartRing(t, ring)
-
-	pool := uring.NewContextPools(32)
-	manager := uring.NewListenerManager(ring, pool)
-
-	listenerHandler := &exampleListenerHandler{
-		ready:  make(chan struct{}),
-		failed: make(chan struct{}),
+	if err := ring.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
 	}
-
-	addr := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
-	listenerOp, err := manager.ListenTCP4(addr, 128, listenerHandler)
-	if err != nil {
-		if errors.Is(err, iox.ErrWouldBlock) {
-			t.Skip("context pool exhausted")
-		}
-		t.Fatalf("ListenTCP4: %v", err)
-	}
-	defer listenerOp.Close()
-
-	ready, listenerProgress := waitForListenerCondition(t, ring, listenerOp, listenerExampleTimeout, func() bool {
-		select {
-		case <-listenerHandler.ready:
-			return true
-		case <-listenerHandler.failed:
-			t.Fatalf("listener setup failed at op=%d", listenerHandler.errorOp.Load())
-			return false
-		default:
-			return false
+	t.Cleanup(func() {
+		if err := ring.Stop(); err != nil {
+			t.Errorf("Stop: %v", err)
 		}
 	})
-	if !ready {
-		skipIfNoListenerProgress(t, listenerProgress)
-		t.Fatal("listener did not become ready")
-	}
-	t.Logf("Listener ready: fd=%d", listenerOp.FD())
-	addr = actualTCP4AddrForFD(t, listenerOp.FD())
-
-	// Phase 2: Start multishot accept via listenerOp
-	acceptHandler := &exampleAcceptHandler{
-		accepted: make(chan int32, 10),
-		stopped:  make(chan struct{}),
-	}
-
-	acceptSub, err := listenerOp.AcceptMultishot(acceptHandler)
+	manager := uring.NewListenerManager(ring, uring.NewContextPools(8))
+	listenerHandler := &exampleListenerHandler{}
+	listener, err := manager.ListenTCP4(&net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)}, 128, listenerHandler)
 	if err != nil {
-		if errors.Is(err, iox.ErrWouldBlock) {
-			t.Skip("context pool exhausted for accept")
-		}
-		t.Fatalf("AcceptMultishot: %v", err)
+		t.Fatalf("ListenTCP4: %v", err)
 	}
-	t.Log("Multishot accept started")
-
-	// Phase 3: Connect clients
-	const numClients = 3
-	clientErrs := make(chan error, numClients)
-	for i := 0; i < numClients; i++ {
-		go func(idx int) {
-			conn, err := net.DialTimeout("tcp", addr.String(), 2*time.Second)
-			if err != nil {
-				clientErrs <- fmt.Errorf("client %d dial: %w", idx, err)
-				return
+	t.Cleanup(listener.Close)
+	var cqes [1]uring.CQEView
+	var backoff iox.Backoff
+	retry := false
+	deadline := time.Now().Add(3 * time.Second)
+	for !listenerHandler.ready && listenerHandler.err == nil {
+		// A full SQ leaves the next stage prepared. Retry only its admission;
+		// replaying the preceding CQE would repeat the callback and transition.
+		if retry {
+			err := ring.SubmitExtended(uring.PackExtended(listener.Ext()))
+			if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+				t.Fatalf("SubmitExtended: %v", err)
 			}
-			_, _ = conn.Write([]byte("hello"))
-			time.Sleep(50 * time.Millisecond)
-			conn.Close()
-			clientErrs <- nil
-		}(i)
-	}
-
-	// Process accepts
-	acceptCount := 0
-	cqes := make([]uring.CQEView, 32)
-	deadline := time.Now().Add(5 * time.Second)
-	b := iox.Backoff{}
-
-	for acceptCount < numClients && time.Now().Before(deadline) {
-		n, err := ring.Wait(cqes)
+			retry = errors.Is(err, iox.ErrWouldBlock)
+		}
+		n, err := ring.Wait(cqes[:])
 		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait: %v", err)
 		}
-		for i := range n {
-			if acceptSub.HandleCQE(cqes[i]) {
-				select {
-				case fd := <-acceptHandler.accepted:
-					acceptCount++
-					t.Logf("Accepted connection %d: fd=%d", acceptCount, fd)
-					zcall.Close(uintptr(fd))
-				default:
+		if n == 0 {
+			if time.Now().After(deadline) {
+				t.Fatal("listener setup timed out")
+			}
+			backoff.Wait()
+			continue
+		}
+		backoff.Reset()
+		ok, err := listener.HandleCQE(cqes[0])
+		if !ok {
+			t.Fatal("unexpected listener completion")
+		}
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+			t.Fatalf("HandleCQE: %v", err)
+		}
+		retry = errors.Is(err, iox.ErrWouldBlock)
+	}
+	if listenerHandler.err != nil {
+		t.Fatalf("listener opcode %d: %v", listenerHandler.op, listenerHandler.err)
+	}
+
+	const clients = 3
+	addr := actualTCP4AddrForFD(t, listener.FD())
+	for range clients {
+		conn, err := net.DialTimeout("tcp4", addr.String(), 3*time.Second)
+		if err != nil {
+			t.Fatalf("DialTimeout: %v", err)
+		}
+		t.Cleanup(func() {
+			if err := conn.Close(); err != nil {
+				t.Errorf("client Close: %v", err)
+			}
+		})
+	}
+	accepted, stops := 0, 0
+	handler := uring.NewMultishotSubscriber().
+		OnStep(func(step uring.MultishotStep) uring.MultishotAction {
+			if step.Err != nil {
+				if !step.Cancelled {
+					t.Errorf("accept: %v", step.Err)
 				}
+				return uring.MultishotContinue
 			}
-		}
-		b.Wait()
-	}
-
-	acceptSub.Cancel()
-	clientFailed := false
-	for i := 0; i < numClients; i++ {
-		select {
-		case err := <-clientErrs:
-			if err != nil {
-				t.Error(err)
-				clientFailed = true
+			// Every successful accept owns an FD, even if cancellation is underway.
+			if errno := zcall.Close(uintptr(step.CQE.Res)); errno != 0 {
+				t.Errorf("accepted FD close: %v", zcall.Errno(errno))
 			}
-		case <-time.After(2 * time.Second):
-			t.Errorf("client %d did not finish", i)
-			clientFailed = true
+			accepted++
+			return uring.MultishotContinue
+		}).
+		OnStop(func(err error, cancelled bool) {
+			stops++
+			if !cancelled {
+				t.Errorf("expected cancellation: %v", err)
+			}
+		})
+	sub, err := listener.AcceptMultishot(handler)
+	if err != nil {
+		t.Fatalf("AcceptMultishot: %v", err)
+	}
+	cancelSubmitted, cancelDone := false, false
+	deadline = time.Now().Add(3 * time.Second)
+	for stops == 0 || (cancelSubmitted && !cancelDone) {
+		n, err := ring.Wait(cqes[:])
+		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+			t.Fatalf("Wait: %v", err)
+		}
+		if n == 0 {
+			if time.Now().After(deadline) {
+				t.Fatal("accept or cancellation timed out")
+			}
+			backoff.Wait()
+			continue
+		}
+		backoff.Reset()
+		cqe := cqes[0]
+		// Inspect borrowed context before HandleCQE can return it to the pool.
+		if cqe.Op() == uring.IORING_OP_ASYNC_CANCEL {
+			if cancelDone || cqe.Res != 0 {
+				t.Fatalf("unexpected cancellation: %+v", cqe)
+			}
+			cancelDone = true
+		}
+		if !sub.HandleCQE(cqe) {
+			t.Fatal("unhandled accept or cancellation completion")
+		}
+		if accepted == clients && sub.Active() {
+			if err := sub.Cancel(); err != nil {
+				t.Fatalf("Cancel: %v", err)
+			}
+			cancelSubmitted = true
 		}
 	}
-	if clientFailed {
-		t.FailNow()
+	if accepted != clients || stops != 1 || !cancelSubmitted || !cancelDone || sub.State() != uring.SubscriptionStopped {
+		t.Fatalf("accepted=%d stops=%d cancel=%v/%v state=%v", accepted, stops, cancelSubmitted, cancelDone, sub.State())
 	}
-	if acceptCount == 0 {
-		t.Skip("AcceptMultishot completion not received - timing-sensitive")
-	}
-	if acceptCount != numClients {
-		t.Fatalf("accepted %d/%d connections via multishot", acceptCount, numClients)
-	}
-	t.Logf("Accepted %d/%d connections via multishot", acceptCount, numClients)
+	// All setup, accept and cancellation CQEs are drained before cleanup.
 }
 
-// exampleListenerHandler implements ListenerHandler for examples.
+// Callbacks share the completion loop's owner; plain fields record setup results.
 type exampleListenerHandler struct {
-	socketFD     atomic.Int32
-	socketCalled atomic.Bool
-	boundCalled  atomic.Bool
-	listenCalled atomic.Bool
-	errorOp      atomic.Uint32
-	ready        chan struct{}
-	failed       chan struct{}
+	ready bool
+	op    uint8
+	err   error
 }
 
-func (h *exampleListenerHandler) OnSocketCreated(fd iofd.FD) bool {
-	h.socketFD.Store(int32(fd))
-	h.socketCalled.Store(true)
-	return true
-}
-
-func (h *exampleListenerHandler) OnBound() bool {
-	h.boundCalled.Store(true)
-	return true
-}
-
-func (h *exampleListenerHandler) OnListening() {
-	h.listenCalled.Store(true)
-	close(h.ready)
-}
-
-func (h *exampleListenerHandler) OnError(op uint8, err error) {
-	h.errorOp.Store(uint32(op))
-	select {
-	case <-h.failed:
-	default:
-		close(h.failed)
-	}
-}
+func (h *exampleListenerHandler) OnSocketCreated(iofd.FD) bool { return true }
+func (h *exampleListenerHandler) OnBound() bool                { return true }
+func (h *exampleListenerHandler) OnListening()                 { h.ready = true }
+func (h *exampleListenerHandler) OnError(op uint8, err error)  { h.op, h.err = op, err }
 
 func actualTCP4AddrForFD(t *testing.T, fd iofd.FD) *net.TCPAddr {
 	t.Helper()
-
 	var raw [16]byte
 	addrLen := uint32(len(raw))
-	errno := zcall.Getsockname(uintptr(fd), unsafe.Pointer(&raw[0]), unsafe.Pointer(&addrLen))
-	if errno != 0 {
-		t.Fatalf("Getsockname: errno=%d", errno)
+	if errno := zcall.Getsockname(uintptr(fd), unsafe.Pointer(&raw), unsafe.Pointer(&addrLen)); errno != 0 {
+		t.Fatalf("Getsockname: %v", zcall.Errno(errno))
 	}
-
-	port := int(raw[2])<<8 | int(raw[3])
-	return &net.TCPAddr{
-		IP:   net.IPv4(127, 0, 0, 1),
-		Port: port,
-	}
-}
-
-// exampleAcceptHandler implements MultishotHandler for accept.
-type exampleAcceptHandler struct {
-	accepted chan int32
-	stopped  chan struct{}
-}
-
-func (h *exampleAcceptHandler) OnMultishotStep(step uring.MultishotStep) uring.MultishotAction {
-	if step.Err == nil && step.CQE.Res >= 0 {
-		select {
-		case h.accepted <- step.CQE.Res:
-		default:
-		}
-		return uring.MultishotContinue
-	}
-	return uring.MultishotStop
-}
-
-func (h *exampleAcceptHandler) OnMultishotStop(error, bool) {
-	close(h.stopped)
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(raw[2])<<8 | int(raw[3])}
 }

@@ -7,230 +7,224 @@
 package examples_test
 
 import (
+	"bytes"
+	"runtime"
 	"testing"
-	"unsafe"
+	"time"
 
+	"code.hybscloud.com/iox"
 	"code.hybscloud.com/uring"
 )
 
-// TestBufferRingBasics demonstrates fixed (registered) buffer access and the
-// buffer architecture in io_uring.
+// Fixed buffers are selected by the caller's registered index. Provided buffers
+// are published in a group for the kernel to select; the CQE identifies the
+// selected buffer. A receive bundle can span several published buffers:
 //
-// io_uring supports two buffer mechanisms:
-//   - Fixed buffers: pre-registered at ring setup, accessed by index via
-//     ring.RegisteredBuffer(idx). Eliminates per-operation page pinning.
-//   - Provided buffer rings: registered via IORING_REGISTER_PBUF_RING,
-//     kernel selects from ring and returns BufID in CQE flags.
+//	CQE: first buffer ID + total bytes -> BundleIterator -> borrowed slices
+//	                                                        |
+//	                                           process, then Recycle
 //
-// This example demonstrates fixed buffer access. For provided buffer ring
-// usage with kernel buffer selection, see TestMultishotRecvWithBufferSelection.
-func TestBufferRingBasics(t *testing.T) {
-	ring, err := uring.New(
-		func(opts *uring.Options) {
-			opts.LockedBufferMem = 1 << 20
-		},
-	)
+// BundleIterator follows publication order, including after ring wraparound.
+// Buffer IDs are identities; their numeric order does not define a bundle.
+func TestBundleIteratorUsage(t *testing.T) {
+	const size, entries = 64, 4
+	ring, err := uring.New(func(opt *uring.Options) {
+		opt.Entries = uring.EntriesNano
+		opt.LockedBufferMem = uring.BufferSizeLarge
+		opt.ReadBufferSize = size
+		opt.ReadBufferNum = entries
+		opt.NotifySucceed = true
+	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	mustStartRing(t, ring)
-
-	t.Log("Fixed Buffer Architecture:")
-	t.Log("-----------------------------------------------------")
-	t.Log("  +-----------------------------------------------------+")
-	t.Log("  |  User Space                                         |")
-	t.Log("  |  +-------------------------------------------------+|")
-	t.Log("  |  | Fixed Buffers (pre-pinned at ring setup)        ||")
-	t.Log("  |  | [buf0][buf1][buf2]...                           ||")
-	t.Log("  |  | ring.RegisteredBuffer(idx) -> []byte            ||")
-	t.Log("  |  +-------------------------------------------------+|")
-	t.Log("  +-----------------------------------------------------+")
-	t.Log("                    | IORING_REGISTER_BUFFERS")
-	t.Log("                    v")
-	t.Log("  +-----------------------------------------------------+")
-	t.Log("  |  Kernel: pages pre-pinned, no per-op pinning cost  |")
-	t.Log("  +-----------------------------------------------------+")
-	t.Log("-----------------------------------------------------")
-
-	buf0 := ring.RegisteredBuffer(0)
-	if buf0 != nil {
-		t.Logf("Fixed buffer 0: %d bytes at %p", len(buf0), unsafe.Pointer(&buf0[0]))
+	if err := ring.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
 	}
-
-	buf1 := ring.RegisteredBuffer(1)
-	if buf1 != nil {
-		t.Logf("Fixed buffer 1: %d bytes at %p", len(buf1), unsafe.Pointer(&buf1[0]))
+	t.Cleanup(func() {
+		// All submitted operations must finish before the ring is destroyed.
+		if err := ring.Stop(); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	})
+	fd, client := tcpPair(t)
+	payload := make([]byte, 3*size+13)
+	for i := range payload {
+		payload[i] = byte(i)
 	}
-
-	t.Log("")
-	t.Log("Buffer usage patterns:")
-	t.Log("  1. Fixed buffers: ring.RegisteredBuffer(idx) - direct access by index")
-	t.Log("  2. Buffer selection: IOSQE_BUFFER_SELECT - kernel picks")
-	t.Log("  3. Bundle recv: multiple buffers consumed per CQE")
-}
-
-// TestBundleIteratorUsage demonstrates BundleIterator for processing
-// bundle receive results where multiple buffers are consumed per CQE.
-//
-// Bundle operations (IORING_RECV_BUNDLE) receive data into multiple
-// contiguous buffers from a buffer ring. The CQE contains:
-//   - Res: total bytes received
-//   - BufID: starting buffer ID encoded by the kernel
-//   - Buffer count is computed: ceil(Res / bufSize)
-//
-// See also: TestMultishotRecvWithBufferSelection for multishot recv.
-func TestBundleIteratorUsage(t *testing.T) {
-	t.Log("BundleIterator for multi-buffer receives:")
-	t.Log("-----------------------------------------------------")
-
-	type simulatedBundle struct {
-		totalBytes int
-		startID    uint16
-		bufSize    int
-		ringSize   int
-	}
-
-	examples := []simulatedBundle{
-		{totalBytes: 5000, startID: 0, bufSize: 1024, ringSize: 16},
-		{totalBytes: 3500, startID: 14, bufSize: 1024, ringSize: 16},
-		{totalBytes: 512, startID: 5, bufSize: 1024, ringSize: 16},
-	}
-
-	for i, ex := range examples {
-		bufCount := (ex.totalBytes + ex.bufSize - 1) / ex.bufSize
-		t.Logf("\nExample %d: %d bytes, startID=%d, bufSize=%d",
-			i+1, ex.totalBytes, ex.startID, ex.bufSize)
-		t.Logf("  Buffers consumed: %d", bufCount)
-
-		mask := uint16(ex.ringSize - 1)
-		t.Log("  Buffer IDs:")
-		for j := range bufCount {
-			id := (ex.startID + uint16(j)) & mask
-			size := ex.bufSize
-			if remaining := ex.totalBytes - j*ex.bufSize; remaining < size {
-				size = remaining
+	largest := 0
+	for range 3 {
+		if n, err := client.Write(payload); err != nil || n != len(payload) {
+			t.Fatalf("write: n=%d err=%v", n, err)
+		}
+		received := 0
+		for received < len(payload) {
+			if err := ring.ReceiveBundle(uring.ForFD(int32(fd)), &fd); err != nil {
+				t.Fatal(err)
 			}
-			t.Logf("    [%d] id=%d, size=%d", j, id, size)
+			var cqes [1]uring.CQEView
+			var backoff iox.Backoff
+			deadline := time.Now().Add(exampleTimeout)
+			for {
+				n, err := ring.Wait(cqes[:])
+				if err != nil && !iox.IsWouldBlock(err) {
+					t.Fatalf("Wait: %v", err)
+				}
+				if n > 0 {
+					backoff.Reset()
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("timed out waiting for completion")
+				}
+				backoff.Wait()
+			}
+			cqe := cqes[0]
+			if cqe.Op() != uring.IORING_OP_RECV || cqe.Res <= 0 {
+				t.Fatalf("bundle result=%d", cqe.Res)
+			}
+			it, ok := ring.BundleIterator(cqe, cqe.BufGroup())
+			if !ok {
+				t.Fatal("missing bundle buffers")
+			}
+			largest = max(largest, it.Count())
+			for buf := range it.All() {
+				end := received + len(buf)
+				if end > len(payload) || !bytes.Equal(buf, payload[received:end]) {
+					t.Error("bundle contains incorrect payload bytes")
+				}
+				received = end
+			}
+			// Process all borrowed slices before returning any buffer.
+			if err := it.Recycle(ring); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if received != len(payload) {
+			t.Fatalf("received %d bytes", received)
 		}
 	}
-
-	t.Log("\n-----------------------------------------------------")
-	t.Log("BundleIterator methods:")
-	t.Log("  iter.All()        -> iter.Seq[[]byte]  (Go 1.23+)")
-	t.Log("  iter.AllWithSlotID() -> iter.Seq2[uint16, []byte] (slot ID, data)")
-	t.Log("  iter.Buffer(idx)  -> []byte (random access)")
-	t.Log("  iter.CopyTo(dst)  -> int (copy all to dst)")
+	if largest < 2 {
+		t.Fatal("no completion spanned multiple buffers")
+	}
 }
 
-// TestBufferRingTiers shows the tiered buffer system for different message sizes.
+// BUF_MORE describes buffer ownership, independently of request completion.
+// Each IncrementalReceiver.Recv below is a separate single-shot request.
 //
-// The uring package supports multiple buffer tiers, each optimized for
-// different payload sizes. This reduces memory waste by matching buffer
-// size to expected message size.
-func TestBufferRingTiers(t *testing.T) {
-	t.Log("Buffer Tier System:")
-	t.Log("-----------------------------------------------------")
-	t.Log("  Tier    | Size    | Use Case")
-	t.Log("  --------+---------+--------------------------------")
-	t.Logf("  Pico    | %5d B | Tiny metadata, ACKs", uring.BufferSizePico)
-	t.Logf("  Nano    | %5d B | Small headers, control msgs", uring.BufferSizeNano)
-	t.Logf("  Micro   | %5d B | Protocol frames", uring.BufferSizeMicro)
-	t.Logf("  Small   | %5d B | Small messages", uring.BufferSizeSmall)
-	t.Logf("  Medium  | %5d B | Page-sized operations", uring.BufferSizeMedium)
-	t.Logf("  Big     | %5d B | Large messages", uring.BufferSizeBig)
-	t.Logf("  Huge    | %5d B | Bulk transfers", uring.BufferSizeHuge)
-	t.Logf("  Giant   | %5d B | Maximum buffers", uring.BufferSizeGiant)
-	t.Log("-----------------------------------------------------")
-	t.Log("")
-	t.Log("Selection strategy:")
-	t.Log("  - Use smallest tier that fits expected message size")
-	t.Log("  - Different buffer groups for different protocols")
-	t.Log("  - Multishot recv can use specific buffer group")
-}
-
-// TestBufferSelectionWorkflow demonstrates the complete workflow for
-// kernel buffer selection in recv operations.
-func TestBufferSelectionWorkflow(t *testing.T) {
-	t.Log("Kernel Buffer Selection Workflow:")
-	t.Log("-----------------------------------------------------")
-	t.Log("")
-	t.Log("Setup phase:")
-	t.Log("  1. Allocate backing memory (page-aligned)")
-	t.Log("  2. Create buffer ring structure (16B per entry)")
-	t.Log("  3. Register with IORING_REGISTER_PBUF_RING")
-	t.Log("  4. Populate ring with buffer addresses")
-	t.Log("")
-	t.Log("Operation phase:")
-	t.Log("  1. Submit recv SQE with IOSQE_BUFFER_SELECT flag")
-	t.Log("  2. Set bufIndex = buffer group ID")
-	t.Log("  3. Kernel picks buffer from ring when data arrives")
-	t.Log("  4. CQE contains:")
-	t.Log("     - res: bytes received (or negative errno)")
-	t.Log("     - flags: IORING_CQE_F_BUFFER set")
-	t.Log("     - BufID(): first logical buffer ID")
-	t.Log("")
-	t.Log("Return phase:")
-	t.Log("  1. Process data in buffer[BufID() & mask]")
-	t.Log("  2. Re-add buffer to ring (advance tail)")
-	t.Log("  3. Ring automatically wraps around")
-	t.Log("-----------------------------------------------------")
-}
-
-// TestIncrementalBufferConsumption shows how IOU_PBUF_RING_INC works
-// for incremental buffer consumption.
+//	BUF_MORE set    Consume this fragment; leave the buffer with the kernel
+//	BUF_MORE clear  Consume the final fragment; the buffer may be republished
 //
-// With incremental mode (IOU_PBUF_RING_INC), a single buffer can
-// span multiple CQEs until fully consumed. IORING_CQE_F_BUF_MORE
-// indicates more data coming in the same buffer.
+// Add stages a buffer descriptor; Advance publishes it. Keep the backing array
+// live throughout, and republish only after consuming its final fragment.
 func TestIncrementalBufferConsumption(t *testing.T) {
-	t.Log("Incremental Buffer Consumption (IOU_PBUF_RING_INC):")
-	t.Log("-----------------------------------------------------")
-	t.Log("")
-	t.Log("Standard mode:")
-	t.Log("  CQE1: BufID=0, 1024B -> buffer returned to ring")
-	t.Log("  CQE2: BufID=1, 1024B -> buffer returned to ring")
-	t.Log("")
-	t.Log("Incremental mode:")
-	t.Log("  CQE1: BufID=0, 512B, F_BUF_MORE -> buffer still in use")
-	t.Log("  CQE2: BufID=0, 512B, no flag   -> buffer now returned")
-	t.Log("")
-	t.Log("Use case: Large messages arriving in fragments")
-	t.Log("Benefit: Same buffer ID until complete, no reassembly")
-	t.Log("-----------------------------------------------------")
-}
-
-// TestBufferRingWrapAround demonstrates how the ring handles wrap-around.
-//
-// Buffer rings are circular: when the head/tail reaches the end,
-// it wraps back to the beginning using modular arithmetic.
-func TestBufferRingWrapAround(t *testing.T) {
-	t.Log("Buffer Ring Wrap-Around:")
-	t.Log("-----------------------------------------------------")
-	t.Log("")
-	t.Log("Ring with 16 entries (mask = 15 = 0x0F):")
-	t.Log("")
-
-	ringSize := 16
-	mask := uint16(ringSize - 1)
-
-	scenarios := []struct {
-		startID uint16
-		count   int
-	}{
-		{0, 3},
-		{14, 5},
-		{15, 2},
+	const size, entries = 64, 2
+	const group uint16 = 60000
+	backing := make([]byte, size*entries)
+	// Register this cleanup before the ring cleanup so roots outlive Stop.
+	t.Cleanup(func() { runtime.KeepAlive(backing) })
+	ring, err := uring.New(func(opt *uring.Options) {
+		opt.Entries = uring.EntriesNano
+		opt.LockedBufferMem = uring.BufferSizeLarge
+		opt.ReadBufferNum = 64
+		opt.NotifySucceed = true
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
 	}
-
-	for _, s := range scenarios {
-		t.Logf("  StartID=%d, Count=%d:", s.startID, s.count)
-		for i := range s.count {
-			id := (s.startID + uint16(i)) & mask
-			t.Logf("    index %d -> ID %d", i, id)
+	if err := ring.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() {
+		// All submitted operations must finish before the ring is destroyed.
+		if err := ring.Stop(); err != nil {
+			t.Errorf("Stop: %v", err)
 		}
-		t.Log("")
+	})
+	bufRing, err := ring.RegisterBufRingIncremental(entries, group)
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	t.Log("Formula: id = (startID + index) & (ringSize - 1)")
-	t.Log("-----------------------------------------------------")
+	for i := range entries {
+		if err := bufRing.Add(backing[i*size:(i+1)*size], uint16(i), i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := bufRing.Advance(entries); err != nil {
+		t.Fatal(err)
+	}
+	receiver := uring.NewIncrementalReceiver(ring, uring.NewContextPools(2), group, size, backing, entries)
+	fd, client := tcpPair(t)
+	var got [size]byte
+	received, submitted, completed := 0, 0, 0
+	handler := uring.NewIncrementalSubscriber().
+		OnData(func(buf []byte, bufferMore bool) {
+			received += copy(got[received:], buf)
+			if bufferMore != (received < size) {
+				t.Error("incorrect buffer continuation")
+			}
+		}).
+		OnComplete(func() { completed++ }).
+		OnError(func(err error) { t.Errorf("incremental receive: %v", err) }).Handler()
+	var firstID uint16
+	for i, length := range [...]int{1, 7, 24, 5, 27} {
+		payload := bytes.Repeat([]byte{byte('A' + i)}, length)
+		start, end := received, received+len(payload)
+		if n, err := client.Write(payload); err != nil || n != len(payload) {
+			t.Fatalf("write: n=%d err=%v", n, err)
+		}
+		// TCP may split a write across several receive completions.
+		for received < end {
+			if err := receiver.Recv(fd, handler); err != nil {
+				t.Fatal(err)
+			}
+			submitted++
+			var cqes [1]uring.CQEView
+			var backoff iox.Backoff
+			deadline := time.Now().Add(exampleTimeout)
+			for {
+				n, err := ring.Wait(cqes[:])
+				if err != nil && !iox.IsWouldBlock(err) {
+					t.Fatalf("Wait: %v", err)
+				}
+				if n > 0 {
+					backoff.Reset()
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("timed out waiting for completion")
+				}
+				backoff.Wait()
+			}
+			cqe := cqes[0]
+			if cqe.Op() != uring.IORING_OP_RECV || cqe.Res <= 0 || int(cqe.Res) > end-received {
+				t.Fatalf("incremental result=%d, remaining=%d", cqe.Res, end-received)
+			}
+			id, bufferMore := cqe.BufID(), cqe.HasBufferMore()
+			if submitted == 1 {
+				firstID = id
+			}
+			if id != firstID || cqe.HasMore() {
+				t.Error("incorrect incremental request identity")
+			}
+			if !receiver.HandleCQE(cqe) {
+				t.Fatal("unhandled incremental completion")
+			}
+			// HandleCQE retired the request context. Only copied facts survive.
+			if !bufferMore {
+				if err := bufRing.Add(backing[int(id)*size:(int(id)+1)*size], id, 0); err != nil {
+					t.Fatal(err)
+				}
+				if err := bufRing.Advance(1); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		if !bytes.Equal(got[start:end], payload) {
+			t.Error("incorrect incremental fragment")
+		}
+	}
+	if completed != submitted || received != size {
+		t.Fatalf("completed=%d submitted=%d received=%d", completed, submitted, received)
+	}
 }

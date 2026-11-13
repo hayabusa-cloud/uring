@@ -48,7 +48,9 @@ type Options struct {
 	MultiSizeBuffer int
 	// MultiIssuers mirrors the Linux task-migratable setup contract. It defaults
 	// to true; set it to false only for a caller pinned to one OS thread.
-	MultiIssuers            bool
+	MultiIssuers bool
+	// NotifySucceed disables default CQE suppression on write-like operations.
+	// Explicit IOSQE_CQE_SKIP_SUCCESS flags still apply.
 	NotifySucceed           bool
 	IndirectSubmissionQueue bool
 	SQE128                  bool

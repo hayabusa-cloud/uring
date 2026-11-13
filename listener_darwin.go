@@ -16,7 +16,7 @@ import (
 	"code.hybscloud.com/zcall"
 )
 
-// ListenerState tracks which stage of socket→bind→listen has completed (darwin stub).
+// ListenerState identifies the prepared socket→bind→listen stage or final state (darwin stub).
 type ListenerState uint8
 
 const (
@@ -29,8 +29,8 @@ const (
 )
 
 // ListenerHandler receives completion events during listener creation (darwin stub).
-// The caller invokes these callbacks and advances setup with the Prepare helpers.
-// A true result permits the next phase; false tells the caller to abort setup.
+// [ListenerOp.HandleCQE] invokes callbacks and submits the next stage on Linux.
+// A false callback result stops setup; the caller still owns Close.
 type ListenerHandler interface {
 	// OnSocketCreated reports that socket creation succeeded. Return true to
 	// continue listener setup or false to abort it.
@@ -158,6 +158,11 @@ func (op *ListenerOp) SetFD(fd iofd.FD) {
 // Ext returns the ExtSQE (darwin stub).
 func (op *ListenerOp) Ext() *ExtSQE {
 	return op.ext
+}
+
+// HandleCQE advances listener setup on Linux (darwin stub).
+func (op *ListenerOp) HandleCQE(cqe CQEView) (bool, error) {
+	return false, ErrNotSupported
 }
 
 func (op *ListenerOp) closeFD() {

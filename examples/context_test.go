@@ -7,7 +7,6 @@
 package examples_test
 
 import (
-	"errors"
 	"testing"
 	"time"
 
@@ -15,279 +14,252 @@ import (
 	"code.hybscloud.com/uring"
 )
 
-// TestSQEContextDirect demonstrates Direct mode context encoding.
+// A submission queue entry (SQE) describes work for the kernel. A completion
+// queue entry (CQE) reports an outcome. SQEContext travels in user_data so the
+// caller can associate each completion with its request.
 //
-// Direct mode packs all context into a single 64-bit value:
+//	Mode      Stored in user_data    Context storage
+//	Direct    Inline scalar fields   No separate target
+//	Indirect  Tagged address         64-byte base SQE
+//	Extended  Tagged address         Base SQE + 64-byte UserData
 //
-//	┌─────────┬─────────┬──────────────┬────────────────────────────┬────┐
-//	│ Op (8b) │Flags(8b)│ BufGrp (16b) │        FD (30b)            │ 00 │
-//	└─────────┴─────────┴──────────────┴────────────────────────────┴────┘
+// Choose Direct when the scalar fields suffice, Indirect to retain the submitted
+// SQE, and Extended to attach caller data as well. Direct-mode user_data layout,
+// from high to low bits:
 //
-// Benefits:
-//   - Zero heap allocation
-//   - Single register operation
-//   - Fits in io_uring's user_data field
-//
-// Use when: Simple operations with minimal context needs.
+//	Bits   63..62 | 61..32 | 31..16   | 15..8 | 7..0
+//	Field  Mode=0 | FD     | BufGroup | Flags | Op
 func TestSQEContextDirect(t *testing.T) {
-	// Pack context for a read operation
-	ctx := uring.PackDirect(
-		uring.IORING_OP_READ, // op: operation type
-		uring.IOSQE_ASYNC,    // flags: run asynchronously
-		5,                    // bufGroup: buffer group ID
-		42,                   // fd: file descriptor
-	)
-
-	// Verify we can extract fields
-	if ctx.Op() != uring.IORING_OP_READ {
-		t.Errorf("Op: got %d, want %d", ctx.Op(), uring.IORING_OP_READ)
+	// Direct mode stores scalar fields in user_data; it has no borrowed target.
+	// PackDirect arguments: opcode, SQE flags, buffer group, file descriptor.
+	ctx := uring.PackDirect(uring.IORING_OP_READ, uring.IOSQE_ASYNC, 5, 42)
+	if !ctx.IsDirect() || ctx.Op() != uring.IORING_OP_READ ||
+		ctx.Flags() != uring.IOSQE_ASYNC || ctx.BufGroup() != 5 || ctx.FD() != 42 {
+		t.Fatalf("incorrect Direct context: %#x", ctx.Raw())
 	}
-	if ctx.Flags() != uring.IOSQE_ASYNC {
-		t.Errorf("Flags: got %d, want %d", ctx.Flags(), uring.IOSQE_ASYNC)
-	}
-	if ctx.BufGroup() != 5 {
-		t.Errorf("BufGroup: got %d, want 5", ctx.BufGroup())
-	}
-	if ctx.FD() != 42 {
-		t.Errorf("FD: got %d, want 42", ctx.FD())
-	}
-
-	// Mode detection
-	if !ctx.IsDirect() {
-		t.Error("Expected Direct mode")
-	}
-	if ctx.IsIndirect() || ctx.IsExtended() {
-		t.Error("Should not be Indirect or Extended")
-	}
-
-	t.Logf("Direct context: 0x%016x", ctx.Raw())
-	t.Logf("  Op=%d Flags=%d BufGroup=%d FD=%d",
-		ctx.Op(), ctx.Flags(), ctx.BufGroup(), ctx.FD())
 }
 
-// TestSQEContextWithFlags demonstrates flag manipulation.
+// SQE flags control submission; CQE flags describe a completion. Common SQE flags:
 //
-// Common SQE flags:
-//   - IOSQE_FIXED_FILE: Use registered file index instead of fd
-//   - IOSQE_IO_DRAIN: Wait for previous SQEs to complete
-//   - IOSQE_IO_LINK: Link to next SQE (chain operations)
-//   - IOSQE_ASYNC: Force async execution
-//   - IOSQE_BUFFER_SELECT: Let kernel select buffer from group
-//   - IOSQE_CQE_SKIP_SUCCESS: Don't generate CQE on success
+//	Flag                    Meaning
+//	IOSQE_FIXED_FILE        FD names a registered-file slot
+//	IOSQE_IO_DRAIN          Issue after earlier in-flight work completes
+//	IOSQE_IO_LINK           Link this request to the next SQE
+//	IOSQE_ASYNC             Offload execution without an initial inline attempt
+//	IOSQE_BUFFER_SELECT     Select from a provided-buffer group
+//	IOSQE_CQE_SKIP_SUCCESS  Suppress the successful operation CQE
+//
+// This test checks flag encoding. The I/O examples enable NotifySucceed so
+// their completion loops can account for successful operations too.
 func TestSQEContextWithFlags(t *testing.T) {
-	// Create context with initial flags
 	flags := uint8(uring.IOSQE_ASYNC | uring.IOSQE_IO_LINK)
 	ctx := uring.PackDirect(uring.IORING_OP_WRITE, flags, 0, 10)
-
-	if ctx.Flags() != flags {
-		t.Errorf("Flags: got %d, want %d", ctx.Flags(), flags)
+	// WithFlags replaces the flag set; OrFlags adds bits. Direct mode returns a
+	// new value; Indirect and Extended setters modify their shared target.
+	replaced := ctx.WithFlags(uring.IOSQE_IO_DRAIN)
+	combined := ctx.OrFlags(uring.IOSQE_IO_DRAIN)
+	if replaced.Flags() != uring.IOSQE_IO_DRAIN ||
+		combined.Flags() != flags|uring.IOSQE_IO_DRAIN || ctx.Flags() != flags {
+		t.Fatal("incorrect Direct flag transformation")
 	}
-
-	// WithFlags REPLACES flags (not OR) - useful for changing or clearing the
-	// exact flag set.
-	newFlags := uint8(uring.IOSQE_IO_DRAIN)
-	ctx2 := ctx.WithFlags(newFlags)
-	if ctx2.Flags() != newFlags {
-		t.Errorf("WithFlags: got %d, want %d", ctx2.Flags(), newFlags)
-	}
-
-	// To add flags while preserving existing bits, use OrFlags.
-	combinedFlags := flags | uring.IOSQE_IO_DRAIN
-	ctx3 := ctx.OrFlags(uring.IOSQE_IO_DRAIN)
-	if ctx3.Flags() != combinedFlags {
-		t.Errorf("Combined flags: got %d, want %d", ctx3.Flags(), combinedFlags)
-	}
-
-	// Original unchanged (immutable)
-	if ctx.Flags() != flags {
-		t.Error("Original context was mutated")
-	}
-
-	t.Logf("Original flags: 0b%08b", ctx.Flags())
-	t.Logf("Replaced flags: 0b%08b", ctx2.Flags())
-	t.Logf("Combined flags: 0b%08b", ctx3.Flags())
 }
 
-// TestSQEContextIndirect demonstrates Indirect mode for full SQE access.
+// Indirect mode retains the submitted SQE in a separate context target:
 //
-// Indirect mode stores a pointer to a 64-byte IndirectSQE structure.
-// The ring populates the SQE fields internally when you submit operations.
-// On completion, you recover the pointer to access the full SQE context.
+//	SQE.user_data -> IndirectSQE <- CQE.Context()
 //
-// Use when: You need the complete SQE fields on completion (e.g., multi-shot ops).
+// Submission fills the target's SQE fields. The completion recovers that same
+// target; return it to the pool only after completion processing finishes.
 func TestSQEContextIndirect(t *testing.T) {
-	ring, err := uring.New(
-		testMinimalBufferOptions,
-		func(opts *uring.Options) {
-			opts.Entries = uring.EntriesSmall
-		},
-	)
+	ring, err := uring.New(func(opt *uring.Options) {
+		opt.Entries = uring.EntriesNano
+		opt.LockedBufferMem = uring.BufferSizeLarge
+		opt.ReadBufferNum = 64
+		opt.NotifySucceed = true
+	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	mustStartRing(t, ring)
+	if err := ring.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// Drain submitted requests before this deferred teardown.
+	defer func() {
+		if err := ring.Stop(); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	}()
 
-	// Get IndirectSQE from pool - these are 64-byte aligned
 	indirect := ring.IndirectSQE()
 	if indirect == nil {
-		t.Fatal("Pool exhausted")
+		t.Fatal("context pool exhausted")
 	}
-
-	// Pack as Indirect context (pointer with mode bits)
 	ctx := uring.PackIndirect(indirect)
-
-	// Verify mode detection
-	if !ctx.IsIndirect() {
-		t.Error("Expected Indirect mode")
+	if err := ring.Nop(ctx); err != nil {
+		ring.PutIndirectSQE(indirect)
+		t.Fatalf("Nop: %v", err)
 	}
-	if ctx.IsDirect() || ctx.IsExtended() {
-		t.Error("Should not be Direct or Extended")
+	var cqes [1]uring.CQEView
+	var backoff iox.Backoff
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		n, err := ring.Wait(cqes[:])
+		if err != nil && !iox.IsWouldBlock(err) {
+			t.Fatalf("Wait: %v", err)
+		}
+		if n > 0 {
+			backoff.Reset()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for completion")
+		}
+		backoff.Wait()
 	}
-
-	// Extract pointer back - this is how completion handlers recover context
-	ptr := ctx.IndirectSQE()
-	if ptr != indirect {
-		t.Error("Pointer round-trip failed")
+	cqe := cqes[0]
+	if cqe.Op() != uring.IORING_OP_NOP || cqe.Res != 0 {
+		t.Fatalf("unexpected completion: opcode=%d result=%d error=%v", cqe.Op(), cqe.Res, cqe.Err())
 	}
-
-	// Return to pool after use
+	if !cqe.Context().IsIndirect() || cqe.Context().IndirectSQE() != indirect {
+		t.Fatal("completion did not retain the Indirect context")
+	}
+	// SQEView borrows the context target. Copy required facts before release.
+	op := cqe.SQE().Opcode()
 	ring.PutIndirectSQE(indirect)
-
-	t.Logf("Indirect context: 0x%016x", ctx.Raw())
-	t.Logf("  Mode bits: %d (1=Indirect)", ctx.Mode()>>62)
+	if op != uring.IORING_OP_NOP {
+		t.Fatalf("submitted opcode = %d", op)
+	}
 }
 
-// TestSQEContextExtended demonstrates Extended mode for user data.
+// Extended mode adds 64 bytes of caller data, useful for request IDs or tags:
 //
-// Extended mode provides 128 bytes:
-//   - 64 bytes: Full SQE (populated internally by ring operations)
-//   - 64 bytes: Raw scalar user data
+//	ExtSQE = [retained base SQE: 64 bytes][UserData: 64 bytes]
 //
-// The UserData field is [64]byte, giving you flexible storage for:
-//   - Connection/request IDs
-//   - Fixed-size tags
-//   - Pointer-free application state snapshots
-//
-// Use when: You need to associate custom data with operations.
+// This example stores a connection tag and retrieves it on completion.
 func TestSQEContextExtended(t *testing.T) {
-	ring, err := uring.New(
-		testMinimalBufferOptions,
-		func(opts *uring.Options) {
-			opts.Entries = uring.EntriesSmall
-		},
-	)
+	ring, err := uring.New(func(opt *uring.Options) {
+		opt.Entries = uring.EntriesNano
+		opt.LockedBufferMem = uring.BufferSizeLarge
+		opt.ReadBufferNum = 64
+		opt.NotifySucceed = true
+	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	mustStartRing(t, ring)
+	if err := ring.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// Drain submitted requests before this deferred teardown.
+	defer func() {
+		if err := ring.Stop(); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	}()
 
-	// Get ExtSQE from the pool.
 	ext := ring.ExtSQE()
 	if ext == nil {
-		t.Fatal("Pool exhausted")
+		t.Fatal("context pool exhausted")
 	}
-
-	// Store user data (64 bytes available as [64]byte)
-	// You can overlay structures or store raw bytes
-	copy(ext.UserData[:8], []byte("CONN_001")) // Connection tag
-	ext.UserData[8] = 0x42                     // Request type
-	ext.UserData[9] = 0x01                     // Flags
-
-	// Pack as Extended context
+	// ExtSQE adds caller storage to a retained base SQE. Its UserData is separate
+	// from the kernel's optional SQE128 extension.
+	copy(ext.UserData[:], "CONN_001")
 	ctx := uring.PackExtended(ext)
-
-	// Verify mode detection
-	if !ctx.IsExtended() {
-		t.Error("Expected Extended mode")
+	if err := ring.Nop(ctx); err != nil {
+		ring.PutExtSQE(ext)
+		t.Fatalf("Nop: %v", err)
 	}
-	if ctx.IsDirect() || ctx.IsIndirect() {
-		t.Error("Should not be Direct or Indirect")
+	var cqes [1]uring.CQEView
+	var backoff iox.Backoff
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		n, err := ring.Wait(cqes[:])
+		if err != nil && !iox.IsWouldBlock(err) {
+			t.Fatalf("Wait: %v", err)
+		}
+		if n > 0 {
+			backoff.Reset()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for completion")
+		}
+		backoff.Wait()
 	}
-
-	// On completion, extract the ExtSQE pointer
-	ptr := ctx.ExtSQE()
-	if ptr != ext {
-		t.Error("Pointer round-trip failed")
+	cqe := cqes[0]
+	if cqe.Op() != uring.IORING_OP_NOP || cqe.Res != 0 {
+		t.Fatalf("unexpected completion: opcode=%d result=%d error=%v", cqe.Op(), cqe.Res, cqe.Err())
 	}
-
-	// Access user data on completion
-	tag := string(ptr.UserData[:8])
-	if tag != "CONN_001" {
-		t.Errorf("UserData tag: got %q, want CONN_001", tag)
+	if !cqe.Extended() || cqe.ExtSQE() != ext {
+		t.Fatal("completion did not retain the Extended context")
 	}
-	if ptr.UserData[8] != 0x42 {
-		t.Errorf("UserData[8]: got 0x%x, want 0x42", ptr.UserData[8])
-	}
-
-	// Return to pool
+	// UserData is raw storage. Use pointer-free data or keep Go roots elsewhere.
+	// The copy survives pool reuse; cqe.ExtSQE() remains a borrowed pointer.
+	tag := cqe.ExtSQE().UserData
 	ring.PutExtSQE(ext)
-
-	t.Logf("Extended context: 0x%016x", ctx.Raw())
-	t.Logf("  Mode bits: %d (2=Extended)", ctx.Mode()>>62)
-	t.Logf("  UserData tag: %s", tag)
+	if string(tag[:8]) != "CONN_001" {
+		t.Fatalf("tag = %q", tag[:8])
+	}
 }
 
-// TestCQEViewAccess demonstrates reading completion results.
+// CQEView.Res contains the operation result or negative errno; Flags contains
+// IORING_CQE_F_* completion flags. Context recovers the submission context;
+// Indirect and Extended views borrow their retained targets.
 //
-// CQEView provides access to:
-//   - Res: Result (bytes transferred, new fd, or -errno)
-//   - Flags: CQE flags (IORING_CQE_F_*)
-//   - Context extraction based on mode
+//	Completion flag       Meaning (IORING_CQE_F_ prefix omitted)
+//	BUFFER                Upper flag bits identify a selected buffer
+//	MORE                  The request has further completion events
+//	NOTIF                 Buffer-release notification for a zero-copy send
+//	BUF_MORE              The kernel retains an incremental buffer
+//
+// MORE concerns the request; BUF_MORE concerns the buffer. Neither is a byte
+// count. Interpret Res by opcode: for example, NOP returns 0 and READ returns
+// bytes read, while a negative result encodes an errno.
 func TestCQEViewAccess(t *testing.T) {
-	ring, err := uring.New(
-		testMinimalBufferOptions,
-		func(opts *uring.Options) {
-			opts.Entries = uring.EntriesSmall
-			opts.NotifySucceed = true
-		},
-	)
+	ring, err := uring.New(func(opt *uring.Options) {
+		opt.Entries = uring.EntriesNano
+		opt.LockedBufferMem = uring.BufferSizeLarge
+		opt.ReadBufferNum = 64
+		opt.NotifySucceed = true
+	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	mustStartRing(t, ring)
+	if err := ring.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// Drain submitted requests before this deferred teardown.
+	defer func() {
+		if err := ring.Stop(); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	}()
 
-	// Submit a NOP with identifiable context
 	ctx := uring.PackDirect(uring.IORING_OP_NOP, 0, 99, 77)
 	if err := ring.Nop(ctx); err != nil {
 		t.Fatalf("Nop: %v", err)
 	}
-
-	// Wait and examine CQE
-	cqes := make([]uring.CQEView, 16)
-	deadline := time.Now().Add(time.Second)
-	b := iox.Backoff{}
-
-	for time.Now().Before(deadline) {
-		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+	var cqes [1]uring.CQEView
+	var backoff iox.Backoff
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		n, err := ring.Wait(cqes[:])
+		if err != nil && !iox.IsWouldBlock(err) {
 			t.Fatalf("Wait: %v", err)
 		}
-		for i := 0; i < n; i++ {
-			cqe := &cqes[i]
-
-			// Extract operation info
-			op := cqe.Op()
-			if op != uring.IORING_OP_NOP {
-				continue
-			}
-
-			t.Logf("CQE received:")
-			t.Logf("  Res=%d (0 = success for NOP)", cqe.Res)
-			t.Logf("  Flags=0x%x", cqe.Flags)
-			t.Logf("  Op=%d BufGroup=%d FD=%d",
-				cqe.Op(), cqe.BufGroup(), cqe.FD())
-
-			// Verify context fields
-			if cqe.BufGroup() != 99 {
-				t.Errorf("BufGroup: got %d, want 99", cqe.BufGroup())
-			}
-			if cqe.FD() != 77 {
-				t.Errorf("FD: got %d, want 77", cqe.FD())
-			}
-
-			return
+		if n > 0 {
+			backoff.Reset()
+			break
 		}
-		b.Wait()
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for completion")
+		}
+		backoff.Wait()
 	}
-	t.Error("NOP completion not received")
+	cqe := cqes[0]
+	if cqe.Op() != uring.IORING_OP_NOP || cqe.Res != 0 {
+		t.Fatalf("unexpected completion: opcode=%d result=%d error=%v", cqe.Op(), cqe.Res, cqe.Err())
+	}
+	if cqe.BufGroup() != 99 || cqe.FD() != 77 {
+		t.Fatal("completion lost caller correlation fields")
+	}
 }

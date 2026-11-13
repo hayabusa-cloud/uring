@@ -7,7 +7,6 @@
 package examples_test
 
 import (
-	"errors"
 	"testing"
 	"time"
 
@@ -16,334 +15,306 @@ import (
 	"code.hybscloud.com/zcall"
 )
 
-// TestBasicTimeout demonstrates io_uring timeout operations.
-//
-// Timeouts in io_uring are themselves SQEs that complete after a duration.
-// Unlike traditional timers, they integrate into the completion queue,
-// enabling unified event handling.
-//
-// Note: This test is known to be unreliable in WSL2 environments due to
-// timing-sensitive kernel-userspace interactions. It works reliably on
-// native Linux systems.
-//
-// Use cases:
-//   - Operation deadlines
-//   - Periodic wake-ups in event loops
-//   - Linked timeouts for I/O cancellation
+// A timeout is an asynchronous request with its own CQE. With the default flags,
+// expiry reports -ETIME; the submission call itself does not wait for the timer.
 func TestBasicTimeout(t *testing.T) {
-	// Skip in environments where timeout completions are unreliable
-	// This matches the behavior of integration_test.go
-	if testing.Short() {
-		t.Skip("skipping timeout test in short mode")
-	}
-
-	ring, err := uring.New(
-		testMinimalBufferOptions,
-		func(opts *uring.Options) {
-			opts.Entries = uring.EntriesSmall
-			opts.NotifySucceed = true
-			opts.MultiIssuers = true // Use the shared-submit configuration in this example.
-		},
-	)
+	ring, err := uring.New(func(opt *uring.Options) {
+		opt.Entries = uring.EntriesNano
+		opt.LockedBufferMem = uring.BufferSizeLarge
+		opt.ReadBufferNum = 64
+		opt.NotifySucceed = true // Observe successful operations as well as errors.
+	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	mustStartRing(t, ring)
-
-	// Submit a 20ms timeout (shorter for faster test)
+	if err := ring.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() {
+		// Drain every submitted request before destroying the ring.
+		if err := ring.Stop(); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	})
 	ctx := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, 0, 0)
-	start := time.Now()
-
-	if err := ring.Timeout(ctx, 20*time.Millisecond); err != nil {
-		t.Fatalf("Timeout submit: %v", err)
+	if err := ring.Timeout(ctx, 10*time.Millisecond); err != nil {
+		t.Fatal(err)
 	}
-	t.Log("Timeout submitted")
-
-	// Wait for completion using same pattern as integration test
-	cqes := make([]uring.CQEView, 16)
-	deadline := time.Now().Add(time.Second)
-	b := iox.Backoff{}
-
-	for time.Now().Before(deadline) {
-		n, err := ring.Wait(cqes)
-		// Ignore transient errors that occur in WSL2
-		if err != nil &&
-			!errors.Is(err, iox.ErrWouldBlock) {
+	var cqes [1]uring.CQEView
+	var backoff iox.Backoff
+	deadline := time.Now().Add(exampleTimeout)
+	for {
+		n, err := ring.Wait(cqes[:])
+		if err != nil && !iox.IsWouldBlock(err) {
 			t.Fatalf("Wait: %v", err)
 		}
-		for i := 0; i < n; i++ {
-			if cqes[i].Op() == uring.IORING_OP_TIMEOUT {
-				elapsed := time.Since(start)
-				t.Logf("Timeout completed after %v (res=%d)", elapsed, cqes[i].Res)
-				if elapsed < 15*time.Millisecond {
-					t.Errorf("Timeout too fast: %v", elapsed)
-				}
-				return // Test passed
-			}
-		}
-		b.Wait()
-	}
-
-	// If we get here in WSL2, skip rather than fail
-	t.Skip("Timeout completion not received - likely WSL2 timing issue")
-}
-
-// TestMultipleTimeouts demonstrates handling multiple concurrent timeouts.
-//
-// Multiple timeouts can be in-flight simultaneously. Each has its own
-// context, allowing the completion handler to identify which timer fired.
-//
-// Note: This test is known to be unreliable in WSL2 environments.
-func TestMultipleTimeouts(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping timeout test in short mode")
-	}
-
-	ring, err := uring.New(
-		testMinimalBufferOptions,
-		func(opts *uring.Options) {
-			opts.Entries = uring.EntriesSmall
-			opts.NotifySucceed = true
-			opts.MultiIssuers = true // Use the shared-submit configuration in this example.
-		},
-	)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	mustStartRing(t, ring)
-
-	// Submit timeouts with different durations
-	// Use bufGroup field to identify which timeout (hack for demo)
-	timeouts := []struct {
-		id       uint16
-		duration time.Duration
-	}{
-		{1, 20 * time.Millisecond},
-		{2, 40 * time.Millisecond},
-		{3, 60 * time.Millisecond},
-	}
-
-	start := time.Now()
-	for _, to := range timeouts {
-		ctx := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, to.id, 0)
-		if err := ring.Timeout(ctx, to.duration); err != nil {
-			t.Fatalf("Timeout[%d] submit: %v", to.id, err)
-		}
-	}
-	t.Logf("Submitted %d timeouts", len(timeouts))
-
-	// Collect completions in order
-	cqes := make([]uring.CQEView, 16)
-	completed := 0
-	deadline := time.Now().Add(time.Second)
-	var order []uint16
-	b := iox.Backoff{}
-
-	for completed < len(timeouts) && time.Now().Before(deadline) {
-		n, err := ring.Wait(cqes)
-		// Ignore transient errors that occur in WSL2
-		if err != nil &&
-			!errors.Is(err, iox.ErrWouldBlock) {
-			t.Fatalf("Wait: %v", err)
-		}
-		for i := 0; i < n; i++ {
-			if cqes[i].Op() == uring.IORING_OP_TIMEOUT {
-				id := cqes[i].BufGroup()
-				elapsed := time.Since(start)
-				t.Logf("Timeout %d completed at %v", id, elapsed)
-				order = append(order, id)
-				completed++
-			}
-		}
-		b.Wait()
-	}
-
-	// Verify order: should be 1, 2, 3 (shortest first)
-	if len(order) == 3 {
-		if order[0] != 1 || order[1] != 2 || order[2] != 3 {
-			t.Errorf("Unexpected order: %v", order)
-		}
-		return // Test passed
-	}
-
-	// If we get here in WSL2, skip rather than fail
-	t.Skipf("Not all timeouts completed (got %v) - likely WSL2 timing issue", order)
-}
-
-// TestPollWithTimeout demonstrates polling a pipe with a timeout.
-//
-// This pattern is common in event loops:
-//  1. Submit poll for read-ready
-//  2. Submit timeout as deadline
-//  3. First completion wins
-//
-// Note: This test is known to be unreliable in WSL2 environments.
-func TestPollWithTimeout(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping timeout test in short mode")
-	}
-
-	ring, err := uring.New(
-		testMinimalBufferOptions,
-		func(opts *uring.Options) {
-			opts.Entries = uring.EntriesSmall
-			opts.NotifySucceed = true
-			opts.MultiIssuers = true // Use the shared-submit configuration in this example.
-		},
-	)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	mustStartRing(t, ring)
-
-	// Create a pipe
-	r, w, err := createPipe()
-	if err != nil {
-		t.Fatalf("Pipe: %v", err)
-	}
-	defer closeFd(r)
-	defer closeFd(w)
-
-	// Submit poll for POLLIN on read end
-	pollCtx := uring.PackDirect(uring.IORING_OP_POLL_ADD, 0, 1, int32(r))
-	if err := ring.PollAdd(pollCtx, uring.EPOLLIN); err != nil {
-		t.Fatalf("PollAdd: %v", err)
-	}
-
-	// Submit timeout as deadline (shorter for faster test)
-	timeoutCtx := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, 2, 0)
-	if err := ring.Timeout(timeoutCtx, 50*time.Millisecond); err != nil {
-		t.Fatalf("Timeout: %v", err)
-	}
-
-	t.Log("Submitted poll and timeout, waiting for first completion...")
-
-	// Wait - timeout should fire first since pipe has no data
-	cqes := make([]uring.CQEView, 16)
-	deadline := time.Now().Add(time.Second)
-	firstOp := uint8(0)
-	b := iox.Backoff{}
-
-	for time.Now().Before(deadline) {
-		n, err := ring.Wait(cqes)
-		// Ignore transient errors that occur in WSL2
-		if err != nil &&
-			!errors.Is(err, iox.ErrWouldBlock) {
-			t.Fatalf("Wait: %v", err)
-		}
-		for i := 0; i < n; i++ {
-			op := cqes[i].Op()
-			if op == uring.IORING_OP_POLL_ADD || op == uring.IORING_OP_TIMEOUT {
-				firstOp = op
-				t.Logf("First completion: op=%d (6=POLL_ADD, 11=TIMEOUT)", op)
-				break
-			}
-		}
-		if firstOp != 0 {
+		if n > 0 {
+			backoff.Reset()
 			break
 		}
-		b.Wait()
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for TIMEOUT completion")
+		}
+		backoff.Wait()
 	}
-
-	if firstOp == uring.IORING_OP_TIMEOUT {
-		t.Log("Timeout fired first (expected - no data on pipe)")
-		return // Test passed
-	} else if firstOp == uring.IORING_OP_POLL_ADD {
-		t.Error("Poll completed first - unexpected")
-		return
+	cqe := cqes[0]
+	// Wait's error describes ring progress. The request's result is in Res;
+	// -ETIME is the expected timer expiry here.
+	if cqe.Op() != uring.IORING_OP_TIMEOUT || cqe.Res != -int32(zcall.ETIME) {
+		t.Fatalf("unexpected completion: opcode=%d result=%d error=%v", cqe.Op(), cqe.Res, cqe.Err())
 	}
-
-	// If we get here in WSL2, skip rather than fail
-	t.Skip("Neither poll nor timeout completed - likely WSL2 timing issue")
 }
 
-// TestLinkedTimeout demonstrates IOSQE_IO_LINK with LinkTimeout.
-//
-// Linked operations form atomic chains where:
-//   - IOSQE_IO_LINK: soft link - failure cancels remaining chain
-//   - IOSQE_IO_HARDLINK: hard link - continues regardless of result
-//
-// LinkTimeout is special: if it fires before the linked operation completes,
-// the operation is cancelled with -ECANCELED (-125).
-//
-// Pattern:
-//
-//	SQE1: Operation (with IOSQE_IO_LINK flag)
-//	SQE2: LinkTimeout (fires if SQE1 takes too long)
-//
-// Use cases:
-//   - Read/write with deadline
-//   - Connect with timeout
-//   - Any I/O that must complete within a duration
-func TestLinkedTimeout(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping timeout test in short mode")
-	}
-
-	ring, err := uring.New(
-		testMinimalBufferOptions,
-		func(opts *uring.Options) {
-			opts.Entries = uring.EntriesSmall
-			opts.NotifySucceed = true
-			opts.MultiIssuers = true
-		},
-	)
+// Give each timer a distinct context ID so completions can be matched without
+// relying on their arrival order. TIMEOUT does not use a buffer group, so this
+// example carries the ID in that Direct-context field.
+func TestMultipleTimeouts(t *testing.T) {
+	ring, err := uring.New(func(opt *uring.Options) {
+		opt.Entries = uring.EntriesNano
+		opt.LockedBufferMem = uring.BufferSizeLarge
+		opt.ReadBufferNum = 64
+		opt.NotifySucceed = true // Observe successful operations as well as errors.
+	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	mustStartRing(t, ring)
-
-	// Submit a NOP with IOSQE_IO_LINK flag, followed by LinkTimeout
-	// The NOP will complete immediately, so the timeout should be cancelled
-	nopCtx := uring.PackDirect(uring.IORING_OP_NOP, 0, 1, 0) // bufGroup=1 to identify
-	if err := ring.Nop(nopCtx, uring.WithFlags(uring.IOSQE_IO_LINK)); err != nil {
-		t.Fatalf("Nop submit: %v", err)
+	if err := ring.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
 	}
-
-	timeoutCtx := uring.PackDirect(uring.IORING_OP_LINK_TIMEOUT, 0, 2, 0) // bufGroup=2 to identify
-	if err := ring.LinkTimeout(timeoutCtx, 100*time.Millisecond); err != nil {
-		t.Fatalf("LinkTimeout submit: %v", err)
+	t.Cleanup(func() {
+		// Drain every submitted request before destroying the ring.
+		if err := ring.Stop(); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	})
+	for i, d := range []time.Duration{30, 10, 20} {
+		ctx := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, uint16(i), 0)
+		if err := ring.Timeout(ctx, d*time.Millisecond); err != nil {
+			t.Fatal(err)
+		}
 	}
-	t.Log("Submitted NOP + LinkTimeout chain")
+	var seen [3]bool
+	for range seen {
+		var cqes [1]uring.CQEView
+		var backoff iox.Backoff
+		deadline := time.Now().Add(exampleTimeout)
+		for {
+			n, err := ring.Wait(cqes[:])
+			if err != nil && !iox.IsWouldBlock(err) {
+				t.Fatalf("Wait: %v", err)
+			}
+			if n > 0 {
+				backoff.Reset()
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("timed out waiting for TIMEOUT completion")
+			}
+			backoff.Wait()
+		}
+		cqe := cqes[0]
+		if cqe.Op() != uring.IORING_OP_TIMEOUT {
+			t.Fatalf("unexpected opcode %d", cqe.Op())
+		}
+		id := int(cqe.BufGroup())
+		if id >= len(seen) || seen[id] {
+			t.Fatalf("unexpected or duplicate timeout ID %d", id)
+		}
+		seen[id] = true
+		if cqe.Res != -int32(zcall.ETIME) {
+			t.Fatalf("opcode %d: result=%d error=%v, want %d", cqe.Op(), cqe.Res, cqe.Err(), -int32(zcall.ETIME))
+		}
+	}
+}
 
-	// Wait for completions
-	cqes := make([]uring.CQEView, 16)
-	deadline := time.Now().Add(time.Second)
-	nopDone := false
-	timeoutDone := false
-	b := iox.Backoff{}
-
-	for time.Now().Before(deadline) && (!nopDone || !timeoutDone) {
-		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+// Independent timeouts do not cancel other requests. Cancel and reap the
+// losing poll explicitly before tearing down the ring.
+func TestPollWithTimeout(t *testing.T) {
+	ring, err := uring.New(func(opt *uring.Options) {
+		opt.Entries = uring.EntriesNano
+		opt.LockedBufferMem = uring.BufferSizeLarge
+		opt.ReadBufferNum = 64
+		opt.NotifySucceed = true // Observe successful operations as well as errors.
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := ring.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() {
+		// Drain every submitted request before destroying the ring.
+		if err := ring.Stop(); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	})
+	r, w, err := createPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := r.Close(); err != nil {
+			t.Errorf("close pipe reader: %v", err)
+		}
+		if err := w.Close(); err != nil {
+			t.Errorf("close pipe writer: %v", err)
+		}
+	}()
+	poll := uring.PackDirect(uring.IORING_OP_POLL_ADD, 0, 0, int32(r))
+	if err := ring.PollAdd(poll, uring.EPOLLIN); err != nil {
+		t.Fatal(err)
+	}
+	timeout := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, 0, 0)
+	if err := ring.Timeout(timeout, 10*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	var cqes [1]uring.CQEView
+	var backoff iox.Backoff
+	deadline := time.Now().Add(exampleTimeout)
+	for {
+		n, err := ring.Wait(cqes[:])
+		if err != nil && !iox.IsWouldBlock(err) {
 			t.Fatalf("Wait: %v", err)
 		}
-		for i := 0; i < n; i++ {
-			op := cqes[i].Op()
-			res := cqes[i].Res
-			id := cqes[i].BufGroup()
-
-			switch id {
-			case 1: // NOP
-				t.Logf("NOP completed: res=%d", res)
-				if res != 0 {
-					t.Errorf("NOP expected res=0, got %d", res)
-				}
-				nopDone = true
-			case 2: // LinkTimeout
-				t.Logf("LinkTimeout completed: res=%d (op=%d)", res, op)
-				// When linked op completes first, timeout gets -ECANCELED
-				if res != -int32(zcall.ECANCELED) {
-					t.Logf("Note: LinkTimeout res=%d (expected %d for cancelled)", res, -int32(zcall.ECANCELED))
-				}
-				timeoutDone = true
-			}
+		if n > 0 {
+			backoff.Reset()
+			break
 		}
-		b.Wait()
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for TIMEOUT completion")
+		}
+		backoff.Wait()
 	}
+	cqe := cqes[0]
+	if cqe.Op() != uring.IORING_OP_TIMEOUT || cqe.Res != -int32(zcall.ETIME) {
+		t.Fatalf("unexpected completion: opcode=%d result=%d error=%v", cqe.Op(), cqe.Res, cqe.Err())
+	}
+	cancel := uring.PackDirect(uring.IORING_OP_ASYNC_CANCEL, 0, 0, 0)
+	if err := ring.AsyncCancel(cancel, poll.Raw()); err != nil {
+		t.Fatal(err)
+	}
+	var pollDone, cancelDone bool
+	for range 2 {
+		var cqes [1]uring.CQEView
+		var backoff iox.Backoff
+		deadline := time.Now().Add(exampleTimeout)
+		for {
+			n, err := ring.Wait(cqes[:])
+			if err != nil && !iox.IsWouldBlock(err) {
+				t.Fatalf("Wait: %v", err)
+			}
+			if n > 0 {
+				backoff.Reset()
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("timed out waiting for request completion")
+			}
+			backoff.Wait()
+		}
+		cqe := cqes[0]
+		switch cqe.Op() {
+		case uring.IORING_OP_POLL_ADD:
+			if pollDone {
+				t.Fatal("duplicate poll completion")
+			}
+			pollDone = true
+			if cqe.Res != -int32(uring.ECANCELED) {
+				t.Fatalf("opcode %d: result=%d error=%v, want %d", cqe.Op(), cqe.Res, cqe.Err(), -int32(uring.ECANCELED))
+			}
+		case uring.IORING_OP_ASYNC_CANCEL:
+			if cancelDone {
+				t.Fatal("duplicate cancellation completion")
+			}
+			cancelDone = true
+			if cqe.Res != 0 {
+				t.Fatalf("opcode %d: result=%d error=%v, want %d", cqe.Op(), cqe.Res, cqe.Err(), 0)
+			}
+		default:
+			t.Fatalf("unexpected opcode %d", cqe.Op())
+		}
+	}
+	if !pollDone || !cancelDone {
+		t.Fatal("pending request after cancellation")
+	}
+}
 
-	if !nopDone || !timeoutDone {
-		t.Skip("Linked operations did not complete - likely WSL2 timing issue")
+// Put the link flag on the operation followed immediately by its timeout:
+//
+//	SQE 1: NOP + IOSQE_IO_LINK -> SQE 2: LINK_TIMEOUT
+//
+// Here the NOP completes first and the timeout reports -ECANCELED. If the timer
+// expires first, it attempts to cancel the linked operation. Reap both CQEs to
+// learn their actual outcomes before releasing request resources.
+func TestLinkedTimeout(t *testing.T) {
+	ring, err := uring.New(func(opt *uring.Options) {
+		opt.Entries = uring.EntriesNano
+		opt.LockedBufferMem = uring.BufferSizeLarge
+		opt.ReadBufferNum = 64
+		opt.NotifySucceed = true // Observe successful operations as well as errors.
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
 	}
-	t.Log("Linked timeout test passed")
+	if err := ring.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() {
+		// Drain every submitted request before destroying the ring.
+		if err := ring.Stop(); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	})
+	nop := uring.PackDirect(uring.IORING_OP_NOP, uring.IOSQE_IO_LINK, 0, 0)
+	if err := ring.Nop(nop); err != nil {
+		t.Fatal(err)
+	}
+	timeout := uring.PackDirect(uring.IORING_OP_LINK_TIMEOUT, 0, 0, 0)
+	if err := ring.LinkTimeout(timeout, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	var nopDone, timeoutDone bool
+	for range 2 {
+		var cqes [1]uring.CQEView
+		var backoff iox.Backoff
+		deadline := time.Now().Add(exampleTimeout)
+		for {
+			n, err := ring.Wait(cqes[:])
+			if err != nil && !iox.IsWouldBlock(err) {
+				t.Fatalf("Wait: %v", err)
+			}
+			if n > 0 {
+				backoff.Reset()
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("timed out waiting for request completion")
+			}
+			backoff.Wait()
+		}
+		cqe := cqes[0]
+		switch cqe.Op() {
+		case uring.IORING_OP_NOP:
+			if nopDone {
+				t.Fatal("duplicate NOP completion")
+			}
+			nopDone = true
+			if cqe.Res != 0 {
+				t.Fatalf("opcode %d: result=%d error=%v, want %d", cqe.Op(), cqe.Res, cqe.Err(), 0)
+			}
+		case uring.IORING_OP_LINK_TIMEOUT:
+			if timeoutDone {
+				t.Fatal("duplicate linked timeout completion")
+			}
+			timeoutDone = true
+			if cqe.Res != -int32(uring.ECANCELED) {
+				t.Fatalf("opcode %d: result=%d error=%v, want %d", cqe.Op(), cqe.Res, cqe.Err(), -int32(uring.ECANCELED))
+			}
+		default:
+			t.Fatalf("unexpected opcode %d", cqe.Op())
+		}
+	}
+	if !nopDone || !timeoutDone {
+		t.Fatal("linked request pair did not complete")
+	}
 }
