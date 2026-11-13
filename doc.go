@@ -356,7 +356,7 @@
 // # Performance
 //
 // The hot submit and reap paths are designed to remain zero-allocation.
-// See the benchmark tests for current machine-specific numbers.
+// Run the benchmark tests to measure performance on your system.
 //
 // # Ring Setup
 //

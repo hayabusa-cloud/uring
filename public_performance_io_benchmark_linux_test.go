@@ -9,6 +9,7 @@ package uring_test
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"testing"
 	"time"
 
@@ -340,6 +341,8 @@ func benchmarkPublicPerformanceZeroCopyIO(b *testing.B, payloadSize, destination
 func newPublicPerformanceSingleIssuerIORing(b *testing.B) *uring.Uring {
 	b.Helper()
 
+	runtime.LockOSThread()
+	b.Cleanup(runtime.UnlockOSThread)
 	return newPublicPerformanceIORing(b, false)
 }
 

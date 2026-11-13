@@ -10,6 +10,10 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: public-benchmarks-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -22,37 +26,44 @@ jobs:
   public-benchmarks:
     name: Benchmarks (Linux/amd64, Go 1.26.x)
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version: '1.26.x'
           check-latest: true
+
+      - name: Check runner environment
+        run: |
+          cat /etc/os-release
+          uname -a
+          go version
+          echo "Image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+          kernel=$(uname -r)
+          IFS=. read -r major minor _ <<< "$kernel"
+          if (( major < 6 || (major == 6 && minor < 18) )); then
+            echo "::error::Linux 6.18+ is required; runner uses $kernel"
+            exit 1
+          fi
 
       - name: Run public benchmarks
         env:
           CGO_ENABLED: '0'
         run: |
-          set -o pipefail
           report_dir="${RUNNER_TEMP}/uring-public-performance"
           mkdir -p "$report_dir"
           log="$report_dir/raw.txt"
           summary="$report_dir/summary.md"
 
-          echo "Memlock before:"
-          grep "Max locked memory" "/proc/$$/limits" || true
-          sudo prlimit --pid "$$" --memlock=unlimited:unlimited || true
-          ulimit -l unlimited || true
-          echo "Memlock after:"
-          grep "Max locked memory" "/proc/$$/limits" || true
-          echo "ulimit -l: $(ulimit -l || true)"
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited
+          ulimit -l
 
-          : > "$log"
+          { go version; uname -a; } | tee "$log"
           status=0
           benchmark_groups=(
             '^BenchmarkPublicPerformance(SQEContextPackDirect|CQEViewAccessors|DirectCQEAccessors|CompletionError)$'
@@ -83,15 +94,21 @@ jobs:
             BenchmarkPublicPerformanceSocketIOBatchRoundTrip/512B/Batch64
             BenchmarkPublicPerformanceSocketIOBatchRoundTrip/4KiB/Batch64
           )
-          missing=0
-          missing_benchmark_rows=()
+          incomplete_benchmarks=()
           for benchmark in "${required_benchmarks[@]}"; do
-            if ! grep -q "^${benchmark}" "$log"; then
-              missing_benchmark_rows+=("$benchmark")
-              missing=1
+            samples=$(awk -v expected="$benchmark" '
+              /^BenchmarkPublicPerformance/ && $2 ~ /^[0-9]+$/ && / ns\/op/ && / B\/op/ && / allocs\/op/ {
+                name=$1
+                sub(/-[0-9]+$/, "", name)
+                if (name == expected) count++
+              }
+              END { print count+0 }
+            ' "$log")
+            if [ "$samples" -ne 10 ]; then
+              incomplete_benchmarks+=("$benchmark: $samples samples, want 10")
             fi
           done
-          if [ "$missing" -ne 0 ]; then
+          if [ "${#incomplete_benchmarks[@]}" -ne 0 ]; then
             status=1
           fi
 
@@ -112,16 +129,16 @@ jobs:
               echo "> Benchmark collection or required-row verification exited with status $status. The rows below are the measurements produced before failure."
               echo
             fi
-            for benchmark in "${missing_benchmark_rows[@]}"; do
-              echo "- Missing benchmark row: \`${benchmark}\`"
+            for benchmark in "${incomplete_benchmarks[@]}"; do
+              echo "- Incomplete benchmark: \`${benchmark}\`"
             done
-            if [ "$missing" -ne 0 ]; then
+            if [ "${#incomplete_benchmarks[@]}" -ne 0 ]; then
               echo
             fi
             echo "| Benchmark | samples | avg ns/op | best ns/op | avg MB/s | best MB/s | avg B/op | avg allocs/op |"
             echo "|---|---:|---:|---:|---:|---:|---:|---:|"
             awk '
-              /^BenchmarkPublicPerformance/ {
+              /^BenchmarkPublicPerformance/ && $2 ~ /^[0-9]+$/ && / ns\/op/ && / B\/op/ && / allocs\/op/ {
                 name=$1
                 sub(/-[0-9]+$/, "", name)
                 if (!(name in seen)) {

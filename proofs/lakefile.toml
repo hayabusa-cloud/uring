@@ -1,0 +1,21 @@
+name = "uring_proofs"
+version = "0.1.0"
+defaultTargets = ["ZeroCopy", "Cancellation", "Incremental", "CompletionQueue", "Context"]
+
+[leanOptions]
+warningAsError = true
+
+[[lean_lib]]
+name = "ZeroCopy"
+
+[[lean_lib]]
+name = "Cancellation"
+
+[[lean_lib]]
+name = "Incremental"
+
+[[lean_lib]]
+name = "CompletionQueue"
+
+[[lean_lib]]
+name = "Context"
