@@ -17,395 +17,6 @@ import (
 	"unsafe"
 )
 
-func TestDarwinDoCloseUsesRegisteredFileSlot(t *testing.T) {
-	slotFile, err := os.Open(os.DevNull)
-	if err != nil {
-		t.Fatalf("Open(slotFile): %v", err)
-	}
-	sqeFile, err := os.Open(os.DevNull)
-	if err != nil {
-		_ = slotFile.Close()
-		t.Fatalf("Open(sqeFile): %v", err)
-	}
-
-	ur := &ioUring{
-		files: []int32{int32(slotFile.Fd())},
-	}
-	sqe := &ioUringSqe{
-		fd:         int32(sqeFile.Fd()),
-		spliceFdIn: 1,
-	}
-
-	if got := ur.doClose(sqe); got != 0 {
-		_ = slotFile.Close()
-		_ = sqeFile.Close()
-		t.Fatalf("doClose() = %d, want 0", got)
-	}
-	if got := ur.files[0]; got != -1 {
-		_ = slotFile.Close()
-		_ = sqeFile.Close()
-		t.Fatalf("files[0] = %d, want -1", got)
-	}
-	if err := sqeFile.Close(); err != nil {
-		_ = slotFile.Close()
-		t.Fatalf("sqeFile should stay open: %v", err)
-	}
-	if err := slotFile.Close(); err == nil {
-		t.Fatal("slotFile.Close() succeeded after direct close, want closed descriptor")
-	}
-}
-
-func TestDarwinDoCloseRejectsEmptyRegisteredFileSlot(t *testing.T) {
-	sqeFile, err := os.Open(os.DevNull)
-	if err != nil {
-		t.Fatalf("Open(sqeFile): %v", err)
-	}
-
-	ur := &ioUring{
-		files: []int32{-1},
-	}
-	sqe := &ioUringSqe{
-		fd:         int32(sqeFile.Fd()),
-		spliceFdIn: 1,
-	}
-
-	if got := ur.doClose(sqe); got != -int32(syscall.EBADF) {
-		_ = sqeFile.Close()
-		t.Fatalf("doClose() = %d, want %d", got, -int32(syscall.EBADF))
-	}
-	if err := sqeFile.Close(); err != nil {
-		t.Fatalf("sqeFile should stay open on EBADF: %v", err)
-	}
-}
-
-func tooManyDarwinIovecs() [][]byte {
-	return make([][]byte, maxIovecs+1)
-}
-
-func TestDarwinSendZeroCopyRejectsOversizedLen32(t *testing.T) {
-	var ur ioUring
-	payload := mappedTestSlice[byte](t, oversizedLen32(t))
-
-	err := ur.sendZeroCopy(PackDirect(0, 0, 0, 0), payload, 0, len(payload), 0)
-	if err != ErrInvalidParam {
-		t.Fatalf("sendZeroCopy oversized len error = %v, want %v", err, ErrInvalidParam)
-	}
-}
-
-func TestDarwinSignedKernelCarrierDomainsRejectOutOfRange(t *testing.T) {
-	var ur ioUring
-	oversized := oversizedSignedInt32(t)
-	payload := mappedTestSlice[byte](t, oversized)
-	ctx := PackDirect(0, 0, 0, 7)
-
-	tests := []struct {
-		name string
-		call func() error
-	}{
-		{name: "send length", call: func() error { return ur.send(ctx, 0, payload, 0, len(payload)) }},
-		{name: "receive length", call: func() error { return ur.receive(ctx, 0, payload, 0, len(payload)) }},
-		{name: "receive buffer-select length", call: func() error { return ur.receiveWithBufferSelect(ctx, 0, oversized, 0) }},
-		{name: "send zero-copy length", call: func() error { return ur.sendZeroCopy(ctx, payload, 0, len(payload), 0) }},
-		{name: "socket domain", call: func() error { return ur.socket(ctx, oversized, SOCK_STREAM, 0) }},
-		{name: "socket type", call: func() error { return ur.socket(ctx, AF_INET, oversized, 0) }},
-		{name: "socket protocol", call: func() error { return ur.socket(ctx, AF_INET, SOCK_STREAM, oversized) }},
-		{name: "socket direct protocol", call: func() error { return ur.socketDirect(ctx, AF_INET, SOCK_STREAM, oversized, 0) }},
-		{name: "listen backlog", call: func() error { return ur.listen(ctx, oversized) }},
-		{name: "shutdown mode", call: func() error { return ur.shutdown(ctx, SHUT_RDWR+1) }},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if err := tt.call(); err != ErrInvalidParam {
-				t.Fatalf("error = %v, want %v", err, ErrInvalidParam)
-			}
-		})
-	}
-}
-
-func TestDarwinFixedBufferRejectsOversizedLen32(t *testing.T) {
-	payload := mappedTestSlice[byte](t, oversizedLen32(t))
-
-	tests := []struct {
-		name string
-		call func(*ioUring) error
-	}{
-		{
-			name: "readFixed",
-			call: func(ur *ioUring) error {
-				_, err := ur.readFixed(PackDirect(0, 0, 0, 0), 0, 0, len(payload))
-				return err
-			},
-		},
-		{
-			name: "writeFixed",
-			call: func(ur *ioUring) error {
-				return ur.writeFixed(PackDirect(0, 0, 0, 0), 0, 0, len(payload))
-			},
-		},
-		{
-			name: "sendFixed",
-			call: func(ur *ioUring) error {
-				return ur.sendFixed(PackDirect(0, 0, 0, 0), 0, 0, len(payload), 0)
-			},
-		},
-		{
-			name: "sendZeroCopyFixed",
-			call: func(ur *ioUring) error {
-				return ur.sendZeroCopyFixed(PackDirect(0, 0, 0, 0), 0, 0, len(payload), 0)
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			ur := &ioUring{bufs: [][]byte{payload}}
-			if err := tt.call(ur); err != ErrInvalidParam {
-				t.Fatalf("%s error = %v, want %v", tt.name, err, ErrInvalidParam)
-			}
-		})
-	}
-}
-
-func TestDarwinReadWriteVRejectsInvalidIovs(t *testing.T) {
-	var ur ioUring
-	iovs := tooManyDarwinIovecs()
-
-	if err := ur.readv(PackDirect(0, 0, 0, 0), nil); err != ErrInvalidParam {
-		t.Fatalf("readv(nil) error = %v, want %v", err, ErrInvalidParam)
-	}
-	if err := ur.writev(PackDirect(0, 0, 0, 0), nil); err != ErrInvalidParam {
-		t.Fatalf("writev(nil) error = %v, want %v", err, ErrInvalidParam)
-	}
-	if err := ur.readv(PackDirect(0, 0, 0, 0), iovs); err != ErrInvalidParam {
-		t.Fatalf("readv oversized iovs error = %v, want %v", err, ErrInvalidParam)
-	}
-	if err := ur.writev(PackDirect(0, 0, 0, 0), iovs); err != ErrInvalidParam {
-		t.Fatalf("writev oversized iovs error = %v, want %v", err, ErrInvalidParam)
-	}
-}
-
-func TestDarwinMessageIovecsRejectOversizedCount(t *testing.T) {
-	var ur ioUring
-	iovs := tooManyDarwinIovecs()
-	ctx := PackDirect(0, 0, 0, 7)
-
-	if err := ur.sendmsg(ctx, 0, iovs, nil, nil); err != ErrInvalidParam {
-		t.Fatalf("sendmsg oversized iovs error = %v, want %v", err, ErrInvalidParam)
-	}
-	msg := &Msghdr{Iov: new(IoVec), Iovlen: maxIovecs + 1}
-	if err := ur.recvmsg(ctx, 0, msg); err != ErrInvalidParam {
-		t.Fatalf("recvmsg oversized Iovlen error = %v, want %v", err, ErrInvalidParam)
-	}
-}
-
-func TestDarwinTimeoutRejectsCountOutsideUint32(t *testing.T) {
-	var ur ioUring
-	ts := Timespec{Sec: 1}
-	ctx := PackDirect(0, 0, 0, 7)
-
-	for _, count := range []int{-1, oversizedLen32(t)} {
-		if err := ur.timeout(ctx, count, &ts, 0); err != ErrInvalidParam {
-			t.Fatalf("timeout(count=%d) error = %v, want %v", count, err, ErrInvalidParam)
-		}
-	}
-}
-
-func TestDarwinPollInputContractRejectsInvalidValues(t *testing.T) {
-	var ur ioUring
-	ctx := PackDirect(0, 0, 0, 7)
-	oversized := oversizedLen32(t)
-
-	tests := []struct {
-		name string
-		call func() error
-	}{
-		{name: "negative add events", call: func() error { return ur.pollAdd(ctx, 0, -1) }},
-		{name: "oversized add events", call: func() error { return ur.pollAdd(ctx, 0, oversized) }},
-		{name: "negative update events", call: func() error {
-			return ur.pollUpdate(ctx, 1, 0, -1, IORING_POLL_UPDATE_EVENTS)
-		}},
-		{name: "oversized update events", call: func() error {
-			return ur.pollUpdate(ctx, 1, 0, oversized, IORING_POLL_UPDATE_EVENTS)
-		}},
-		{name: "negative update flags", call: func() error { return ur.pollUpdate(ctx, 1, 0, 0, -1) }},
-		{name: "oversized update flags", call: func() error { return ur.pollUpdate(ctx, 1, 0, 0, oversized) }},
-		{name: "multishot only", call: func() error {
-			return ur.pollUpdate(ctx, 1, 0, 0, IORING_POLL_ADD_MULTI)
-		}},
-		{name: "multishot events", call: func() error {
-			return ur.pollUpdate(ctx, 1, 0, EPOLLIN, IORING_POLL_UPDATE_EVENTS|IORING_POLL_ADD_MULTI)
-		}},
-		{name: "multishot user data", call: func() error {
-			return ur.pollUpdate(ctx, 1, 2, 0, IORING_POLL_UPDATE_USER_DATA|IORING_POLL_ADD_MULTI)
-		}},
-		{name: "multishot combined", call: func() error {
-			return ur.pollUpdate(ctx, 1, 2, EPOLLIN,
-				IORING_POLL_UPDATE_EVENTS|IORING_POLL_UPDATE_USER_DATA|IORING_POLL_ADD_MULTI)
-		}},
-		{name: "user data without flag", call: func() error { return ur.pollUpdate(ctx, 1, 2, 0, 0) }},
-		{name: "events without flag", call: func() error { return ur.pollUpdate(ctx, 1, 0, EPOLLIN, 0) }},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if err := tt.call(); err != ErrInvalidParam {
-				t.Fatalf("error = %v, want %v", err, ErrInvalidParam)
-			}
-		})
-	}
-}
-
-func TestDarwinBoundaryLen32RejectsOversizedInputs(t *testing.T) {
-	var ur ioUring
-	payload := mappedTestSlice[byte](t, oversizedLen32(t))
-	fds := mappedTestSlice[int32](t, oversizedLen32(t))
-
-	tests := []struct {
-		name string
-		call func() error
-	}{
-		{
-			name: "fsetxattr",
-			call: func() error {
-				return ur.fsetxattr(PackDirect(0, 0, 0, 0), "user.payload", payload, 0)
-			},
-		},
-		{
-			name: "setxattr",
-			call: func() error {
-				return ur.setxattr(PackDirect(0, 0, 0, 0), "/tmp/uring-xattr", "user.payload", payload, 0)
-			},
-		},
-		{
-			name: "fgetxattr",
-			call: func() error {
-				return ur.fgetxattr(PackDirect(0, 0, 0, 0), "user.payload", payload)
-			},
-		},
-		{
-			name: "getxattr",
-			call: func() error {
-				return ur.getxattr(PackDirect(0, 0, 0, 0), "/tmp/uring-xattr", "user.payload", payload)
-			},
-		},
-		{
-			name: "filesUpdate",
-			call: func() error {
-				return ur.filesUpdate(PackDirect(0, 0, 0, 0), fds, 0)
-			},
-		},
-		{
-			name: "uringCmd",
-			call: func() error {
-				return ur.uringCmd(PackDirect(0, 0, 0, 0), 0x1234, payload, 0)
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if err := tt.call(); err != ErrInvalidParam {
-				t.Fatalf("%s error = %v, want %v", tt.name, err, ErrInvalidParam)
-			}
-		})
-	}
-}
-
-func TestDarwinSQEView(t *testing.T) {
-	t.Run("ViewSQE from IndirectSQE", func(t *testing.T) {
-		indirect := &IndirectSQE{}
-		indirect.opcode = IORING_OP_RECV
-		indirect.flags = IOSQE_BUFFER_SELECT | IOSQE_ASYNC
-		indirect.ioprio = 42
-		indirect.fd = 100
-		indirect.off = 0x1234567890
-		indirect.addr = 0xDEADBEEF
-		indirect.len = 4096
-		indirect.uflags = 0x8000
-		indirect.bufIndex = 7
-		indirect.personality = 3
-		indirect.spliceFdIn = 50
-		indirect.userData = PackDirect(IORING_OP_RECV, indirect.flags, indirect.bufIndex, indirect.fd).Raw()
-
-		view := ViewSQE(indirect)
-
-		if !view.Valid() {
-			t.Error("expected Valid() to be true")
-		}
-		if view.Opcode() != IORING_OP_RECV {
-			t.Errorf("Opcode() = %d, want %d", view.Opcode(), IORING_OP_RECV)
-		}
-		if view.Flags() != IOSQE_BUFFER_SELECT|IOSQE_ASYNC {
-			t.Errorf("Flags() = %d, want %d", view.Flags(), IOSQE_BUFFER_SELECT|IOSQE_ASYNC)
-		}
-		if view.IoPrio() != 42 {
-			t.Errorf("IoPrio() = %d, want 42", view.IoPrio())
-		}
-		if view.RawFD() != 100 {
-			t.Errorf("RawFD() = %d, want 100", view.RawFD())
-		}
-		if view.Off() != 0x1234567890 {
-			t.Errorf("Off() = %x, want 0x1234567890", view.Off())
-		}
-		if view.Addr() != 0xDEADBEEF {
-			t.Errorf("Addr() = %x, want 0xDEADBEEF", view.Addr())
-		}
-		if view.Len() != 4096 {
-			t.Errorf("Len() = %d, want 4096", view.Len())
-		}
-		if view.UFlags() != 0x8000 {
-			t.Errorf("UFlags() = %x, want 0x8000", view.UFlags())
-		}
-		if view.UserData() != indirect.userData {
-			t.Errorf("UserData() = %x, want %x", view.UserData(), indirect.userData)
-		}
-		if view.BufIndex() != 7 {
-			t.Errorf("BufIndex() = %d, want 7", view.BufIndex())
-		}
-		if view.BufGroup() != 7 {
-			t.Errorf("BufGroup() = %d, want 7", view.BufGroup())
-		}
-		if view.Personality() != 3 {
-			t.Errorf("Personality() = %d, want 3", view.Personality())
-		}
-		if view.SpliceFDIn() != 50 {
-			t.Errorf("SpliceFDIn() = %d, want 50", view.SpliceFDIn())
-		}
-		if view.FileIndex() != 50 {
-			t.Errorf("FileIndex() = %d, want 50", view.FileIndex())
-		}
-		if !view.HasBufferSelect() {
-			t.Error("expected HasBufferSelect() true")
-		}
-		if !view.HasAsync() {
-			t.Error("expected HasAsync() true")
-		}
-	})
-
-	t.Run("ViewExtSQE from ExtSQE", func(t *testing.T) {
-		ext := &ExtSQE{}
-		ext.SQE.opcode = IORING_OP_SEND
-		ext.SQE.flags = IOSQE_CQE_SKIP_SUCCESS
-		ext.SQE.fd = 200
-
-		view := ViewExtSQE(ext)
-
-		if !view.Valid() {
-			t.Error("expected Valid() to be true")
-		}
-		if view.Opcode() != IORING_OP_SEND {
-			t.Errorf("Opcode() = %d, want %d", view.Opcode(), IORING_OP_SEND)
-		}
-		if view.RawFD() != 200 {
-			t.Errorf("RawFD() = %d, want 200", view.RawFD())
-		}
-		if !view.HasCQESkipSuccess() {
-			t.Error("expected HasCQESkipSuccess() to be true")
-		}
-	})
-}
-
 func TestDarwinNewIoUringRejectsEntriesOutsideSetupDomain(t *testing.T) {
 	for _, entries := range []int{-1, 0, EntriesHuge + 1} {
 		ur, err := newIoUring(entries)
@@ -932,4 +543,393 @@ func TestDarwinDoSendReportsPartialProgress(t *testing.T) {
 	if int(res) >= len(payload) {
 		t.Fatalf("doSend result = %d, want a short send below %d", res, len(payload))
 	}
+}
+
+func TestDarwinDoCloseUsesRegisteredFileSlot(t *testing.T) {
+	slotFile, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatalf("Open(slotFile): %v", err)
+	}
+	sqeFile, err := os.Open(os.DevNull)
+	if err != nil {
+		_ = slotFile.Close()
+		t.Fatalf("Open(sqeFile): %v", err)
+	}
+
+	ur := &ioUring{
+		files: []int32{int32(slotFile.Fd())},
+	}
+	sqe := &ioUringSqe{
+		fd:         int32(sqeFile.Fd()),
+		spliceFdIn: 1,
+	}
+
+	if got := ur.doClose(sqe); got != 0 {
+		_ = slotFile.Close()
+		_ = sqeFile.Close()
+		t.Fatalf("doClose() = %d, want 0", got)
+	}
+	if got := ur.files[0]; got != -1 {
+		_ = slotFile.Close()
+		_ = sqeFile.Close()
+		t.Fatalf("files[0] = %d, want -1", got)
+	}
+	if err := sqeFile.Close(); err != nil {
+		_ = slotFile.Close()
+		t.Fatalf("sqeFile should stay open: %v", err)
+	}
+	if err := slotFile.Close(); err == nil {
+		t.Fatal("slotFile.Close() succeeded after direct close, want closed descriptor")
+	}
+}
+
+func TestDarwinDoCloseRejectsEmptyRegisteredFileSlot(t *testing.T) {
+	sqeFile, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatalf("Open(sqeFile): %v", err)
+	}
+
+	ur := &ioUring{
+		files: []int32{-1},
+	}
+	sqe := &ioUringSqe{
+		fd:         int32(sqeFile.Fd()),
+		spliceFdIn: 1,
+	}
+
+	if got := ur.doClose(sqe); got != -int32(syscall.EBADF) {
+		_ = sqeFile.Close()
+		t.Fatalf("doClose() = %d, want %d", got, -int32(syscall.EBADF))
+	}
+	if err := sqeFile.Close(); err != nil {
+		t.Fatalf("sqeFile should stay open on EBADF: %v", err)
+	}
+}
+
+func tooManyDarwinIovecs() [][]byte {
+	return make([][]byte, maxIovecs+1)
+}
+
+func TestDarwinSendZeroCopyRejectsOversizedLen32(t *testing.T) {
+	var ur ioUring
+	payload := mappedTestSlice[byte](t, oversizedLen32(t))
+
+	err := ur.sendZeroCopy(PackDirect(0, 0, 0, 0), payload, 0, len(payload), 0)
+	if err != ErrInvalidParam {
+		t.Fatalf("sendZeroCopy oversized len error = %v, want %v", err, ErrInvalidParam)
+	}
+}
+
+func TestDarwinSignedKernelCarrierDomainsRejectOutOfRange(t *testing.T) {
+	var ur ioUring
+	oversized := oversizedSignedInt32(t)
+	payload := mappedTestSlice[byte](t, oversized)
+	ctx := PackDirect(0, 0, 0, 7)
+
+	tests := []struct {
+		name string
+		call func() error
+	}{
+		{name: "send length", call: func() error { return ur.send(ctx, 0, payload, 0, len(payload)) }},
+		{name: "receive length", call: func() error { return ur.receive(ctx, 0, payload, 0, len(payload)) }},
+		{name: "receive buffer-select length", call: func() error { return ur.receiveWithBufferSelect(ctx, 0, oversized, 0) }},
+		{name: "send zero-copy length", call: func() error { return ur.sendZeroCopy(ctx, payload, 0, len(payload), 0) }},
+		{name: "socket domain", call: func() error { return ur.socket(ctx, oversized, SOCK_STREAM, 0) }},
+		{name: "socket type", call: func() error { return ur.socket(ctx, AF_INET, oversized, 0) }},
+		{name: "socket protocol", call: func() error { return ur.socket(ctx, AF_INET, SOCK_STREAM, oversized) }},
+		{name: "socket direct protocol", call: func() error { return ur.socketDirect(ctx, AF_INET, SOCK_STREAM, oversized, 0) }},
+		{name: "listen backlog", call: func() error { return ur.listen(ctx, oversized) }},
+		{name: "shutdown mode", call: func() error { return ur.shutdown(ctx, SHUT_RDWR+1) }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.call(); err != ErrInvalidParam {
+				t.Fatalf("error = %v, want %v", err, ErrInvalidParam)
+			}
+		})
+	}
+}
+
+func TestDarwinFixedBufferRejectsOversizedLen32(t *testing.T) {
+	payload := mappedTestSlice[byte](t, oversizedLen32(t))
+
+	tests := []struct {
+		name string
+		call func(*ioUring) error
+	}{
+		{
+			name: "readFixed",
+			call: func(ur *ioUring) error {
+				_, err := ur.readFixed(PackDirect(0, 0, 0, 0), 0, 0, len(payload))
+				return err
+			},
+		},
+		{
+			name: "writeFixed",
+			call: func(ur *ioUring) error {
+				return ur.writeFixed(PackDirect(0, 0, 0, 0), 0, 0, len(payload))
+			},
+		},
+		{
+			name: "sendFixed",
+			call: func(ur *ioUring) error {
+				return ur.sendFixed(PackDirect(0, 0, 0, 0), 0, 0, len(payload), 0)
+			},
+		},
+		{
+			name: "sendZeroCopyFixed",
+			call: func(ur *ioUring) error {
+				return ur.sendZeroCopyFixed(PackDirect(0, 0, 0, 0), 0, 0, len(payload), 0)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ur := &ioUring{bufs: [][]byte{payload}}
+			if err := tt.call(ur); err != ErrInvalidParam {
+				t.Fatalf("%s error = %v, want %v", tt.name, err, ErrInvalidParam)
+			}
+		})
+	}
+}
+
+func TestDarwinReadWriteVRejectsInvalidIovs(t *testing.T) {
+	var ur ioUring
+	iovs := tooManyDarwinIovecs()
+
+	if err := ur.readv(PackDirect(0, 0, 0, 0), nil); err != ErrInvalidParam {
+		t.Fatalf("readv(nil) error = %v, want %v", err, ErrInvalidParam)
+	}
+	if err := ur.writev(PackDirect(0, 0, 0, 0), nil); err != ErrInvalidParam {
+		t.Fatalf("writev(nil) error = %v, want %v", err, ErrInvalidParam)
+	}
+	if err := ur.readv(PackDirect(0, 0, 0, 0), iovs); err != ErrInvalidParam {
+		t.Fatalf("readv oversized iovs error = %v, want %v", err, ErrInvalidParam)
+	}
+	if err := ur.writev(PackDirect(0, 0, 0, 0), iovs); err != ErrInvalidParam {
+		t.Fatalf("writev oversized iovs error = %v, want %v", err, ErrInvalidParam)
+	}
+}
+
+func TestDarwinMessageIovecsRejectOversizedCount(t *testing.T) {
+	var ur ioUring
+	iovs := tooManyDarwinIovecs()
+	ctx := PackDirect(0, 0, 0, 7)
+
+	if err := ur.sendmsg(ctx, 0, iovs, nil, nil); err != ErrInvalidParam {
+		t.Fatalf("sendmsg oversized iovs error = %v, want %v", err, ErrInvalidParam)
+	}
+	msg := &Msghdr{Iov: new(IoVec), Iovlen: maxIovecs + 1}
+	if err := ur.recvmsg(ctx, 0, msg); err != ErrInvalidParam {
+		t.Fatalf("recvmsg oversized Iovlen error = %v, want %v", err, ErrInvalidParam)
+	}
+}
+
+func TestDarwinTimeoutRejectsCountOutsideUint32(t *testing.T) {
+	var ur ioUring
+	ts := Timespec{Sec: 1}
+	ctx := PackDirect(0, 0, 0, 7)
+
+	for _, count := range []int{-1, oversizedLen32(t)} {
+		if err := ur.timeout(ctx, count, &ts, 0); err != ErrInvalidParam {
+			t.Fatalf("timeout(count=%d) error = %v, want %v", count, err, ErrInvalidParam)
+		}
+	}
+}
+
+func TestDarwinPollInputContractRejectsInvalidValues(t *testing.T) {
+	var ur ioUring
+	ctx := PackDirect(0, 0, 0, 7)
+	oversized := oversizedLen32(t)
+
+	tests := []struct {
+		name string
+		call func() error
+	}{
+		{name: "negative add events", call: func() error { return ur.pollAdd(ctx, 0, -1) }},
+		{name: "oversized add events", call: func() error { return ur.pollAdd(ctx, 0, oversized) }},
+		{name: "negative update events", call: func() error {
+			return ur.pollUpdate(ctx, 1, 0, -1, IORING_POLL_UPDATE_EVENTS)
+		}},
+		{name: "oversized update events", call: func() error {
+			return ur.pollUpdate(ctx, 1, 0, oversized, IORING_POLL_UPDATE_EVENTS)
+		}},
+		{name: "negative update flags", call: func() error { return ur.pollUpdate(ctx, 1, 0, 0, -1) }},
+		{name: "oversized update flags", call: func() error { return ur.pollUpdate(ctx, 1, 0, 0, oversized) }},
+		{name: "multishot only", call: func() error {
+			return ur.pollUpdate(ctx, 1, 0, 0, IORING_POLL_ADD_MULTI)
+		}},
+		{name: "multishot events", call: func() error {
+			return ur.pollUpdate(ctx, 1, 0, EPOLLIN, IORING_POLL_UPDATE_EVENTS|IORING_POLL_ADD_MULTI)
+		}},
+		{name: "multishot user data", call: func() error {
+			return ur.pollUpdate(ctx, 1, 2, 0, IORING_POLL_UPDATE_USER_DATA|IORING_POLL_ADD_MULTI)
+		}},
+		{name: "multishot combined", call: func() error {
+			return ur.pollUpdate(ctx, 1, 2, EPOLLIN,
+				IORING_POLL_UPDATE_EVENTS|IORING_POLL_UPDATE_USER_DATA|IORING_POLL_ADD_MULTI)
+		}},
+		{name: "user data without flag", call: func() error { return ur.pollUpdate(ctx, 1, 2, 0, 0) }},
+		{name: "events without flag", call: func() error { return ur.pollUpdate(ctx, 1, 0, EPOLLIN, 0) }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.call(); err != ErrInvalidParam {
+				t.Fatalf("error = %v, want %v", err, ErrInvalidParam)
+			}
+		})
+	}
+}
+
+func TestDarwinBoundaryLen32RejectsOversizedInputs(t *testing.T) {
+	var ur ioUring
+	payload := mappedTestSlice[byte](t, oversizedLen32(t))
+	fds := mappedTestSlice[int32](t, oversizedLen32(t))
+
+	tests := []struct {
+		name string
+		call func() error
+	}{
+		{
+			name: "fsetxattr",
+			call: func() error {
+				return ur.fsetxattr(PackDirect(0, 0, 0, 0), "user.payload", payload, 0)
+			},
+		},
+		{
+			name: "setxattr",
+			call: func() error {
+				return ur.setxattr(PackDirect(0, 0, 0, 0), "/tmp/uring-xattr", "user.payload", payload, 0)
+			},
+		},
+		{
+			name: "fgetxattr",
+			call: func() error {
+				return ur.fgetxattr(PackDirect(0, 0, 0, 0), "user.payload", payload)
+			},
+		},
+		{
+			name: "getxattr",
+			call: func() error {
+				return ur.getxattr(PackDirect(0, 0, 0, 0), "/tmp/uring-xattr", "user.payload", payload)
+			},
+		},
+		{
+			name: "filesUpdate",
+			call: func() error {
+				return ur.filesUpdate(PackDirect(0, 0, 0, 0), fds, 0)
+			},
+		},
+		{
+			name: "uringCmd",
+			call: func() error {
+				return ur.uringCmd(PackDirect(0, 0, 0, 0), 0x1234, payload, 0)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.call(); err != ErrInvalidParam {
+				t.Fatalf("%s error = %v, want %v", tt.name, err, ErrInvalidParam)
+			}
+		})
+	}
+}
+
+func TestDarwinSQEView(t *testing.T) {
+	t.Run("ViewSQE from IndirectSQE", func(t *testing.T) {
+		indirect := &IndirectSQE{}
+		indirect.opcode = IORING_OP_RECV
+		indirect.flags = IOSQE_BUFFER_SELECT | IOSQE_ASYNC
+		indirect.ioprio = 42
+		indirect.fd = 100
+		indirect.off = 0x1234567890
+		indirect.addr = 0xDEADBEEF
+		indirect.len = 4096
+		indirect.uflags = 0x8000
+		indirect.bufIndex = 7
+		indirect.personality = 3
+		indirect.spliceFdIn = 50
+		indirect.userData = PackDirect(IORING_OP_RECV, indirect.flags, indirect.bufIndex, indirect.fd).Raw()
+
+		view := ViewSQE(indirect)
+
+		if !view.Valid() {
+			t.Error("expected Valid() to be true")
+		}
+		if view.Opcode() != IORING_OP_RECV {
+			t.Errorf("Opcode() = %d, want %d", view.Opcode(), IORING_OP_RECV)
+		}
+		if view.Flags() != IOSQE_BUFFER_SELECT|IOSQE_ASYNC {
+			t.Errorf("Flags() = %d, want %d", view.Flags(), IOSQE_BUFFER_SELECT|IOSQE_ASYNC)
+		}
+		if view.IoPrio() != 42 {
+			t.Errorf("IoPrio() = %d, want 42", view.IoPrio())
+		}
+		if view.RawFD() != 100 {
+			t.Errorf("RawFD() = %d, want 100", view.RawFD())
+		}
+		if view.Off() != 0x1234567890 {
+			t.Errorf("Off() = %x, want 0x1234567890", view.Off())
+		}
+		if view.Addr() != 0xDEADBEEF {
+			t.Errorf("Addr() = %x, want 0xDEADBEEF", view.Addr())
+		}
+		if view.Len() != 4096 {
+			t.Errorf("Len() = %d, want 4096", view.Len())
+		}
+		if view.UFlags() != 0x8000 {
+			t.Errorf("UFlags() = %x, want 0x8000", view.UFlags())
+		}
+		if view.UserData() != indirect.userData {
+			t.Errorf("UserData() = %x, want %x", view.UserData(), indirect.userData)
+		}
+		if view.BufIndex() != 7 {
+			t.Errorf("BufIndex() = %d, want 7", view.BufIndex())
+		}
+		if view.BufGroup() != 7 {
+			t.Errorf("BufGroup() = %d, want 7", view.BufGroup())
+		}
+		if view.Personality() != 3 {
+			t.Errorf("Personality() = %d, want 3", view.Personality())
+		}
+		if view.SpliceFDIn() != 50 {
+			t.Errorf("SpliceFDIn() = %d, want 50", view.SpliceFDIn())
+		}
+		if view.FileIndex() != 50 {
+			t.Errorf("FileIndex() = %d, want 50", view.FileIndex())
+		}
+		if !view.HasBufferSelect() {
+			t.Error("expected HasBufferSelect() true")
+		}
+		if !view.HasAsync() {
+			t.Error("expected HasAsync() true")
+		}
+	})
+
+	t.Run("ViewExtSQE from ExtSQE", func(t *testing.T) {
+		ext := &ExtSQE{}
+		ext.SQE.opcode = IORING_OP_SEND
+		ext.SQE.flags = IOSQE_CQE_SKIP_SUCCESS
+		ext.SQE.fd = 200
+
+		view := ViewExtSQE(ext)
+
+		if !view.Valid() {
+			t.Error("expected Valid() to be true")
+		}
+		if view.Opcode() != IORING_OP_SEND {
+			t.Errorf("Opcode() = %d, want %d", view.Opcode(), IORING_OP_SEND)
+		}
+		if view.RawFD() != 200 {
+			t.Errorf("RawFD() = %d, want 200", view.RawFD())
+		}
+		if !view.HasCQESkipSuccess() {
+			t.Error("expected HasCQESkipSuccess() to be true")
+		}
+	})
 }

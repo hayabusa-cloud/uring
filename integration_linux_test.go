@@ -53,6 +53,41 @@ func logRingDiagnostics(t *testing.T, label string, ring *uring.Uring) {
 	)
 }
 
+func TestSingleIssuerWrongTaskWaitReturnsErrExists(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping io_uring task-identity test in short mode")
+	}
+
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
+	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
+		opt.MultiIssuers = false
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	mustStartRing(t, ring)
+
+	waitErr := make(chan error, 1)
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+
+		_, err := ring.Wait(make([]uring.CQEView, 1))
+		waitErr <- err
+	}()
+
+	select {
+	case err := <-waitErr:
+		if !errors.Is(err, uring.ErrExists) {
+			t.Fatalf("wrong-task Wait error = %v, want %v", err, uring.ErrExists)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("wrong-task Wait did not return")
+	}
+}
+
 func skipIfXattrUnsupported(t *testing.T, op string, res int32) {
 	t.Helper()
 
@@ -3427,40 +3462,5 @@ func BenchmarkUringNopCycle(b *testing.B) {
 			}
 			backoff.Wait()
 		}
-	}
-}
-
-func TestSingleIssuerWrongTaskWaitReturnsErrExists(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping io_uring task-identity test in short mode")
-	}
-
-	runtime.LockOSThread()
-	t.Cleanup(runtime.UnlockOSThread)
-
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.MultiIssuers = false
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	mustStartRing(t, ring)
-
-	waitErr := make(chan error, 1)
-	go func() {
-		runtime.LockOSThread()
-		defer runtime.UnlockOSThread()
-
-		_, err := ring.Wait(make([]uring.CQEView, 1))
-		waitErr <- err
-	}()
-
-	select {
-	case err := <-waitErr:
-		if !errors.Is(err, uring.ErrExists) {
-			t.Fatalf("wrong-task Wait error = %v, want %v", err, uring.ErrExists)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("wrong-task Wait did not return")
 	}
 }
