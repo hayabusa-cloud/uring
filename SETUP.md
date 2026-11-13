@@ -5,6 +5,21 @@ Kernel upgrade, memlock configuration, and failure resolution for `uring`.
 `uring` requires Linux 6.18+ and Go 1.26+. The examples below use Debian 13
 (trixie).
 
+## Continuous integration
+
+Linux CI uses `ubuntu-latest` and requires kernel 6.18+. It logs the image,
+kernel, and Go versions and raises the memlock limit in each test shell.
+Root-package tests and runtime examples run as required checks, both normally
+and with the race detector. SEND_ZC runtime checks need a suitable network
+environment and remain excluded from hosted CI; their encoding and lifecycle
+tests still run.
+
+Coverage comes from the stable Go toolchain's normal root-package run. Test
+logs are retained as artifacts. Darwin and cross-target jobs build packages
+and compile tests without claiming kernel execution. The benchmark workflow
+requires ten samples for every selected benchmark; measured speed is
+informational and does not determine success.
+
 ## Kernel upgrade
 
 Check the running kernel:
@@ -34,14 +49,14 @@ suite provides 6.18+.
 
    Skip this step if the suite is already present.
 
-2. Refresh the index and verify the candidate version:
+2. Refresh the index and check the backports candidates:
 
    ```bash
    sudo apt update
-   apt policy linux-image-amd64 linux-headers-amd64
+   apt -t trixie-backports policy linux-image-amd64 linux-headers-amd64
    ```
 
-   Proceed once `apt policy` shows a `trixie-backports` candidate ≥ 6.18.
+   Proceed once both candidates are from `trixie-backports` and ≥ 6.18.
 
 3. Install the kernel and headers:
 
@@ -149,8 +164,7 @@ cannot pin the required pages.
 
 ### EPERM, io_uring disabled by sysctl
 
-Some distributions ship `kernel.io_uring_disabled ≠ 0`. The kernel
-returns `EPERM` from `io_uring_setup`.
+When `kernel.io_uring_disabled` restricts the calling process, `io_uring_setup` returns `EPERM`. Existing rings remain usable.
 
 ```bash
 sysctl kernel.io_uring_disabled
@@ -159,7 +173,7 @@ sysctl kernel.io_uring_disabled
 | Value | Effect                                           |
 |-------|--------------------------------------------------|
 | `0`   | All users may create rings (upstream default)    |
-| `1`   | Restricted to members of `kernel.io_uring_group` |
+| `1`   | Requires `CAP_SYS_ADMIN` or membership in `kernel.io_uring_group` |
 | `2`   | Disabled for all users including root            |
 
 Re-enable for the running session:
@@ -174,16 +188,16 @@ To persist across reboots, write to `/etc/sysctl.d/99-io_uring.conf`:
 kernel.io_uring_disabled = 0
 ```
 
-When the value is `1`, add the current user to the permitted group
-instead of disabling the restriction:
+When the value is `1`, an administrator can grant access through a dedicated group instead of disabling the restriction. The default `kernel.io_uring_group=-1` admits only processes with `CAP_SYS_ADMIN`; configure a group before adding users:
 
 ```bash
-GID=$(sysctl -n kernel.io_uring_group)
-GROUP=$(getent group "$GID" | cut -d: -f1)
-sudo usermod -aG "$GROUP" "$USER"
+sudo groupadd -f io_uring
+uring_gid=$(getent group io_uring | cut -d: -f3)
+sudo sysctl -w kernel.io_uring_group="$uring_gid"
+sudo usermod -aG io_uring "$USER"
 ```
 
-Log out and back in for group membership to take effect.
+If an access group is already configured, use that group instead. Persist the chosen numeric group ID as `kernel.io_uring_group` in `/etc/sysctl.d/99-io_uring.conf`, alongside `kernel.io_uring_disabled = 1`. Log out and back in for group membership to take effect. See the [kernel sysctl documentation](https://docs.kernel.org/6.18/admin-guide/sysctl/kernel.html#io-uring-disabled).
 
 ### ENOSYS, syscall absent
 

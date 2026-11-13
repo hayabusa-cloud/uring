@@ -9,12 +9,7 @@ bench:
 	go test -bench=. -benchmem -run=^$$ ./...
 
 vet:
-	@output=$$(go vet ./... 2>&1 || true); \
-	filtered=$$(printf '%s\n' "$$output" | grep -v "ctx.go:.*possible misuse of unsafe.Pointer" || true); \
-	if [ -n "$$filtered" ]; then \
-		echo "$$filtered"; \
-		exit 1; \
-	fi
+	go vet ./...
 
 clean:
 	rm -f coverage.out

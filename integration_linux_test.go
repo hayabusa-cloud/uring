@@ -3357,10 +3357,39 @@ func BenchmarkUringNopSubmit(b *testing.B) {
 	mustStartRing(b, ring)
 
 	ctx := uring.PackDirect(uring.IORING_OP_NOP, 0, 0, 0)
+	var cqes [256]uring.CQEView
+	var backoff iox.Backoff
+	b.ReportAllocs()
 	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
-		ring.Nop(ctx)
+	for submitted := 0; submitted < b.N; {
+		batch := min(ring.Features.SQEntries, b.N-submitted)
+		for range batch {
+			if err := ring.Nop(ctx); err != nil {
+				b.Fatalf("Nop: %v", err)
+			}
+		}
+		submitted += batch
+		// Measure accepted SQ submissions; flush and drain outside the timer.
+		b.StopTimer()
+		for pending := batch; pending > 0; {
+			n, err := ring.Wait(cqes[:])
+			if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+				b.Fatalf("Wait: %v", err)
+			}
+			if n == 0 {
+				backoff.Wait()
+				continue
+			}
+			backoff.Reset()
+			for _, cqe := range cqes[:n] {
+				if cqe.Op() != uring.IORING_OP_NOP || cqe.Res != 0 {
+					b.Fatalf("NOP completion: op=%d result=%d", cqe.Op(), cqe.Res)
+				}
+			}
+			pending -= n
+		}
+		b.StartTimer()
 	}
 }
 
@@ -3373,18 +3402,30 @@ func BenchmarkUringNopCycle(b *testing.B) {
 	}
 	mustStartRing(b, ring)
 
-	cqes := make([]uring.CQEView, 256)
+	ctx := uring.PackDirect(uring.IORING_OP_NOP, 0, 0, 0)
+	var cqes [1]uring.CQEView
+	var backoff iox.Backoff
+	b.ReportAllocs()
 	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
-		ctx := uring.PackDirect(uring.IORING_OP_NOP, 0, 0, 0)
-		ring.Nop(ctx)
+	for range b.N {
+		if err := ring.Nop(ctx); err != nil {
+			b.Fatalf("Nop: %v", err)
+		}
 
 		for {
-			n, _ := ring.Wait(cqes)
+			n, err := ring.Wait(cqes[:])
+			if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+				b.Fatalf("Wait: %v", err)
+			}
 			if n > 0 {
+				backoff.Reset()
+				if cqes[0].Op() != uring.IORING_OP_NOP || cqes[0].Res != 0 {
+					b.Fatalf("NOP completion: op=%d result=%d", cqes[0].Op(), cqes[0].Res)
+				}
 				break
 			}
+			backoff.Wait()
 		}
 	}
 }
