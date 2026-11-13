@@ -1,7 +1,7 @@
 code.hybscloud.com/dwcas v0.1.5 h1:eTDWcCYUmF1F8HGN7d0I7CIh9uqq3fETTeO587gWwnM=
 code.hybscloud.com/dwcas v0.1.5/go.mod h1:XgYaxFoiBGTTM1fBJLhuPuG2xRfohYWzX1MvNUmW7dY=
-code.hybscloud.com/framer v0.1.5 h1:iSnjt24AzwZPOmSInv8aDJN/T1oyOSdN1cyvaYe6SYA=
-code.hybscloud.com/framer v0.1.5/go.mod h1:YuNOHOsb51+czOomfGOKsvq1tfF+hXYWPavFIv9d39c=
+code.hybscloud.com/framer v0.1.6 h1:DvxHC5EdPf1NhYMlaOBg293FVWB24/6pvhEE3+YIuVc=
+code.hybscloud.com/framer v0.1.6/go.mod h1:YuNOHOsb51+czOomfGOKsvq1tfF+hXYWPavFIv9d39c=
 code.hybscloud.com/iobuf v0.3.3 h1:yUrh+C7UIZidP21bfh1hFCY+oVoWj0OJoKDhIOlRJGk=
 code.hybscloud.com/iobuf v0.3.3/go.mod h1:C1ItcRUC2JBkrLnnjlDbYzZzCPPO50BHPmeRmca69VQ=
 code.hybscloud.com/iofd v0.3.6 h1:J6exBCWB7dW4m4CjiPjZ/D1nltQZiCu0PzHCJ3QktLI=

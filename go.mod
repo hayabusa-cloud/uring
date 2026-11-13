@@ -4,7 +4,7 @@ go 1.26
 
 require (
 	code.hybscloud.com/dwcas v0.1.5
-	code.hybscloud.com/framer v0.1.5
+	code.hybscloud.com/framer v0.1.6
 	code.hybscloud.com/iobuf v0.3.3
 	code.hybscloud.com/iofd v0.3.6
 	code.hybscloud.com/iox v0.3.6
