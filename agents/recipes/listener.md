@@ -25,4 +25,4 @@ After an early `Close`, dispatch the pending setup CQE to retire it and close an
 
 For manual control, use `DecodeListenerCQE`, `SetFD`, the `PrepareListener*` helpers, and `SetListenerReady`. Consume each CQE exactly once through manual decoding or `HandleCQE`.
 
-[Listener example](../../listener_example_test.go) demonstrates setup through accept cancellation and drain. [Regression tests](../../listener_auto_test.go) cover IPv4/IPv6/Unix, wildcard inputs, callback stops, errors, routing, close, and full-SQ retry; [manual tests](../../listener_linux_test.go) cover the primitives. Review [resource lifetimes](../boundary/resources.md) and follow the [verification workflow](../workflow/task-loop.md).
+[Listener example](../../listener_example_test.go) demonstrates setup through accept cancellation and drain. [Regression tests](../../listener_auto_test.go) cover IPv4/IPv6/Unix, wildcard inputs, callback stops, errors, routing, close, and full-SQ retry; [manual tests](../../listener_linux_test.go) cover the primitives. Review [resource lifetimes](../boundary/resources.md) and follow [verification](../verify.md).

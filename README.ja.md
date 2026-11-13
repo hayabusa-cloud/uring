@@ -47,11 +47,11 @@ Debian 13 の安定版トラックが提供するカーネルは 6.12 です。`
 
 リング生成時に `ENOMEM`・`EPERM`・`ENOSYS` が返る場合、memlock 上限、sysctl 設定、またはカーネルのサポート状況が原因です。[Docker のデフォルト seccomp プロファイル](https://docs.docker.com/engine/security/seccomp/) は `io_uring` システムコールをブロックします。診断と解決手順は [SETUP.md](./SETUP.md) を参照してください。
 
-## `code.hybscloud.com/uring` 境界周辺のエージェント向けコーディング
+## 呼び出し側向けガイド
 
-`code.hybscloud.com/uring` 境界周辺の呼び出し側コード、つまりランタイム、プロトコルスタック、サービス、および正確な Linux `io_uring` 境界を必要とするレビュー作業を生成またはレビューするときは、独立したガイドの入口 [`AGENTS.md`](./AGENTS.md) を使用します。[`agents/INDEX.md`](./agents/INDEX.md) はトピック索引として使い、SQE/CQE の機構、`user_data` による識別、バッファ所有権、完了結果、ライフサイクル規則、統合境界、参照確認、そして要求分析から形式化、推論、Go へのコンパイル、検証までの流れを保ってください。
+`uring` を使うランタイム、プロトコルスタック、サービスを実装またはレビューする際は、[`AGENTS.md`](./AGENTS.md) から読み始めてください。[呼び出し側向けガイド](./agents/INDEX.md) では、発行、完了処理、リクエストの識別、バッファ所有権、ライフサイクル、パッケージ連携、検証を説明しています。
 
-規則は単純です。`code.hybscloud.com/uring` はカーネルの事実を公開し、ポリシーは呼び出し側レイヤーが選びます。再試行/backoff、ポーリング周期、スケジューリング、ルーティング、ルートの終了処理、プロトコル状態、パース、完了ルーティング、キャンセルおよびタイムアウトポリシー、安全性チェック、サービスライフサイクルは `code.hybscloud.com/uring` の境界外に置き、`ErrWouldBlock`、`ErrMore`、`IORING_CQE_F_MORE`、所有権の移動、機能不足による失敗を可視のまま保ってください。
+`uring` はカーネル操作と完了結果を提供します。ポーリング、スケジューリング、再試行とバックオフ、完了ルーティングとルートの終了処理、プロトコル状態と解析、キャンセルとタイムアウトの方針、安全性チェック、サービスのライフサイクルは呼び出し側が管理します。操作を組み合わせる際も、`ErrWouldBlock`、`ErrMore`、`IORING_CQE_F_MORE`、所有権の移動、機能不足による失敗の意味を保ってください。
 
 ## リングのライフサイクル
 
@@ -433,7 +433,7 @@ for i := range n {
 }
 ```
 
-`OnStep` コールバックは 1 件の `MultishotStep` を観察します。ストリームを維持するなら `MultishotContinue` を、キャンセルを要求するなら `MultishotStop` を返します。コールバックが終端観察まで有効なままなら、`OnStop` は最終エラーと `cancelled` フラグを伴って高々一度だけ実行されます。ステップ自身の `step.Cancelled` は、境界上でカーネルが `-ECANCELED` を返した判定をその他の失敗と明示的に区別します。両コールバックは `MultishotHandler` インタフェース（`OnMultishotStep` / `OnMultishotStop`）のビルダー側射影です。明示的なハンドラを書く場合はこのインタフェースを直接実装してください。`HandleCQE` は呼び出し側の直列化された完了ループ内で即時 dispatch するための補助です。コピー済み CQE をそのループの後も保持する場合、呼び出し側が独自の route state を保持し、すでに解放されたサブスクリプションの観察を拒否してください。明示的な単一発行者リング（`MultiIssuers=false`）では、OS スレッドに固定したリング所有者から `Cancel` / `Unsubscribe` を呼び、発行、`Wait`、`WaitDirect`、`WaitExtended`、`Stop`、`ResizeRings` と直列化してください。デフォルトの `MultiIssuers` リングでは、共有発行パスがキャンセル SQE を直列化します。
+`OnStep` コールバックは 1 件の `MultishotStep` を観察します。ストリームを維持するなら `MultishotContinue` を、キャンセルを要求するなら `MultishotStop` を返します。コールバックが終端観察まで有効なままなら、`OnStop` は最終エラーと `cancelled` フラグを伴って高々一度だけ実行されます。ステップ自身の `step.Cancelled` は、境界上でカーネルが `-ECANCELED` を返した判定をその他の失敗と明示的に区別します。これらのコールバックはそれぞれ `MultishotHandler.OnMultishotStep` と `MultishotHandler.OnMultishotStop` に対応します。インタフェースを直接実装することもできます。`HandleCQE` は呼び出し側の直列化された完了ループ内で即時 dispatch するための補助です。コピー済み CQE をそのループの後も保持する場合、呼び出し側が独自の route state を保持し、すでに解放されたサブスクリプションの観察を拒否してください。明示的な単一発行者リング（`MultiIssuers=false`）では、OS スレッドに固定したリング所有者から `Cancel` / `Unsubscribe` を呼び、発行、`Wait`、`WaitDirect`、`WaitExtended`、`Stop`、`ResizeRings` と直列化してください。デフォルトの `MultiIssuers` リングでは、共有発行パスがキャンセル SQE を直列化します。
 
 投入済みのキャンセル CQE は、`SubscriptionStopped` または `OnStop` の後も、同じサブスクリプションの `HandleCQE` またはその拡張ハンドラへ渡してください。投入の失敗や何もしない呼び出しでは、新たなキャンセル CQE の処理義務は生じません。サブスクリプションは両コンテキストを所有し、元の終端 CQE の処理、キャンセルの dispatch、キャンセル投入処理がすべて終わってから、元のコンテキストをプールへ返します。これらのコンテキストを手動で返さないでください。[受信の例](./examples/multishot_test.go)は、自然な完了とハンドラからのキャンセルを示します。
 

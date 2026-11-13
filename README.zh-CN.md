@@ -47,11 +47,11 @@ Debian 13 稳定版默认提供的内核为 6.12，`trixie-backports` 软件源�
 
 Ring 创建可能返回 `ENOMEM`、`EPERM` 或 `ENOSYS`，分别对应 memlock 上限、sysctl 配置或内核支持等问题。[Docker 的默认 seccomp 配置](https://docs.docker.com/engine/security/seccomp/) 会阻止 `io_uring` 系统调用。诊断与解决方法见 [SETUP.md](./SETUP.md)。
 
-## 围绕 `code.hybscloud.com/uring` 边界的代理编码
+## 调用方指南
 
-在生成或审查围绕 `code.hybscloud.com/uring` 边界的调用方代码时，包括运行时、协议栈、服务以及需要精确 Linux `io_uring` 边界的审查工作，请使用独立指南入口 [`AGENTS.md`](./AGENTS.md)。将 [`agents/INDEX.md`](./agents/INDEX.md) 作为主题索引，以保持内核边界清晰：SQE/CQE 机制、`user_data` 标识、缓冲区所有权、完成结果、生命周期规则、集成边界、参考检查，以及从需求分析、形式化、推理、编译到 Go 代码、再到验证的工作流。
+使用 `uring` 构建或审查运行时、协议栈或服务时，请从 [`AGENTS.md`](./AGENTS.md) 开始阅读。[调用方指南](./agents/INDEX.md) 涵盖提交、完成处理、请求标识、缓冲区所有权、生命周期、包集成和验证。
 
-规则很简单：`code.hybscloud.com/uring` 暴露内核事实；调用方层选择策略。重试/backoff、轮询节奏、调度、路由、路由退役、协议状态、解析、完成路由、取消和超时策略、安全检查和服务生命周期应留在 `code.hybscloud.com/uring` 边界之外，同时保持 `ErrWouldBlock`、`ErrMore`、`IORING_CQE_F_MORE`、所有权转移和能力检查失败可见。
+`uring` 提供内核操作和完成结果。调用方负责轮询、调度、重试与退避、完成路由及其注销、协议状态与解析、取消和超时策略、安全检查以及服务生命周期。组合这些操作时，应保留 `ErrWouldBlock`、`ErrMore`、`IORING_CQE_F_MORE`、所有权转移和能力检查失败的含义。
 
 ## Ring 生命周期
 
@@ -433,7 +433,7 @@ for i := range n {
 }
 ```
 
-每一次 `OnStep` 回调观察一个 `MultishotStep`：返回 `MultishotContinue` 保持流活跃，或返回 `MultishotStop` 请求取消。如果回调一直保持启用直到终态观察，`OnStop` 至多以最终错误及 `cancelled` 标志触发一次；在步骤自身上，`step.Cancelled` 在边界处把内核的 `-ECANCELED` 判定与其他失败明确区分开。两个回调都是 `MultishotHandler` 接口（`OnMultishotStep` / `OnMultishotStop`）在构建器侧的投影；需要显式处理器时，可直接实现该接口。`HandleCQE` 用于调用方串行化完成循环内的立即 dispatch；若调用方在该循环之后保留复制 CQE，则需维护自己的 route state，并拒绝已退役订阅的观察。在显式单提交者 ring（`MultiIssuers=false`）上，应从固定于 OS 线程的 ring 所有者调用 `Cancel` / `Unsubscribe`，并将其与提交、`Wait`、`WaitDirect`、`WaitExtended`、`Stop` 以及 `ResizeRings` 串行化。默认 `MultiIssuers` ring 通过共享提交路径串行化取消 SQE。
+每一次 `OnStep` 回调观察一个 `MultishotStep`：返回 `MultishotContinue` 保持流活跃，或返回 `MultishotStop` 请求取消。如果回调一直保持启用直到终态观察，`OnStop` 至多以最终错误及 `cancelled` 标志触发一次；在步骤自身上，`step.Cancelled` 在边界处把内核的 `-ECANCELED` 判定与其他失败明确区分开。这两个回调分别对应 `MultishotHandler.OnMultishotStep` 和 `MultishotHandler.OnMultishotStop`；也可以直接实现该接口。`HandleCQE` 用于调用方串行化完成循环内的立即 dispatch；若调用方在该循环之后保留复制 CQE，则需维护自己的 route state，并拒绝已退役订阅的观察。在显式单提交者 ring（`MultiIssuers=false`）上，应从固定于 OS 线程的 ring 所有者调用 `Cancel` / `Unsubscribe`，并将其与提交、`Wait`、`WaitDirect`、`WaitExtended`、`Stop` 以及 `ResizeRings` 串行化。默认 `MultiIssuers` ring 通过共享提交路径串行化取消 SQE。
 
 每个已入队的取消 CQE 都应交给同一订阅的 `HandleCQE` 或其扩展处理器，即使已到达 `SubscriptionStopped` 或触发 `OnStop`。提交失败或未执行新提交的调用不会产生新的取消 CQE 处理义务。订阅拥有两个上下文，只有在处理完原请求的终态 CQE、完成取消分派且取消提交过程结束后，才将原上下文归还池。不要手动归还这些上下文。[接收示例](./examples/multishot_test.go)展示了自然完成和由处理器请求的取消。
 
