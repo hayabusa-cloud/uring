@@ -262,8 +262,10 @@ func TestListenerAutomaticRouting(t *testing.T) {
 	ring := newTestRing(t, func(o *uring.Options) { o.NotifySucceed = true })
 	manager := uring.NewListenerManager(ring, uring.NewContextPools(2))
 	var ops [2]*uring.ListenerOp
+	var handlers [2]automaticListenerHandler
 	for i := range ops {
-		op, err := manager.ListenTCP4(&net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)}, 16, &automaticListenerHandler{stop: 1})
+		handlers[i].stop = 1
+		op, err := manager.ListenTCP4(&net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)}, 16, &handlers[i])
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -283,10 +285,28 @@ func TestListenerAutomaticRouting(t *testing.T) {
 			t.Fatalf("owned CQE: handled=%v err=%v", ok, err)
 		}
 	}
-	if err := ring.Nop(uring.ForFD(-1)); err != nil {
+	// After setup stops, the same context can carry a non-listener completion.
+	ext, fd := ops[0].Ext(), ops[0].FD()
+	if err := ring.Nop(uring.PackExtended(ext)); err != nil {
 		t.Fatal(err)
 	}
 	cqe := nextListenerCQE(t, ring)
+	if cqe.Op() != uring.IORING_OP_NOP || cqe.Res != 0 || !cqe.Extended() || cqe.ExtSQE() != ext {
+		t.Fatalf("unexpected extended NOP completion: %+v", cqe)
+	}
+	if ok, err := ops[0].HandleCQE(cqe); ok || err != nil {
+		t.Fatalf("extended NOP: handled=%v err=%v", ok, err)
+	}
+	if ops[0].Ext() != ext || ops[0].FD() != fd {
+		t.Fatal("extended NOP changed listener ownership")
+	}
+	if handlers[0].calls != [3]int{1, 0, 0} || handlers[0].err != nil {
+		t.Fatalf("extended NOP invoked listener callbacks: calls=%v err=%v", handlers[0].calls, handlers[0].err)
+	}
+	if err := ring.Nop(uring.ForFD(-1)); err != nil {
+		t.Fatal(err)
+	}
+	cqe = nextListenerCQE(t, ring)
 	for _, op := range ops {
 		if ok, err := op.HandleCQE(cqe); ok || err != nil {
 			t.Fatalf("NOP: handled=%v err=%v", ok, err)
