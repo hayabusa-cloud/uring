@@ -8,7 +8,6 @@ package examples_test
 
 import (
 	"bytes"
-	"errors"
 	"testing"
 	"time"
 
@@ -93,7 +92,7 @@ func TestWriteFixedOperation(t *testing.T) {
 	deadline := time.Now().Add(3 * time.Second)
 	for {
 		n, err := ring.Wait(cqes[:])
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+		if err != nil && !iox.IsWouldBlock(err) {
 			t.Fatalf("Wait: %v", err)
 		}
 		if n > 0 {
@@ -157,7 +156,7 @@ func TestReadFixedOperation(t *testing.T) {
 	deadline := time.Now().Add(3 * time.Second)
 	for {
 		n, err := ring.Wait(cqes[:])
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+		if err != nil && !iox.IsWouldBlock(err) {
 			t.Fatalf("Wait: %v", err)
 		}
 		if n > 0 {

@@ -45,7 +45,7 @@ Debian 13 稳定版默认提供的内核为 6.12，`trixie-backports` 软件源�
 
 ### 常见问题排查
 
-Ring 创建可能返回 `ENOMEM`、`EPERM` 或 `ENOSYS`，分别对应 memlock 上限、sysctl 配置或内核支持等问题。容器运行时默认会阻止 `io_uring` 系统调用。诊断与解决方法见 [SETUP.md](./SETUP.md)。
+Ring 创建可能返回 `ENOMEM`、`EPERM` 或 `ENOSYS`，分别对应 memlock 上限、sysctl 配置或内核支持等问题。[Docker 的默认 seccomp 配置](https://docs.docker.com/engine/security/seccomp/) 会阻止 `io_uring` 系统调用。诊断与解决方法见 [SETUP.md](./SETUP.md)。
 
 ## 围绕 `code.hybscloud.com/uring` 边界的代理编码
 
@@ -55,62 +55,55 @@ Ring 创建可能返回 `ENOMEM`、`EPERM` 或 `ENOSYS`，分别对应 memlock �
 
 ## Ring 生命周期
 
-`New` 返回一个未启动的 ring，并立即构建上下文池；提交操作前须先调用 `Start`，由它注册 ring 资源并启用 ring。下面的示例提交一次文件读取，等待匹配的 CQE，并使用 `iox.Classify` 保持 `ErrWouldBlock` 的“暂无进展”语义，而不是把它当作失败处理。
+`New` 返回尚未启动的 ring，并立即构建上下文池。在提交操作前调用 `Start`，以注册资源并启用 ring。下面的示例将一次读取的结果写入 ring 所有的注册内存，其地址在 `Stop` 前保持稳定。完成后先处理读取的数据，再复用缓冲区。`iox.IsWouldBlock` 表示当前没有进展；调用方使用 `iox.Backoff` 等待，兼顾 CPU 效率。
 
 ```go
 ring, err := uring.New(func(o *uring.Options) {
-    o.Entries = uring.EntriesMedium
-    o.NotifySucceed = true
+	o.Entries = uring.EntriesMedium
+	o.NotifySucceed = true
 })
 if err != nil {
-    return err
+	return err
 }
 
 if err := ring.Start(); err != nil {
-    return err
+	return err
 }
 defer ring.Stop()
 
-fd := iofd.NewFD(int(file.Fd()))
-buf := make([]byte, 4096)
+fd := iofd.FD(file.Fd()) // 借用的 FD；file 保留关闭责任。
+buf := ring.RegisteredBuffer(0)
 ctx := uring.PackDirect(uring.IORING_OP_READ, 0, 0, 0).WithFD(fd)
 if err := ring.Read(ctx, buf); err != nil {
-    return err
+	return err
 }
 
-cqes := make([]uring.CQEView, 64)
+var cqes [1]uring.CQEView // Only one request is outstanding.
 var backoff iox.Backoff
-
 for {
-    n, err := ring.Wait(cqes)
-    switch iox.Classify(err) {
-    case iox.OutcomeWouldBlock:
-        backoff.Wait()
-        continue
-    case iox.OutcomeFailure:
-        return err
-    }
-    if n == 0 {
-        backoff.Wait()
-        continue
-    }
+	n, err := ring.Wait(cqes[:])
+	if err != nil && !iox.IsWouldBlock(err) {
+		return err
+	}
+	if n == 0 {
+		backoff.Wait()
+		continue
+	}
 
-    backoff.Reset()
-    for i := range n {
-        cqe := cqes[i]
-        if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
-            continue
-        }
-        if err := cqe.Err(); err != nil {
-            return fmt.Errorf("uring read failed: %w", err)
-        }
-        handle(buf[:int(cqe.Res)])
-        return nil
-    }
+	backoff.Reset()
+	cqe := cqes[0]
+	if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
+		return fmt.Errorf("unexpected completion: op=%d fd=%d", cqe.Op(), cqe.FD())
+	}
+	if err := cqe.Err(); err != nil {
+		return fmt.Errorf("uring read failed: %w", err)
+	}
+	handle(buf[:int(cqe.Res)])
+	return nil
 }
 ```
 
-`Wait` 先刷新待提交项，再回收完成事件。在单提交者 ring 上，它还会在 SQ 排空后向内核发起进入调用，以推进延迟任务执行；调用方需保证 `Wait`、`WaitDirect` 和 `WaitExtended` 与其他提交状态操作串行执行。当 `Wait` 返回的 `err` 经 `iox.Classify(err)` 分类为 `iox.OutcomeWouldBlock` 时，表示当前边界上没有可观察到的完成事件。
+`Wait` 先刷新待提交的 SQE，再回收完成事件。对于单一提交者 ring，它还会执行 kernel enter，使 SQ 排空后的延迟任务继续推进；调用方必须将 `Wait`、`WaitDirect`、`WaitExtended` 与其他提交状态操作串行执行。`iox.IsWouldBlock(err)` 表示当前没有可观察的完成事件。
 
 `Start` 与 `Stop` 是 ring 生命周期的配对操作。`Stop` 幂等但不可逆，调用后 ring 将永久不可用；调用 `Stop` 前必须确保所有进行中的操作已完成、未处理的 CQE 已回收、活跃的 multishot 订阅已终止。
 
@@ -171,9 +164,9 @@ for {
 `SQEContext` 是本包的核心标识令牌。Direct 模式将 opcode、SQE flags、buffer-group ID 与文件描述符打包为一个 64 位值。
 
 ```go
-sqeCtx := uring.ForFD(fd).
-    WithOp(uring.IORING_OP_RECV).
-    WithBufGroup(groupID)
+sqeCtx := uring.ForFD(int32(fd)).
+	WithOp(uring.IORING_OP_RECV).
+	WithBufGroup(groupID)
 ```
 
 上下文有三种模式：
@@ -205,40 +198,29 @@ ring.PutExtSQE(ext)
 
 ### 通过 `CQEView` 分发完成事件
 
-`uring` 没有独立的 completion-context 类型，完成分发统一通过 `CQEView` 进行。需要原始提交令牌时调用 `cqe.Context()`。
+没有独立的完成上下文类型。使用 `cqe.Context()` 获取原始提交标识，使用 `cqe.Err()` 获取请求结果，并检查标志以判断缓冲区状态和生命周期。`Wait` 返回的错误描述回收过程，而非单个请求。必须分发返回批次中的每个 CQE，包括失败的请求；提前返回会丢弃已从 ring 中回收的完成记录。
 
 ```go
-cqes := make([]uring.CQEView, 64)
-
-n, err := ring.Wait(cqes)
-switch iox.Classify(err) {
-case iox.OutcomeWouldBlock:
-    return iox.ErrWouldBlock
-case iox.OutcomeFailure:
-    return err
+var cqes [64]uring.CQEView
+n, err := ring.Wait(cqes[:])
+if err != nil {
+	return err
 }
 if n == 0 {
-    return iox.ErrWouldBlock
+	return iox.ErrWouldBlock
 }
 
-for i := 0; i < n; i++ {
-    cqe := cqes[i]
-    if err := cqe.Err(); err != nil {
-        return fmt.Errorf("completion failed: op=%d fd=%d: %w", cqe.Op(), cqe.FD(), err)
-    }
-
-    switch cqe.Op() {
-    case uring.IORING_OP_ACCEPT:
-        fmt.Printf("accepted fd=%d\n", cqe.Res)
-    case uring.IORING_OP_RECV:
-        if cqe.HasBuffer() {
-            fmt.Printf("buffer id=%d\n", cqe.BufID())
-        }
-        if cqe.Extended() {
-            seq := uring.CtxV1Of(cqe.ExtSQE()).Val1
-            fmt.Printf("request seq=%d\n", seq)
-        }
-    }
+for i := range n {
+	cqe := cqes[i]
+	// Res < 0 encodes -errno; flags describe buffers and request lifetime.
+	if err := cqe.Err(); err != nil {
+		fmt.Printf("completion failed: op=%d fd=%d: %v\n", cqe.Op(), cqe.FD(), err)
+	}
+	if cqe.HasBuffer() {
+		fmt.Printf("buffer id=%d\n", cqe.BufID())
+	}
+	// Route every CQE, including failures, so its owner can release resources.
+	dispatch(ring, cqe)
 }
 ```
 
@@ -257,7 +239,7 @@ for i := 0; i < n; i++ {
 ```go
 opts := uring.OptionsForSystem(uring.MachineMemory4GB)
 ring, err := uring.New(func(o *uring.Options) {
-    *o = opts
+	*o = opts
 })
 ```
 
@@ -272,24 +254,24 @@ fmt.Printf("buffer tiers=%+v scale=%d\n", cfg, scale)
 
 ```go
 const (
-    groupID = 60000
-    entries = 8
-    bufSize = 4096
+	groupID = 60000
+	entries = 8
+	bufSize = 4096
 )
 
 backing := make([]byte, entries*bufSize)
 bufRing, err := ring.RegisterBufRingIncremental(entries, groupID)
 if err != nil {
-    return err
+	return err
 }
 for i := range entries {
-    buf := backing[i*bufSize : (i+1)*bufSize]
-    if err := bufRing.Add(buf, uint16(i), i); err != nil {
-        return err
-    }
+	buf := backing[i*bufSize : (i+1)*bufSize]
+	if err := bufRing.Add(buf, uint16(i), i); err != nil {
+		return err
+	}
 }
 if err := bufRing.Advance(entries); err != nil {
-    return err
+	return err
 }
 
 pool := uring.NewContextPools(entries)
@@ -306,10 +288,10 @@ Fixed-buffer I/O 通过索引使用注册缓冲区。返回的切片属于 ring 
 buf := ring.RegisteredBuffer(0)
 copy(buf, payload)
 
-fd := iofd.NewFD(int(file.Fd()))
+fd := iofd.FD(file.Fd()) // 借用的 FD；file 保留关闭责任。
 ctx := uring.PackDirect(uring.IORING_OP_WRITE_FIXED, 0, 0, 0).WithFD(fd)
 if err := ring.WriteFixed(ctx, 0, len(payload)); err != nil {
-    return err
+	return err
 }
 ```
 
@@ -319,12 +301,12 @@ Socket 接收若要使用内核缓冲区选择，传入 `nil` 作为接收缓冲
 recvCtx := uring.PackDirect(uring.IORING_OP_RECV, 0, 0, 0)
 
 if err := ring.Receive(recvCtx, &socketFD, nil, uring.WithReadBufferSize(uring.BufferSizeSmall)); err != nil {
-    return err
+	return err
 }
 
 // 稍后，在 Wait 返回匹配 CQE 后：
 if cqe.HasBuffer() {
-    fmt.Printf("kernel selected group=%d id=%d\n", cqe.BufGroup(), cqe.BufID())
+	fmt.Printf("kernel selected group=%d id=%d\n", cqe.BufGroup(), cqe.BufID())
 }
 ```
 
@@ -332,16 +314,16 @@ if cqe.HasBuffer() {
 
 ```go
 if err := ring.ReceiveBundle(recvCtx, &socketFD, uring.WithReadBufferSize(uring.BufferSizeSmall)); err != nil {
-    return err
+	return err
 }
 
 if it, ok := ring.BundleIterator(cqe, cqe.BufGroup()); ok {
-    for buf := range it.All() {
-        handle(buf)
-    }
-    if err := it.Recycle(ring); err != nil {
-        return err
-    }
+	for buf := range it.All() {
+		handle(buf)
+	}
+	if err := it.Recycle(ring); err != nil {
+		return err
+	}
 }
 ```
 
@@ -351,7 +333,7 @@ if it, ok := ring.BundleIterator(cqe, cqe.BufGroup()); ok {
 
 `AcceptMultishot`、`ReceiveMultishot`、`SubmitAcceptMultishot`、`SubmitAcceptDirectMultishot`、`SubmitReceiveMultishot` 和 `SubmitReceiveBundleMultishot` 用于提交 multishot socket 操作。
 
-CQE 路由策略由调用方自行实现，不在本包范围内。监听器的配置流程通过 `DecodeListenerCQE`、`PrepareListenerBind`、`PrepareListenerListen` 和 `SetListenerReady` 逐步推进，由调用方决定完成事件的分发方式与停止时机。
+CQE 路由仍由调用方负责。`ListenerOp.HandleCQE` 推进 SOCKET → BIND → LISTEN，并调用各阶段的回调。`DecodeListenerCQE`、`PrepareListenerBind`、`PrepareListenerListen` 和 `SetListenerReady` 仍可用于手动推进。参见[监听器指南](agents/recipes/listener.md)。
 
 ## 架构实现
 
@@ -383,33 +365,34 @@ CQE 路由策略由调用方自行实现，不在本包范围内。监听器的�
 
 ```go
 func runLoop(ring *uring.Uring, stop <-chan struct{}) error {
-    cqes := make([]uring.CQEView, 64)
-    var backoff iox.Backoff
-    for {
-        select {
-        case <-stop:
-            return nil
-        default:
-        }
+	cqes := make([]uring.CQEView, 64)
+	var backoff iox.Backoff
+	for {
+		select {
+		case <-stop:
+			// The caller must still cancel and drain live requests before ring.Stop.
+			return nil
+		default:
+		}
 
-        n, err := ring.Wait(cqes)
-        switch iox.Classify(err) {
-        case iox.OutcomeWouldBlock:
-            backoff.Wait()
-            continue
-        case iox.OutcomeFailure:
-            return err
-        }
-        if n == 0 {
-            backoff.Wait()
-            continue
-        }
+		n, err := ring.Wait(cqes)
+		switch iox.Classify(err) {
+		case iox.OutcomeWouldBlock:
+			backoff.Wait()
+			continue
+		case iox.OutcomeFailure:
+			return err
+		}
+		if n == 0 {
+			backoff.Wait()
+			continue
+		}
 
-        backoff.Reset()
-        for i := range n {
-            dispatch(ring, cqes[i])
-        }
-    }
+		backoff.Reset()
+		for i := range n {
+			dispatch(ring, cqes[i])
+		}
+	}
 }
 ```
 
@@ -421,32 +404,32 @@ Multishot 操作产生 CQE 流，直到内核发送最终 CQE（不含 `IORING_C
 
 ```go
 handler := uring.NewMultishotSubscriber().
-    OnStep(func(step uring.MultishotStep) uring.MultishotAction {
-        if step.Err != nil {
-            return uring.MultishotStop
-        }
-        connFD := iofd.FD(step.CQE.Res)
-        registerConnection(connFD)
-        return uring.MultishotContinue
-    }).
-    OnStop(func(err error, cancelled bool) {
-        if !cancelled {
-            resubscribeAccept()
-        }
-    })
+	OnStep(func(step uring.MultishotStep) uring.MultishotAction {
+		if step.Err != nil {
+			return uring.MultishotStop
+		}
+		connFD := iofd.FD(step.CQE.Res)
+		registerConnection(connFD)
+		return uring.MultishotContinue
+	}).
+	OnStop(func(err error, cancelled bool) {
+		if !cancelled {
+			resubscribeAccept()
+		}
+	})
 
 sub, err := ring.AcceptMultishot(acceptCtx, handler.Handler())
 if err != nil {
-    return err
+	return err
 }
 
 // 在同一个串行化完成循环中 dispatch。若调用方在该循环之后保留复制 CQE，
 // 调用方必须维护自己的 route state。
 for i := range n {
-    if sub.HandleCQE(cqes[i]) {
-        continue
-    }
-    dispatch(ring, cqes[i])
+	if sub.HandleCQE(cqes[i]) {
+		continue
+	}
+	dispatch(ring, cqes[i])
 }
 ```
 
@@ -496,17 +479,17 @@ ring.PutExtSQE(ext)
 `LinkTimeout` 通过 `IOSQE_IO_LINK` 链将截止时间附加到前一个 SQE 上。到期时会尝试取消关联操作，但该操作可能已经完成。必须检查两条 CQE 的结果；超时本身不能证明操作已被取消。
 
 ```go
-recvCtx := uring.ForFD(fd).
-    WithOp(uring.IORING_OP_RECV).
-    WithBufGroup(group)
+recvCtx := uring.ForFD(int32(fd)).
+	WithOp(uring.IORING_OP_RECV).
+	WithBufGroup(group)
 
 if err := ring.Receive(recvCtx, &fd, nil, uring.WithFlags(uring.IOSQE_IO_LINK)); err != nil {
-    return err
+	return err
 }
 
 timeoutCtx := uring.PackDirect(uring.IORING_OP_LINK_TIMEOUT, 0, 0, 0)
 if err := ring.LinkTimeout(timeoutCtx, 5*time.Second); err != nil {
-    return err
+	return err
 }
 ```
 
@@ -523,32 +506,23 @@ if err := ring.LinkTimeout(timeoutCtx, 5*time.Second); err != nil {
 
 ### TCP Echo 服务器
 
-使用 `ListenerManager` 可自动完成 socket → bind → listen 链路的准备工作。监听器处理器中返回布尔值的回调是控制流钩子：返回 `true` 推进到下一配置阶段，返回 `false` 则在进入该阶段前中止。监听器就绪后，在连接 FD 上启动 multishot accept 和 multishot receive。
+`ListenerManager` 提交最初的 SOCKET 请求。将配置阶段的每个 CQE 交给 `listenerOp.HandleCQE`，即可自动调用回调并提交 BIND 和 LISTEN。如果返回 `iox.ErrWouldBlock`，应先驱动 ring，再通过 `ring.SubmitExtended(uring.PackExtended(listenerOp.Ext()))` 重试已准备好的 SQE；不要重复处理该 CQE。收到 `OnListening` 的成功通知后再开始接受连接。
 
 ```go
-pool := uring.NewContextPools(32)
-manager := uring.NewListenerManager(ring, pool)
-
-listenerOp, err := manager.ListenTCP4(addr, 128, listenerHandler)
-if err != nil {
-    return err
-}
-
+// OnListening has reported successful setup for listenerOp.
 acceptSub, err := listenerOp.AcceptMultishot(acceptHandler)
 if err != nil {
-    return err
+	return err
 }
-defer acceptSub.Cancel()
 
-recvCtx := uring.ForFD(clientFD).WithBufGroup(readGroup)
+recvCtx := uring.ForFD(int32(clientFD)).WithBufGroup(readGroup)
 recvSub, err := ring.ReceiveMultishot(recvCtx, recvHandler)
 if err != nil {
-    return err
+	return err
 }
-defer recvSub.Cancel()
 ```
 
-`listener_example_test.go` 演示监听器创建与 multishot accept；`examples/multishot_test.go` 演示处理器侧的 multishot receive CQE 处理流程；`examples/echo_test.go` 则给出完整的 loopback echo 示例。
+停止订阅时调用 `Cancel`，然后继续分发，直到处理完其终端 CQE，以及已提交的取消请求对应的 CQE。两个订阅都必须完成收尾，才能关闭其描述符或停止 ring。[监听器示例](./listener_example_test.go) 展示完整的创建与关闭流程；[multishot 示例](./examples/multishot_test.go) 和 [echo 示例](./examples/echo_test.go) 展示连接处理。
 
 ### TCP 客户端
 
@@ -557,28 +531,35 @@ defer recvSub.Cancel()
 ```go
 clientCtx := uring.PackDirect(uring.IORING_OP_SOCKET, 0, 0, 0)
 if err := ring.TCP4Socket(clientCtx); err != nil {
-    return err
+	return err
 }
 
+// After Wait returns the matching SOCKET CQE:
+if err := socketCQE.Err(); err != nil {
+	return err
+}
 clientFD := iofd.NewFD(int(socketCQE.Res))
 
 connectCtx := uring.PackDirect(uring.IORING_OP_CONNECT, 0, 0, int32(clientFD))
 if err := ring.Connect(connectCtx, remoteAddr); err != nil {
-    return err
+	return err
 }
 
+// Wait for a successful CONNECT CQE before sending.
 sendCtx := uring.PackDirect(uring.IORING_OP_SEND, 0, 0, int32(clientFD))
 if err := ring.Send(sendCtx, &clientFD, payload); err != nil {
-    return err
+	return err
 }
 
+// Check the SEND CQE and retry only any unsent suffix.
 recvCtx := uring.PackDirect(uring.IORING_OP_RECV, 0, 0, int32(clientFD))
 if err := ring.Receive(recvCtx, &clientFD, buf); err != nil {
-    return err
+	return err
 }
+// Wait for the RECV CQE before reading or reusing buf.
 ```
 
-每次提交后，可复用“Ring 生命周期”一节中的 `Wait` 循环来等待完成事件。包级 `socket_integration_linux_test.go` 覆盖了 connect/send 流程。
+每次提交后，使用 ring 生命周期一节中的 `Wait` 循环观察对应的完成事件，再执行依赖它的下一步操作。保持数据有效直到完成，短发送后只重试尚未发送的后缀。[socket_test.go](./examples/socket_test.go) 展示完整的客户端流程；[echo_test.go](./examples/echo_test.go) 进一步展示接收与回复。
 
 ## 零拷贝接收（ZCRX）
 
@@ -613,29 +594,32 @@ Idle → Active → Stopping → Retiring → Stopped
 
 ## 示例
 
-`uring/examples/` 下的示例测试覆盖了各主要 API 的用法：
+`examples/` 中的可运行测试通过直接调用公开 API，展示初始化 → 提交 → 完成 → 清理。建议从上下文和文件 I/O 开始，再学习套接字与 multishot 示例中的所有权规则。
 
-- `multishot_test.go`，multishot accept、multishot receive 及订阅停止行为
-- `file_io_test.go`，基本文件读写与批量提交
-- `fixed_buffers_test.go`，注册缓冲区与固定缓冲区 I/O
-- `vectored_io_test.go`，向量化读写操作
-- `splice_tee_test.go`，splice 与 tee 零拷贝数据传输
-- `zerocopy_test.go`，零拷贝发送路径与完成跟踪
-- `poll_test.go`，基于 poll 的就绪通知
-- `buffer_ring_test.go`，缓冲区环供给与多尺寸缓冲区组
-- `context_test.go`，`SQEContext` 的 Direct、Indirect、Extended 模式及 `CQEView` 访问
-- `echo_test.go`，TCP echo 服务器与 UDP ping-pong 流程
-- `timeout_linux_test.go`，超时与链式超时操作
+- [context_test.go](./examples/context_test.go)：Direct、Indirect、Extended 上下文，完成解码与借用上下文归还
+- [completion_test.go](./examples/completion_test.go)：区分提交错误与完成错误、关联请求标识，以及排空包含成功和失败结果的批次
+- [file_io_test.go](./examples/file_io_test.go)：文件读写、分块读取至 EOF 与批量提交
+- [file_lifecycle_test.go](./examples/file_lifecycle_test.go)：通过完成事件依次打开、写入、同步和关闭文件
+- [vectored_io_test.go](./examples/vectored_io_test.go)：分散读取与聚集写入
+- [fixed_buffers_test.go](./examples/fixed_buffers_test.go)：注册缓冲区与 fixed-buffer I/O
+- [buffer_ring_test.go](./examples/buffer_ring_test.go)：bundle 接收、增量接收与缓冲区回收
+- [socket_test.go](./examples/socket_test.go)：客户端套接字创建、连接完成，以及继续发送剩余字节
+- [echo_test.go](./examples/echo_test.go)：TCP echo、流式 I/O 的部分完成与 UDP 数据报
+- [multishot_test.go](./examples/multishot_test.go)：重复的 accept/receive 完成事件与取消后的排空
+- [zerocopy_test.go](./examples/zerocopy_test.go)：零拷贝发送、自动 multicast 选择，以及独立的结果与释放跟踪
+- [poll_test.go](./examples/poll_test.go)：就绪状态观察与 poll 取消
+- [timeout_linux_test.go](./examples/timeout_linux_test.go)：到期、取消与链接超时
+- [splice_tee_test.go](./examples/splice_tee_test.go)：由完成事件驱动的 splice 与 tee 传输
 
-包级 `listener_example_test.go` 演示监听器创建与 multishot accept，`socket_integration_linux_test.go` 演示 TCP 客户端的 connect/send 流程。
+包根目录下的 [listener_example_test.go](./listener_example_test.go) 展示自动 SOCKET → BIND → LISTEN 初始化与 multishot accept；[socket_integration_linux_test.go](./socket_integration_linux_test.go) 展示 TCP connect/send。
 
 ## 运行注意事项
 
-- 若需为每个成功操作生成可见的 CQE，启用 `NotifySucceed`。
+- 启用 `NotifySucceed` 可默认保留写入类操作成功时的 CQE。显式指定的 `IOSQE_CQE_SKIP_SUCCESS` 标志仍然有效。
 - `ring.Features` 报告实际 SQ/CQ 条目数、SQE 槽宽以及本包解析 `user_data` 的字节序。
 - 普通 Go 执行和并发提交状态调用应保留默认的任务可迁移 `MultiIssuers=true` 配置（`COOP_TASKRUN`）。仅当所有者在 `New` 前调用 `runtime.LockOSThread`、持续固定到 `Stop`，并串行化 `submit`、`Wait`、`WaitDirect`、`WaitExtended`、`Stop` 与 `ResizeRings` 时，才设置 `MultiIssuers=false`；该显式快速路径请求 `SINGLE_ISSUER` + `DEFER_TASKRUN`。
 - `EpollWait` 要求 `timeout` 为 `0`；如需设置截止时间，使用 `LinkTimeout`。
-- 借用式完成目标与池化上下文应及时归还。
+- 所有请求完成处理和借用访问结束后，才能归还池化上下文。
 - `ListenerOp.Close` 会立即关闭监听 FD。若仍有设置 CQE 待处理，需先回收该 CQE，再调用 `Close` 将借用的 `ExtSQE` 归还池中。
 
 ## 平台支持

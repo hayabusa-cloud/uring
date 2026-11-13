@@ -8,7 +8,6 @@ package examples_test
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -60,7 +59,7 @@ func TestFileWriteRead(t *testing.T) {
 	deadline := time.Now().Add(3 * time.Second)
 	for {
 		n, err := ring.Wait(cqes[:])
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+		if err != nil && !iox.IsWouldBlock(err) {
 			t.Fatalf("Wait: %v", err)
 		}
 		if n > 0 {
@@ -85,7 +84,7 @@ func TestFileWriteRead(t *testing.T) {
 	deadline = time.Now().Add(3 * time.Second)
 	for {
 		n, err := ring.Wait(cqes[:])
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+		if err != nil && !iox.IsWouldBlock(err) {
 			t.Fatalf("Wait: %v", err)
 		}
 		if n > 0 {
@@ -103,6 +102,91 @@ func TestFileWriteRead(t *testing.T) {
 	}
 	if !bytes.Equal(buf, payload) {
 		t.Fatalf("read %q, want %q", buf, payload)
+	}
+}
+
+// Read a regular file in small chunks, using each CQE to decide what comes next:
+//
+//	CQE.Res < 0   operation failed
+//	CQE.Res > 0   consume these bytes and advance the file offset
+//	CQE.Res = 0   EOF, when the requested buffer is nonempty
+//
+// A short read is still progress; submit another read to observe EOF. Explicit
+// offsets leave the file's shared position unchanged. WithOffset(-1) instead
+// uses and advances that shared position, so such operations need serialization.
+func TestFileReadUntilEOF(t *testing.T) {
+	ring, err := uring.New(func(opt *uring.Options) {
+		opt.Entries = uring.EntriesNano
+		opt.LockedBufferMem = uring.BufferSizeLarge
+		opt.ReadBufferNum = 64
+		opt.NotifySucceed = true
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := ring.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() {
+		if err := ring.Stop(); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	}()
+
+	const content = "A file read in small chunks."
+	f := tempFile(t)
+	// WriteAt prepares the fixture without advancing its shared file position.
+	if _, err := f.WriteAt([]byte(content), 0); err != nil {
+		t.Fatalf("prepare file: %v", err)
+	}
+	ctx := uring.ForFD(int32(f.Fd()))
+	var buf [8]byte
+	// Pin once so the kernel's buffer address stays valid between submission and
+	// completion, even if the goroutine's stack moves while waiting.
+	var pin runtime.Pinner
+	pin.Pin(&buf[0])
+	defer pin.Unpin() // All reads have completed before the buffer is unpinned.
+	var got [len(content)]byte
+	var cqes [1]uring.CQEView
+	var backoff iox.Backoff
+	offset := 0
+	for {
+		// The default offset is zero; supply the next position on every read.
+		if err := ring.Read(ctx, buf[:], uring.WithOffset(int64(offset))); err != nil {
+			t.Fatalf("Read: %v", err)
+		}
+		deadline := time.Now().Add(exampleTimeout)
+		for {
+			n, err := ring.Wait(cqes[:])
+			if err != nil && !iox.IsWouldBlock(err) {
+				t.Fatalf("Wait: %v", err)
+			}
+			if n > 0 {
+				backoff.Reset()
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("timed out waiting for read completion")
+			}
+			backoff.Wait()
+		}
+		cqe := cqes[0]
+		if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != iofd.FD(ctx.FD()) || cqe.Err() != nil {
+			t.Fatalf("read completion: opcode=%d fd=%d result=%d error=%v", cqe.Op(), cqe.FD(), cqe.Res, cqe.Err())
+		}
+		n := int(cqe.Res)
+		if n == 0 {
+			break // EOF is a successful zero-byte read, not an empty CQ.
+		}
+		if n > len(buf) || n > len(got)-offset {
+			t.Fatalf("unexpected read length %d at offset %d", n, offset)
+		}
+		// Consume only the reported bytes before reusing buf for another request.
+		copy(got[offset:], buf[:n])
+		offset += n
+	}
+	if offset != len(content) || string(got[:offset]) != content {
+		t.Fatalf("read %q (%d bytes), want %q", string(got[:offset]), offset, content)
 	}
 }
 
@@ -145,7 +229,7 @@ func TestBatchedFileOps(t *testing.T) {
 	deadline := time.Now().Add(3 * time.Second)
 	for completed < len(files) {
 		n, err := ring.Wait(cqes[:])
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+		if err != nil && !iox.IsWouldBlock(err) {
 			t.Fatalf("Wait: %v", err)
 		}
 		if n == 0 {
@@ -215,7 +299,7 @@ func TestBatchedNops(t *testing.T) {
 		for submitted < count {
 			ctx := uring.PackDirect(uring.IORING_OP_NOP, 0, uint16(submitted), 0)
 			err := ring.Nop(ctx)
-			if errors.Is(err, iox.ErrWouldBlock) {
+			if iox.IsWouldBlock(err) {
 				break // Reap/submit progress before retrying this same ID.
 			}
 			if err != nil {
@@ -224,7 +308,7 @@ func TestBatchedNops(t *testing.T) {
 			submitted++
 		}
 		n, err := ring.Wait(cqes[:])
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
+		if err != nil && !iox.IsWouldBlock(err) {
 			t.Fatalf("Wait: %v", err)
 		}
 		if n == 0 {

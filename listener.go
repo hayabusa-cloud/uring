@@ -21,21 +21,22 @@ import (
 
 // Listener state and context for compact SQE/CQE encoding.
 
-// ListenerState tracks which stage of socket→bind→listen has completed.
+// ListenerState identifies the prepared socket→bind→listen stage or final state.
 type ListenerState uint8
 
 const (
 	ListenerStateInit   ListenerState = iota // Initial state
-	ListenerStateSocket                      // Socket creation completed
-	ListenerStateBind                        // Bind completed
-	ListenerStateListen                      // Listen completed
+	ListenerStateSocket                      // Socket creation prepared
+	ListenerStateBind                        // Bind prepared
+	ListenerStateListen                      // Listen prepared
 	ListenerStateReady                       // Listener is ready for accept
 	ListenerStateFailed                      // Operation failed
 )
 
 // ListenerHandler receives completion events during listener setup.
-// The caller invokes these callbacks and advances setup with the Prepare helpers.
-// A true result permits the next phase; false tells the caller to abort setup.
+// [ListenerOp.HandleCQE] invokes callbacks and submits the next stage.
+// Alternatively, the caller can use [DecodeListenerCQE] and the Prepare helpers.
+// A false callback result stops setup; the caller still owns Close.
 type ListenerHandler interface {
 	// OnSocketCreated reports that socket creation succeeded. Return true to
 	// continue listener setup or false to abort it.
@@ -79,8 +80,8 @@ var _ [40 - unsafe.Sizeof(listenerCtx{})]struct{}
 // The caller decides what happens next based on this value.
 type ListenerStep struct {
 	Op      uint8         // Kernel op that completed (IORING_OP_SOCKET, _BIND, _LISTEN)
-	FD      iofd.FD       // Socket FD (meaningful after SOCKET completes)
-	State   ListenerState // State at the time of this completion
+	FD      iofd.FD       // Successful SOCKET result, or request FD for BIND/LISTEN
+	State   ListenerState // Prepared stage, or ListenerStateFailed on kernel error
 	Err     error         // Non-nil if the operation failed
 	Ext     *ExtSQE       // The ExtSQE carrying this listener context
 	Handler ListenerHandler
@@ -89,6 +90,8 @@ type ListenerStep struct {
 // DecodeListenerCQE decodes a CQE into a ListenerStep.
 // Returns (step, true) if the CQE belongs to a listener operation,
 // or (zero, false) if it does not.
+// Decoding retires that setup request. Consume each CQE exactly once, through
+// either DecodeListenerCQE or [ListenerOp.HandleCQE].
 func DecodeListenerCQE(cqe CQEView) (ListenerStep, bool) {
 	if !cqe.Extended() {
 		return ListenerStep{}, false
@@ -193,8 +196,9 @@ func SetListenerReady(ext *ExtSQE) {
 
 // ListenerManager provides convenience methods for starting async listener
 // creation. It prepares the initial SOCKET SQE and submits it.
-// The caller is responsible for CQE routing and chain advancement
-// (bind→listen) using DecodeListenerCQE + Prepare helpers.
+// Route completions to [ListenerOp.HandleCQE] to advance bind→listen, or use
+// [DecodeListenerCQE] and the Prepare helpers for manual advancement.
+// The caller owns polling, admission retry, and cleanup.
 type ListenerManager struct {
 	ring *Uring
 	pool *ContextPools
@@ -215,24 +219,43 @@ func (m *ListenerManager) Ring() *Uring { return m.ring }
 func (m *ListenerManager) Pool() *ContextPools { return m.pool }
 
 // ListenTCP4 prepares and submits the initial SOCKET for TCP IPv4.
-// The caller must decode subsequent CQEs via DecodeListenerCQE and
-// advance the chain with PrepareListenerBind/PrepareListenerListen.
+// A nil addr or empty IP binds the IPv4 wildcard; port zero lets the kernel choose.
+// The caller's address is not modified.
+// Dispatch completions through [ListenerOp.HandleCQE] to finish setup.
 func (m *ListenerManager) ListenTCP4(addr *net.TCPAddr, backlog int, handler ListenerHandler) (*ListenerOp, error) {
-	sa := sock.TCPAddrToSockaddr(addr)
+	var address net.TCPAddr
+	if addr != nil {
+		address = *addr
+	}
+	if len(address.IP) == 0 {
+		address.IP = net.IPv4zero
+	}
+	sa := sock.TCPAddrToSockaddr(&address)
 	return m.startSocket(AF_INET, SOCK_STREAM|SOCK_CLOEXEC, IPPROTO_TCP, sa, backlog, handler)
 }
 
 // ListenTCP6 prepares and submits the initial SOCKET for TCP IPv6.
+// A nil addr or empty IP binds the IPv6 wildcard; port zero lets the kernel choose.
+// An IPv4 address selects IPv4. The caller's address is not modified.
+// Dispatch completions through [ListenerOp.HandleCQE] to finish setup.
 func (m *ListenerManager) ListenTCP6(addr *net.TCPAddr, backlog int, handler ListenerHandler) (*ListenerOp, error) {
-	sa := sock.TCPAddrToSockaddr(addr)
+	var address net.TCPAddr
+	if addr != nil {
+		address = *addr
+	}
+	if len(address.IP) == 0 {
+		address.IP = net.IPv6zero
+	}
+	sa := sock.TCPAddrToSockaddr(&address)
 	domain := AF_INET6
-	if addr.IP.To4() != nil {
+	if address.IP.To4() != nil {
 		domain = AF_INET
 	}
 	return m.startSocket(domain, SOCK_STREAM|SOCK_CLOEXEC, IPPROTO_TCP, sa, backlog, handler)
 }
 
 // ListenUnix prepares and submits the initial SOCKET for Unix domain.
+// Dispatch completions through [ListenerOp.HandleCQE] to finish setup.
 func (m *ListenerManager) ListenUnix(addr *net.UnixAddr, backlog int, handler ListenerHandler) (*ListenerOp, error) {
 	sa := sock.UnixAddrToSockaddr(addr)
 	return m.startSocket(AF_LOCAL, SOCK_STREAM|SOCK_CLOEXEC, 0, sa, backlog, handler)
@@ -266,8 +289,7 @@ func (m *ListenerManager) startSocket(domain, sockType, proto int, sa Sockaddr, 
 }
 
 // ListenerOp is a handle to a listener creation operation.
-// The caller drives the setup state machine; ListenerOp holds the listener FD
-// and provides convenience methods around it.
+// It holds the listener FD and advances setup through HandleCQE when selected.
 type ListenerOp struct {
 	ring    *Uring
 	ext     *ExtSQE
@@ -284,15 +306,14 @@ func (op *ListenerOp) closeFD() {
 	}
 }
 
-// FD returns the listener socket file descriptor.
-// Returns -1 if the socket hasn't been created yet.
+// FD returns the listener socket FD, or -1 before creation or after Close.
 //
 //go:nosplit
 func (op *ListenerOp) FD() iofd.FD {
 	return iofd.FD(op.fd.Load())
 }
 
-// SetFD stores the socket FD obtained from SOCKET completion.
+// SetFD stores a successful SOCKET result, closing it if Close was already called.
 func (op *ListenerOp) SetFD(fd iofd.FD) {
 	op.fd.Store(int32(fd))
 	if op.closed.Load() {
@@ -300,9 +321,67 @@ func (op *ListenerOp) SetFD(fd iofd.FD) {
 	}
 }
 
-// Ext returns the ExtSQE for use with Prepare helpers and SubmitExtended.
+// Ext returns the borrowed setup context for Prepare helpers and SubmitExtended.
+// It returns nil after final Close.
 func (op *ListenerOp) Ext() *ExtSQE {
 	return op.ext
+}
+
+// HandleCQE consumes this listener's CQE, invokes its callback, and attempts
+// the next submission once:
+//
+//	SOCKET -> OnSocketCreated -> BIND -> OnBound -> LISTEN -> OnListening
+//
+// It returns false for unrelated CQEs. A true result reports CQE consumption;
+// OnListening reports readiness. Kernel failures go to OnError; the returned
+// error reports only the next submission's failure. On [iox.ErrWouldBlock],
+// the next SQE remains prepared: drive the ring, then retry
+// ring.SubmitExtended(PackExtended(op.Ext())). Never replay the CQE or callback.
+//
+// Caller must serialize dispatch, retry, and Close and consume each CQE exactly
+// once through this method or [DecodeListenerCQE]. Callbacks must not reenter
+// dispatch or change the prepared SQE. A false callback result or Close stops
+// advancement; the caller retains cleanup responsibility.
+//
+// After an earlier Close, this method drains pending setup CQEs without callbacks
+// and closes any late socket result. Call Close again after draining to release
+// the context. Drain all operations using the listener FD before final Close.
+func (op *ListenerOp) HandleCQE(cqe CQEView) (bool, error) {
+	if op.ext == nil || !cqe.Extended() || cqe.ExtSQE() != op.ext {
+		return false, nil
+	}
+	step, ok := DecodeListenerCQE(cqe)
+	if !ok {
+		return false, nil
+	}
+	if step.Op == IORING_OP_SOCKET && step.Err == nil {
+		op.SetFD(step.FD)
+	}
+	if op.closed.Load() {
+		return true, nil
+	}
+	if step.Err != nil {
+		asListenerCtx(step.Ext).Data.State = ListenerStateFailed
+		step.Handler.OnError(step.Op, step.Err)
+		return true, nil
+	}
+	switch step.Op {
+	case IORING_OP_SOCKET:
+		if !step.Handler.OnSocketCreated(step.FD) || op.closed.Load() {
+			return true, nil
+		}
+		PrepareListenerBind(step.Ext, step.FD)
+	case IORING_OP_BIND:
+		if !step.Handler.OnBound() || op.closed.Load() {
+			return true, nil
+		}
+		PrepareListenerListen(step.Ext, step.FD)
+	case IORING_OP_LISTEN:
+		SetListenerReady(step.Ext)
+		step.Handler.OnListening()
+		return true, nil
+	}
+	return true, op.ring.SubmitExtended(PackExtended(step.Ext))
 }
 
 // Close releases resources. If the listener has an open FD, it is closed.

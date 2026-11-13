@@ -45,7 +45,7 @@ Debian 13 ships kernel 6.12 in its stable track. The `trixie-backports` suite pr
 
 ### Troubleshooting
 
-Ring creation may return `ENOMEM`, `EPERM`, or `ENOSYS` depending on memlock limits, sysctl settings, or kernel support. Container runtimes block `io_uring` syscalls by default. See [SETUP.md](./SETUP.md) for diagnosis and resolution.
+Ring creation may return `ENOMEM`, `EPERM`, or `ENOSYS` depending on memlock limits, sysctl settings, or kernel support. [Docker's default seccomp profile](https://docs.docker.com/engine/security/seccomp/) blocks `io_uring` syscalls. See [SETUP.md](./SETUP.md) for diagnosis and resolution.
 
 ## Agentic coding around the `code.hybscloud.com/uring` boundary
 
@@ -55,62 +55,55 @@ The rule is simple: `code.hybscloud.com/uring` exposes kernel facts; caller-side
 
 ## Ring lifecycle
 
-`New` returns an unstarted ring and eagerly constructs the context pools. Call `Start` before submitting operations; it registers ring resources and enables the ring. The example below submits a read, waits for the matching CQE, and uses `iox.Classify` so `ErrWouldBlock` stays a semantic no-progress result rather than a failure.
+`New` returns an unstarted ring and eagerly constructs the context pools. Call `Start` before submitting operations; it registers ring resources and enables the ring. This example submits one read into ring-owned registered storage, whose address stays stable until `Stop`. Consume the bytes after completion and before reusing the buffer. `iox.IsWouldBlock` identifies no progress; caller-owned `iox.Backoff` keeps the wait CPU-friendly.
 
 ```go
 ring, err := uring.New(func(o *uring.Options) {
-    o.Entries = uring.EntriesMedium
-    o.NotifySucceed = true
+	o.Entries = uring.EntriesMedium
+	o.NotifySucceed = true
 })
 if err != nil {
-    return err
+	return err
 }
 
 if err := ring.Start(); err != nil {
-    return err
+	return err
 }
 defer ring.Stop()
 
-fd := iofd.NewFD(int(file.Fd()))
-buf := make([]byte, 4096)
+fd := iofd.FD(file.Fd()) // Borrowed; file owns Close.
+buf := ring.RegisteredBuffer(0)
 ctx := uring.PackDirect(uring.IORING_OP_READ, 0, 0, 0).WithFD(fd)
 if err := ring.Read(ctx, buf); err != nil {
-    return err
+	return err
 }
 
-cqes := make([]uring.CQEView, 64)
+var cqes [1]uring.CQEView // Only one request is outstanding.
 var backoff iox.Backoff
-
 for {
-    n, err := ring.Wait(cqes)
-    switch iox.Classify(err) {
-    case iox.OutcomeWouldBlock:
-        backoff.Wait()
-        continue
-    case iox.OutcomeFailure:
-        return err
-    }
-    if n == 0 {
-        backoff.Wait()
-        continue
-    }
+	n, err := ring.Wait(cqes[:])
+	if err != nil && !iox.IsWouldBlock(err) {
+		return err
+	}
+	if n == 0 {
+		backoff.Wait()
+		continue
+	}
 
-    backoff.Reset()
-    for i := range n {
-        cqe := cqes[i]
-        if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
-            continue
-        }
-        if err := cqe.Err(); err != nil {
-            return fmt.Errorf("uring read failed: %w", err)
-        }
-        handle(buf[:int(cqe.Res)])
-        return nil
-    }
+	backoff.Reset()
+	cqe := cqes[0]
+	if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
+		return fmt.Errorf("unexpected completion: op=%d fd=%d", cqe.Op(), cqe.FD())
+	}
+	if err := cqe.Err(); err != nil {
+		return fmt.Errorf("uring read failed: %w", err)
+	}
+	handle(buf[:int(cqe.Res)])
+	return nil
 }
 ```
 
-`Wait` flushes pending submissions, then reaps completions. On single-issuer rings it also issues the kernel enter that keeps deferred task work moving once the SQ drains; the caller must serialize `Wait`, `WaitDirect`, and `WaitExtended` with other submit-state operations. If `iox.Classify(err)` yields `iox.OutcomeWouldBlock`, no completion is currently observable at the boundary.
+`Wait` flushes pending submissions, then reaps completions. On single-issuer rings it also issues the kernel enter that keeps deferred task work moving once the SQ drains; the caller must serialize `Wait`, `WaitDirect`, and `WaitExtended` with other submit-state operations. `iox.IsWouldBlock(err)` means no completion is currently observable.
 
 `Start` and `Stop` form the ring lifecycle pair. `Stop` is idempotent and renders the ring permanently unusable; call it only after you have drained all in-flight operations, reaped outstanding CQEs, and quiesced live multishot subscriptions.
 
@@ -171,9 +164,9 @@ Each accepted stream send may complete with fewer bytes than requested. Keep suc
 `SQEContext` is the primary identity token. In direct mode it packs the opcode, SQE flags, buffer-group ID, and file descriptor into a single 64-bit value.
 
 ```go
-sqeCtx := uring.ForFD(fd).
-    WithOp(uring.IORING_OP_RECV).
-    WithBufGroup(groupID)
+sqeCtx := uring.ForFD(int32(fd)).
+	WithOp(uring.IORING_OP_RECV).
+	WithBufGroup(groupID)
 ```
 
 The three context modes are:
@@ -205,40 +198,29 @@ ring.PutExtSQE(ext)
 
 ### Completion dispatch with `CQEView`
 
-There is no separate completion-context type. All completion dispatch goes through `CQEView`; call `cqe.Context()` to recover the original submission token.
+There is no separate completion-context type. Call `cqe.Context()` to recover the original submission token, `cqe.Err()` for the request result, and inspect its flags for buffer and lifetime information. The error returned by `Wait` describes reaping, not individual requests. Dispatch every CQE in the returned batch, including failures: returning early would discard observations already removed from the ring.
 
 ```go
-cqes := make([]uring.CQEView, 64)
-
-n, err := ring.Wait(cqes)
-switch iox.Classify(err) {
-case iox.OutcomeWouldBlock:
-    return iox.ErrWouldBlock
-case iox.OutcomeFailure:
-    return err
+var cqes [64]uring.CQEView
+n, err := ring.Wait(cqes[:])
+if err != nil {
+	return err
 }
 if n == 0 {
-    return iox.ErrWouldBlock
+	return iox.ErrWouldBlock
 }
 
-for i := 0; i < n; i++ {
-    cqe := cqes[i]
-    if err := cqe.Err(); err != nil {
-        return fmt.Errorf("completion failed: op=%d fd=%d: %w", cqe.Op(), cqe.FD(), err)
-    }
-
-    switch cqe.Op() {
-    case uring.IORING_OP_ACCEPT:
-        fmt.Printf("accepted fd=%d\n", cqe.Res)
-    case uring.IORING_OP_RECV:
-        if cqe.HasBuffer() {
-            fmt.Printf("buffer id=%d\n", cqe.BufID())
-        }
-        if cqe.Extended() {
-            seq := uring.CtxV1Of(cqe.ExtSQE()).Val1
-            fmt.Printf("request seq=%d\n", seq)
-        }
-    }
+for i := range n {
+	cqe := cqes[i]
+	// Res < 0 encodes -errno; flags describe buffers and request lifetime.
+	if err := cqe.Err(); err != nil {
+		fmt.Printf("completion failed: op=%d fd=%d: %v\n", cqe.Op(), cqe.FD(), err)
+	}
+	if cqe.HasBuffer() {
+		fmt.Printf("buffer id=%d\n", cqe.BufID())
+	}
+	// Route every CQE, including failures, so its owner can release resources.
+	dispatch(ring, cqe)
 }
 ```
 
@@ -257,7 +239,7 @@ For most systems the configuration helpers are the easiest entry point:
 ```go
 opts := uring.OptionsForSystem(uring.MachineMemory4GB)
 ring, err := uring.New(func(o *uring.Options) {
-    *o = opts
+	*o = opts
 })
 ```
 
@@ -272,24 +254,24 @@ Explicit incremental rings are initialized empty. After `Start`, choose a group 
 
 ```go
 const (
-    groupID = 60000
-    entries = 8
-    bufSize = 4096
+	groupID = 60000
+	entries = 8
+	bufSize = 4096
 )
 
 backing := make([]byte, entries*bufSize)
 bufRing, err := ring.RegisterBufRingIncremental(entries, groupID)
 if err != nil {
-    return err
+	return err
 }
 for i := range entries {
-    buf := backing[i*bufSize : (i+1)*bufSize]
-    if err := bufRing.Add(buf, uint16(i), i); err != nil {
-        return err
-    }
+	buf := backing[i*bufSize : (i+1)*bufSize]
+	if err := bufRing.Add(buf, uint16(i), i); err != nil {
+		return err
+	}
 }
 if err := bufRing.Advance(entries); err != nil {
-    return err
+	return err
 }
 
 pool := uring.NewContextPools(entries)
@@ -306,10 +288,10 @@ Fixed-buffer I/O uses a registered buffer by index. The returned slice is ring-o
 buf := ring.RegisteredBuffer(0)
 copy(buf, payload)
 
-fd := iofd.NewFD(int(file.Fd()))
+fd := iofd.FD(file.Fd()) // Borrowed; file owns Close.
 ctx := uring.PackDirect(uring.IORING_OP_WRITE_FIXED, 0, 0, 0).WithFD(fd)
 if err := ring.WriteFixed(ctx, 0, len(payload)); err != nil {
-    return err
+	return err
 }
 ```
 
@@ -319,12 +301,12 @@ For socket receive with kernel buffer selection, pass `nil` as the receive buffe
 recvCtx := uring.PackDirect(uring.IORING_OP_RECV, 0, 0, 0)
 
 if err := ring.Receive(recvCtx, &socketFD, nil, uring.WithReadBufferSize(uring.BufferSizeSmall)); err != nil {
-    return err
+	return err
 }
 
 // Later, after Wait returns the matching CQE:
 if cqe.HasBuffer() {
-    fmt.Printf("kernel selected group=%d id=%d\n", cqe.BufGroup(), cqe.BufID())
+	fmt.Printf("kernel selected group=%d id=%d\n", cqe.BufGroup(), cqe.BufID())
 }
 ```
 
@@ -332,16 +314,16 @@ Bundle receives use the same provided-buffer storage but may consume more than o
 
 ```go
 if err := ring.ReceiveBundle(recvCtx, &socketFD, uring.WithReadBufferSize(uring.BufferSizeSmall)); err != nil {
-    return err
+	return err
 }
 
 if it, ok := ring.BundleIterator(cqe, cqe.BufGroup()); ok {
-    for buf := range it.All() {
-        handle(buf)
-    }
-    if err := it.Recycle(ring); err != nil {
-        return err
-    }
+	for buf := range it.All() {
+		handle(buf)
+	}
+	if err := it.Recycle(ring); err != nil {
+		return err
+	}
 }
 ```
 
@@ -351,7 +333,7 @@ Registered buffers require pinned memory. If large buffer registration fails, in
 
 `AcceptMultishot`, `ReceiveMultishot`, `SubmitAcceptMultishot`, `SubmitAcceptDirectMultishot`, `SubmitReceiveMultishot`, and `SubmitReceiveBundleMultishot` each submit a multishot socket operation.
 
-CQE routing policy stays outside the package. Listener setup progresses through `DecodeListenerCQE`, `PrepareListenerBind`, `PrepareListenerListen`, and `SetListenerReady`; the caller decides how to dispatch completions and when to stop the chain.
+CQE routing stays with the caller. `ListenerOp.HandleCQE` advances SOCKET → BIND → LISTEN and invokes the setup callbacks. `DecodeListenerCQE`, `PrepareListenerBind`, `PrepareListenerListen`, and `SetListenerReady` remain available for manual advancement. See the [listener guide](agents/recipes/listener.md).
 
 ## Architecture implementation
 
@@ -383,33 +365,34 @@ In the default task-migratable mode, shared submission-state synchronization all
 
 ```go
 func runLoop(ring *uring.Uring, stop <-chan struct{}) error {
-    cqes := make([]uring.CQEView, 64)
-    var backoff iox.Backoff
-    for {
-        select {
-        case <-stop:
-            return nil
-        default:
-        }
+	cqes := make([]uring.CQEView, 64)
+	var backoff iox.Backoff
+	for {
+		select {
+		case <-stop:
+			// The caller must still cancel and drain live requests before ring.Stop.
+			return nil
+		default:
+		}
 
-        n, err := ring.Wait(cqes)
-        switch iox.Classify(err) {
-        case iox.OutcomeWouldBlock:
-            backoff.Wait()
-            continue
-        case iox.OutcomeFailure:
-            return err
-        }
-        if n == 0 {
-            backoff.Wait()
-            continue
-        }
+		n, err := ring.Wait(cqes)
+		switch iox.Classify(err) {
+		case iox.OutcomeWouldBlock:
+			backoff.Wait()
+			continue
+		case iox.OutcomeFailure:
+			return err
+		}
+		if n == 0 {
+			backoff.Wait()
+			continue
+		}
 
-        backoff.Reset()
-        for i := range n {
-            dispatch(ring, cqes[i])
-        }
-    }
+		backoff.Reset()
+		for i := range n {
+			dispatch(ring, cqes[i])
+		}
+	}
 }
 ```
 
@@ -421,32 +404,32 @@ A multishot operation produces a stream of CQEs until the kernel sends a final o
 
 ```go
 handler := uring.NewMultishotSubscriber().
-    OnStep(func(step uring.MultishotStep) uring.MultishotAction {
-        if step.Err != nil {
-            return uring.MultishotStop
-        }
-        connFD := iofd.FD(step.CQE.Res)
-        registerConnection(connFD)
-        return uring.MultishotContinue
-    }).
-    OnStop(func(err error, cancelled bool) {
-        if !cancelled {
-            resubscribeAccept()
-        }
-    })
+	OnStep(func(step uring.MultishotStep) uring.MultishotAction {
+		if step.Err != nil {
+			return uring.MultishotStop
+		}
+		connFD := iofd.FD(step.CQE.Res)
+		registerConnection(connFD)
+		return uring.MultishotContinue
+	}).
+	OnStop(func(err error, cancelled bool) {
+		if !cancelled {
+			resubscribeAccept()
+		}
+	})
 
 sub, err := ring.AcceptMultishot(acceptCtx, handler.Handler())
 if err != nil {
-    return err
+	return err
 }
 
 // Dispatch in the same serialized completion loop. If caller code stores
 // copied CQEs beyond this loop, it must keep its own route state.
 for i := range n {
-    if sub.HandleCQE(cqes[i]) {
-        continue
-    }
-    dispatch(ring, cqes[i])
+	if sub.HandleCQE(cqes[i]) {
+		continue
+	}
+	dispatch(ring, cqes[i])
 }
 ```
 
@@ -496,17 +479,17 @@ Keep live Go pointer roots reachable outside `UserData`. The GC does not trace t
 `LinkTimeout` attaches a deadline to the preceding SQE through an `IOSQE_IO_LINK` chain. Expiry attempts to cancel the linked operation, which may already have completed. Inspect both CQE results; a timeout does not prove that the operation was cancelled.
 
 ```go
-recvCtx := uring.ForFD(fd).
-    WithOp(uring.IORING_OP_RECV).
-    WithBufGroup(group)
+recvCtx := uring.ForFD(int32(fd)).
+	WithOp(uring.IORING_OP_RECV).
+	WithBufGroup(group)
 
 if err := ring.Receive(recvCtx, &fd, nil, uring.WithFlags(uring.IOSQE_IO_LINK)); err != nil {
-    return err
+	return err
 }
 
 timeoutCtx := uring.PackDirect(uring.IORING_OP_LINK_TIMEOUT, 0, 0, 0)
 if err := ring.LinkTimeout(timeoutCtx, 5*time.Second); err != nil {
-    return err
+	return err
 }
 ```
 
@@ -523,32 +506,23 @@ These are the shortest flows, meant to be read alongside the tests:
 
 ### TCP echo server
 
-`ListenerManager` prepares the socket → bind → listen chain for you. The listener handler's bool-return callbacks are control-flow hooks: `true` advances to the next setup phase, `false` aborts before it. Once the listener is live, start multishot accept and multishot receive on the connection FDs.
+`ListenerManager` submits the initial SOCKET request. Route each setup CQE to `listenerOp.HandleCQE` to invoke callbacks and submit BIND and LISTEN automatically. If it returns `iox.ErrWouldBlock`, drive the ring and retry the prepared SQE with `ring.SubmitExtended(uring.PackExtended(listenerOp.Ext()))`; do not replay the CQE. Start accepting after `OnListening` reports success.
 
 ```go
-pool := uring.NewContextPools(32)
-manager := uring.NewListenerManager(ring, pool)
-
-listenerOp, err := manager.ListenTCP4(addr, 128, listenerHandler)
-if err != nil {
-    return err
-}
-
+// OnListening has reported successful setup for listenerOp.
 acceptSub, err := listenerOp.AcceptMultishot(acceptHandler)
 if err != nil {
-    return err
+	return err
 }
-defer acceptSub.Cancel()
 
-recvCtx := uring.ForFD(clientFD).WithBufGroup(readGroup)
+recvCtx := uring.ForFD(int32(clientFD)).WithBufGroup(readGroup)
 recvSub, err := ring.ReceiveMultishot(recvCtx, recvHandler)
 if err != nil {
-    return err
+	return err
 }
-defer recvSub.Cancel()
 ```
 
-`listener_example_test.go` covers listener setup with multishot accept, `examples/multishot_test.go` covers handler-side multishot receive CQEs, and `examples/echo_test.go` covers the full loopback echo flow.
+Call `Cancel` when stopping a subscription, then keep dispatching until its terminal CQE and any submitted cancellation CQE have been consumed. Drain both subscriptions before closing their descriptors or stopping the ring. [The listener example](./listener_example_test.go) shows the complete setup and shutdown; [multishot examples](./examples/multishot_test.go) and [echo examples](./examples/echo_test.go) cover the connection flow.
 
 ### TCP client
 
@@ -557,28 +531,35 @@ Create a socket, wait for the `IORING_OP_SOCKET` completion, then wrap the retur
 ```go
 clientCtx := uring.PackDirect(uring.IORING_OP_SOCKET, 0, 0, 0)
 if err := ring.TCP4Socket(clientCtx); err != nil {
-    return err
+	return err
 }
 
+// After Wait returns the matching SOCKET CQE:
+if err := socketCQE.Err(); err != nil {
+	return err
+}
 clientFD := iofd.NewFD(int(socketCQE.Res))
 
 connectCtx := uring.PackDirect(uring.IORING_OP_CONNECT, 0, 0, int32(clientFD))
 if err := ring.Connect(connectCtx, remoteAddr); err != nil {
-    return err
+	return err
 }
 
+// Wait for a successful CONNECT CQE before sending.
 sendCtx := uring.PackDirect(uring.IORING_OP_SEND, 0, 0, int32(clientFD))
 if err := ring.Send(sendCtx, &clientFD, payload); err != nil {
-    return err
+	return err
 }
 
+// Check the SEND CQE and retry only any unsent suffix.
 recvCtx := uring.PackDirect(uring.IORING_OP_RECV, 0, 0, int32(clientFD))
 if err := ring.Receive(recvCtx, &clientFD, buf); err != nil {
-    return err
+	return err
 }
+// Wait for the RECV CQE before reading or reusing buf.
 ```
 
-After each submit, reuse the `Wait` loop from the ring lifecycle section to observe the matching completion. `socket_integration_linux_test.go` at the package level covers the connect/send cycle.
+After each submit, use the `Wait` loop from the ring lifecycle section to observe the matching completion before the next dependent operation. Keep payloads live through completion, and retry only the unsent suffix after a short send. [socket_test.go](./examples/socket_test.go) shows the complete client sequence; [echo_test.go](./examples/echo_test.go) adds receiving and replying.
 
 ## Zero-copy receive (ZCRX)
 
@@ -613,29 +594,32 @@ Idle → Active → Stopping → Retiring → Stopped
 
 ## Examples
 
-The example tests in `uring/examples/` show the API in practice.
+The runnable tests in `examples/` teach setup → submission → completion → cleanup through direct public API calls. Start with contexts and file I/O, then follow the ownership rules in the socket and multishot examples.
 
-- `multishot_test.go`, multishot accept, multishot receive, and subscription stop behavior
-- `file_io_test.go`, basic file reads, writes, and batching
-- `fixed_buffers_test.go`, registered buffers and fixed-buffer I/O
-- `vectored_io_test.go`, vectored read and write operations
-- `splice_tee_test.go`, splice and tee zero-copy data transfer
-- `zerocopy_test.go`, zero-copy send paths and completion tracking
-- `poll_test.go`, poll-based readiness workflows
-- `buffer_ring_test.go`, buffer ring provisioning and multi-size buffer groups
-- `context_test.go`, direct, indirect, and extended `SQEContext` flows plus `CQEView` access
-- `echo_test.go`, TCP echo server and UDP ping-pong flows
-- `timeout_linux_test.go`, timeout and linked-timeout operations
+- [context_test.go](./examples/context_test.go): Direct, Indirect, and Extended contexts; decoding completions and returning borrowed contexts
+- [completion_test.go](./examples/completion_test.go): submission versus completion errors, request identity, and draining mixed-result batches
+- [file_io_test.go](./examples/file_io_test.go): file reads and writes, chunked reads through EOF, and batched submissions
+- [file_lifecycle_test.go](./examples/file_lifecycle_test.go): open, write, sync, and close a file through completions
+- [vectored_io_test.go](./examples/vectored_io_test.go): scatter/gather reads and writes
+- [fixed_buffers_test.go](./examples/fixed_buffers_test.go): registered buffers and fixed-buffer I/O
+- [buffer_ring_test.go](./examples/buffer_ring_test.go): bundle receives, incremental receives, and buffer recycling
+- [socket_test.go](./examples/socket_test.go): client socket creation, connection completion, and sending the remaining byte suffix
+- [echo_test.go](./examples/echo_test.go): TCP echo, partial stream I/O, and UDP datagrams
+- [multishot_test.go](./examples/multishot_test.go): repeated accept/receive completions and cancellation draining
+- [zerocopy_test.go](./examples/zerocopy_test.go): zero-copy sends, automatic multicast selection, and separate result/release tracking
+- [poll_test.go](./examples/poll_test.go): readiness observations and poll cancellation
+- [timeout_linux_test.go](./examples/timeout_linux_test.go): expiry, cancellation, and linked timeouts
+- [splice_tee_test.go](./examples/splice_tee_test.go): completion-driven splice and tee transfers
 
-The package-level `listener_example_test.go` covers listener creation with multishot accept, and `socket_integration_linux_test.go` covers the TCP client connect/send flow.
+At the package root, [listener_example_test.go](./listener_example_test.go) demonstrates automatic SOCKET → BIND → LISTEN setup and multishot accept; [socket_integration_linux_test.go](./socket_integration_linux_test.go) covers TCP connect/send.
 
 ## Operational notes
 
-- Enable `NotifySucceed` when you need a visible CQE for every successful operation.
+- Enable `NotifySucceed` to retain successful write-like CQEs by default. Explicit `IOSQE_CQE_SKIP_SUCCESS` flags still apply.
 - `ring.Features` reports actual SQ/CQ entry counts, SQE slot width, and the byte order used to interpret `user_data`.
 - Keep the default `MultiIssuers=true` task-migratable configuration (`COOP_TASKRUN`) for ordinary Go execution and concurrent submit-state calls. Set `MultiIssuers=false` only when the owner calls `runtime.LockOSThread` before `New`, remains pinned through `Stop`, and serializes `submit`, `Wait`, `WaitDirect`, `WaitExtended`, `Stop`, and `ResizeRings`; that explicit fast path requests `SINGLE_ISSUER` + `DEFER_TASKRUN`.
 - `EpollWait` requires `timeout` to remain `0`; use `LinkTimeout` when you need a deadline.
-- Return borrowed completion targets and pooled contexts promptly.
+- Return pooled contexts only after all request completions and borrowed access have finished.
 - `ListenerOp.Close` closes the listener FD immediately. If a setup CQE is still pending, drain it first, then call `Close` again to return the borrowed `ExtSQE` to the pool.
 
 ## Platform support

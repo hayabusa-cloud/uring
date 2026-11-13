@@ -7,347 +7,269 @@
 package examples_test
 
 import (
-	"errors"
-	"net"
-	"sync/atomic"
+	"bytes"
 	"testing"
 	"time"
 
+	"code.hybscloud.com/iofd"
 	"code.hybscloud.com/iox"
-	"code.hybscloud.com/sock"
 	"code.hybscloud.com/uring"
 	"code.hybscloud.com/zcall"
 )
 
-// TestMultishotAcceptServer demonstrates the handler-side completion flow
-// for a multishot accept server.
+// One multishot accept request produces a stream of completion events:
 //
-// Architecture:
-//   - Single IORING_OP_ACCEPT with IORING_ACCEPT_MULTISHOT flag
-//   - Kernel generates one CQE per accepted connection
-//   - No SQE resubmission needed until multishot stops
-//   - F_MORE flag indicates more connections may arrive
+//	submit -> accept CQE (MORE) -> accept CQE (MORE) -> terminal CQE
 //
-// This example focuses on CQE handling once a multishot accept is active.
-//
-// See also: TestTCPEchoServer in echo_test.go for single-shot accept.
+// Each successful accept yields a new connection FD. Returning MultishotStop
+// requests cancellation; continue dispatching until both the original request
+// and any submitted cancellation have completed, in either arrival order.
 func TestMultishotAcceptServer(t *testing.T) {
-	const numClients = 5
-	acceptedFDs := make(chan int32, numClients)
-	var acceptErr error
-	stopped := make(chan struct{}, 1)
-	handler := uring.NewMultishotSubscriber().OnStep(func(step uring.MultishotStep) uring.MultishotAction {
-		if step.Err != nil {
-			acceptErr = step.Err
-			return uring.MultishotStop
+	for _, stopInHandler := range []bool{false, true} {
+		name := "explicit_cancel"
+		if stopInHandler {
+			name = "handler_stop"
 		}
-		acceptedFDs <- step.CQE.Res
-		return uring.MultishotContinue
-	}).OnStop(func(err error, cancelled bool) {
-		if err != nil && acceptErr == nil {
-			acceptErr = err
-		}
-		stopped <- struct{}{}
-	})
-
-	for i := 0; i < numClients; i++ {
-		flags := uint32(0)
-		if i < numClients-1 {
-			flags = uring.IORING_CQE_F_MORE
-		}
-		if keep := dispatchSimplifiedMultishotCQE(
-			handler.Handler(),
-			uring.CQEView{Res: int32(100 + i), Flags: flags},
-		); !keep && i < numClients-1 {
-			t.Fatalf("handler stopped early on CQE %d", i+1)
-		}
-	}
-
-	acceptCount := 0
-	for {
-		select {
-		case fd := <-acceptedFDs:
-			acceptCount++
-			t.Logf("Accepted connection %d: fd=%d", acceptCount, fd)
-		default:
-			goto drainedAccepts
-		}
-	}
-drainedAccepts:
-	if acceptErr != nil {
-		t.Fatalf("accept CQE failed: %v", acceptErr)
-	}
-	select {
-	case <-stopped:
-	default:
-		t.Fatal("expected terminal multishot stop callback")
-	}
-	if acceptCount != numClients {
-		t.Fatalf("accepted %d/%d connections via multishot", acceptCount, numClients)
-	}
-	t.Logf("Accepted %d/%d connections via multishot", acceptCount, numClients)
-}
-
-// TestMultishotRecvWithBufferSelection demonstrates the handler-side CQE flow
-// for multishot receive with kernel buffer selection metadata.
-//
-// Architecture:
-//   - Buffer ring registered with kernel (IORING_REGISTER_PBUF_RING)
-//   - Multishot recv with IOSQE_BUFFER_SELECT flag
-//   - Kernel picks buffer from ring, returns buffer ID in CQE
-//   - Application returns buffer to ring after processing
-//
-// This example focuses on decoding CQE metadata once receive completions arrive.
-func TestMultishotRecvWithBufferSelection(t *testing.T) {
-	received := make(chan recvResult, 16)
-	var recvErr error
-	var missingBuffer bool
-	stopped := make(chan struct{}, 1)
-	handler := uring.NewMultishotSubscriber().OnStep(func(step uring.MultishotStep) uring.MultishotAction {
-		if step.Err != nil {
-			recvErr = step.Err
-			return uring.MultishotStop
-		}
-		if step.CQE.Res == 0 {
-			return uring.MultishotContinue
-		}
-		if !step.CQE.HasBuffer() {
-			missingBuffer = true
-			return uring.MultishotStop
-		}
-		received <- recvResult{bufID: step.CQE.BufID(), nbytes: int(step.CQE.Res)}
-		return uring.MultishotContinue
-	}).OnStop(func(err error, cancelled bool) {
-		if err != nil && recvErr == nil {
-			recvErr = err
-		}
-		stopped <- struct{}{}
-	})
-
-	payload := []byte("HelloWorldMultishotRecv")
-	sentBytes := len(payload)
-	firstChunk := 11
-	secondChunk := sentBytes - firstChunk
-	events := []uring.CQEView{
-		{
-			Res:   int32(firstChunk),
-			Flags: uring.IORING_CQE_F_BUFFER | uring.IORING_CQE_F_MORE,
-		},
-		{
-			Res: int32(secondChunk),
-			Flags: uring.IORING_CQE_F_BUFFER |
-				(1 << uring.IORING_CQE_BUFFER_SHIFT),
-		},
-	}
-
-	recvCount := 0
-	totalBytes := 0
-	for i, cqe := range events {
-		if keep := dispatchSimplifiedMultishotCQE(handler.Handler(), cqe); !keep && i < len(events)-1 {
-			t.Fatalf("handler stopped early on recv CQE %d", i+1)
-		}
-		draining := true
-		for draining {
-			select {
-			case res := <-received:
-				recvCount++
-				totalBytes += res.nbytes
-				t.Logf("Received CQE %d: bufID=%d bytes=%d hasBuffer=true",
-					recvCount, res.bufID, res.nbytes)
-			default:
-				draining = false
+		t.Run(name, func(t *testing.T) {
+			ring, err := uring.New(func(opt *uring.Options) {
+				opt.Entries = uring.EntriesNano
+				opt.LockedBufferMem = uring.BufferSizeLarge
+				opt.ReadBufferNum = 64
+				opt.NotifySucceed = true
+			})
+			if err != nil {
+				t.Fatalf("New: %v", err)
 			}
-		}
-	}
-	if recvErr != nil {
-		t.Fatalf("recv CQE failed: %v", recvErr)
-	}
-	if missingBuffer {
-		t.Fatal("recv CQE missing buffer-selection metadata")
-	}
-	select {
-	case <-stopped:
-	default:
-		t.Fatal("expected terminal multishot stop callback")
-	}
-	t.Logf("Received %d CQEs, %d/%d bytes", recvCount, totalBytes, sentBytes)
-
-	// Verify at least one recv CQE arrived with buffer selection metadata.
-	if recvCount == 0 {
-		t.Fatal("no messages received; recv path may be broken")
-	}
-
-	// Verify total byte count matches what was sent.
-	// TCP may coalesce sends, so we check aggregate bytes rather than
-	// per-message boundaries.
-	if totalBytes != sentBytes {
-		t.Fatalf("byte count mismatch: got %d, want %d", totalBytes, sentBytes)
-	}
-}
-
-type recvResult struct {
-	bufID  uint16
-	nbytes int
-}
-
-// TestMultishotLifecycle shows the complete lifecycle of a multishot subscription.
-func TestMultishotLifecycle(t *testing.T) {
-	t.Log("Multishot Subscription Lifecycle:")
-	t.Log("-----------------------------------------------------")
-	t.Log("  1. ring.AcceptMultishot(sqeCtx, handler) -> MultishotSubscription")
-	t.Log("  2. Kernel generates CQE per event (F_MORE=true)")
-	t.Log("  3. handler.OnMultishotStep(step) called for each CQE")
-	t.Log("  4. Return MultishotStop on a result -> triggers Cancel")
-	t.Log("  5. sub.Cancel() -> IORING_OP_ASYNC_CANCEL")
-	t.Log("  6. Final CQE received (F_MORE=false)")
-	t.Log("  7. handler.OnMultishotStop(err, cancelled) called")
-	t.Log("  8. Dispatch any queued cancellation CQE, independently of the original terminal CQE")
-	t.Log("  9. ExtSQE returns to its pool after both observations and cancel submission finish")
-	t.Log("-----------------------------------------------------")
-	t.Log("")
-	t.Log("State transitions:")
-	t.Log("  SubscriptionActive -> SubscriptionCancelling (user cancel)")
-	t.Log("  SubscriptionActive -> SubscriptionStopped (kernel stop)")
-	t.Log("  SubscriptionCancelling -> SubscriptionStopped (after original terminal CQE)")
-}
-
-// TestMultishotHandlerControl demonstrates handler-controlled stopping.
-//
-// The handler can control multishot behavior by returning an action:
-//   - Return `uring.MultishotContinue`: keep accepting events
-//   - Return `uring.MultishotStop`: request cancellation
-//
-// This allows dynamic control based on application state (e.g., max connections).
-//
-// Note: between the handler returning MultishotStop and the kernel processing
-// the cancel, additional CQEs may arrive. The handler must handle these
-// gracefully (e.g., close surplus FDs without counting them toward the limit).
-func TestMultishotHandlerControl(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping multishot handler test in short mode (requires reliable networking)")
-	}
-	ring, err := uring.New(
-		testMinimalBufferOptions,
-	)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	mustStartRing(t, ring)
-
-	serverSock, err := sock.ListenTCP4(&sock.TCPAddr{IP: sock.IPv4LoopBack, Port: 0})
-	if err != nil {
-		t.Fatalf("ListenTCP: %v", err)
-	}
-	defer serverSock.Close()
-
-	const maxConnections = 3
-
-	handler := &limitedAcceptHandler{
-		maxConnections: maxConnections,
-		acceptedFDs:    make(chan int32, maxConnections+4),
-		stopped:        make(chan struct{}),
-	}
-
-	sqeCtx := uring.ForFD(serverSock.FD().Raw())
-	sub, err := ring.AcceptMultishot(sqeCtx, handler)
-	if err != nil {
-		t.Logf("AcceptMultishot: %v", err)
-		t.Skip("multishot may not be supported")
-	}
-
-	// Spawn more clients than max
-	for i := 0; i < maxConnections+2; i++ {
-		go func() {
-			conn, _ := net.Dial("tcp", serverSock.Addr().String())
-			if conn != nil {
-				time.Sleep(100 * time.Millisecond)
-				conn.Close()
+			if err := ring.Start(); err != nil {
+				t.Fatalf("Start: %v", err)
 			}
-		}()
-	}
-
-	cqes := make([]uring.CQEView, 16)
-	deadline := time.Now().Add(2 * time.Second)
-	b := iox.Backoff{}
-
-	cancelSubmitted, cancelDone := false, false
-	for (sub.Active() || (cancelSubmitted && !cancelDone)) && time.Now().Before(deadline) {
-		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
-			t.Fatalf("Wait: %v", err)
-		}
-		if n == 0 {
-			b.Wait()
-			continue
-		}
-		b.Reset()
-		for i := range n {
-			// Read borrowed context facts before dispatch can retire the context.
-			if cqes[i].Op() == uring.IORING_OP_ASYNC_CANCEL {
-				if cancelDone {
-					t.Fatal("duplicate cancellation completion")
+			t.Cleanup(func() {
+				// All submitted operations must finish before the ring is destroyed.
+				if err := ring.Stop(); err != nil {
+					t.Errorf("Stop: %v", err)
 				}
-				cancelDone = true
+			})
+			listener, addr := tcpListener(t)
+			const clients = 3
+			for range clients {
+				dialTCP(t, addr) // Connections queue in the listener backlog.
 			}
-			if !sub.HandleCQE(cqes[i]) {
-				t.Fatal("unhandled multishot completion")
+			accepted, stops := 0, 0
+			handler := uring.NewMultishotSubscriber().
+				OnStep(func(step uring.MultishotStep) uring.MultishotAction {
+					if step.Err != nil {
+						if !step.Cancelled {
+							t.Errorf("accept: %v", step.Err)
+						}
+						return uring.MultishotContinue
+					}
+					// Every successful accept transfers a descriptor, including
+					// accepts racing with a cancellation request.
+					fd := iofd.NewFD(int(step.CQE.Res))
+					if err := fd.Close(); err != nil {
+						t.Errorf("accepted connection Close: %v", err)
+					}
+					accepted++
+					if stopInHandler && accepted >= clients {
+						return uring.MultishotStop
+					}
+					return uring.MultishotContinue
+				}).
+				OnStop(func(err error, cancelled bool) {
+					stops++
+					if !cancelled {
+						t.Errorf("expected cancellation, got %v", err)
+					}
+				})
+			sub, err := ring.AcceptMultishot(uring.ForFD(int32(listener)), handler)
+			if err != nil {
+				t.Fatal(err)
 			}
-			if sub.State() == uring.SubscriptionCancelling {
-				cancelSubmitted = true
+			cancelSubmitted, cancelDone := false, false
+			for stops == 0 || (cancelSubmitted && !cancelDone) {
+				var cqes [1]uring.CQEView
+				var backoff iox.Backoff
+				deadline := time.Now().Add(exampleTimeout)
+				for {
+					n, err := ring.Wait(cqes[:])
+					if err != nil && !iox.IsWouldBlock(err) {
+						t.Fatalf("Wait: %v", err)
+					}
+					if n > 0 {
+						backoff.Reset()
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatal("timed out waiting for completion")
+					}
+					backoff.Wait()
+				}
+				cqe := cqes[0]
+				if cqe.Op() == uring.IORING_OP_ASYNC_CANCEL {
+					if cancelDone {
+						t.Fatal("duplicate cancellation completion")
+					}
+					cancelDone = true
+					if cqe.Res != 0 {
+						t.Fatalf("cancel result=%d error=%v", cqe.Res, cqe.Err())
+					}
+					if !sub.HandleCQE(cqe) {
+						t.Fatal("unhandled cancellation completion")
+					}
+					continue
+				}
+				// HandleCQE performs callback dispatch, cancellation requested
+				// by the handler, and final context retirement.
+				if !sub.HandleCQE(cqe) {
+					t.Fatal("unhandled accept completion")
+				}
+				if !stopInHandler && accepted == clients && sub.Active() {
+					if err := sub.Cancel(); err != nil {
+						t.Fatal(err)
+					}
+					cancelSubmitted = true
+				}
+				if sub.State() == uring.SubscriptionCancelling {
+					cancelSubmitted = true
+				}
 			}
-		}
-	}
-	if sub.Active() || !cancelSubmitted || !cancelDone {
-		t.Fatalf("incomplete shutdown: state=%v cancel=%v/%v", sub.State(), cancelSubmitted, cancelDone)
-	}
-
-	accepted := handler.count.Load()
-	surplus := handler.surplus.Load()
-	t.Logf("Accepted %d connections at limit, %d surplus after stop (max was %d)", accepted, surplus, maxConnections)
-
-	if accepted < maxConnections {
-		t.Logf("accepted %d < max %d (may be environment-dependent)", accepted, maxConnections)
-	}
-
-	// Cleanup
-	close(handler.acceptedFDs)
-	for fd := range handler.acceptedFDs {
-		zcall.Close(uintptr(fd))
+			if accepted != clients || stops != 1 || sub.State() != uring.SubscriptionStopped ||
+				!cancelSubmitted || !cancelDone {
+				t.Fatalf("accepted=%d stops=%d state=%v cancel=%v/%v",
+					accepted, stops, sub.State(), cancelSubmitted, cancelDone)
+			}
+		})
 	}
 }
 
-type limitedAcceptHandler struct {
-	maxConnections int32
-	count          atomic.Int32
-	surplus        atomic.Int32
-	acceptedFDs    chan int32
-	stopped        chan struct{}
-}
+// A multishot receive repeatedly selects provided buffers for one subscription:
+//
+//	CQE -> selected bytes -> process or copy -> recycle buffer
+//
+// The buffer's lifetime and the subscription's lifetime are separate. Returning
+// a buffer does not end the receive; EOF or cancellation ends this example's
+// subscription. Copy retained payload before recycling its backing storage.
+func TestMultishotRecvWithBufferSelection(t *testing.T) {
+	for _, stopInHandler := range []bool{false, true} {
+		name := "peer_eof"
+		if stopInHandler {
+			name = "handler_stop"
+		}
+		t.Run(name, func(t *testing.T) {
+			ring, err := uring.New(func(opt *uring.Options) {
+				opt.Entries = uring.EntriesNano
+				opt.LockedBufferMem = uring.BufferSizeLarge
+				opt.ReadBufferNum = 64
+				opt.NotifySucceed = true
+			})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			if err := ring.Start(); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			t.Cleanup(func() {
+				// All submitted operations must finish before the ring is destroyed.
+				if err := ring.Stop(); err != nil {
+					t.Errorf("Stop: %v", err)
+				}
+			})
+			fd, client := tcpPair(t)
+			payload := []byte("receive, process, then recycle")
+			if n, err := client.Write(payload); err != nil || n != len(payload) {
+				t.Fatalf("write: n=%d err=%v", n, err)
+			}
+			if !stopInHandler {
+				// End the peer's byte stream; keep the socket open until cleanup.
+				if err := client.Shutdown(zcall.SHUT_WR); err != nil {
+					t.Fatal(err)
+				}
+			}
 
-func (h *limitedAcceptHandler) OnMultishotStep(step uring.MultishotStep) uring.MultishotAction {
-	if step.Err == nil && step.CQE.Res >= 0 {
-		newCount := h.count.Add(1)
-		if newCount > h.maxConnections {
-			// Surplus: arrived between stop request and actual cancel.
-			// Close the FD but do not count toward the limit.
-			h.count.Add(-1)
-			h.surplus.Add(1)
-			zcall.Close(uintptr(step.CQE.Res))
-			return uring.MultishotStop
-		}
-		select {
-		case h.acceptedFDs <- step.CQE.Res:
-		default:
-			zcall.Close(uintptr(step.CQE.Res))
-		}
-		if newCount < h.maxConnections {
-			return uring.MultishotContinue
-		}
-		return uring.MultishotStop
+			var got [64]byte
+			received, stops := 0, 0
+			handler := uring.NewMultishotSubscriber().
+				OnStep(func(step uring.MultishotStep) uring.MultishotAction {
+					if step.Err != nil {
+						if !step.Cancelled {
+							t.Errorf("receive: %v", step.Err)
+						}
+						return uring.MultishotContinue
+					}
+					if step.CQE.Res == 0 {
+						return uring.MultishotContinue
+					}
+					it, ok := ring.BundleIterator(step.CQE, step.CQE.BufGroup())
+					if !ok {
+						t.Error("missing selected buffer")
+						return uring.MultishotStop
+					}
+					for buf := range it.All() {
+						received += copy(got[received:], buf)
+					}
+					if err := it.Recycle(ring); err != nil {
+						t.Errorf("recycle: %v", err)
+					}
+					if stopInHandler && received == len(payload) {
+						return uring.MultishotStop
+					}
+					return uring.MultishotContinue
+				}).
+				OnStop(func(err error, cancelled bool) {
+					stops++
+					if cancelled != stopInHandler || (!cancelled && err != nil) {
+						t.Errorf("receive stop: %v, cancelled=%v", err, cancelled)
+					}
+				})
+			// The small example configuration has one provided-buffer group.
+			ctx := uring.PackDirect(uring.IORING_OP_RECV, 0, uint16(ring.ReadBufferGidOffset), int32(fd))
+			sub, err := ring.ReceiveMultishot(ctx, handler)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cancelSubmitted, cancelDone := false, false
+			for stops == 0 || (cancelSubmitted && !cancelDone) {
+				var cqes [1]uring.CQEView
+				var backoff iox.Backoff
+				deadline := time.Now().Add(exampleTimeout)
+				for {
+					n, err := ring.Wait(cqes[:])
+					if err != nil && !iox.IsWouldBlock(err) {
+						t.Fatalf("Wait: %v", err)
+					}
+					if n > 0 {
+						backoff.Reset()
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatal("timed out waiting for completion")
+					}
+					backoff.Wait()
+				}
+				cqe := cqes[0]
+				// Read borrowed context facts before HandleCQE can retire them.
+				if cqe.Op() == uring.IORING_OP_ASYNC_CANCEL {
+					if cancelDone {
+						t.Fatal("duplicate cancellation completion")
+					}
+					if cqe.Res != 0 {
+						t.Fatalf("cancel result=%d error=%v", cqe.Res, cqe.Err())
+					}
+					cancelDone = true
+				}
+				if !sub.HandleCQE(cqe) {
+					t.Fatal("unhandled receive or cancellation completion")
+				}
+				if sub.State() == uring.SubscriptionCancelling {
+					cancelSubmitted = true
+				}
+			}
+			if sub.State() != uring.SubscriptionStopped || stops != 1 || !bytes.Equal(got[:received], payload) {
+				t.Fatalf("state=%v stops=%d payload=%q", sub.State(), stops, got[:received])
+			}
+			if stopInHandler && (!cancelSubmitted || !cancelDone) {
+				t.Fatalf("cancellation submitted=%v completed=%v", cancelSubmitted, cancelDone)
+			}
+		})
 	}
-	return uring.MultishotStop
-}
-
-func (h *limitedAcceptHandler) OnMultishotStop(error, bool) {
-	close(h.stopped)
 }
