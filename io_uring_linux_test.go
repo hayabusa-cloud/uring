@@ -25,6 +25,18 @@ import (
 	"code.hybscloud.com/zcall"
 )
 
+func TestNewIoUringRejectsEntriesOutsideSetupDomain(t *testing.T) {
+	for _, entries := range []int{-1, 0, EntriesHuge + 1} {
+		ur, err := newIoUring(entries)
+		if ur != nil {
+			t.Fatalf("newIoUring(%d) = non-nil ring, want nil", entries)
+		}
+		if !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("newIoUring(%d) error = %v, want %v", entries, err, ErrInvalidParam)
+		}
+	}
+}
+
 func newTestIoUring(t *testing.T, options ...func(*ioUringParams)) *ioUring {
 	t.Helper()
 
@@ -38,6 +50,42 @@ func newTestIoUring(t *testing.T, options ...func(*ioUringParams)) *ioUring {
 		}
 	})
 	return ur
+}
+
+func TestRegisterBuffersAcceptsNonPowerOfTwoCount(t *testing.T) {
+	ur := newTestIoUring(t)
+	const (
+		bufferCount = 3
+		bufferSize  = 1 << 12
+	)
+	buffers := make([]byte, bufferCount*bufferSize)
+	if err := ur.registerBuffers(unsafe.Pointer(unsafe.SliceData(buffers)), bufferCount, bufferSize); err != nil {
+		t.Fatalf("registerBuffers: %v", err)
+	}
+	if err := ur.unregisterBuffers(); err != nil {
+		t.Fatalf("unregisterBuffers: %v", err)
+	}
+	runtime.KeepAlive(buffers)
+}
+
+func TestRegisterBuffersFailureDoesNotPublishState(t *testing.T) {
+	ur := &ioUring{ringFd: -1}
+	buffer := make([]byte, 1<<12)
+	addr := unsafe.Pointer(unsafe.SliceData(buffer))
+
+	for attempt := range 2 {
+		err := ur.registerBuffers(addr, 1, len(buffer))
+		if err == nil {
+			t.Fatalf("registerBuffers attempt %d succeeded with an invalid ring descriptor", attempt+1)
+		}
+		if errors.Is(err, ErrExists) {
+			t.Fatalf("registerBuffers attempt %d error = %v, want syscall failure", attempt+1, err)
+		}
+		if len(ur.bufs) != 0 {
+			t.Fatalf("registerBuffers attempt %d published %d buffers after failure, want 0", attempt+1, len(ur.bufs))
+		}
+	}
+	runtime.KeepAlive(buffer)
 }
 
 func newPollingDirectFilePath(t *testing.T) string {
@@ -328,8 +376,6 @@ func TestIOUring_BasicUsage(t *testing.T) {
 			t.Errorf("socked recv expected %s but got %s", wb, rb)
 			return
 		}
-		return
-
 	}
 
 	udsw := func(t *testing.T, ur *ioUring) {
@@ -401,8 +447,6 @@ func TestIOUring_BasicUsage(t *testing.T) {
 			t.Errorf("socked recv expected %s but got %s", wb, rb)
 			return
 		}
-
-		return
 	}
 
 	t.Run("normal mode read file", func(t *testing.T) {
@@ -1788,12 +1832,6 @@ func TestInlineCmdData128(t *testing.T) {
 	}
 }
 
-func TestNoCopyLockUnlock(t *testing.T) {
-	var nc noCopy
-	nc.Lock()
-	nc.Unlock()
-}
-
 func TestUnregisterBufRingWithoutRegistration(t *testing.T) {
 	ring := newStartedSharedTestRing(t)
 
@@ -2064,53 +2102,5 @@ func TestWaitBatchExtendedUsesCQE32Stride(t *testing.T) {
 	}
 	if cqes[1].Ext != ext2 {
 		t.Fatalf("cqes[1].Ext = %p, want %p", cqes[1].Ext, ext2)
-	}
-}
-
-func TestRegisterBuffersAcceptsNonPowerOfTwoCount(t *testing.T) {
-	ur := newTestIoUring(t)
-	const (
-		bufferCount = 3
-		bufferSize  = 1 << 12
-	)
-	buffers := make([]byte, bufferCount*bufferSize)
-	if err := ur.registerBuffers(unsafe.Pointer(unsafe.SliceData(buffers)), bufferCount, bufferSize); err != nil {
-		t.Fatalf("registerBuffers: %v", err)
-	}
-	if err := ur.unregisterBuffers(); err != nil {
-		t.Fatalf("unregisterBuffers: %v", err)
-	}
-	runtime.KeepAlive(buffers)
-}
-
-func TestRegisterBuffersFailureDoesNotPublishState(t *testing.T) {
-	ur := &ioUring{ringFd: -1}
-	buffer := make([]byte, 1<<12)
-	addr := unsafe.Pointer(unsafe.SliceData(buffer))
-
-	for attempt := range 2 {
-		err := ur.registerBuffers(addr, 1, len(buffer))
-		if err == nil {
-			t.Fatalf("registerBuffers attempt %d succeeded with an invalid ring descriptor", attempt+1)
-		}
-		if errors.Is(err, ErrExists) {
-			t.Fatalf("registerBuffers attempt %d error = %v, want syscall failure", attempt+1, err)
-		}
-		if len(ur.bufs) != 0 {
-			t.Fatalf("registerBuffers attempt %d published %d buffers after failure, want 0", attempt+1, len(ur.bufs))
-		}
-	}
-	runtime.KeepAlive(buffer)
-}
-
-func TestNewIoUringRejectsEntriesOutsideSetupDomain(t *testing.T) {
-	for _, entries := range []int{-1, 0, EntriesHuge + 1} {
-		ur, err := newIoUring(entries)
-		if ur != nil {
-			t.Fatalf("newIoUring(%d) = non-nil ring, want nil", entries)
-		}
-		if !errors.Is(err, ErrInvalidParam) {
-			t.Fatalf("newIoUring(%d) error = %v, want %v", entries, err, ErrInvalidParam)
-		}
 	}
 }

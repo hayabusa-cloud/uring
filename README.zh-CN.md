@@ -117,8 +117,8 @@ for {
 | `CQEView`             | 已复制完成描述符，提供解码访问器；模式相关目标仍为借用 |
 | `ListenerOp`          | 监听器创建操作的句柄，持有 FD 并提供 accept 辅助方法 |
 | `BundleIterator`      | 遍历 bundle 接收中消耗的缓冲区              |
-| `IncrementalReceiver` | 管理增量缓冲区环接收（`IOU_PBUF_RING_INC`）  |
 | `BufferRing`          | 显式注册的不透明提供缓冲区环；`Add` 暂存，`Advance` 发布 |
+| `IncrementalReceiver` | 管理增量缓冲区环接收（`IOU_PBUF_RING_INC`）  |
 | `ZCTracker`           | 跟踪零拷贝发送的通知与回退生命周期              |
 | `ContextPools`        | Indirect 与 extended 提交上下文的对象池    |
 | `ZCRXReceiver`        | NIC RX 队列零拷贝接收的生命周期管理            |
@@ -151,9 +151,9 @@ for {
 
 `Nop128` 和 `UringCmd128` 需要以 `Options.SQE128` 创建的 ring，且内核须声明支持相应 opcode，否则返回 `ErrNotSupported`。
 
-`Uring.Close` 提交的是针对目标文件描述符的 `IORING_OP_CLOSE` 操作，而非 ring 本身的销毁方法。
-
 `PollAddLevel` 和 `PollAddMultishotLevel` 始终返回 `ErrNotSupported`；Linux io_uring 不允许 `IORING_OP_POLL_ADD` 使用 level 标志。
+
+`Uring.Close` 提交的是针对目标文件描述符的 `IORING_OP_CLOSE` 操作，而非 ring 本身的销毁方法。
 
 ## 上下文传递
 

@@ -1973,6 +1973,16 @@ func newRegistrationFailureTestRing() *Uring {
 	}
 }
 
+func TestZCRXExportFailureReturnsInvalidFD(t *testing.T) {
+	fd, err := newRegistrationFailureTestRing().ZCRXExport(1)
+	if err == nil {
+		t.Fatal("ZCRXExport error = nil, want invalid-ring failure")
+	}
+	if fd != iofd.InvalidFD {
+		t.Fatalf("ZCRXExport fd = %d, want %d", fd, iofd.InvalidFD)
+	}
+}
+
 func TestAdvancedRegistrationWrappersReturnKernelErrors(t *testing.T) {
 	ring := newRegistrationFailureTestRing()
 	cloneSource := newRegistrationFailureTestRing()
@@ -2648,6 +2658,24 @@ func TestZCTrackerSendZCRejectsInvalidOptionRange(t *testing.T) {
 	}
 }
 
+func TestZCTrackerSendZCRejectsOversizedSignedInt32(t *testing.T) {
+	ring := newWrapperSyntheticSubmitRing(t, 8)
+	pool := NewContextPools(1)
+
+	tracker := NewZCTracker(ring, pool)
+	payload := mappedTestSlice[byte](t, oversizedSignedInt32(t))
+	err := tracker.SendZC(iofd.FD(11), payload, nil)
+	if !errors.Is(err, ErrInvalidParam) {
+		t.Fatalf("SendZC oversized len error = %v, want %v", err, ErrInvalidParam)
+	}
+	if got := pool.ExtendedAvailable(); got != 1 {
+		t.Fatalf("available ExtSQE after oversized len = %d, want 1", got)
+	}
+	if got := ring.ioUring.sqCount(); got != 0 {
+		t.Fatalf("submitted SQEs after oversized len = %d, want 0", got)
+	}
+}
+
 func TestZCTrackerSendZCEncodesOptionRange(t *testing.T) {
 	ring := newWrapperSyntheticSubmitRing(t, 8)
 	pool := NewContextPools(1)
@@ -2738,33 +2766,5 @@ func TestZCTrackerSendZCFixedEncodesOptionRange(t *testing.T) {
 	}
 	if sqe.len != uint32(10-3) {
 		t.Fatalf("SendZCFixed offset-only len = %d, want %d", sqe.len, 10-3)
-	}
-}
-
-func TestZCRXExportFailureReturnsInvalidFD(t *testing.T) {
-	fd, err := newRegistrationFailureTestRing().ZCRXExport(1)
-	if err == nil {
-		t.Fatal("ZCRXExport error = nil, want invalid-ring failure")
-	}
-	if fd != iofd.InvalidFD {
-		t.Fatalf("ZCRXExport fd = %d, want %d", fd, iofd.InvalidFD)
-	}
-}
-
-func TestZCTrackerSendZCRejectsOversizedSignedInt32(t *testing.T) {
-	ring := newWrapperSyntheticSubmitRing(t, 8)
-	pool := NewContextPools(1)
-
-	tracker := NewZCTracker(ring, pool)
-	payload := mappedTestSlice[byte](t, oversizedSignedInt32(t))
-	err := tracker.SendZC(iofd.FD(11), payload, nil)
-	if !errors.Is(err, ErrInvalidParam) {
-		t.Fatalf("SendZC oversized len error = %v, want %v", err, ErrInvalidParam)
-	}
-	if got := pool.ExtendedAvailable(); got != 1 {
-		t.Fatalf("available ExtSQE after oversized len = %d, want 1", got)
-	}
-	if got := ring.ioUring.sqCount(); got != 0 {
-		t.Fatalf("submitted SQEs after oversized len = %d, want 0", got)
 	}
 }

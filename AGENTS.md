@@ -1,9 +1,10 @@
-# Systems Programmability with uring
+# uring
 
+<a id="systems-programmability-with-uring"></a>
 <a id="codehybscloudcomuring-boundary-guide"></a>
 <a id="purpose"></a>
 
-Compose explicit contracts into direct execution. Establish correctness and zero abstraction overhead against equivalent direct code.
+Use `uring` to submit Linux `io_uring` operations and inspect their completions. Start with the [README](README.md) and [file I/O examples](examples/file_io_test.go); use the [guide](agents/INDEX.md) for operation-specific contracts.
 
 <a id="boundary-placement"></a>
 
@@ -16,17 +17,18 @@ Compose explicit contracts into direct execution. Establish correctness and zero
 <a id="outcome-discipline"></a>
 <a id="ownership-and-lifecycle"></a>
 
-- Separate admission, result, liveness, release, and protocol progress; preserve counts and flags.
-- Retain identity, typed roots, and stable addresses through final use. Copied CQEs may still borrow storage.
-- Resume continuations at most once; use subscriptions for repeated events. Cancellation, callbacks, and disposal leave independent drain obligations.
-- Prefer one ring owner and bounded state. Preserve contention retries and `spin` backoff; caller I/O waits use `iox.Backoff`. Go serialization does not establish Linux task affinity.
+- Submission success establishes admission. Inspect completion results, counts and flags separately; dispatch every reaped CQE and retry only unaccepted work. Set `NotifySucceed` when write-like success CQEs are required; explicit SQE suppression still applies.
+- Retain request identity, typed Go roots and stable addresses through each resource's final use. Copied CQEs may still borrow context or payload storage. Follow the [release conditions](agents/boundary/resources.md) before recycling either.
+- Resume continuations at most once; use subscriptions for repeated events. Cancellation, callbacks and continuation disposal leave separate drain obligations. Drain requests, reap CQEs and quiesce subscriptions before serialized `Stop`; it does not drain for you.
+- Prefer one ring owner and bounded state. With `MultiIssuers=false`, lock that owner to one OS thread before `New` through `Stop`; serialize submission, waits, resize and teardown.
+- Preserve contention retries and `spin` backoff. For caller I/O waits, use `iox.Backoff` after no progress and reset it after reaping completions. See [waiting](agents/boundary/integration.md#waiting-and-backoff).
 
 <a id="required-reading"></a>
 <a id="protocol-and-runtime-integration"></a>
 
-Use [task selection](agents/INDEX.md) for contracts, recipes, runtime roles, and required sources; [README](README.md) for API orientation.
+Choose optional [runtime roles](agents/runtime/INDEX.md) for continuation, context or protocol needs; the caller retains scheduling and lifecycle policy.
 
 <a id="workflow"></a>
 <a id="references"></a>
 
-Follow [verification](agents/verify.md). Preserve contract assumptions and distinguish source, test, proof, and measurement evidence. [Focused proofs](proofs/README.md) state their scope and source mapping; ordinary Go builds do not require Lean. Use [primary sources](agents/references.md) for external claims.
+After [environment setup](SETUP.md), run `make all` on native Linux 6.18+ with Go 1.26+ for vet and race tests. Follow [verification](agents/verify.md) for capability requirements, affected examples and comparison with equivalent direct code. [Focused proofs](proofs/README.md) document model assumptions and limits; ordinary Go builds do not require Lean. Use [primary sources](agents/references.md) for kernel contracts.

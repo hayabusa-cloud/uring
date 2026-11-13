@@ -226,9 +226,9 @@ func (ur *Uring) Start() (err error) {
 		}
 	}()
 
-	// Register probes as dormant placeholder infrastructure for future
-	// post-baseline capability branches. Current Linux 6.18+ startup does not
-	// derive public feature state from probe results.
+	// Register probes eagerly for post-baseline capability branches. Current
+	// Linux 6.18+ startup does not derive public feature state from probe
+	// results.
 	probe := ioUringProbe{}
 	err = ur.registerProbe(&probe)
 	if err != nil {
@@ -1374,7 +1374,7 @@ func (ur *Uring) RegisteredFileCount() int {
 }
 
 // ========================================
-// Query Interface (Linux 6.18+)
+// Query Interface
 // ========================================
 
 // QueryOpcodes queries the kernel for supported io_uring operations.

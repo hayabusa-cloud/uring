@@ -42,6 +42,15 @@ const (
 )
 
 const (
+	IORING_OFF_SQ_RING    int64 = 0
+	IORING_OFF_CQ_RING    int64 = 0x8000000
+	IORING_OFF_SQES       int64 = 0x10000000
+	IORING_OFF_PBUF_RING        = 0x80000000
+	IORING_OFF_PBUF_SHIFT       = 16
+	IORING_OFF_MMAP_MASK        = 0xf8000000
+)
+
+const (
 	IORING_ENTER_GETEVENTS       = 1 << 0
 	IORING_ENTER_SQ_WAKEUP       = 1 << 1
 	IORING_ENTER_SQ_WAIT         = 1 << 2
@@ -93,6 +102,8 @@ const (
 	IORING_CQE_F_SKIP     // Skip CQE gap filler
 )
 
+const IORING_CQE_F_32 = 1 << 15
+
 const (
 	IORING_CQE_BUFFER_SHIFT = 16
 )
@@ -141,6 +152,265 @@ const (
 // IORING_REGISTER_USE_REGISTERED_RING is a flag that can be OR'd with register
 // opcodes to use a registered ring fd instead of a regular fd.
 const IORING_REGISTER_USE_REGISTERED_RING = 1 << 31
+
+// Provided-buffer ring registration flags.
+const (
+	IOU_PBUF_RING_MMAP = 1
+	IOU_PBUF_RING_INC  = 2
+)
+
+// ZCRX area encoding constants.
+const (
+	IORING_ZCRX_AREA_SHIFT  = 48
+	IORING_ZCRX_AREA_MASK   = ^((uint64(1) << IORING_ZCRX_AREA_SHIFT) - 1)
+	IORING_ZCRX_AREA_DMABUF = 1
+)
+
+// ZCRX control operations.
+const (
+	ZCRX_CTRL_FLUSH_RQ = 0
+	ZCRX_CTRL_EXPORT   = 1
+)
+
+// ZCRX registration flags.
+const ZCRX_REG_IMPORT = 1
+
+// Query operation types for IORING_REGISTER_QUERY.
+const (
+	IO_URING_QUERY_OPCODES = 0
+	IO_URING_QUERY_ZCRX    = 1
+	IO_URING_QUERY_SCQ     = 2
+)
+
+// QueryHdr is the header for query operations.
+type QueryHdr struct {
+	NextEntry uint64 // Pointer to the next QueryHdr, or zero.
+	QueryData uint64 // Pointer to query-specific data.
+	QueryOp   uint32 // IO_URING_QUERY_* operation.
+	Size      uint32 // Input buffer size; returned data size, in bytes.
+	Result    int32
+	_         [3]uint32
+}
+
+// QueryOpcode describes supported io_uring operations.
+type QueryOpcode struct {
+	NrRequestOpcodes  uint32
+	NrRegisterOpcodes uint32
+	FeatureFlags      uint64
+	RingSetupFlags    uint64
+	EnterFlags        uint64
+	SqeFlags          uint64
+	NrQueryOpcodes    uint32
+	_                 uint32
+	ResultSize        uint32
+}
+
+// ZCRX query feature flags.
+const ZCRX_FEATURE_RX_PAGE_SIZE = 1 << 0
+
+// QueryZCRX describes ZCRX capabilities.
+type QueryZCRX struct {
+	RegisterFlags  uint64
+	AreaFlags      uint64
+	NrCtrlOpcodes  uint32
+	Features       uint32
+	RqHdrSize      uint32
+	RqHdrAlignment uint32
+	_              uint64
+	ResultSize     uint32
+}
+
+// QuerySCQ describes SQ/CQ ring header requirements.
+type QuerySCQ struct {
+	HdrSize      uint64
+	HdrAlignment uint64
+	ResultSize   uint32
+}
+
+// Memory region types.
+const IORING_MEM_REGION_TYPE_USER = 1
+
+// Memory region registration flags.
+const IORING_MEM_REGION_REG_WAIT_ARG = 1
+
+// RegionDesc describes an io_uring memory region.
+type RegionDesc struct {
+	UserAddr   uint64 // User virtual address.
+	Size       uint64 // Region size in bytes.
+	Flags      uint32
+	ID         uint32
+	MmapOffset uint64 // Offset for mapping the region from the ring fd.
+	_          [4]uint64
+}
+
+// MemRegionReg registers an io_uring memory region.
+type MemRegionReg struct {
+	RegionUptr uint64 // Pointer to RegionDesc.
+	Flags      uint64 // IORING_MEM_REGION_REG_* flags.
+	_          [2]uint64
+}
+
+// NAPI operation types.
+const (
+	IO_URING_NAPI_REGISTER_OP   = 0
+	IO_URING_NAPI_STATIC_ADD_ID = 1
+	IO_URING_NAPI_STATIC_DEL_ID = 2
+)
+
+// NAPI tracking strategies.
+const (
+	IO_URING_NAPI_TRACKING_DYNAMIC  = 0
+	IO_URING_NAPI_TRACKING_STATIC   = 1
+	IO_URING_NAPI_TRACKING_INACTIVE = 255
+)
+
+// NapiReg configures NAPI busy polling.
+type NapiReg struct {
+	BusyPollTo     uint32 // Busy-poll timeout in microseconds.
+	PreferBusyPoll uint8
+	Opcode         uint8 // IO_URING_NAPI_* operation.
+	_              [2]uint8
+	OpParam        uint32 // Tracking strategy or NAPI ID, selected by Opcode.
+	_              uint32
+}
+
+// Socket uring command operations.
+const (
+	SOCKET_URING_OP_SIOCINQ      = 0
+	SOCKET_URING_OP_SIOCOUTQ     = 1
+	SOCKET_URING_OP_GETSOCKOPT   = 2
+	SOCKET_URING_OP_SETSOCKOPT   = 3
+	SOCKET_URING_OP_TX_TIMESTAMP = 4
+	SOCKET_URING_OP_GETSOCKNAME  = 5
+)
+
+// Socket uring timestamp constants.
+const (
+	IORING_TIMESTAMP_HW_SHIFT   = 16
+	IORING_TIMESTAMP_TYPE_SHIFT = IORING_TIMESTAMP_HW_SHIFT + 1
+	IORING_CQE_F_TSTAMP_HW      = 1 << IORING_TIMESTAMP_HW_SHIFT
+)
+
+// IoTimespec is a 128-bit timespec for high-precision timestamps.
+type IoTimespec struct {
+	TvSec  uint64
+	TvNsec uint64
+}
+
+// NOP operation flags.
+const (
+	IORING_NOP_INJECT_RESULT = 1 << 0
+	IORING_NOP_FILE          = 1 << 1
+	IORING_NOP_FIXED_FILE    = 1 << 2
+	IORING_NOP_FIXED_BUFFER  = 1 << 3
+	IORING_NOP_TW            = 1 << 4
+	IORING_NOP_CQE32         = 1 << 5
+)
+
+// Clone buffer registration flags.
+const (
+	IORING_REGISTER_SRC_REGISTERED = 1 << 0
+	IORING_REGISTER_DST_REPLACE    = 1 << 1
+)
+
+// CloneBuffers describes a registered-buffer clone operation.
+type CloneBuffers struct {
+	SrcFD  uint32 // Source ring fd or registered-ring index, selected by Flags.
+	Flags  uint32
+	SrcOff uint32 // Starting source buffer index.
+	DstOff uint32 // Starting destination buffer index.
+	Nr     uint32
+	_      [3]uint32
+}
+
+// Registered wait flags.
+const IORING_REG_WAIT_TS = 1 << 0
+
+// RegWait is a registered wait-region entry.
+type RegWait struct {
+	Ts          Timespec
+	MinWaitUsec uint32 // Minimum wait time in microseconds.
+	Flags       uint32 // IORING_REG_WAIT_* flags.
+	Sigmask     uint64 // Pointer to a signal mask.
+	SigmaskSz   uint32 // Signal-mask size in bytes.
+	_           [3]uint32
+	_           [2]uint64
+}
+
+// Read/write attribute flags.
+const IORING_RW_ATTR_FLAG_PI = 1 << 0
+
+// AttrPI describes protection-information attributes.
+type AttrPI struct {
+	Flags  uint16
+	AppTag uint16
+	Len    uint32
+	Addr   uint64
+	Seed   uint64
+	_      uint64
+}
+
+// ZCRXRqe is a zero-copy receive refill-queue entry.
+type ZCRXRqe struct {
+	Off uint64 // Area token combined with the byte offset.
+	Len uint32
+	_   uint32
+}
+
+// ZCRXCqe is a zero-copy receive completion extension.
+type ZCRXCqe struct {
+	Off uint64 // Area token combined with the byte offset.
+	_   uint64
+}
+
+// ZCRXOffsets contains byte offsets within a ZCRX refill ring.
+type ZCRXOffsets struct {
+	Head uint32
+	Tail uint32
+	Rqes uint32
+	_    uint32
+	Resv [2]uint64
+}
+
+// ZCRXAreaReg describes a ZCRX receive area.
+type ZCRXAreaReg struct {
+	Addr        uint64
+	Len         uint64
+	RqAreaToken uint64 // Combine with buffer offsets in refill entries.
+	Flags       uint32
+	DmabufFD    uint32
+	Resv        [2]uint64
+}
+
+// ZCRXIfqReg configures a ZCRX interface queue.
+type ZCRXIfqReg struct {
+	IfIdx     uint32
+	IfRxq     uint32
+	RqEntries uint32
+	Flags     uint32
+	AreaPtr   uint64
+	RegionPtr uint64
+	Offsets   ZCRXOffsets
+	ZcrxID    uint32
+	RxBufLen  uint32
+	Resv      [3]uint64
+}
+
+// ZCRXIfqRegistration is the observable result of ZCRX interface-queue registration.
+type ZCRXIfqRegistration struct {
+	ID        uint32
+	RqEntries uint32 // Effective refill queue entry count.
+	Offsets   ZCRXOffsets
+	RxBufLen  uint32
+}
+
+// ZCRXCtrl describes a ZCRX control operation.
+type ZCRXCtrl struct {
+	ZcrxID uint32
+	Op     uint32
+	Resv   [2]uint64
+	Data   [48]byte // Control payload selected by Op.
+}
 
 // Resource registration flags.
 const (
@@ -946,288 +1216,4 @@ func (ur *ioUring) doListen(sqe *ioUringSqe) int32 {
 		return -int32(err.(syscall.Errno))
 	}
 	return 0
-}
-
-const (
-	IORING_OFF_SQ_RING    int64 = 0
-	IORING_OFF_CQ_RING    int64 = 0x8000000
-	IORING_OFF_SQES       int64 = 0x10000000
-	IORING_OFF_PBUF_RING        = 0x80000000
-	IORING_OFF_PBUF_SHIFT       = 16
-	IORING_OFF_MMAP_MASK        = 0xf8000000
-)
-
-const IORING_CQE_F_32 = 1 << 15
-
-// Provided-buffer ring registration flags.
-const (
-	IOU_PBUF_RING_MMAP = 1
-	IOU_PBUF_RING_INC  = 2
-)
-
-// ZCRX area encoding constants.
-const (
-	IORING_ZCRX_AREA_SHIFT  = 48
-	IORING_ZCRX_AREA_MASK   = ^((uint64(1) << IORING_ZCRX_AREA_SHIFT) - 1)
-	IORING_ZCRX_AREA_DMABUF = 1
-)
-
-// ZCRX control operations.
-const (
-	ZCRX_CTRL_FLUSH_RQ = 0
-	ZCRX_CTRL_EXPORT   = 1
-)
-
-// ZCRX registration flags.
-const ZCRX_REG_IMPORT = 1
-
-// Query operation types for IORING_REGISTER_QUERY.
-const (
-	IO_URING_QUERY_OPCODES = 0
-	IO_URING_QUERY_ZCRX    = 1
-	IO_URING_QUERY_SCQ     = 2
-)
-
-// Memory region types.
-const IORING_MEM_REGION_TYPE_USER = 1
-
-// Memory region registration flags.
-const IORING_MEM_REGION_REG_WAIT_ARG = 1
-
-// NAPI operation types.
-const (
-	IO_URING_NAPI_REGISTER_OP   = 0
-	IO_URING_NAPI_STATIC_ADD_ID = 1
-	IO_URING_NAPI_STATIC_DEL_ID = 2
-)
-
-// NAPI tracking strategies.
-const (
-	IO_URING_NAPI_TRACKING_DYNAMIC  = 0
-	IO_URING_NAPI_TRACKING_STATIC   = 1
-	IO_URING_NAPI_TRACKING_INACTIVE = 255
-)
-
-// Socket uring command operations.
-const (
-	SOCKET_URING_OP_SIOCINQ      = 0
-	SOCKET_URING_OP_SIOCOUTQ     = 1
-	SOCKET_URING_OP_GETSOCKOPT   = 2
-	SOCKET_URING_OP_SETSOCKOPT   = 3
-	SOCKET_URING_OP_TX_TIMESTAMP = 4
-	SOCKET_URING_OP_GETSOCKNAME  = 5
-)
-
-// Socket uring timestamp constants.
-const (
-	IORING_TIMESTAMP_HW_SHIFT   = 16
-	IORING_TIMESTAMP_TYPE_SHIFT = IORING_TIMESTAMP_HW_SHIFT + 1
-	IORING_CQE_F_TSTAMP_HW      = 1 << IORING_TIMESTAMP_HW_SHIFT
-)
-
-// NOP operation flags.
-const (
-	IORING_NOP_INJECT_RESULT = 1 << 0
-	IORING_NOP_FILE          = 1 << 1
-	IORING_NOP_FIXED_FILE    = 1 << 2
-	IORING_NOP_FIXED_BUFFER  = 1 << 3
-	IORING_NOP_TW            = 1 << 4
-	IORING_NOP_CQE32         = 1 << 5
-)
-
-// Clone buffer registration flags.
-const (
-	IORING_REGISTER_SRC_REGISTERED = 1 << 0
-	IORING_REGISTER_DST_REPLACE    = 1 << 1
-)
-
-// Registered wait flags.
-const IORING_REG_WAIT_TS = 1 << 0
-
-// Read/write attribute flags.
-const IORING_RW_ATTR_FLAG_PI = 1 << 0
-
-// QueryHdr is the header for query operations.
-// Matches struct io_uring_query_hdr in Linux.
-type QueryHdr struct {
-	NextEntry uint64 // Pointer to next query entry
-	QueryData uint64 // Query-specific data pointer
-	QueryOp   uint32 // Query operation type (IO_URING_QUERY_*)
-	Size      uint32 // Size of the query response
-	Result    int32  // Result code
-	_         [3]uint32
-}
-
-// QueryOpcode describes supported io_uring operations.
-type QueryOpcode struct {
-	NrRequestOpcodes  uint32
-	NrRegisterOpcodes uint32
-	FeatureFlags      uint64
-	RingSetupFlags    uint64
-	EnterFlags        uint64
-	SqeFlags          uint64
-	NrQueryOpcodes    uint32
-	_                 uint32
-	ResultSize        uint32
-}
-
-// ZCRX query feature flags.
-const ZCRX_FEATURE_RX_PAGE_SIZE = 1 << 0
-
-// QueryZCRX describes ZCRX capabilities.
-type QueryZCRX struct {
-	RegisterFlags  uint64
-	AreaFlags      uint64
-	NrCtrlOpcodes  uint32
-	Features       uint32
-	RqHdrSize      uint32
-	RqHdrAlignment uint32
-	_              uint64
-	ResultSize     uint32
-}
-
-// QuerySCQ describes SQ/CQ ring header requirements.
-type QuerySCQ struct {
-	HdrSize      uint64
-	HdrAlignment uint64
-	ResultSize   uint32
-}
-
-// RegionDesc describes a memory region for io_uring.
-// Matches struct io_uring_region_desc in Linux.
-type RegionDesc struct {
-	UserAddr   uint64 // User address of the region
-	Size       uint64 // Size of the region
-	Flags      uint32 // Region flags
-	ID         uint32 // Region identifier
-	MmapOffset uint64 // Offset for mmap
-	_          [4]uint64
-}
-
-// MemRegionReg is the registration structure for memory regions.
-// Matches struct io_uring_mem_region_reg in Linux.
-type MemRegionReg struct {
-	RegionUptr uint64 // Pointer to RegionDesc
-	Flags      uint64 // Registration flags (IORING_MEM_REGION_REG_*)
-	_          [2]uint64
-}
-
-// NapiReg is the registration structure for NAPI busy polling.
-// Matches struct io_uring_napi in Linux.
-type NapiReg struct {
-	BusyPollTo     uint32 // Busy poll timeout in microseconds
-	PreferBusyPoll uint8  // Prefer busy poll over sleeping
-	Opcode         uint8  // IO_URING_NAPI_* operation
-	_              [2]uint8
-	OpParam        uint32 // Operation parameter (strategy or NAPI ID)
-	_              uint32
-}
-
-// IoTimespec is a 128-bit timespec for high-precision timestamps.
-// Matches struct io_timespec in Linux.
-type IoTimespec struct {
-	TvSec  uint64 // Seconds
-	TvNsec uint64 // Nanoseconds
-}
-
-// CloneBuffers describes a buffer clone operation.
-// Matches struct io_uring_clone_buffers in Linux.
-type CloneBuffers struct {
-	SrcFD  uint32 // Source ring file descriptor
-	Flags  uint32 // IORING_REGISTER_SRC_* flags
-	SrcOff uint32 // Source buffer offset
-	DstOff uint32 // Destination buffer offset
-	Nr     uint32 // Number of buffers to clone
-	_      [3]uint32
-}
-
-// RegWait is a registered wait region entry.
-// Matches struct io_uring_reg_wait in Linux.
-type RegWait struct {
-	Ts          Timespec // Timeout specification
-	MinWaitUsec uint32   // Minimum wait time in microseconds
-	Flags       uint32   // IORING_REG_WAIT_* flags
-	Sigmask     uint64   // Signal mask
-	SigmaskSz   uint32   // Signal mask size
-	_           [3]uint32
-	_           [2]uint64
-}
-
-// AttrPI is the PI attribute information for read/write operations.
-// Matches struct io_uring_attr_pi in Linux.
-type AttrPI struct {
-	Flags  uint16 // PI flags
-	AppTag uint16 // Application tag
-	Len    uint32 // Length
-	Addr   uint64 // Address
-	Seed   uint64 // Seed value
-	_      uint64
-}
-
-// ZCRXRqe is a zero-copy receive refill queue entry.
-// Matches struct io_uring_zcrx_rqe in Linux.
-type ZCRXRqe struct {
-	Off uint64 // Offset into the ZCRX area
-	Len uint32 // Length of the buffer
-	_   uint32 // Padding
-}
-
-// ZCRXCqe is a zero-copy receive completion queue entry extension.
-// Matches struct io_uring_zcrx_cqe in Linux.
-type ZCRXCqe struct {
-	Off uint64 // Offset into the ZCRX area
-	_   uint64 // Padding
-}
-
-// ZCRXOffsets describes the layout of a ZCRX refill queue ring.
-// Matches struct io_uring_zcrx_offsets in Linux.
-type ZCRXOffsets struct {
-	Head uint32    // Head offset
-	Tail uint32    // Tail offset
-	Rqes uint32    // RQE array offset
-	_    uint32    // Reserved
-	Resv [2]uint64 // Reserved
-}
-
-// ZCRXAreaReg is the area registration for ZCRX.
-// Matches struct io_uring_zcrx_area_reg in Linux.
-type ZCRXAreaReg struct {
-	Addr        uint64    // Base address of the area
-	Len         uint64    // Length of the area
-	RqAreaToken uint64    // Token for RQ area
-	Flags       uint32    // IORING_ZCRX_AREA_* flags
-	DmabufFD    uint32    // DMA buffer file descriptor
-	Resv        [2]uint64 // Reserved
-}
-
-// ZCRXIfqReg configures a ZCRX interface queue.
-type ZCRXIfqReg struct {
-	IfIdx     uint32
-	IfRxq     uint32
-	RqEntries uint32
-	Flags     uint32
-	AreaPtr   uint64
-	RegionPtr uint64
-	Offsets   ZCRXOffsets
-	ZcrxID    uint32
-	RxBufLen  uint32
-	Resv      [3]uint64
-}
-
-// ZCRXIfqRegistration is the observable result of ZCRX interface-queue registration.
-type ZCRXIfqRegistration struct {
-	ID        uint32
-	RqEntries uint32 // Effective refill queue entry count.
-	Offsets   ZCRXOffsets
-	RxBufLen  uint32
-}
-
-// ZCRXCtrl is the control structure for ZCRX operations.
-// Matches struct zcrx_ctrl in Linux.
-type ZCRXCtrl struct {
-	ZcrxID uint32    // ZCRX instance ID
-	Op     uint32    // ZCRX_CTRL_* operation
-	Resv   [2]uint64 // Reserved
-	// Union: either ZcExport or ZcFlush based on Op
-	Data [48]byte // Large enough for both structures
 }
