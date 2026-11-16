@@ -19,6 +19,8 @@ var defaultOptions = Options{
 	LockedBufferMem:         registerBufferDefaultMem,
 	ReadBufferSize:          bufferSizeDefault,
 	ReadBufferNum:           EntriesMedium * 2,
+	WriteBufferSize:         bufferSizeDefault,
+	WriteBufferNum:          EntriesMedium,
 	MultiIssuers:            true,
 	NotifySucceed:           false,
 	IndirectSubmissionQueue: false,

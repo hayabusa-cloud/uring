@@ -99,6 +99,8 @@ func OptionsForBudget(budget int) Options {
 		LockedBufferMem: lockedMem,
 		ReadBufferSize:  bufferSizeDefault,
 		ReadBufferNum:   readBufferNum,
+		WriteBufferSize: bufferSizeDefault,
+		WriteBufferNum:  entries,
 		MultiSizeBuffer: scale,
 		MultiIssuers:    true,
 	}

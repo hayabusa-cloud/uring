@@ -43,6 +43,10 @@ type Options struct {
 	// ReadBufferGidOffset is the non-negative base group ID. The selected buffer
 	// layout must fit in the remaining uint16 group-ID namespace.
 	ReadBufferGidOffset int
+	// WriteBufferSize is the write buffer sizing hint in bytes.
+	WriteBufferSize int
+	// WriteBufferNum is the write buffer count hint.
+	WriteBufferNum int
 	// MultiSizeBuffer selects single-size mode at 0. Values in [1, 4096] enable
 	// multi-size groups and are rounded upward to a power of two.
 	MultiSizeBuffer int
