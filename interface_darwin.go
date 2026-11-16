@@ -25,8 +25,8 @@ const (
 	EntriesHuge   = 1 << 15 // 32768 entries
 )
 
-// Options configures the io_uring instance behavior.
-// All fields have sensible defaults if not specified.
+// Options configures an io_uring instance.
+// New applies option functions in order to the default configuration.
 type Options struct {
 	// Entries must be between 1 and EntriesHuge, inclusive.
 	Entries int
@@ -50,8 +50,9 @@ type Options struct {
 	// MultiSizeBuffer selects single-size mode at 0. Values in [1, 4096] enable
 	// multi-size groups and are rounded upward to a power of two.
 	MultiSizeBuffer int
-	// MultiIssuers mirrors the Linux task-migratable setup contract. It defaults
-	// to true; set it to false only for a caller pinned to one OS thread.
+	// MultiIssuers mirrors Linux shared-submit configuration. It defaults to
+	// false, requiring one serialized owner pinned to an OS thread from before
+	// Start through Stop on Linux. Set it to true for shared submission or migration.
 	MultiIssuers bool
 	// NotifySucceed disables default CQE suppression on write-like operations.
 	// Explicit IOSQE_CQE_SKIP_SUCCESS flags still apply.
@@ -65,6 +66,12 @@ type Options struct {
 // It returns ErrInvalidParam for an invalid option domain before creating the
 // ring. A successful call returns an unstarted ring; call Start to initialize
 // buffers and enable it.
+//
+// Before Start, the caller may transfer the unstarted ring to another goroutine
+// with synchronized, exclusive access. On Linux, the default requires the owner to call
+// runtime.LockOSThread before Start and remain locked through Stop, serializing
+// ring operations. Set Options.MultiIssuers to true to allow shared submission
+// or OS-thread migration.
 func New(options ...OptionFunc) (*Uring, error) {
 	opt := defaultOptions
 	opt.Apply(options...)
@@ -147,8 +154,9 @@ func newSetupOptions(opt Options, sqe128 bool) []func(params *ioUringParams) {
 
 // Uring is the main io_uring interface for submitting and completing I/O operations.
 // It wraps the kernel io_uring instance with buffer management and typed operations.
-// Default rings use the task-migratable shared-submit path. Set MultiIssuers
-// to false only for a caller pinned to one OS thread from New through Stop.
+// On Linux, default rings require one serialized owner pinned to an OS thread
+// from before Start through Stop. Set MultiIssuers to true for shared submission
+// or OS-thread migration.
 type Uring struct {
 	_ [0]func()
 
@@ -170,6 +178,10 @@ type Uring struct {
 }
 
 // Start initializes the io_uring instance, populates simulated capabilities, registers buffers, and enables the ring.
+// On Linux, MultiIssuers=false binds the ring to the calling task when enabled;
+// call runtime.LockOSThread before Start and remain locked through Stop.
+// Initialization failure closes the ring; calling Start on an already-started
+// ring returns ErrExists without closing it.
 func (ur *Uring) Start() (err error) {
 	if ur.closed.Load() {
 		return ErrClosed
@@ -230,6 +242,8 @@ func (ur *Uring) Start() (err error) {
 // It is idempotent. Caller must drain all in-flight operations, reap
 // outstanding CQEs, and quiesce live subscriptions before calling Stop. Stop
 // is not safe for concurrent use.
+// On Linux, stop a started single-issuer ring on its owning goroutine before
+// unlocking its OS thread. An unstarted ring may be stopped by its current owner.
 func (ur *Uring) Stop() error {
 	var err error
 	if ur.bufferRings != nil {

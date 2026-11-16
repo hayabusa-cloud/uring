@@ -55,27 +55,33 @@ Start with [`AGENTS.md`](./AGENTS.md) when building or reviewing runtimes, proto
 
 ## Ring lifecycle
 
-`New` returns an unstarted ring and eagerly constructs the context pools. Call `Start` before submitting operations; it registers ring resources and enables the ring. This example submits one read into ring-owned registered storage, whose address stays stable until `Stop`. Consume the bytes after completion and before reusing the buffer. `iox.IsWouldBlock` identifies no progress; caller-owned `iox.Backoff` keeps the wait CPU-friendly.
+`New` creates an unstarted ring and its context pools. With the default `MultiIssuers=false`, keep its owning goroutine locked to one OS thread from before `Start` through `Stop`. Call `Start` to register resources and enable submissions.
+
+This example reads into a ring-owned registered buffer whose address stays stable until `Stop`. Consume the bytes after completion and before reuse. `iox.IsWouldBlock` identifies no progress; use caller-owned `iox.Backoff` to keep waits CPU-friendly.
+
+This example exits on unrecoverable errors with `log.Fatal`. Services must retain and drain pending requests before teardown.
 
 ```go
+runtime.LockOSThread()
+defer runtime.UnlockOSThread()
+
 ring, err := uring.New(func(o *uring.Options) {
 	o.Entries = uring.EntriesMedium
 	o.NotifySucceed = true
 })
 if err != nil {
-	return err
+	log.Fatal(err)
 }
 
 if err := ring.Start(); err != nil {
-	return err
+	log.Fatal(err)
 }
-defer ring.Stop()
 
 fd := iofd.FD(file.Fd()) // Borrowed; file owns Close.
 buf := ring.RegisteredBuffer(0)
 ctx := uring.PackDirect(uring.IORING_OP_READ, 0, 0, 0).WithFD(fd)
 if err := ring.Read(ctx, buf); err != nil {
-	return err
+	log.Fatal(err)
 }
 
 var cqes [1]uring.CQEView // Only one request is outstanding.
@@ -83,7 +89,7 @@ var backoff iox.Backoff
 for {
 	n, err := ring.Wait(cqes[:])
 	if err != nil && !iox.IsWouldBlock(err) {
-		return err
+		log.Fatal(err)
 	}
 	if n == 0 {
 		backoff.Wait()
@@ -91,15 +97,22 @@ for {
 	}
 
 	backoff.Reset()
-	cqe := cqes[0]
-	if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
-		return fmt.Errorf("unexpected completion: op=%d fd=%d", cqe.Op(), cqe.FD())
-	}
-	if err := cqe.Err(); err != nil {
-		return fmt.Errorf("uring read failed: %w", err)
-	}
+	break
+}
+
+cqe := cqes[0]
+if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
+	log.Fatalf("unexpected completion: op=%d fd=%d", cqe.Op(), cqe.FD())
+}
+completionErr := cqe.Err()
+if completionErr == nil {
 	handle(buf[:int(cqe.Res)])
-	return nil
+}
+if err := ring.Stop(); err != nil {
+	log.Fatal(err)
+}
+if completionErr != nil {
+	log.Fatal(completionErr)
 }
 ```
 
@@ -238,9 +251,16 @@ For most systems the configuration helpers are the easiest entry point:
 
 ```go
 opts := uring.OptionsForSystem(uring.MachineMemory4GB)
+runtime.LockOSThread()
+defer runtime.UnlockOSThread()
+
 ring, err := uring.New(func(o *uring.Options) {
 	*o = opts
 })
+if err != nil {
+	return err
+}
+defer ring.Stop()
 ```
 
 Use `OptionsForBudget` to start from an explicit memory budget, or `BufferConfigForBudget` to inspect the tier layout chosen for a given budget:
@@ -361,7 +381,7 @@ Context and abstract-execution layers above this boundary do not change `code.hy
 
 ### Ring-owning event loop
 
-In the default task-migratable mode, shared submission-state synchronization allows a goroutine to move between OS threads. A ring-owner loop may still serialize all submit-state operations: it submits pending work, applies caller-owned `iox.Backoff` when `Wait` reports no observable progress, and dispatches completions:
+Run the default ring's event loop on the goroutine locked before `Start`, keeping it locked through `Stop`. The loop serializes ring operations, submits pending work, applies caller-owned `iox.Backoff` when `Wait` reports no observable progress, and dispatches completions:
 
 ```go
 func runLoop(ring *uring.Uring, stop <-chan struct{}) error {
@@ -433,7 +453,7 @@ for i := range n {
 }
 ```
 
-Each `OnStep` callback observes one `MultishotStep`: return `MultishotContinue` to keep the stream live, or `MultishotStop` to request cancellation. If callbacks remain enabled until the terminal observation, `OnStop` runs at most once with the final error and a `cancelled` flag; on the step itself, `step.Cancelled` distinguishes the specific `-ECANCELED` kernel verdict from other failures at the boundary. These callbacks correspond to `MultishotHandler.OnMultishotStep` and `MultishotHandler.OnMultishotStop`; you can also implement that interface directly. `HandleCQE` is for immediate dispatch in the caller's serialized completion loop; if caller code stores copied CQEs beyond that loop, it must keep its own route state and reject observations for retired subscriptions. On explicit single-issuer rings (`MultiIssuers=false`), call `Cancel` / `Unsubscribe` from the OS-thread-pinned ring owner and serialize them with submit, `Wait`, `WaitDirect`, `WaitExtended`, `Stop`, and `ResizeRings`. Default `MultiIssuers` rings serialize cancel SQEs through the shared-submit path.
+Each `OnStep` callback observes one `MultishotStep`: return `MultishotContinue` to keep the stream live, or `MultishotStop` to request cancellation. If callbacks remain enabled until the terminal observation, `OnStop` runs at most once with the final error and a `cancelled` flag; on the step itself, `step.Cancelled` distinguishes the specific `-ECANCELED` kernel verdict from other failures at the boundary. These callbacks correspond to `MultishotHandler.OnMultishotStep` and `MultishotHandler.OnMultishotStop`; you can also implement that interface directly. `HandleCQE` is for immediate dispatch in the caller's serialized completion loop; if caller code stores copied CQEs beyond that loop, it must keep its own route state and reject observations for retired subscriptions. On default single-issuer rings (`MultiIssuers=false`), call `Cancel` / `Unsubscribe` from the OS-thread-pinned ring owner and serialize them with submit, `Wait`, `WaitDirect`, `WaitExtended`, `Stop`, and `ResizeRings`. `MultiIssuers=true` rings serialize cancel SQEs through the shared-submit path.
 
 Route every queued cancellation CQE through the same subscription's `HandleCQE` or its extended handler, even after `SubscriptionStopped` or `OnStop`. Failed submission or a no-op creates no new cancellation CQE obligation. The subscription owns both contexts and returns the original to its pool only after original terminality, cancellation dispatch, and cancellation submission have finished. Do not return these contexts manually. The [receive example](./examples/multishot_test.go) demonstrates natural completion and handler-requested cancellation.
 
@@ -617,7 +637,7 @@ At the package root, [listener_example_test.go](./listener_example_test.go) demo
 
 - Enable `NotifySucceed` to retain successful write-like CQEs by default. Explicit `IOSQE_CQE_SKIP_SUCCESS` flags still apply.
 - `ring.Features` reports actual SQ/CQ entry counts, SQE slot width, and the byte order used to interpret `user_data`.
-- Keep the default `MultiIssuers=true` task-migratable configuration (`COOP_TASKRUN`) for ordinary Go execution and concurrent submit-state calls. Set `MultiIssuers=false` only when the owner calls `runtime.LockOSThread` before `New`, remains pinned through `Stop`, and serializes `submit`, `Wait`, `WaitDirect`, `WaitExtended`, `Stop`, and `ResizeRings`; that explicit fast path requests `SINGLE_ISSUER` + `DEFER_TASKRUN`.
+- The default `MultiIssuers=false` requests `SINGLE_ISSUER` + `DEFER_TASKRUN` and avoids shared-submit synchronization. Lock the owner with `runtime.LockOSThread` before `Start`, remain pinned through `Stop`, and serialize submissions, waits, resize, and teardown. Select `MultiIssuers=true` (`COOP_TASKRUN`) for shared submission or OS-thread migration.
 - `EpollWait` requires `timeout` to remain `0`; use `LinkTimeout` when you need a deadline.
 - Return pooled contexts only after all request completions and borrowed access have finished.
 - `ListenerOp.Close` closes the listener FD immediately. If a setup CQE is still pending, drain it first, then call `Close` again to return the borrowed `ExtSQE` to the pool.

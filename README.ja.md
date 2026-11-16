@@ -55,27 +55,33 @@ Debian 13 の安定版トラックが提供するカーネルは 6.12 です。`
 
 ## リングのライフサイクル
 
-`New` は未開始のリングを返し、コンテキストプールを直ちに構築します。操作の発行前に `Start` を呼び、リソースを登録してリングを有効にします。次の例ではリングが所有する登録済みメモリへ read を一度発行します。このメモリのアドレスは `Stop` まで変わりません。完了後、バッファを再利用する前に読み取ったデータを処理します。`iox.IsWouldBlock` で進展がない状態を判定し、呼び出し側の `iox.Backoff` で CPU 負荷を抑えて待機します。
+`New` は未開始のリングとコンテキストプールを作成します。デフォルトの `MultiIssuers=false` では、所有者の goroutine を `Start` の前に一つの OS スレッドへ固定し、`Stop` が完了するまで固定を保ちます。`Start` を呼んでリソースを登録し、操作の発行を有効にします。
+
+次の例はリングが所有する登録済みバッファへ読み込みます。そのアドレスは `Stop` まで変わりません。完了後、バッファを再利用する前にデータを処理します。`iox.IsWouldBlock` で進展がない状態を判定し、呼び出し側の `iox.Backoff` で CPU 負荷を抑えて待機します。
+
+この例は回復不能なエラーが発生すると `log.Fatal` でプロセスを終了します。サービスでは未完了のリクエストを保持し、すべての完了を処理してからリングを破棄します。
 
 ```go
+runtime.LockOSThread()
+defer runtime.UnlockOSThread()
+
 ring, err := uring.New(func(o *uring.Options) {
 	o.Entries = uring.EntriesMedium
 	o.NotifySucceed = true
 })
 if err != nil {
-	return err
+	log.Fatal(err)
 }
 
 if err := ring.Start(); err != nil {
-	return err
+	log.Fatal(err)
 }
-defer ring.Stop()
 
 fd := iofd.FD(file.Fd()) // 借用した FD。Close の責任は file が保持する。
 buf := ring.RegisteredBuffer(0)
 ctx := uring.PackDirect(uring.IORING_OP_READ, 0, 0, 0).WithFD(fd)
 if err := ring.Read(ctx, buf); err != nil {
-	return err
+	log.Fatal(err)
 }
 
 var cqes [1]uring.CQEView // Only one request is outstanding.
@@ -83,7 +89,7 @@ var backoff iox.Backoff
 for {
 	n, err := ring.Wait(cqes[:])
 	if err != nil && !iox.IsWouldBlock(err) {
-		return err
+		log.Fatal(err)
 	}
 	if n == 0 {
 		backoff.Wait()
@@ -91,15 +97,22 @@ for {
 	}
 
 	backoff.Reset()
-	cqe := cqes[0]
-	if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
-		return fmt.Errorf("unexpected completion: op=%d fd=%d", cqe.Op(), cqe.FD())
-	}
-	if err := cqe.Err(); err != nil {
-		return fmt.Errorf("uring read failed: %w", err)
-	}
+	break
+}
+
+cqe := cqes[0]
+if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
+	log.Fatalf("unexpected completion: op=%d fd=%d", cqe.Op(), cqe.FD())
+}
+completionErr := cqe.Err()
+if completionErr == nil {
 	handle(buf[:int(cqe.Res)])
-	return nil
+}
+if err := ring.Stop(); err != nil {
+	log.Fatal(err)
+}
+if completionErr != nil {
+	log.Fatal(completionErr)
 }
 ```
 
@@ -238,9 +251,16 @@ for i := range n {
 
 ```go
 opts := uring.OptionsForSystem(uring.MachineMemory4GB)
+runtime.LockOSThread()
+defer runtime.UnlockOSThread()
+
 ring, err := uring.New(func(o *uring.Options) {
 	*o = opts
 })
+if err != nil {
+	return err
+}
+defer ring.Stop()
 ```
 
 メモリ予算を明示的に指定したい場合は `OptionsForBudget` を、予算に対して選択される階層構成を確認したい場合は `BufferConfigForBudget` を使用してください。
@@ -361,7 +381,7 @@ CQE のルーティングは呼び出し側が担当します。`ListenerOp.Hand
 
 ### リング所有イベントループ
 
-デフォルトのタスク移動可能モードでは、共有された発行状態の同期により goroutine は OS スレッド間を移動できます。リング所有ループは引き続きすべての発行状態操作を直列化できます。一般的なループでは保留中のワークを発行し、`Wait` が観測可能な進展を返さないときは呼び出し側の `iox.Backoff` を適用し、完了を振り分けます。
+デフォルトのリングのイベントループは、`Start` の前に OS スレッドへ固定した goroutine で実行し、`Stop` まで固定を保ちます。ループはリング操作を直列化して保留中の処理を発行し、`Wait` が観測可能な進展を返さないときは呼び出し側の `iox.Backoff` を適用して、完了を振り分けます。
 
 ```go
 func runLoop(ring *uring.Uring, stop <-chan struct{}) error {
@@ -433,7 +453,7 @@ for i := range n {
 }
 ```
 
-`OnStep` コールバックは 1 件の `MultishotStep` を観察します。ストリームを維持するなら `MultishotContinue` を、キャンセルを要求するなら `MultishotStop` を返します。コールバックが終端観察まで有効なままなら、`OnStop` は最終エラーと `cancelled` フラグを伴って高々一度だけ実行されます。ステップ自身の `step.Cancelled` は、境界上でカーネルが `-ECANCELED` を返した判定をその他の失敗と明示的に区別します。これらのコールバックはそれぞれ `MultishotHandler.OnMultishotStep` と `MultishotHandler.OnMultishotStop` に対応します。インタフェースを直接実装することもできます。`HandleCQE` は呼び出し側の直列化された完了ループ内で即時 dispatch するための補助です。コピー済み CQE をそのループの後も保持する場合、呼び出し側が独自の route state を保持し、すでに解放されたサブスクリプションの観察を拒否してください。明示的な単一発行者リング（`MultiIssuers=false`）では、OS スレッドに固定したリング所有者から `Cancel` / `Unsubscribe` を呼び、発行、`Wait`、`WaitDirect`、`WaitExtended`、`Stop`、`ResizeRings` と直列化してください。デフォルトの `MultiIssuers` リングでは、共有発行パスがキャンセル SQE を直列化します。
+`OnStep` コールバックは 1 件の `MultishotStep` を観察します。ストリームを維持するなら `MultishotContinue` を、キャンセルを要求するなら `MultishotStop` を返します。コールバックが終端観察まで有効なままなら、`OnStop` は最終エラーと `cancelled` フラグを伴って高々一度だけ実行されます。ステップ自身の `step.Cancelled` は、境界上でカーネルが `-ECANCELED` を返した判定をその他の失敗と明示的に区別します。これらのコールバックはそれぞれ `MultishotHandler.OnMultishotStep` と `MultishotHandler.OnMultishotStop` に対応します。インタフェースを直接実装することもできます。`HandleCQE` は呼び出し側の直列化された完了ループ内で即時 dispatch するための補助です。コピー済み CQE をそのループの後も保持する場合、呼び出し側が独自の route state を保持し、すでに解放されたサブスクリプションの観察を拒否してください。デフォルトの単一発行者リング（`MultiIssuers=false`）では、OS スレッドに固定したリング所有者から `Cancel` / `Unsubscribe` を呼び、発行、`Wait`、`WaitDirect`、`WaitExtended`、`Stop`、`ResizeRings` と直列化してください。`MultiIssuers=true` のリングでは、共有発行パスがキャンセル SQE を直列化します。
 
 投入済みのキャンセル CQE は、`SubscriptionStopped` または `OnStop` の後も、同じサブスクリプションの `HandleCQE` またはその拡張ハンドラへ渡してください。投入の失敗や何もしない呼び出しでは、新たなキャンセル CQE の処理義務は生じません。サブスクリプションは両コンテキストを所有し、元の終端 CQE の処理、キャンセルの dispatch、キャンセル投入処理がすべて終わってから、元のコンテキストをプールへ返します。これらのコンテキストを手動で返さないでください。[受信の例](./examples/multishot_test.go)は、自然な完了とハンドラからのキャンセルを示します。
 
@@ -617,7 +637,7 @@ Idle → Active → Stopping → Retiring → Stopped
 
 - `NotifySucceed` を有効にすると、書き込み系操作の成功 CQE がデフォルトで保持されます。明示した `IOSQE_CQE_SKIP_SUCCESS` フラグは引き続き適用されます。
 - `ring.Features` は実際の SQ エントリ数・CQ エントリ数・SQE スロット幅・`user_data` 解釈時のバイト順を返す。
-- 通常の Go 実行および発行状態の並行呼び出しでは、デフォルトのタスク移動可能な `MultiIssuers=true` 構成（`COOP_TASKRUN`）を維持します。`MultiIssuers=false` は、所有者が `New` より前に `runtime.LockOSThread` を呼び、`Stop` まで固定されたまま、`submit`、`Wait`、`WaitDirect`、`WaitExtended`、`Stop`、`ResizeRings` を直列化する場合に限って使用します。この明示的な高速パスは `SINGLE_ISSUER` + `DEFER_TASKRUN` を要求します。
+- デフォルトの `MultiIssuers=false` は `SINGLE_ISSUER` + `DEFER_TASKRUN` を要求し、共有発行の同期処理を省きます。所有者は `Start` の前に `runtime.LockOSThread` を呼び、`Stop` まで同じ OS スレッドに固定したまま、発行、待機、リサイズ、終了処理を直列化します。発行を共有する場合や OS スレッド間の移動を許す場合は、`MultiIssuers=true`（`COOP_TASKRUN`）を明示的に選択します。
 - `EpollWait` の `timeout` は `0` のままにすること。期限が必要な場合は `LinkTimeout` を使う。
 - リクエストの全完了処理と借用アクセスが終了してから、プールのコンテキストを返却すること。
 - `ListenerOp.Close` はリスナー FD を即座に閉じる。構築中の CQE が未回収の場合は、その CQE を回収してから再度 `Close` を呼び出し、借用中の `ExtSQE` をプールに返却する。

@@ -7,6 +7,7 @@
 package examples_test
 
 import (
+	"runtime"
 	"testing"
 	"time"
 
@@ -18,6 +19,9 @@ import (
 // A timeout is an asynchronous request with its own CQE. With the default flags,
 // expiry reports -ETIME; the submission call itself does not wait for the timer.
 func TestBasicTimeout(t *testing.T) {
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
 	ring, err := uring.New(func(opt *uring.Options) {
 		opt.Entries = uring.EntriesNano
 		opt.LockedBufferMem = uring.BufferSizeLarge
@@ -69,6 +73,9 @@ func TestBasicTimeout(t *testing.T) {
 // relying on their arrival order. TIMEOUT does not use a buffer group, so this
 // example carries the ID in that Direct-context field.
 func TestMultipleTimeouts(t *testing.T) {
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
 	ring, err := uring.New(func(opt *uring.Options) {
 		opt.Entries = uring.EntriesNano
 		opt.LockedBufferMem = uring.BufferSizeLarge
@@ -130,6 +137,9 @@ func TestMultipleTimeouts(t *testing.T) {
 // Independent timeouts do not cancel other requests. Cancel and reap the
 // losing poll explicitly before tearing down the ring.
 func TestPollWithTimeout(t *testing.T) {
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
 	ring, err := uring.New(func(opt *uring.Options) {
 		opt.Entries = uring.EntriesNano
 		opt.LockedBufferMem = uring.BufferSizeLarge
@@ -247,6 +257,9 @@ func TestPollWithTimeout(t *testing.T) {
 // expires first, it attempts to cancel the linked operation. Reap both CQEs to
 // learn their actual outcomes before releasing request resources.
 func TestLinkedTimeout(t *testing.T) {
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
 	ring, err := uring.New(func(opt *uring.Options) {
 		opt.Entries = uring.EntriesNano
 		opt.LockedBufferMem = uring.BufferSizeLarge

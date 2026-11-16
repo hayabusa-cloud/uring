@@ -29,6 +29,9 @@ import (
 // OnNotification, including the fallback that needs no notification CQE.
 // Keep the payload live and unchanged until that release callback.
 func TestZCTrackerBasic(t *testing.T) {
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
 	ring, err := uring.New(func(opt *uring.Options) {
 		opt.Entries = uring.EntriesNano
 		opt.LockedBufferMem = uring.BufferSizeLarge
@@ -137,6 +140,9 @@ func TestMulticastZeroCopy(t *testing.T) {
 		{"zero_copy", bytes.Repeat([]byte("x"), 2048), uring.IORING_OP_SEND_ZC},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			runtime.LockOSThread()
+			t.Cleanup(runtime.UnlockOSThread)
+
 			ring, err := uring.New(func(opt *uring.Options) {
 				opt.Entries = uring.EntriesNano
 				opt.LockedBufferMem = uring.BufferSizeLarge

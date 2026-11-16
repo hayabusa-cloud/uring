@@ -30,7 +30,7 @@ Keep results, failures, terminality, and releases distinct. Neither terminal cal
 
 Finalizers retain their own prerequisites. `takt.Loop.Drain` discards suspensions; `takt.SubscriptionLoop.Drain` requests cancellation and retires routes. Neither waits for kernel completion. Preserve backend dispatch for late CQEs. The `sess.Close` effect closes only the local protocol endpoint.
 
-`Uring.Stop` is the final destructor and synthesizes no terminal callbacks. `ZCRXReceiver.Stop` requests cancellation; `Close` additionally requires receiver retirement and owning-ring teardown. Keep explicit single-issuer task affinity through final `Stop`.
+`Uring.Stop` is the final destructor and synthesizes no terminal callbacks. `ZCRXReceiver.Stop` requests cancellation; `Close` additionally requires receiver retirement and owning-ring teardown. Keep single-issuer task affinity through final `Stop`.
 
 ## Validate
 

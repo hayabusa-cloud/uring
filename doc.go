@@ -16,24 +16,29 @@
 // one outstanding read and uses [iox.Backoff] when no completion is available.
 // The file retains close ownership. The ring owns the registered buffer until
 // Stop; consume its bytes after completion and before reuse or ring teardown.
+// This example exits on unrecoverable errors with log.Fatal. Services must
+// retain and drain pending requests before stopping the ring.
+//
+//	runtime.LockOSThread()
+//	defer runtime.UnlockOSThread()
 //
 //	ring, err := uring.New(func(opt *uring.Options) {
 //	    opt.Entries = uring.EntriesMedium
 //	    opt.NotifySucceed = true
 //	})
 //	if err != nil {
-//	    return err
+//	    log.Fatal(err)
 //	}
+//
 //	if err := ring.Start(); err != nil {
-//	    return err
+//	    log.Fatal(err)
 //	}
-//	defer ring.Stop()
 //
 //	fd := iofd.FD(file.Fd()) // Borrowed; file owns Close.
 //	buf := ring.RegisteredBuffer(0)
 //	ctx := uring.PackDirect(uring.IORING_OP_READ, 0, 0, 0).WithFD(fd)
 //	if err := ring.Read(ctx, buf); err != nil {
-//	    return err
+//	    log.Fatal(err)
 //	}
 //
 //	var cqes [1]uring.CQEView // Only one request is outstanding.
@@ -41,7 +46,7 @@
 //	for {
 //	    n, err := ring.Wait(cqes[:])
 //	    if err != nil && !iox.IsWouldBlock(err) {
-//	        return err
+//	        log.Fatal(err)
 //	    }
 //	    if n == 0 {
 //	        backoff.Wait()
@@ -49,15 +54,22 @@
 //	    }
 //
 //	    backoff.Reset()
-//	    cqe := cqes[0]
-//	    if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
-//	        return fmt.Errorf("unexpected completion: op=%d fd=%d", cqe.Op(), cqe.FD())
-//	    }
-//	    if err := cqe.Err(); err != nil {
-//	        return fmt.Errorf("uring read failed: %w", err)
-//	    }
+//	    break
+//	}
+//
+//	cqe := cqes[0]
+//	if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
+//	    log.Fatalf("unexpected completion: op=%d fd=%d", cqe.Op(), cqe.FD())
+//	}
+//	completionErr := cqe.Err()
+//	if completionErr == nil {
 //	    handle(buf[:int(cqe.Res)])
-//	    return nil
+//	}
+//	if err := ring.Stop(); err != nil {
+//	    log.Fatal(err)
+//	}
+//	if completionErr != nil {
+//	    log.Fatal(completionErr)
 //	}
 //
 // [Uring.SubmitAcceptMultishot], [Uring.SubmitReceiveMultishot], and
@@ -88,7 +100,7 @@
 //	}
 //
 //	// Cancel when done
-//	// On explicit single-issuer rings, call Cancel from the OS-thread-pinned
+//	// On default single-issuer rings, call Cancel from the OS-thread-pinned
 //	// ring owner and serialize it with submit, Wait, WaitDirect,
 //	// WaitExtended, Stop, and ResizeRings.
 //	if err := sub.Cancel(); err != nil {
@@ -238,12 +250,20 @@
 // result. Finish borrowed payload access before republishing the buffer.
 //
 //	opts := uring.OptionsForBudget(256 * uring.MiB)
+//	runtime.LockOSThread()
+//	defer runtime.UnlockOSThread()
+//
 //	ring, err := uring.New(func(opt *uring.Options) {
 //	    *opt = opts
 //	})
 //	if err != nil {
 //	    return err
 //	}
+//
+//	if err := ring.Start(); err != nil {
+//	    return err
+//	}
+//	defer ring.Stop()
 //
 //	cfg, scale := uring.BufferConfigForBudget(256 * uring.MiB)
 //	fmt.Printf("buffer tiers=%+v scale=%d\n", cfg, scale)
@@ -360,7 +380,15 @@
 //
 // # Ring Setup
 //
+// New returns an unstarted ring that may be handed to another goroutine with
+// synchronized, exclusive access. With MultiIssuers=false, call
+// runtime.LockOSThread before Start and keep the owner locked through Stop.
+// Drain outstanding work before Stop. The example locks before New.
+//
 // Create and start an io_uring instance:
+//
+//	runtime.LockOSThread()
+//	defer runtime.UnlockOSThread()
 //
 //	ring, err := uring.New(func(opt *uring.Options) {
 //	    opt.Entries = uring.EntriesMedium // 2048 entries
@@ -371,6 +399,7 @@
 //	if err := ring.Start(); err != nil {
 //	    return err
 //	}
+//	defer ring.Stop()
 //
 // # Memory Barriers
 //

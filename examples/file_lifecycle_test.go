@@ -28,6 +28,9 @@ import (
 // descriptor, transferred byte count, or operation result. Waiting between these
 // dependent operations makes their ordering explicit.
 func TestFileOpenSyncClose(t *testing.T) {
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
 	ring, err := uring.New(func(opt *uring.Options) {
 		opt.Entries = uring.EntriesNano
 		opt.LockedBufferMem = uring.BufferSizeLarge

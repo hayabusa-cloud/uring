@@ -8,6 +8,7 @@ package examples_test
 
 import (
 	"bytes"
+	"runtime"
 	"testing"
 	"time"
 
@@ -24,6 +25,9 @@ import (
 // The first CQE confirms bytes entered the pipe before the second splice drains
 // them. The context FD is the destination; the separate FD argument is the source.
 func TestSpliceBasics(t *testing.T) {
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
 	ring, err := uring.New(func(opt *uring.Options) {
 		opt.Entries = uring.EntriesNano
 		opt.LockedBufferMem = uring.BufferSizeLarge
@@ -125,6 +129,9 @@ func TestSpliceBasics(t *testing.T) {
 //	     |                     |
 //	 original bytes       duplicate bytes
 func TestTeeOperation(t *testing.T) {
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
 	ring, err := uring.New(func(opt *uring.Options) {
 		opt.Entries = uring.EntriesNano
 		opt.LockedBufferMem = uring.BufferSizeLarge

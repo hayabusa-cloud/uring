@@ -55,27 +55,33 @@ Empiece por [`AGENTS.md`](./AGENTS.md) al desarrollar o revisar runtimes, pilas 
 
 ## Ciclo de vida del ring
 
-`New` devuelve un ring sin iniciar y construye los pools de contextos de inmediato. Llame a `Start` antes de enviar operaciones para registrar los recursos y habilitar el ring. Este ejemplo envía una lectura al almacenamiento registrado del ring, cuya dirección permanece estable hasta `Stop`. Consuma los bytes después de la finalización y antes de reutilizar el búfer. `iox.IsWouldBlock` identifica la falta de progreso; el llamador usa `iox.Backoff` para esperar sin consumir CPU innecesariamente.
+`New` crea un ring sin iniciar y sus pools de contextos. Con `MultiIssuers=false`, el valor predeterminado, mantenga la goroutine propietaria fijada a un hilo del sistema operativo desde antes de `Start` hasta que termine `Stop`. Llame a `Start` para registrar recursos y habilitar los envíos.
+
+Este ejemplo lee datos en un búfer registrado del ring, cuya dirección permanece estable hasta `Stop`. Consuma los bytes después de la finalización y antes de reutilizarlo. `iox.IsWouldBlock` identifica la falta de progreso; use un `iox.Backoff` del llamador para esperar sin consumir CPU innecesariamente.
+
+Este ejemplo termina el proceso con `log.Fatal` ante errores irrecuperables. Un servicio debe conservar las solicitudes pendientes y procesar todas sus finalizaciones antes de liberar el ring.
 
 ```go
+runtime.LockOSThread()
+defer runtime.UnlockOSThread()
+
 ring, err := uring.New(func(o *uring.Options) {
 	o.Entries = uring.EntriesMedium
 	o.NotifySucceed = true
 })
 if err != nil {
-	return err
+	log.Fatal(err)
 }
 
 if err := ring.Start(); err != nil {
-	return err
+	log.Fatal(err)
 }
-defer ring.Stop()
 
 fd := iofd.FD(file.Fd()) // Prestado; file conserva la responsabilidad de Close.
 buf := ring.RegisteredBuffer(0)
 ctx := uring.PackDirect(uring.IORING_OP_READ, 0, 0, 0).WithFD(fd)
 if err := ring.Read(ctx, buf); err != nil {
-	return err
+	log.Fatal(err)
 }
 
 var cqes [1]uring.CQEView // Only one request is outstanding.
@@ -83,7 +89,7 @@ var backoff iox.Backoff
 for {
 	n, err := ring.Wait(cqes[:])
 	if err != nil && !iox.IsWouldBlock(err) {
-		return err
+		log.Fatal(err)
 	}
 	if n == 0 {
 		backoff.Wait()
@@ -91,15 +97,22 @@ for {
 	}
 
 	backoff.Reset()
-	cqe := cqes[0]
-	if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
-		return fmt.Errorf("unexpected completion: op=%d fd=%d", cqe.Op(), cqe.FD())
-	}
-	if err := cqe.Err(); err != nil {
-		return fmt.Errorf("uring read failed: %w", err)
-	}
+	break
+}
+
+cqe := cqes[0]
+if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
+	log.Fatalf("unexpected completion: op=%d fd=%d", cqe.Op(), cqe.FD())
+}
+completionErr := cqe.Err()
+if completionErr == nil {
 	handle(buf[:int(cqe.Res)])
-	return nil
+}
+if err := ring.Stop(); err != nil {
+	log.Fatal(err)
+}
+if completionErr != nil {
+	log.Fatal(completionErr)
 }
 ```
 
@@ -238,9 +251,16 @@ En la mayoría de los sistemas, las funciones auxiliares de configuración ofrec
 
 ```go
 opts := uring.OptionsForSystem(uring.MachineMemory4GB)
+runtime.LockOSThread()
+defer runtime.UnlockOSThread()
+
 ring, err := uring.New(func(o *uring.Options) {
 	*o = opts
 })
+if err != nil {
+	return err
+}
+defer ring.Stop()
 ```
 
 Utilice `OptionsForBudget` para partir de un presupuesto de memoria explícito, y `BufferConfigForBudget` para inspeccionar la distribución por niveles elegida para dicho presupuesto:
@@ -361,7 +381,7 @@ Las capas de contexto y ejecución abstracta por encima de esta frontera no camb
 
 ### Bucle de eventos propietario del ring
 
-En el modo predeterminado migrable entre tareas, la sincronización compartida del estado de envío permite que una goroutine cambie de hilo del sistema operativo. Un bucle propietario del ring aún puede serializar todas las operaciones: emite el trabajo pendiente, aplica un `iox.Backoff` propiedad del llamador cuando `Wait` no informa progreso observable y despacha las finalizaciones:
+Ejecute el bucle de eventos del ring predeterminado en la goroutine fijada a un hilo antes de `Start`, manteniéndola en ese hilo hasta `Stop`. El bucle serializa las operaciones del ring, envía el trabajo pendiente, aplica un `iox.Backoff` del llamador cuando `Wait` no informa progreso observable y despacha las finalizaciones:
 
 ```go
 func runLoop(ring *uring.Uring, stop <-chan struct{}) error {
@@ -433,7 +453,7 @@ for i := range n {
 }
 ```
 
-Cada llamada a `OnStep` observa un `MultishotStep`: devuelva `MultishotContinue` para mantener el flujo activo o `MultishotStop` para solicitar la cancelación. Si las devoluciones de llamada permanecen habilitadas hasta la observación terminal, `OnStop` se ejecuta como máximo una vez con el error final y la bandera `cancelled`; en el propio paso, `step.Cancelled` distingue en el límite el veredicto específico `-ECANCELED` del kernel del resto de fallos. Estas funciones corresponden a `MultishotHandler.OnMultishotStep` y `MultishotHandler.OnMultishotStop`; también puede implementar esa interfaz directamente. `HandleCQE` sirve para el despacho inmediato en el bucle de finalización serializado del llamador; si el código llamador conserva CQE copiadas más allá de ese bucle, debe mantener su propio estado de ruta y rechazar observaciones de suscripciones ya retiradas. En rings de emisor único explícitos (`MultiIssuers=false`), llame a `Cancel` / `Unsubscribe` desde el propietario fijado a un hilo del sistema operativo y serialícelos con envío, `Wait`, `WaitDirect`, `WaitExtended`, `Stop` y `ResizeRings`. Los rings `MultiIssuers` predeterminados serializan los SQE de cancelación mediante la ruta de envío compartida.
+Cada llamada a `OnStep` observa un `MultishotStep`: devuelva `MultishotContinue` para mantener el flujo activo o `MultishotStop` para solicitar la cancelación. Si las devoluciones de llamada permanecen habilitadas hasta la observación terminal, `OnStop` se ejecuta como máximo una vez con el error final y la bandera `cancelled`; en el propio paso, `step.Cancelled` distingue en el límite el veredicto específico `-ECANCELED` del kernel del resto de fallos. Estas funciones corresponden a `MultishotHandler.OnMultishotStep` y `MultishotHandler.OnMultishotStop`; también puede implementar esa interfaz directamente. `HandleCQE` sirve para el despacho inmediato en el bucle de finalización serializado del llamador; si el código llamador conserva CQE copiadas más allá de ese bucle, debe mantener su propio estado de ruta y rechazar observaciones de suscripciones ya retiradas. En los rings predeterminados de emisor único (`MultiIssuers=false`), llame a `Cancel` / `Unsubscribe` desde el propietario fijado a un hilo del sistema operativo y serialícelos con envío, `Wait`, `WaitDirect`, `WaitExtended`, `Stop` y `ResizeRings`. Los rings con `MultiIssuers=true` serializan los SQE de cancelación mediante la ruta de envío compartida.
 
 Dirija cada CQE de cancelación encolada al `HandleCQE` de la misma suscripción o a su manejador extendido, incluso después de `SubscriptionStopped` o `OnStop`. Un fallo de envío o una llamada sin efecto no crea una nueva obligación de CQE de cancelación. La suscripción posee ambos contextos y devuelve el original a su pool solo tras procesar la CQE terminal original, despachar la cancelación y finalizar su envío. No devuelva estos contextos manualmente. El [ejemplo de recepción](./examples/multishot_test.go) muestra la finalización natural y la cancelación solicitada por el manejador.
 
@@ -617,7 +637,7 @@ En la raíz del paquete, [listener_example_test.go](./listener_example_test.go) 
 
 - Active `NotifySucceed` para conservar por defecto los CQE de operaciones exitosas de tipo escritura. Los flags explícitos `IOSQE_CQE_SKIP_SUCCESS` siguen aplicándose.
 - `ring.Features` informa de las entradas reales de SQ y CQ, el ancho de la ranura SQE y el orden de bytes que usa este paquete al interpretar `user_data`.
-- Mantenga la configuración predeterminada `MultiIssuers=true`, migrable entre tareas (`COOP_TASKRUN`), para la ejecución ordinaria en Go y las llamadas concurrentes al estado de envío. Use `MultiIssuers=false` solo si el propietario llama a `runtime.LockOSThread` antes de `New`, permanece fijado hasta `Stop` y serializa `submit`, `Wait`, `WaitDirect`, `WaitExtended`, `Stop` y `ResizeRings`; esa ruta rápida explícita solicita `SINGLE_ISSUER` + `DEFER_TASKRUN`.
+- La configuración predeterminada `MultiIssuers=false` solicita `SINGLE_ISSUER` + `DEFER_TASKRUN` y evita la sincronización de envíos compartidos. El propietario debe llamar a `runtime.LockOSThread` antes de `Start`, permanecer fijado al hilo hasta `Stop` y serializar los envíos, las esperas, el redimensionamiento y la liberación del ring. Seleccione `MultiIssuers=true` (`COOP_TASKRUN`) para compartir los envíos o permitir la migración entre hilos del sistema operativo.
 - `EpollWait` requiere que `timeout` sea `0`; use `LinkTimeout` cuando necesite un plazo.
 - Devuelva los contextos al pool solo cuando hayan terminado todas las finalizaciones de la petición y los accesos prestados.
 - `ListenerOp.Close` cierra el FD del escucha de inmediato. Si aún hay un CQE de configuración pendiente, drene ese CQE y vuelva a llamar a `Close` para devolver el `ExtSQE` prestado al pool.
