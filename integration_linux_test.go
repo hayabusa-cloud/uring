@@ -53,6 +53,96 @@ func logRingDiagnostics(t *testing.T, label string, ring *uring.Uring) {
 	)
 }
 
+func TestSingleIssuerStartBindsOwner(t *testing.T) {
+	// Keep the creator pinned so the owner must use a different OS thread.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	ring, err := uring.New(func(opt *uring.Options) {
+		opt.Entries = uring.EntriesNano
+		opt.LockedBufferMem = testLockedBufferMem
+		opt.ReadBufferNum = testProvidedBufferNum
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ready := make(chan struct{})
+	resume := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		runtime.LockOSThread()
+		var err error
+		pending := false
+		defer func() {
+			// A failed wait does not permit teardown of an unobserved request.
+			// In that failure case, leave resources intact and exit locked.
+			if !pending {
+				err = errors.Join(err, ring.Stop())
+				runtime.UnlockOSThread()
+			}
+			done <- err
+		}()
+		if err = ring.Start(); err != nil {
+			return
+		}
+		ctx := uring.PackDirect(uring.IORING_OP_NOP, 0, 0, 0)
+		if err = ring.Nop(ctx); err != nil {
+			return
+		}
+		pending = true
+		var cqes [1]uring.CQEView
+		var backoff iox.Backoff
+		deadline := time.Now().Add(time.Second)
+		for pending && time.Now().Before(deadline) {
+			n, waitErr := ring.Wait(cqes[:])
+			if n > 0 {
+				backoff.Reset()
+				if cqes[0].Context() != ctx || cqes[0].HasMore() {
+					err = fmt.Errorf("unexpected NOP completion: %+v", cqes[0])
+					return
+				}
+				pending = false
+				if cqes[0].Res != 0 {
+					err = fmt.Errorf("NOP result = %d, want 0", cqes[0].Res)
+					return
+				}
+			}
+			if waitErr != nil && !errors.Is(waitErr, iox.ErrWouldBlock) {
+				err = waitErr
+				return
+			}
+			if pending {
+				backoff.Wait()
+			}
+		}
+		if pending {
+			err = errors.New("owner NOP did not complete")
+			return
+		}
+		close(ready)
+		<-resume // The creator's intentional wrong-thread call must be serialized.
+	}()
+
+	select {
+	case <-ready:
+		var cqes [1]uring.CQEView
+		_, waitErr := ring.Wait(cqes[:])
+		close(resume)
+		if err := <-done; err != nil {
+			t.Fatalf("owner Stop: %v", err)
+		}
+		if !errors.Is(waitErr, uring.ErrExists) {
+			t.Fatalf("creator Wait = %v, want %v", waitErr, uring.ErrExists)
+		}
+	case err := <-done:
+		close(resume)
+		t.Fatalf("owner startup or completion: %v", err)
+	case <-time.After(5 * time.Second):
+		close(resume)
+		t.Fatal("owner did not finish startup and completion")
+	}
+}
+
 func TestSingleIssuerWrongTaskWaitReturnsErrExists(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping io_uring task-identity test in short mode")
@@ -101,12 +191,22 @@ func skipIfXattrUnsupported(t *testing.T, op string, res int32) {
 // =============================================================================
 
 func TestUringNopCycle(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions)
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
+	ring, err := uring.New(func(opt *uring.Options) {
+		opt.Entries = uring.EntriesNano
+		opt.LockedBufferMem = testLockedBufferMem
+		opt.ReadBufferNum = testProvidedBufferNum
+	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	mustStartRing(t, ring)
-	// Note: Uring doesn't have a Destroy method; OS reclaims resources on exit
+	if ring.MultiIssuers {
+		t.Fatal("default ring enabled shared submission")
+	}
+	runtime.Gosched() // The default owner must remain on its locked OS thread.
 
 	ctx := uring.PackDirect(uring.IORING_OP_NOP, 0, 0, 0)
 	if err := ring.Nop(ctx); err != nil {

@@ -37,15 +37,16 @@ const (
 
 // OptionsForSystem returns Options configured for a machine with the given total memory.
 // It derives a memory budget (25% of system memory) and delegates to [OptionsForBudget].
+// The returned options use the single-issuer defaults; follow the ownership
+// requirements of [New].
 //
 // Use the MachineMemory* constants for common configurations:
 //
 //	// 1GB machine (e.g., Linode Nanode, small CI runner)
 //	opts := OptionsForSystem(MachineMemory1GB)
-//	ring, err := New(func(o *Options) { *o = opts })
 //
 //	// 4GB machine (e.g., medium VM)
-//	opts := OptionsForSystem(MachineMemory4GB)
+//	opts = OptionsForSystem(MachineMemory4GB)
 //
 // Or pass the actual system memory:
 //
@@ -59,6 +60,8 @@ func OptionsForSystem(systemMemory int) Options {
 //
 // Budget specifies the total memory in bytes to allocate for the io_uring instance.
 // Supports budgets from 16 MiB to 128 GiB (values outside this range are clamped).
+// The returned options use the single-issuer defaults; follow the ownership
+// requirements of [New].
 //
 // Memory is distributed as:
 //   - Ring entries: sized to match expected throughput (more budget = more entries)
@@ -72,10 +75,9 @@ func OptionsForSystem(systemMemory int) Options {
 //
 //	// 256 MiB budget for a medium server
 //	opts := OptionsForBudget(256 * MiB)
-//	ring, err := New(func(o *Options) { *o = opts })
 //
 //	// 64 MiB budget for memory-constrained environment
-//	opts := OptionsForBudget(64 * MiB)
+//	opts = OptionsForBudget(64 * MiB)
 func OptionsForBudget(budget int) Options {
 	budget = clampBudget(budget)
 
@@ -102,7 +104,7 @@ func OptionsForBudget(budget int) Options {
 		WriteBufferSize: bufferSizeDefault,
 		WriteBufferNum:  entries,
 		MultiSizeBuffer: scale,
-		MultiIssuers:    true,
+		MultiIssuers:    false,
 	}
 }
 

@@ -15,7 +15,7 @@ var defaultOptions = Options{
 	ReadBufferNum:           EntriesMedium * 2,
 	WriteBufferSize:         bufferSizeDefault,
 	WriteBufferNum:          EntriesMedium,
-	MultiIssuers:            true,
+	MultiIssuers:            false,
 	NotifySucceed:           false,
 	IndirectSubmissionQueue: false,
 }

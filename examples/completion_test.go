@@ -9,6 +9,7 @@ package examples_test
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -29,6 +30,9 @@ import (
 // One request's failure does not cancel unrelated requests. Process every CQE
 // in each returned batch and correlate by context, not arrival order.
 func TestCompletionBatchErrors(t *testing.T) {
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
 	ring, err := uring.New(func(opt *uring.Options) {
 		opt.Entries = uring.EntriesNano
 		opt.LockedBufferMem = uring.BufferSizeLarge

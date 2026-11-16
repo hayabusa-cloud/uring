@@ -7,6 +7,7 @@
 package examples_test
 
 import (
+	"runtime"
 	"testing"
 	"time"
 
@@ -71,6 +72,9 @@ func TestSQEContextWithFlags(t *testing.T) {
 // Submission fills the target's SQE fields. The completion recovers that same
 // target; return it to the pool only after completion processing finishes.
 func TestSQEContextIndirect(t *testing.T) {
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
 	ring, err := uring.New(func(opt *uring.Options) {
 		opt.Entries = uring.EntriesNano
 		opt.LockedBufferMem = uring.BufferSizeLarge
@@ -137,6 +141,9 @@ func TestSQEContextIndirect(t *testing.T) {
 //
 // This example stores a connection tag and retrieves it on completion.
 func TestSQEContextExtended(t *testing.T) {
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
 	ring, err := uring.New(func(opt *uring.Options) {
 		opt.Entries = uring.EntriesNano
 		opt.LockedBufferMem = uring.BufferSizeLarge
@@ -215,6 +222,9 @@ func TestSQEContextExtended(t *testing.T) {
 // count. Interpret Res by opcode: for example, NOP returns 0 and READ returns
 // bytes read, while a negative result encodes an errno.
 func TestCQEViewAccess(t *testing.T) {
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
 	ring, err := uring.New(func(opt *uring.Options) {
 		opt.Entries = uring.EntriesNano
 		opt.LockedBufferMem = uring.BufferSizeLarge

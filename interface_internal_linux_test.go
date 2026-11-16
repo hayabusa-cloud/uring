@@ -8,6 +8,7 @@ package uring
 
 import (
 	"errors"
+	"runtime"
 	"testing"
 )
 
@@ -23,37 +24,37 @@ func TestOptionsApplySupportsPackageOptionHelpers(t *testing.T) {
 	}
 }
 
-func TestDefaultOptionsUseTaskMigratableSetup(t *testing.T) {
-	if !defaultOptions.MultiIssuers {
-		t.Fatal("default MultiIssuers = false, want true")
+func TestDefaultOptionsUsePinnedTaskSetup(t *testing.T) {
+	if defaultOptions.MultiIssuers {
+		t.Fatal("default MultiIssuers = true, want false")
 	}
 
 	params := ioUringParams{}
 	for _, apply := range newSetupOptions(defaultOptions, false) {
 		apply(&params)
 	}
-	if params.flags&IORING_SETUP_COOP_TASKRUN == 0 {
-		t.Fatal("default setup omitted IORING_SETUP_COOP_TASKRUN")
+	want := uint32(IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN)
+	if params.flags&want != want {
+		t.Fatalf("default setup flags = %#x, want bits %#x", params.flags, want)
 	}
-	if params.flags&(IORING_SETUP_SINGLE_ISSUER|IORING_SETUP_DEFER_TASKRUN) != 0 {
-		t.Fatalf("default setup flags = %#x, included pinned-task flags", params.flags)
+	if params.flags&IORING_SETUP_COOP_TASKRUN != 0 {
+		t.Fatalf("default setup flags = %#x, included IORING_SETUP_COOP_TASKRUN", params.flags)
 	}
 }
 
-func TestExplicitSingleIssuerUsesPinnedTaskSetup(t *testing.T) {
+func TestExplicitMultiIssuerUsesTaskMigratableSetup(t *testing.T) {
 	opt := defaultOptions
-	opt.MultiIssuers = false
+	opt.MultiIssuers = true
 
 	params := ioUringParams{}
 	for _, apply := range newSetupOptions(opt, false) {
 		apply(&params)
 	}
-	want := uint32(IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN)
-	if params.flags&want != want {
-		t.Fatalf("single-issuer setup flags = %#x, want bits %#x", params.flags, want)
+	if params.flags&IORING_SETUP_COOP_TASKRUN == 0 {
+		t.Fatal("shared setup omitted IORING_SETUP_COOP_TASKRUN")
 	}
-	if params.flags&IORING_SETUP_COOP_TASKRUN != 0 {
-		t.Fatalf("single-issuer setup flags = %#x, included IORING_SETUP_COOP_TASKRUN", params.flags)
+	if params.flags&(IORING_SETUP_SINGLE_ISSUER|IORING_SETUP_DEFER_TASKRUN) != 0 {
+		t.Fatalf("shared setup flags = %#x, included pinned-task flags", params.flags)
 	}
 }
 
@@ -139,12 +140,15 @@ func TestNewRejectsInvalidOptionsBeforeSetup(t *testing.T) {
 
 func TestOptionsForBudgetDisablesMultiSizeWhenDefaultGroupsDoNotFit(t *testing.T) {
 	opts := OptionsForBudget(64 * MiB)
-	if !opts.MultiIssuers {
-		t.Fatal("MultiIssuers = false, want task-migratable default")
+	if opts.MultiIssuers {
+		t.Fatal("MultiIssuers = true, want single-issuer default")
 	}
 	if opts.MultiSizeBuffer != 0 {
 		t.Fatalf("MultiSizeBuffer = %d, want 0", opts.MultiSizeBuffer)
 	}
+
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
 
 	ring, err := New(func(opt *Options) { *opt = opts })
 	if err != nil {
@@ -169,6 +173,9 @@ func TestNewUsesDefaultMultiSizeBufferGroups(t *testing.T) {
 	if opts.MultiSizeBuffer != 1 {
 		t.Fatalf("MultiSizeBuffer = %d, want 1", opts.MultiSizeBuffer)
 	}
+
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
 
 	ring, err := New(func(opt *Options) { *opt = opts })
 	if err != nil {

@@ -6,7 +6,7 @@ An adapter exposes one kernel-facing action and its observations. Apply the [enc
 
 Check public and opcode-specific input domains before narrowing, indexing, or writing the SQE. Initialize required fields and clear rejected fields. Retain identity through completion, release, and outstanding [cancellation lookups](resources.md#managed-cancellation).
 
-Ordinary Go ownership uses the default task-migratable mode. Explicit single-issuer mode requires one locked OS thread from before `New` through `Stop`, with serialized submit-state operations. Goroutine serialization does not establish Linux task identity.
+The default single-issuer mode requires one locked OS thread from before `Start` through `Stop`, with serialized ring operations. Select `MultiIssuers=true` for shared submission or OS-thread migration. Goroutine serialization alone does not establish Linux task identity.
 
 ## Observation
 

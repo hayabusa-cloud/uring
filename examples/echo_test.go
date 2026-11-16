@@ -39,6 +39,9 @@ func boundPort(t *testing.T, fd iofd.FD) int {
 // TCP carries bytes without message boundaries. The echo loops advance by each
 // CQE's byte count until this example's known payload has been received and sent.
 func TestTCPEchoServer(t *testing.T) {
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
 	ring, err := uring.New(func(opt *uring.Options) {
 		opt.Entries = uring.EntriesNano
 		opt.LockedBufferMem = uring.BufferSizeLarge
@@ -201,6 +204,9 @@ func TestTCPEchoServer(t *testing.T) {
 // This finite example knows the encoded frame size. It receives that frame
 // completely before decoding it, then broadcasts it with explicit short sends.
 func TestBroadcastServerWithFramer(t *testing.T) {
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
 	ring, err := uring.New(func(opt *uring.Options) {
 		opt.Entries = uring.EntriesNano
 		opt.LockedBufferMem = uring.BufferSizeLarge
@@ -313,6 +319,9 @@ func TestBroadcastServerWithFramer(t *testing.T) {
 // UDP preserves datagram boundaries. Connecting this socket selects its peer;
 // each receive/send below transfers one complete ping or pong datagram.
 func TestUDPPingPong(t *testing.T) {
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
 	ring, err := uring.New(func(opt *uring.Options) {
 		opt.Entries = uring.EntriesNano
 		opt.LockedBufferMem = uring.BufferSizeLarge

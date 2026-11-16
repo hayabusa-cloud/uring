@@ -26,6 +26,7 @@ const (
 )
 
 func testMinimalBufferOptions(opt *uring.Options) {
+	opt.MultiIssuers = true // Allow unpinned test goroutines.
 	opt.LockedBufferMem = testLockedBufferMem
 	opt.ReadBufferNum = testProvidedBufferNum
 	opt.Entries = uring.EntriesNano

@@ -7,6 +7,7 @@
 package examples_test
 
 import (
+	"runtime"
 	"testing"
 	"time"
 
@@ -19,6 +20,9 @@ import (
 // CQE result is an event mask, so test the requested bit instead of a byte count.
 // EPOLLIN requests read readiness; it does not read the pipe's bytes.
 func TestPollAddBasic(t *testing.T) {
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
 	ring, err := uring.New(func(opt *uring.Options) {
 		opt.Entries = uring.EntriesNano
 		opt.LockedBufferMem = uring.BufferSizeLarge
@@ -92,6 +96,9 @@ func TestPollAddBasic(t *testing.T) {
 //
 // Reap both CQEs; a cancellation result alone does not retire the original poll.
 func TestPollCancelByFD(t *testing.T) {
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
 	ring, err := uring.New(func(opt *uring.Options) {
 		opt.Entries = uring.EntriesNano
 		opt.LockedBufferMem = uring.BufferSizeLarge
@@ -179,6 +186,9 @@ func TestPollCancelByFD(t *testing.T) {
 }
 
 func TestPollMultipleFDs(t *testing.T) {
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
 	ring, err := uring.New(func(opt *uring.Options) {
 		opt.Entries = uring.EntriesNano
 		opt.LockedBufferMem = uring.BufferSizeLarge

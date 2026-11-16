@@ -9,6 +9,7 @@ package uring_test
 import (
 	"errors"
 	"net"
+	"runtime"
 	"testing"
 	"time"
 	"unsafe"
@@ -27,6 +28,9 @@ import (
 // the subscription and dispatch both terminal and cancellation completions
 // before closing the listener and ring.
 func TestListenerWithAccept(t *testing.T) {
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
 	ring, err := uring.New(func(opt *uring.Options) {
 		opt.Entries = uring.EntriesNano
 		opt.LockedBufferMem = uring.BufferSizeLarge

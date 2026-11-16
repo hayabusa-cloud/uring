@@ -8,6 +8,7 @@ package examples_test
 
 import (
 	"bytes"
+	"runtime"
 	"testing"
 	"time"
 
@@ -31,6 +32,9 @@ func TestMultishotAcceptServer(t *testing.T) {
 			name = "handler_stop"
 		}
 		t.Run(name, func(t *testing.T) {
+			runtime.LockOSThread()
+			t.Cleanup(runtime.UnlockOSThread)
+
 			ring, err := uring.New(func(opt *uring.Options) {
 				opt.Entries = uring.EntriesNano
 				opt.LockedBufferMem = uring.BufferSizeLarge
@@ -156,6 +160,9 @@ func TestMultishotRecvWithBufferSelection(t *testing.T) {
 			name = "handler_stop"
 		}
 		t.Run(name, func(t *testing.T) {
+			runtime.LockOSThread()
+			t.Cleanup(runtime.UnlockOSThread)
+
 			ring, err := uring.New(func(opt *uring.Options) {
 				opt.Entries = uring.EntriesNano
 				opt.LockedBufferMem = uring.BufferSizeLarge

@@ -34,8 +34,8 @@ const (
 	EntriesHuge   = 1 << 15 // 32768 entries
 )
 
-// Options configures the io_uring instance behavior.
-// All fields have sensible defaults if not specified.
+// Options configures an io_uring instance.
+// New applies option functions in order to the default configuration.
 type Options struct {
 	// Entries specifies the number of SQE slots and must be between 1 and
 	// EntriesHuge, inclusive (use Entries* constants).
@@ -60,12 +60,11 @@ type Options struct {
 	// MultiSizeBuffer selects single-size mode at 0. Values in [1, 4096] enable
 	// multi-size groups and are rounded upward to a power of two.
 	MultiSizeBuffer int
-	// MultiIssuers selects the task-migratable shared-submit configuration.
-	// It defaults to true because a Go goroutine may execute on different Linux
-	// tasks even when caller code serializes every ring operation. Set it to
-	// false only when the goroutine is locked to one OS thread from New through
-	// Stop; that requests SINGLE_ISSUER + DEFER_TASKRUN and removes shared-submit
-	// synchronization.
+	// MultiIssuers enables shared-submit synchronization and OS-thread migration.
+	// It defaults to false: one owner must lock its goroutine to an OS thread
+	// before Start and keep it locked through Stop, serializing ring operations.
+	// This requests SINGLE_ISSUER + DEFER_TASKRUN and avoids shared-submit
+	// synchronization. Setting it to true requests COOP_TASKRUN.
 	MultiIssuers bool
 	// NotifySucceed disables default CQE suppression on write-like operations.
 	// Explicit IOSQE_CQE_SKIP_SUCCESS flags still apply.
@@ -88,6 +87,12 @@ type Options struct {
 // It returns ErrInvalidParam for an invalid option domain before creating the
 // ring. A successful call returns an unstarted ring; call Start to initialize
 // buffers and enable it.
+//
+// Before Start, the caller may transfer the unstarted ring to another goroutine
+// with synchronized, exclusive access. By default, that owner must call
+// runtime.LockOSThread before Start and remain locked through Stop, serializing
+// ring operations. Set Options.MultiIssuers to true to allow shared submission
+// or OS-thread migration.
 func New(options ...OptionFunc) (*Uring, error) {
 	opt := defaultOptions
 	opt.Apply(options...)
@@ -180,10 +185,10 @@ func newSetupOptions(opt Options, sqe128 bool) []func(params *ioUringParams) {
 
 // Uring is the main io_uring interface for submitting and completing I/O operations.
 // It wraps the kernel io_uring instance with buffer management and typed operations.
-// Default rings use the task-migratable shared-submit path. Set MultiIssuers
-// to false only when one goroutine is locked to one OS thread from New through
-// Stop and serializes submit, Wait, WaitDirect, WaitExtended, Stop, and
-// ResizeRings.
+// Default rings have one owner locked to an OS thread from before Start through
+// Stop. The owner serializes submit, Wait, WaitDirect, WaitExtended, Stop, and
+// ResizeRings. Set MultiIssuers to true for shared submission or OS-thread
+// migration; lifecycle and resource ownership remain caller responsibilities.
 type Uring struct {
 	*ioUring
 	*Options
@@ -217,6 +222,11 @@ type registeredBufRing struct {
 // Start initializes the io_uring instance with buffers and enables the ring.
 // Context pools are constructed eagerly by New and are intentionally not
 // reset here so any SQEs borrowed before Start remain valid.
+//
+// With MultiIssuers=false, enabling binds the ring to the calling Linux task.
+// Call runtime.LockOSThread before Start and keep that goroutine locked through
+// Stop, serializing ring operations. Initialization failure closes the ring;
+// calling Start on an already-started ring returns ErrExists without closing it.
 func (ur *Uring) Start() (err error) {
 	if ur.closed.Load() {
 		return ErrClosed
@@ -284,6 +294,8 @@ func (ur *Uring) Start() (err error) {
 // It is idempotent. Caller must drain all in-flight operations, reap
 // outstanding CQEs, and quiesce live subscriptions before calling Stop. Stop
 // is not safe for concurrent use.
+// For a started single-issuer ring, call Stop on the owning goroutine before
+// unlocking its OS thread. An unstarted ring may be stopped by its current owner.
 func (ur *Uring) Stop() error {
 	var err error
 	if stopErr := ur.ioUring.stop(); stopErr != nil {
@@ -1570,7 +1582,7 @@ func (ur *Uring) cloneBuffersFrom(src *Uring, srcRegisteredRingIdx uint32, regis
 //
 // Requirements:
 //   - MultiIssuers must be false so New requests IORING_SETUP_DEFER_TASKRUN
-//   - The caller must remain locked to one OS thread from before New through Stop
+//   - The caller must remain locked to one OS thread from before Start through Stop
 //   - The ring must not be in CQ overflow condition
 //
 // Parameters:

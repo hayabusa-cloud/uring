@@ -28,6 +28,9 @@ import (
 // Buffer IDs are identities; their numeric order does not define a bundle.
 func TestBundleIteratorUsage(t *testing.T) {
 	const size, entries = 64, 4
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
 	ring, err := uring.New(func(opt *uring.Options) {
 		opt.Entries = uring.EntriesNano
 		opt.LockedBufferMem = uring.BufferSizeLarge
@@ -123,6 +126,9 @@ func TestIncrementalBufferConsumption(t *testing.T) {
 	backing := make([]byte, size*entries)
 	// Register this cleanup before the ring cleanup so roots outlive Stop.
 	t.Cleanup(func() { runtime.KeepAlive(backing) })
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
 	ring, err := uring.New(func(opt *uring.Options) {
 		opt.Entries = uring.EntriesNano
 		opt.LockedBufferMem = uring.BufferSizeLarge

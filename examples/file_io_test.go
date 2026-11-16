@@ -26,7 +26,11 @@ import (
 //
 // Keep each payload or destination valid until its completion. Wait may return
 // no CQEs yet; back off between attempts and reset the backoff after progress.
+// The default ring requires its owner to stay on one OS thread through Stop.
 func TestFileWriteRead(t *testing.T) {
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
 	ring, err := uring.New(func(opt *uring.Options) {
 		opt.Entries = uring.EntriesNano
 		opt.LockedBufferMem = uring.BufferSizeLarge
@@ -115,6 +119,9 @@ func TestFileWriteRead(t *testing.T) {
 // offsets leave the file's shared position unchanged. WithOffset(-1) instead
 // uses and advances that shared position, so such operations need serialization.
 func TestFileReadUntilEOF(t *testing.T) {
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
 	ring, err := uring.New(func(opt *uring.Options) {
 		opt.Entries = uring.EntriesNano
 		opt.LockedBufferMem = uring.BufferSizeLarge
@@ -193,6 +200,9 @@ func TestFileReadUntilEOF(t *testing.T) {
 // Queue independent writes before collecting their completions. Each request
 // carries an ID because CQEs need not arrive in submission order or one at a time.
 func TestBatchedFileOps(t *testing.T) {
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
 	ring, err := uring.New(func(opt *uring.Options) {
 		opt.Entries = uring.EntriesNano
 		opt.LockedBufferMem = uring.BufferSizeLarge
@@ -270,6 +280,9 @@ func TestBatchedFileOps(t *testing.T) {
 // ErrWouldBlock leaves the current ID unsubmitted. Keep separate submitted and
 // completed counts so a retry cannot duplicate work already accepted by the ring.
 func TestBatchedNops(t *testing.T) {
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
 	ring, err := uring.New(func(opt *uring.Options) {
 		opt.Entries = uring.EntriesNano
 		opt.LockedBufferMem = uring.BufferSizeLarge

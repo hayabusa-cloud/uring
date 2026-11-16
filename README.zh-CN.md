@@ -55,27 +55,33 @@ Ring 创建可能返回 `ENOMEM`、`EPERM` 或 `ENOSYS`，分别对应 memlock �
 
 ## Ring 生命周期
 
-`New` 返回尚未启动的 ring，并立即构建上下文池。在提交操作前调用 `Start`，以注册资源并启用 ring。下面的示例将一次读取的结果写入 ring 所有的注册内存，其地址在 `Stop` 前保持稳定。完成后先处理读取的数据，再复用缓冲区。`iox.IsWouldBlock` 表示当前没有进展；调用方使用 `iox.Backoff` 等待，兼顾 CPU 效率。
+`New` 创建尚未启动的 ring 及其上下文池。默认配置为 `MultiIssuers=false`，所有者 goroutine 须在 `Start` 前绑定到一个 OS 线程，并保持绑定直到 `Stop`。调用 `Start` 注册资源并启用提交。
+
+下面的示例将数据读入 ring 所有的注册缓冲区，其地址在 `Stop` 前保持稳定。完成后先处理数据，再复用缓冲区。`iox.IsWouldBlock` 表示当前没有进展；调用方使用 `iox.Backoff` 退避，兼顾 CPU 效率。
+
+本示例遇到不可恢复的错误时通过 `log.Fatal` 退出进程。服务程序须保留未完成的请求，并在销毁 ring 前等待并处理全部完成事件。
 
 ```go
+runtime.LockOSThread()
+defer runtime.UnlockOSThread()
+
 ring, err := uring.New(func(o *uring.Options) {
 	o.Entries = uring.EntriesMedium
 	o.NotifySucceed = true
 })
 if err != nil {
-	return err
+	log.Fatal(err)
 }
 
 if err := ring.Start(); err != nil {
-	return err
+	log.Fatal(err)
 }
-defer ring.Stop()
 
 fd := iofd.FD(file.Fd()) // 借用的 FD；file 保留关闭责任。
 buf := ring.RegisteredBuffer(0)
 ctx := uring.PackDirect(uring.IORING_OP_READ, 0, 0, 0).WithFD(fd)
 if err := ring.Read(ctx, buf); err != nil {
-	return err
+	log.Fatal(err)
 }
 
 var cqes [1]uring.CQEView // Only one request is outstanding.
@@ -83,7 +89,7 @@ var backoff iox.Backoff
 for {
 	n, err := ring.Wait(cqes[:])
 	if err != nil && !iox.IsWouldBlock(err) {
-		return err
+		log.Fatal(err)
 	}
 	if n == 0 {
 		backoff.Wait()
@@ -91,15 +97,22 @@ for {
 	}
 
 	backoff.Reset()
-	cqe := cqes[0]
-	if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
-		return fmt.Errorf("unexpected completion: op=%d fd=%d", cqe.Op(), cqe.FD())
-	}
-	if err := cqe.Err(); err != nil {
-		return fmt.Errorf("uring read failed: %w", err)
-	}
+	break
+}
+
+cqe := cqes[0]
+if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
+	log.Fatalf("unexpected completion: op=%d fd=%d", cqe.Op(), cqe.FD())
+}
+completionErr := cqe.Err()
+if completionErr == nil {
 	handle(buf[:int(cqe.Res)])
-	return nil
+}
+if err := ring.Stop(); err != nil {
+	log.Fatal(err)
+}
+if completionErr != nil {
+	log.Fatal(completionErr)
 }
 ```
 
@@ -238,9 +251,16 @@ for i := range n {
 
 ```go
 opts := uring.OptionsForSystem(uring.MachineMemory4GB)
+runtime.LockOSThread()
+defer runtime.UnlockOSThread()
+
 ring, err := uring.New(func(o *uring.Options) {
 	*o = opts
 })
+if err != nil {
+	return err
+}
+defer ring.Stop()
 ```
 
 需要从显式内存预算出发时使用 `OptionsForBudget`；需要查看某预算对应的分层布局时使用 `BufferConfigForBudget`：
@@ -361,7 +381,7 @@ CQE 路由仍由调用方负责。`ListenerOp.HandleCQE` 推进 SOCKET → BIND 
 
 ### Ring 所有者事件循环
 
-在默认的任务可迁移模式下，共享提交状态同步允许 goroutine 在不同 OS 线程之间迁移。ring 所有者循环仍可串行化全部提交状态操作：提交待处理工作，在 `Wait` 没有返回可观察进展时使用调用方持有的 `iox.Backoff`，然后分发完成事件。
+默认 ring 的事件循环应由在 `Start` 前绑定到 OS 线程的 goroutine 执行，并保持绑定直到 `Stop`。该循环串行执行 ring 操作、提交待处理工作，在 `Wait` 没有返回可观察进展时使用调用方持有的 `iox.Backoff`，并分发完成事件。
 
 ```go
 func runLoop(ring *uring.Uring, stop <-chan struct{}) error {
@@ -433,7 +453,7 @@ for i := range n {
 }
 ```
 
-每一次 `OnStep` 回调观察一个 `MultishotStep`：返回 `MultishotContinue` 保持流活跃，或返回 `MultishotStop` 请求取消。如果回调一直保持启用直到终态观察，`OnStop` 至多以最终错误及 `cancelled` 标志触发一次；在步骤自身上，`step.Cancelled` 在边界处把内核的 `-ECANCELED` 判定与其他失败明确区分开。这两个回调分别对应 `MultishotHandler.OnMultishotStep` 和 `MultishotHandler.OnMultishotStop`；也可以直接实现该接口。`HandleCQE` 用于调用方串行化完成循环内的立即 dispatch；若调用方在该循环之后保留复制 CQE，则需维护自己的 route state，并拒绝已退役订阅的观察。在显式单提交者 ring（`MultiIssuers=false`）上，应从固定于 OS 线程的 ring 所有者调用 `Cancel` / `Unsubscribe`，并将其与提交、`Wait`、`WaitDirect`、`WaitExtended`、`Stop` 以及 `ResizeRings` 串行化。默认 `MultiIssuers` ring 通过共享提交路径串行化取消 SQE。
+每一次 `OnStep` 回调观察一个 `MultishotStep`：返回 `MultishotContinue` 保持流活跃，或返回 `MultishotStop` 请求取消。如果回调一直保持启用直到终态观察，`OnStop` 至多以最终错误及 `cancelled` 标志触发一次；在步骤自身上，`step.Cancelled` 在边界处把内核的 `-ECANCELED` 判定与其他失败明确区分开。这两个回调分别对应 `MultishotHandler.OnMultishotStep` 和 `MultishotHandler.OnMultishotStop`；也可以直接实现该接口。`HandleCQE` 用于调用方串行化完成循环内的立即 dispatch；若调用方在该循环之后保留复制 CQE，则需维护自己的 route state，并拒绝已退役订阅的观察。在默认的单提交者 ring（`MultiIssuers=false`）上，应从固定于 OS 线程的 ring 所有者调用 `Cancel` / `Unsubscribe`，并将其与提交、`Wait`、`WaitDirect`、`WaitExtended`、`Stop` 以及 `ResizeRings` 串行化。`MultiIssuers=true` 的 ring 通过共享提交路径串行化取消 SQE。
 
 每个已入队的取消 CQE 都应交给同一订阅的 `HandleCQE` 或其扩展处理器，即使已到达 `SubscriptionStopped` 或触发 `OnStop`。提交失败或未执行新提交的调用不会产生新的取消 CQE 处理义务。订阅拥有两个上下文，只有在处理完原请求的终态 CQE、完成取消分派且取消提交过程结束后，才将原上下文归还池。不要手动归还这些上下文。[接收示例](./examples/multishot_test.go)展示了自然完成和由处理器请求的取消。
 
@@ -617,7 +637,7 @@ Idle → Active → Stopping → Retiring → Stopped
 
 - 启用 `NotifySucceed` 可默认保留写入类操作成功时的 CQE。显式指定的 `IOSQE_CQE_SKIP_SUCCESS` 标志仍然有效。
 - `ring.Features` 报告实际 SQ/CQ 条目数、SQE 槽宽以及本包解析 `user_data` 的字节序。
-- 普通 Go 执行和并发提交状态调用应保留默认的任务可迁移 `MultiIssuers=true` 配置（`COOP_TASKRUN`）。仅当所有者在 `New` 前调用 `runtime.LockOSThread`、持续固定到 `Stop`，并串行化 `submit`、`Wait`、`WaitDirect`、`WaitExtended`、`Stop` 与 `ResizeRings` 时，才设置 `MultiIssuers=false`；该显式快速路径请求 `SINGLE_ISSUER` + `DEFER_TASKRUN`。
+- 默认的 `MultiIssuers=false` 请求 `SINGLE_ISSUER` + `DEFER_TASKRUN`，避免共享提交同步。所有者须在 `Start` 前调用 `runtime.LockOSThread`，保持线程绑定直到 `Stop`，并串行执行提交、等待、扩缩容和销毁。需要共享提交或在 OS 线程之间迁移时，显式选择 `MultiIssuers=true`（`COOP_TASKRUN`）。
 - `EpollWait` 要求 `timeout` 为 `0`；如需设置截止时间，使用 `LinkTimeout`。
 - 所有请求完成处理和借用访问结束后，才能归还池化上下文。
 - `ListenerOp.Close` 会立即关闭监听 FD。若仍有设置 CQE 待处理，需先回收该 CQE，再调用 `Close` 将借用的 `ExtSQE` 归还池中。

@@ -28,6 +28,9 @@ import (
 // The header and body can stay in separate buffers. bytes.Join below creates
 // the expected test value; WriteV receives the original slices.
 func TestVectoredWrite(t *testing.T) {
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
 	ring, err := uring.New(func(opt *uring.Options) {
 		opt.Entries = uring.EntriesNano
 		opt.LockedBufferMem = uring.BufferSizeLarge
@@ -95,6 +98,9 @@ func TestVectoredWrite(t *testing.T) {
 // Slice lengths define the boundaries. A short read may fill only a prefix;
 // inspect the CQE byte count before using the destination bytes.
 func TestVectoredRead(t *testing.T) {
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
 	ring, err := uring.New(func(opt *uring.Options) {
 		opt.Entries = uring.EntriesNano
 		opt.LockedBufferMem = uring.BufferSizeLarge

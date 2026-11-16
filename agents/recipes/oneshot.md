@@ -6,7 +6,7 @@ Admit one operation, match its completion, and deliver once. Optional roles: [ko
 
 Choose the ring owner and context mode. Retain descriptors, payloads, submission metadata, and typed roots through their final use. Use Direct context when its inline fields suffice; give each request an unambiguous live identity.
 
-Check [opcode and setup requirements](../boundary/encoding.md). Go serialization does not pin a Linux task. Explicit single-issuer mode requires OS-thread affinity from before `New` through `Stop`, with serialized submit, enter/wait, resize, and teardown.
+Check [opcode and setup requirements](../boundary/encoding.md). Go serialization does not pin a Linux task. Default single-issuer mode requires OS-thread affinity from before `Start` through `Stop`, with serialized submit, enter/wait, resize, and teardown.
 
 ## Admission
 

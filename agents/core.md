@@ -24,7 +24,7 @@ Retry only unaccepted work; retain its owners on retryable paths. Never replay a
 
 ## Capabilities and Domains
 
-Check opcode domains, reserved fields, setup flags, and feature evidence. Kernel support does not establish wrapper support. Explicit single-issuer mode requires its pinned Linux-task lifetime; serialized goroutines can migrate. [Encoding and capabilities](boundary/encoding.md)
+Check opcode domains, reserved fields, setup flags, and feature evidence. Kernel support does not establish wrapper support. Default single-issuer mode requires its pinned Linux-task lifetime; serialized goroutines can migrate. [Encoding and capabilities](boundary/encoding.md)
 
 ## Context
 

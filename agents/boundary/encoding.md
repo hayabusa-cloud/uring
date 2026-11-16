@@ -49,7 +49,7 @@ WAITID accepts `P_ALL`, `P_PID`, `P_PGID`, or `P_PIDFD`. IDs fit signed 32-bit: 
 
 ## Setup and Capabilities
 
-The default `MultiIssuers=true` permits a serialized Go owner to migrate between Linux tasks. Explicit single-issuer mode requires one locked OS thread from before `New` through `Stop`, including submission, enter/wait and resize. Never treat wrong-issuer `EEXIST` as success or would-block.
+The default `MultiIssuers=false` requires one owner locked to an OS thread from before `Start` through `Stop`, including submission, enter/wait and resize. `New` creates a disabled ring; `Start` binds the issuer when enabling it. This mode avoids shared-submit synchronization. Select `MultiIssuers=true` for shared submission or Linux-task migration. Never treat wrong-issuer `EEXIST` as success or would-block.
 
 Probe opcode, setup and registration support separately; verify wrapper support too. Optional SQE128 changes the SQE stride. Context retention still copies only the 64-byte base SQE; Extended user bytes are not the SQE128 extension. Resize must preserve pending entries and their width. A remap failure after the kernel commits resize is terminal.
 

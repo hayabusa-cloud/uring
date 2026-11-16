@@ -8,6 +8,7 @@ package uring_test
 
 import (
 	"math"
+	"runtime"
 	"strconv"
 	"testing"
 
@@ -366,6 +367,9 @@ func TestOptionsForBudget_Integration(t *testing.T) {
 	opts := uring.OptionsForBudget(16 * uring.MiB)
 
 	// Create the ring without starting (no buffer allocation)
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
 	ring, err := uring.New(func(o *uring.Options) {
 		*o = opts
 	})

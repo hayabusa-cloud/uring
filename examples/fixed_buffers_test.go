@@ -8,6 +8,7 @@ package examples_test
 
 import (
 	"bytes"
+	"runtime"
 	"testing"
 	"time"
 
@@ -25,6 +26,9 @@ import (
 // The ring owns this storage until Stop; each in-flight operation borrows it.
 // Registration alone does not make a transfer zero-copy.
 func TestFixedBufferBasics(t *testing.T) {
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
 	ring, err := uring.New(func(opt *uring.Options) {
 		opt.Entries = uring.EntriesNano
 		opt.LockedBufferMem = uring.BufferSizeLarge
@@ -60,6 +64,9 @@ func TestFixedBufferBasics(t *testing.T) {
 // Fill the registered buffer before WriteFixed, then keep its bytes unchanged
 // until the write CQE. The buffer index selects storage; n limits bytes written.
 func TestWriteFixedOperation(t *testing.T) {
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
 	ring, err := uring.New(func(opt *uring.Options) {
 		opt.Entries = uring.EntriesNano
 		opt.LockedBufferMem = uring.BufferSizeLarge
@@ -121,6 +128,9 @@ func TestWriteFixedOperation(t *testing.T) {
 // ReadFixed returns a slice into registered storage before the read completes.
 // Wait for its CQE before reading the bytes; a successful Res gives their count.
 func TestReadFixedOperation(t *testing.T) {
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
 	ring, err := uring.New(func(opt *uring.Options) {
 		opt.Entries = uring.EntriesNano
 		opt.LockedBufferMem = uring.BufferSizeLarge

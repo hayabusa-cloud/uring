@@ -55,27 +55,33 @@ Commencez par [`AGENTS.md`](./AGENTS.md) pour développer ou relire des runtimes
 
 ## Cycle de vie du ring
 
-`New` renvoie un ring non démarré et construit immédiatement les pools de contextes. Appelez `Start` avant de soumettre des opérations pour enregistrer les ressources et activer le ring. Cet exemple soumet une lecture dans la mémoire enregistrée du ring, dont l’adresse reste stable jusqu’à `Stop`. Consommez les octets après la complétion et avant de réutiliser le tampon. `iox.IsWouldBlock` signale l’absence de progrès ; le code appelant utilise `iox.Backoff` pour attendre sans solliciter inutilement le CPU.
+`New` crée un ring non démarré et ses pools de contextes. Avec la valeur par défaut `MultiIssuers=false`, gardez la goroutine propriétaire attachée à un même thread du système depuis avant `Start` jusqu'à la fin de `Stop`. Appelez `Start` pour enregistrer les ressources et autoriser les soumissions.
+
+Cet exemple lit les données dans un tampon enregistré appartenant au ring, dont l'adresse reste stable jusqu'à `Stop`. Consommez les octets après la complétion et avant de réutiliser le tampon. `iox.IsWouldBlock` signale l'absence de progrès ; utilisez un `iox.Backoff` du côté appelant pour attendre sans solliciter inutilement le CPU.
+
+Cet exemple termine le processus avec `log.Fatal` en cas d'erreur irrécupérable. Un service doit conserver les requêtes en cours et traiter toutes leurs complétions avant de détruire le ring.
 
 ```go
+runtime.LockOSThread()
+defer runtime.UnlockOSThread()
+
 ring, err := uring.New(func(o *uring.Options) {
 	o.Entries = uring.EntriesMedium
 	o.NotifySucceed = true
 })
 if err != nil {
-	return err
+	log.Fatal(err)
 }
 
 if err := ring.Start(); err != nil {
-	return err
+	log.Fatal(err)
 }
-defer ring.Stop()
 
 fd := iofd.FD(file.Fd()) // Emprunté ; file conserve la responsabilité de Close.
 buf := ring.RegisteredBuffer(0)
 ctx := uring.PackDirect(uring.IORING_OP_READ, 0, 0, 0).WithFD(fd)
 if err := ring.Read(ctx, buf); err != nil {
-	return err
+	log.Fatal(err)
 }
 
 var cqes [1]uring.CQEView // Only one request is outstanding.
@@ -83,7 +89,7 @@ var backoff iox.Backoff
 for {
 	n, err := ring.Wait(cqes[:])
 	if err != nil && !iox.IsWouldBlock(err) {
-		return err
+		log.Fatal(err)
 	}
 	if n == 0 {
 		backoff.Wait()
@@ -91,15 +97,22 @@ for {
 	}
 
 	backoff.Reset()
-	cqe := cqes[0]
-	if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
-		return fmt.Errorf("unexpected completion: op=%d fd=%d", cqe.Op(), cqe.FD())
-	}
-	if err := cqe.Err(); err != nil {
-		return fmt.Errorf("uring read failed: %w", err)
-	}
+	break
+}
+
+cqe := cqes[0]
+if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
+	log.Fatalf("unexpected completion: op=%d fd=%d", cqe.Op(), cqe.FD())
+}
+completionErr := cqe.Err()
+if completionErr == nil {
 	handle(buf[:int(cqe.Res)])
-	return nil
+}
+if err := ring.Stop(); err != nil {
+	log.Fatal(err)
+}
+if completionErr != nil {
+	log.Fatal(completionErr)
 }
 ```
 
@@ -238,9 +251,16 @@ Pour la plupart des systèmes, les fonctions auxiliaires de configuration consti
 
 ```go
 opts := uring.OptionsForSystem(uring.MachineMemory4GB)
+runtime.LockOSThread()
+defer runtime.UnlockOSThread()
+
 ring, err := uring.New(func(o *uring.Options) {
 	*o = opts
 })
+if err != nil {
+	return err
+}
+defer ring.Stop()
 ```
 
 On utilise `OptionsForBudget` pour partir d'un budget mémoire explicite, et `BufferConfigForBudget` pour inspecter la répartition par niveaux retenue pour ce budget :
@@ -361,7 +381,7 @@ Les couches de contexte et d'exécution abstraite au-dessus de cette frontière 
 
 ### Boucle d'événements propriétaire du ring
 
-Dans le mode par défaut, migrable entre tâches, la synchronisation partagée de l'état de soumission permet à une goroutine de changer de thread du système. Une boucle propriétaire du ring peut néanmoins sérialiser toutes les opérations : elle soumet le travail en attente, applique un `iox.Backoff` détenu par l'appelant quand `Wait` ne signale aucun progrès observable, puis distribue les complétions :
+Exécutez la boucle d'événements du ring par défaut dans la goroutine attachée à un thread avant `Start`, en maintenant cet attachement jusqu'à `Stop`. La boucle sérialise les opérations du ring, soumet le travail en attente, applique un `iox.Backoff` détenu par l'appelant quand `Wait` ne signale aucun progrès observable, puis distribue les complétions :
 
 ```go
 func runLoop(ring *uring.Uring, stop <-chan struct{}) error {
@@ -433,7 +453,7 @@ for i := range n {
 }
 ```
 
-Chaque rappel `OnStep` observe un `MultishotStep` : renvoyez `MultishotContinue` pour maintenir le flux actif ou `MultishotStop` pour demander l'annulation. Si les rappels restent activés jusqu'à l'observation terminale, `OnStop` s'exécute au plus une fois avec l'erreur finale et l'indicateur `cancelled` ; sur le pas lui-même, `step.Cancelled` distingue à la frontière le verdict spécifique `-ECANCELED` du noyau des autres échecs. Ces rappels correspondent à `MultishotHandler.OnMultishotStep` et `MultishotHandler.OnMultishotStop` ; vous pouvez aussi implémenter cette interface directement. `HandleCQE` sert au dispatch immédiat dans la boucle de complétion sérialisée de l'appelant ; si le code appelant conserve des CQE copiées après cette boucle, il doit garder son propre état de routage et rejeter les observations de souscriptions déjà retirées. Sur les rings mono-émetteur explicites (`MultiIssuers=false`), appelez `Cancel` / `Unsubscribe` depuis le propriétaire épinglé à un thread du système et sérialisez-les avec les opérations de soumission, `Wait`, `WaitDirect`, `WaitExtended`, `Stop` et `ResizeRings`. Les rings `MultiIssuers` par défaut sérialisent les SQE d'annulation par le chemin de soumission partagé.
+Chaque rappel `OnStep` observe un `MultishotStep` : renvoyez `MultishotContinue` pour maintenir le flux actif ou `MultishotStop` pour demander l'annulation. Si les rappels restent activés jusqu'à l'observation terminale, `OnStop` s'exécute au plus une fois avec l'erreur finale et l'indicateur `cancelled` ; sur le pas lui-même, `step.Cancelled` distingue à la frontière le verdict spécifique `-ECANCELED` du noyau des autres échecs. Ces rappels correspondent à `MultishotHandler.OnMultishotStep` et `MultishotHandler.OnMultishotStop` ; vous pouvez aussi implémenter cette interface directement. `HandleCQE` sert au dispatch immédiat dans la boucle de complétion sérialisée de l'appelant ; si le code appelant conserve des CQE copiées après cette boucle, il doit garder son propre état de routage et rejeter les observations de souscriptions déjà retirées. Sur les rings mono-émetteur par défaut (`MultiIssuers=false`), appelez `Cancel` / `Unsubscribe` depuis le propriétaire épinglé à un thread du système et sérialisez-les avec les opérations de soumission, `Wait`, `WaitDirect`, `WaitExtended`, `Stop` et `ResizeRings`. Les rings avec `MultiIssuers=true` sérialisent les SQE d'annulation par le chemin de soumission partagé.
 
 Transmettez chaque CQE d'annulation soumise au `HandleCQE` de la même souscription ou à son gestionnaire étendu, même après `SubscriptionStopped` ou `OnStop`. Une soumission échouée ou un appel sans effet ne crée aucune nouvelle obligation de CQE d'annulation. La souscription possède les deux contextes et ne rend l'original à son pool qu'après le traitement de la CQE terminale originale, le dispatch d'annulation et la fin de sa soumission. Ne rendez pas ces contextes manuellement. L'[exemple de réception](./examples/multishot_test.go) montre la fin naturelle et l'annulation demandée par le gestionnaire.
 
@@ -617,7 +637,7 @@ Les tests exécutables de `examples/` enseignent initialisation → soumission �
 
 - Activez `NotifySucceed` pour conserver par défaut les CQE des opérations réussies de type écriture. Les flags explicites `IOSQE_CQE_SKIP_SUCCESS` restent applicables.
 - `ring.Features` indique le nombre effectif d'entrées SQ et CQ, la largeur des emplacements SQE, ainsi que l'ordre des octets utilisé par le package pour interpréter `user_data`.
-- Conservez la configuration par défaut `MultiIssuers=true`, migrable entre tâches (`COOP_TASKRUN`), pour l'exécution Go ordinaire et les appels concurrents sur l'état de soumission. Utilisez `MultiIssuers=false` uniquement si le propriétaire appelle `runtime.LockOSThread` avant `New`, reste épinglé jusqu'à `Stop` et sérialise `submit`, `Wait`, `WaitDirect`, `WaitExtended`, `Stop` et `ResizeRings` ; ce chemin rapide explicite demande `SINGLE_ISSUER` + `DEFER_TASKRUN`.
+- La configuration par défaut `MultiIssuers=false` demande `SINGLE_ISSUER` + `DEFER_TASKRUN` et évite la synchronisation des soumissions partagées. Le propriétaire doit appeler `runtime.LockOSThread` avant `Start`, rester attaché au même thread jusqu'à `Stop` et sérialiser les soumissions, les attentes, le redimensionnement et la libération du ring. Choisissez explicitement `MultiIssuers=true` (`COOP_TASKRUN`) pour partager les soumissions ou permettre la migration entre threads du système.
 - `EpollWait` exige que `timeout` vaille `0` ; utilisez `LinkTimeout` si vous avez besoin d'une échéance.
 - Restituez les contextes au pool seulement après le traitement de toutes les complétions de la requête et la fin des accès empruntés.
 - `ListenerOp.Close` ferme le FD de l'écouteur immédiatement. Si un CQE de mise en place est encore en attente, drainez-le d'abord, puis rappelez `Close` pour restituer le `ExtSQE` emprunté au pool.

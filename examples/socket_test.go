@@ -8,6 +8,7 @@ package examples_test
 
 import (
 	"bytes"
+	"runtime"
 	"testing"
 	"time"
 
@@ -24,6 +25,9 @@ import (
 // A nil submission error means the request was accepted, not that the socket
 // is connected or the bytes were sent. Each CQE supplies that next fact.
 func TestTCPClientConnect(t *testing.T) {
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+
 	ring, err := uring.New(func(opt *uring.Options) {
 		opt.Entries = uring.EntriesNano
 		opt.LockedBufferMem = uring.BufferSizeLarge
