@@ -290,7 +290,8 @@ func (ur *ioUring) recvmsg(sqeCtx SQEContext, ioprio uint16, msg *Msghdr) error 
 	if err != nil {
 		return err
 	}
-	slot.keep.ensureExt(ur).recvMsg = msg
+	slot.keep.active = true
+	slot.keep.message = msg
 	msgAddr := uint64(uintptr(unsafe.Pointer(msg)))
 	ctx := sqeCtx.WithOp(IORING_OP_RECVMSG)
 	slot.fill6(ctx, ioprio, 0, msgAddr, 1, MSG_WAITALL)

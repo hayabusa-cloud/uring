@@ -54,6 +54,16 @@ func TestResizeRingsPendingStorage(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantCommand := *ring.sq.sqe128At(2)
+	sendMsg, recvMsg := &Msghdr{}, &Msghdr{}
+	send := PackDirect(IORING_OP_SENDMSG, 0, 0, -1)
+	recv := PackDirect(IORING_OP_RECVMSG, 0, 0, -1)
+	if err := ring.SendMsgHeader(send, -1, sendMsg); err != nil {
+		t.Fatal(err)
+	}
+	fd := &mockPollFd{fd: -1}
+	if err := ring.RecvMsg(recv, fd, recvMsg); err != nil {
+		t.Fatal(err)
+	}
 	for _, size := range []uint32{64, 32, 128} {
 		if err := ring.ResizeRings(size, size*2); err != nil {
 			t.Fatal(err)
@@ -72,17 +82,25 @@ func TestResizeRingsPendingStorage(t *testing.T) {
 		if ext.UserData[0] != 0xa5 {
 			t.Error("resize changed Extended user data")
 		}
+		for i, msg := range []*Msghdr{sendMsg, recvMsg} {
+			keep := &ring.submit.keepAlive[3+i]
+			if !keep.active || keep.message != msg || keep.ext != nil || ring.sq.sqeAt(uint32(3+i)).addr != uint64(uintptr(unsafe.Pointer(msg))) {
+				t.Errorf("resize to %d lost message root or address in slot %d", size, 3+i)
+			}
+		}
 		runtime.GC()
 	}
 	want := map[uint64]int32{
 		timer.Raw():   -int32(zcall.ETIME),
 		update.Raw():  0,
 		command.Raw(): -int32(zcall.EBADF),
+		send.Raw():    -int32(zcall.EBADF),
+		recv.Raw():    -int32(zcall.EBADF),
 	}
-	var cqes [3]CQEView
+	var cqes [5]CQEView
 	var backoff iox.Backoff
 	deadline := time.Now().Add(3 * time.Second)
-	for remaining := 3; remaining > 0 && time.Now().Before(deadline); {
+	for remaining := len(want); remaining > 0 && time.Now().Before(deadline); {
 		n, err := ring.Wait(cqes[:])
 		if err != nil && err != iox.ErrWouldBlock {
 			t.Fatal(err)

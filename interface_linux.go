@@ -961,6 +961,35 @@ func (ur *Uring) SendMsg(sqeCtx SQEContext, pollFD PollFd, buffers [][]byte, oob
 	return ur.sendmsg(ctx, ioprio, buffers, oob, sa)
 }
 
+// SendMsgHeader submits an ordinary send through a caller-prepared message header.
+// A nil return admits one request; its CQE reports the local byte count or error,
+// including zero for an empty message. iox.ErrWouldBlock admits nothing and leaves
+// msg and the context unchanged, apart from effects of caller option functions.
+//
+// Caller must supply a valid non-nil msg and keep the header, iovecs, address,
+// control data and payload reachable, address-stable and immutable through target
+// completion. SQ consumption and cancellation completion do not end this borrow.
+// Context identity must also remain valid while cancellation can reference it.
+//
+// Only Flags and IOPrio options apply, as in SendMsg; IOPrio carries SENDMSG bits.
+// Other option fields and msg.Flags are ignored; SQE message flags are zero.
+// Completion-based reuse requires NotifySucceed and no IOSQE_CQE_SKIP_SUCCESS;
+// callers suppressing success CQEs must establish another terminal release point.
+// With preprovisioned storage and no options, submission does not allocate.
+func (ur *Uring) SendMsgHeader(sqeCtx SQEContext, fd iofd.FD, msg *Msghdr, options ...OpOptionFunc) error {
+	flags, ioprio := ur.sendmsgOptions(options)
+	slot, err := ur.reserveSubmitSlot()
+	if err != nil {
+		return err
+	}
+	ctx := sqeCtx.WithFD(fd).WithOp(IORING_OP_SENDMSG).OrFlags(flags | ur.writeLikeOpFlags)
+	slot.keep.active = true
+	slot.keep.message = msg
+	slot.fill6(ctx, ioprio, 0, uint64(uintptr(unsafe.Pointer(msg))), 1, 0)
+	ur.publishSubmitSlot(slot, ctx)
+	return nil
+}
+
 // RecvMsg receives a message through the caller-owned message header.
 // Caller must keep msg and all memory it references valid until the operation
 // completes.

@@ -9,9 +9,11 @@ Keep asynchronous storage reachable through typed Go roots, address-stable, and 
 | Storage | Retain through |
 |---------|----------------|
 | Submission metadata | Its kernel consumption; payload use may continue |
-| `RecvMsg` header and referenced regions | Operation completion |
+| `SendMsgHeader` / `RecvMsg` header and referenced regions | Target completion; send storage remains immutable |
 | `FilesUpdate` array | Operation completion; allocation mode can write indexes |
 | Context facts | Copy before target mutation, reuse, or release; see [completion retention](sqe-cqe.md#completion-retention) |
+
+`SendMsgHeader` submits caller-prepared metadata; `SendMsg` builds it from buffers and an address. Enable `NotifySucceed` without explicit success suppression when completion governs reuse. SQ consumption and a cancellation CQE do not release the target's storage.
 
 ## Provided Buffers
 

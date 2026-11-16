@@ -1040,10 +1040,13 @@ func TestMessageSubmitAcceptsIovecDomainEndpoints(t *testing.T) {
 					t.Fatalf("error = %v", err)
 				}
 				keep := &ring.ioUring.submit.keepAlive[0]
-				if !keep.active || keep.ext == nil {
+				if !keep.active {
 					t.Fatal("message submit keepAlive is inactive")
 				}
 				if tt.stagesIovecs {
+					if keep.ext == nil {
+						t.Fatal("staged message has no scratch storage")
+					}
 					if len(keep.iovs) != n {
 						t.Fatalf("staged iovecs = %d, want %d", len(keep.iovs), n)
 					}
@@ -1055,10 +1058,13 @@ func TestMessageSubmitAcceptsIovecDomainEndpoints(t *testing.T) {
 				if keep.iovs != nil {
 					t.Fatalf("RecvMsg staged %d package-owned iovecs, want none", len(keep.iovs))
 				}
-				if keep.ext.recvMsg == nil || keep.ext.recvMsg.Iovlen != uint64(n) {
+				if keep.ext != nil {
+					t.Fatal("RecvMsg acquired cold scratch for a caller header")
+				}
+				if keep.message == nil || keep.message.Iovlen != uint64(n) {
 					var got uint64
-					if keep.ext.recvMsg != nil {
-						got = keep.ext.recvMsg.Iovlen
+					if keep.message != nil {
+						got = keep.message.Iovlen
 					}
 					t.Fatalf("caller message iovlen = %d, want %d", got, n)
 				}

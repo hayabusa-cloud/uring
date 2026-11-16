@@ -23,7 +23,8 @@ type submitKeepAlive struct {
 
 	bytes1 []byte
 
-	iovs []IoVec
+	iovs    []IoVec
+	message *Msghdr
 
 	sockaddrArg Sockaddr
 	timespec    Timespec
@@ -36,7 +37,6 @@ type submitKeepAliveExt struct {
 	next *submitKeepAliveExt
 
 	msg             Msghdr
-	recvMsg         *Msghdr
 	epollCtlEvent   EpollEvent
 	epollWaitEvents []EpollEvent
 
@@ -128,6 +128,7 @@ func (k *submitKeepAlive) clear(ur *ioUring) {
 	k.active = false
 	k.bytes1 = nil
 	k.iovs = nil
+	k.message = nil
 	k.sockaddrArg = nil
 	k.iovInline = [8]IoVec{}
 }
@@ -162,7 +163,6 @@ func (ext *submitKeepAliveExt) writePath(dst *[]byte, inline []byte, s string) (
 
 func (ext *submitKeepAliveExt) resetForReuse() {
 	ext.msg = Msghdr{}
-	ext.recvMsg = nil
 	ext.epollCtlEvent = EpollEvent{}
 	ext.epollWaitEvents = nil
 	ext.openHow = nil

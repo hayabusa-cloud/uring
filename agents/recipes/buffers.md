@@ -4,7 +4,7 @@ Retain storage through every access; return it under its own protocol. [Boundary
 
 ## Retain and Publish
 
-Choose ordinary, registered, provided, incremental, or zero-copy storage. Retain typed roots, stable addresses, and owning descriptors/registrations. SQ consumption can release copied submission metadata while payload access continues. `RecvMsg` headers/referenced regions and `FilesUpdate` arrays remain caller-owned through completion.
+Choose ordinary, registered, provided, incremental, or zero-copy storage. Retain typed roots, stable addresses, and owning descriptors/registrations. SQ consumption can release copied submission metadata while payload access continues. `SendMsgHeader` and `RecvMsg` headers/referenced regions and `FilesUpdate` arrays remain caller-owned through completion; send storage remains immutable.
 
 For provided buffers, `Add` stages; matching `Advance` publishes and transfers ownership. Retain backing from staging through return. Do not mutate or republish kernel-owned storage; returned buffers need not be recycled immediately.
 

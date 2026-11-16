@@ -18,6 +18,20 @@ type dummyPollFd int
 
 func (d dummyPollFd) Fd() int { return int(d) }
 
+func TestDarwinSendMsgHeaderUnsupported(t *testing.T) {
+	var ring uring.Uring
+	msg := uring.Msghdr{}
+	called := false
+	if err := ring.SendMsgHeader(0, 0, &msg, func(*uring.OpOption) {
+		called = true
+	}); !errors.Is(err, uring.ErrNotSupported) {
+		t.Fatalf("SendMsgHeader: got %v, want %v", err, uring.ErrNotSupported)
+	}
+	if called || msg != (uring.Msghdr{}) {
+		t.Fatal("unsupported submission evaluated options or changed the header")
+	}
+}
+
 func TestDarwinBundleCountAvoidsIntegerOverflow(t *testing.T) {
 	cqe := uring.CQEView{Res: 2}
 	if got := cqe.BundleCount(int(^uint(0) >> 1)); got != 1 {
