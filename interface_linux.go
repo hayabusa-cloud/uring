@@ -357,6 +357,9 @@ func (ur *Uring) releaseRegisteredBufRings() error {
 //	        handleCompletion(cqe.Res, seq)
 //	    }
 //	}
+//	if err != nil {
+//	    return err
+//	}
 func (ur *Uring) Wait(cqes []CQEView) (n int, err error) {
 	err = ur.ioUring.enter()
 	if err != nil {
