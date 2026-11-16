@@ -323,7 +323,7 @@
 //
 // Socket operations:
 //   - [Uring.Bind], [Uring.Listen], [Uring.Accept], [Uring.AcceptDirect], [Uring.Connect], [Uring.Shutdown]
-//   - [Uring.Receive], [Uring.Send], [Uring.RecvMsg], [Uring.SendMsg]
+//   - [Uring.Receive], [Uring.Send], [Uring.RecvMsg], [Uring.SendMsg], [Uring.SendMsgHeader]
 //   - [Uring.ReceiveBundle], [Uring.ReceiveZeroCopy]
 //   - [Uring.Multicast], [Uring.MulticastZeroCopy]
 //   - Raw multishot submits: [Uring.SubmitAcceptMultishot], [Uring.SubmitAcceptDirectMultishot], [Uring.SubmitReceiveMultishot], [Uring.SubmitReceiveBundleMultishot]

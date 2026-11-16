@@ -475,7 +475,7 @@ func TestMessageWrappersEncodeExpectedSQEs(t *testing.T) {
 		}
 		tail := atomic.LoadUint32(ring.ioUring.sq.kTail)
 		keep := &ring.ioUring.submit.keepAlive[(tail-1)&*ring.ioUring.sq.kRingMask]
-		if keep.ext == nil || keep.ext.recvMsg != &msg {
+		if keep.message != &msg || keep.ext != nil {
 			t.Fatal("submit keepAlive did not retain the caller message header")
 		}
 	})

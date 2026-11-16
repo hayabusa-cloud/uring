@@ -53,8 +53,9 @@ var (
 
 // Method-expression assignment requires the exact public descriptor carriers.
 var (
-	_ func(*uring.Uring, uring.SQEContext, *[2]iofd.FD, uint32, ...uring.OpOptionFunc) error = (*uring.Uring).Pipe
-	_ func(*uring.Uring, uint32) (iofd.FD, error)                                            = (*uring.Uring).ZCRXExport
+	_ func(*uring.Uring, uring.SQEContext, iofd.FD, *uring.Msghdr, ...uring.OpOptionFunc) error = (*uring.Uring).SendMsgHeader
+	_ func(*uring.Uring, uring.SQEContext, *[2]iofd.FD, uint32, ...uring.OpOptionFunc) error    = (*uring.Uring).Pipe
+	_ func(*uring.Uring, uint32) (iofd.FD, error)                                               = (*uring.Uring).ZCRXExport
 )
 
 // Array assignment requires equality of the aliased constant values.

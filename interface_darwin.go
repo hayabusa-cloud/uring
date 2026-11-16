@@ -815,6 +815,12 @@ func (ur *Uring) SendMsg(sqeCtx SQEContext, pollFD PollFd, buffers [][]byte, oob
 	return ur.sendmsg(ctx, ioprio, buffers, oob, sa)
 }
 
+// SendMsgHeader returns ErrNotSupported on Darwin without submitting a request
+// or borrowing the caller's message storage.
+func (ur *Uring) SendMsgHeader(sqeCtx SQEContext, fd iofd.FD, msg *Msghdr, options ...OpOptionFunc) error {
+	return ErrNotSupported
+}
+
 // RecvMsg receives a message through the caller-owned message header.
 // Caller must keep msg and all memory it references valid until the operation
 // completes.

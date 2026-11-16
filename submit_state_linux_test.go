@@ -841,8 +841,8 @@ func TestRecvMsgUsesCallerOwnedCompletionStorage(t *testing.T) {
 	if got, want := sqe1.userData, ctx.WithOp(IORING_OP_RECVMSG).Raw(); got != want {
 		t.Fatalf("first SQE user_data = %#x, want %#x", got, want)
 	}
-	ext1 := ring.ioUring.submit.keepAlive[0].ext
-	if ext1 == nil || ext1.recvMsg != &msg1 {
+	keep1 := &ring.ioUring.submit.keepAlive[0]
+	if !keep1.active || keep1.message != &msg1 || keep1.ext != nil {
 		t.Fatal("first submit did not retain the caller header")
 	}
 
@@ -853,8 +853,8 @@ func TestRecvMsgUsesCallerOwnedCompletionStorage(t *testing.T) {
 	if ring.ioUring.submit.keepAlive[0].active {
 		t.Fatal("consumed first SQ slot remained active")
 	}
-	if ext1.recvMsg != nil {
-		t.Fatal("recycled submit scratch retained the first caller header")
+	if keep1.message != nil {
+		t.Fatal("consumed slot retained the first caller header")
 	}
 
 	msg2 := Msghdr{}
@@ -868,12 +868,9 @@ func TestRecvMsgUsesCallerOwnedCompletionStorage(t *testing.T) {
 	if sqe1.addr == sqe2.addr {
 		t.Fatal("independent recvmsg submissions share completion storage")
 	}
-	ext2 := ring.ioUring.submit.keepAlive[1].ext
-	if ext2 != ext1 {
-		t.Fatal("submit scratch was not reused by the regression witness")
-	}
-	if ext2.recvMsg != &msg2 {
-		t.Fatal("reused submit scratch did not retain the second caller header")
+	keep2 := &ring.ioUring.submit.keepAlive[1]
+	if !keep2.active || keep2.message != &msg2 || keep2.ext != nil {
+		t.Fatal("second submit did not retain the caller header without cold scratch")
 	}
 
 	msg1.Controllen = 9
@@ -1404,6 +1401,7 @@ func TestSubmitKeepAliveClearReturnsExtAndClearsRoots(t *testing.T) {
 	keep.retainBytes(value)
 	keep.iovs = keep.iovInline[:1]
 	keep.iovInline[0] = IoVec{Base: &ctrl, Len: 1}
+	keep.message = &Msghdr{Iov: &keep.iovInline[0], Iovlen: 1}
 	ext := keep.ensureExt(ur)
 	ext.msg = Msghdr{Control: &ctrl, Controllen: 1}
 	ext.epollCtlEvent = EpollEvent{Events: EPOLLIN, Fd: 1}
@@ -1422,6 +1420,9 @@ func TestSubmitKeepAliveClearReturnsExtAndClearsRoots(t *testing.T) {
 	}
 	if keep.iovs != nil {
 		t.Fatal("keepAlive iovs was not cleared")
+	}
+	if keep.message != nil {
+		t.Fatal("keepAlive message was not cleared")
 	}
 	if keep.sockaddrArg != nil {
 		t.Fatal("keepAlive sockaddrArg was not cleared")
