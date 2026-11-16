@@ -27,14 +27,18 @@ import "code.hybscloud.com/iofd"
 //
 // # Usage
 //
+// Inspect every returned CQE, including failures; Wait has already removed
+// the entire batch from the ring.
+//
 //	n, err := ring.Wait(cqes)
 //	for i := range n {
 //	    cqe := cqes[i]
 //	    // Observe the kernel facts first.
 //	    if err := cqe.Err(); err != nil {
-//	        return fmt.Errorf("completion failed: op=%d fd=%d: %w", cqe.Op(), cqe.FD(), err)
+//	        fmt.Printf("completion failed: op=%d fd=%d: %v\n", cqe.Op(), cqe.FD(), err)
+//	    } else {
+//	        fmt.Printf("completed op=%d on fd=%d with res=%d\n", cqe.Op(), cqe.FD(), cqe.Res)
 //	    }
-//	    fmt.Printf("completed op=%d on fd=%d with res=%d\n", cqe.Op(), cqe.FD(), cqe.Res)
 //	    if cqe.HasMore() {
 //	        // Caller-side runtime code decides whether to keep routing this live stream.
 //	    }
@@ -42,6 +46,9 @@ import "code.hybscloud.com/iofd"
 //	        // Indirect and Extended modes also expose the submitted SQE.
 //	        fmt.Printf("submitted opcode=%d\n", cqe.SQE().Opcode())
 //	    }
+//	}
+//	if err != nil {
+//	    return err
 //	}
 type CQEView struct {
 	Res   int32  // Completion result (directly accessible)
