@@ -1660,7 +1660,6 @@ func TestFutexWakeWait(t *testing.T) {
 }
 
 // TestMsgRingSelf tests MSG_RING to the same ring (self-messaging).
-// This helps diagnose if MSG_RING works at all.
 func TestMsgRingSelf(t *testing.T) {
 	ring, err := uring.New(testMinimalBufferOptions)
 	if err != nil {
@@ -1671,7 +1670,7 @@ func TestMsgRingSelf(t *testing.T) {
 	// Get this ring's FD for self-messaging
 	ringFD := ring.RingFD()
 	if ringFD < 0 {
-		t.Skip("RingFD not available")
+		t.Fatal("RingFD not available")
 	}
 	t.Logf("Self ring FD: %d", ringFD)
 
@@ -1697,25 +1696,28 @@ func TestMsgRingSelf(t *testing.T) {
 		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait: %v", err)
 		}
+		if n == 0 {
+			b.Wait()
+			continue
+		}
+		b.Reset()
 		for i := 0; i < n; i++ {
-			res := cqes[i].Res
-			flags := cqes[i].Flags
-			t.Logf("CQE: res=%d, flags=0x%x", res, flags)
-
-			if res == 0 && !sendCompleted {
-				// Send completion (res=0 means success)
+			cqe := cqes[i]
+			switch cqe.Context() {
+			case ctx:
+				if sendCompleted || cqe.Res != 0 {
+					t.Fatalf("unexpected source CQE: res=%d, duplicate=%t", cqe.Res, sendCompleted)
+				}
 				sendCompleted = true
-				t.Log("MSG_RING send completed")
-			} else if res == testResult {
-				// Received message
+			case uring.SQEContext(testUserData):
+				if recvCompleted || cqe.Res != testResult {
+					t.Fatalf("unexpected target CQE: res=%d, duplicate=%t; want res=%d", cqe.Res, recvCompleted, testResult)
+				}
 				recvCompleted = true
-				t.Logf("MSG_RING message received: res=%d", res)
-			} else if res < 0 {
-				t.Logf("Negative result: %d (errno %d)", res, -res)
-				t.Fatalf("MSG_RING failed: res=%d", res)
+			default:
+				t.Fatalf("unexpected CQE: user_data=%#x, res=%d", cqe.Context(), cqe.Res)
 			}
 		}
-		b.Wait()
 	}
 
 	if !sendCompleted {
@@ -1747,7 +1749,7 @@ func TestMsgRing(t *testing.T) {
 	// Get target ring's FD for cross-ring messaging
 	targetFD := dstRing.RingFD()
 	if targetFD < 0 {
-		t.Skip("RingFD not available")
+		t.Fatal("RingFD not available")
 	}
 	t.Logf("Target ring FD: %d", targetFD)
 
@@ -1774,24 +1776,23 @@ func TestMsgRing(t *testing.T) {
 		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait (source): %v", err)
 		}
-		for i := 0; i < n; i++ {
-			res := srcCQEs[i].Res
-			if res < 0 {
-				if res == -38 { // ENOSYS
-					t.Fatalf("MSG_RING failed with ENOSYS on Linux 6.18+ baseline")
-				}
-				t.Fatalf("MsgRing send failed: %d", res)
-			}
-			srcDone = true
-			t.Log("MsgRing send completed on source ring")
+		if n == 0 {
+			b.Wait()
+			continue
 		}
-		b.Wait()
+		b.Reset()
+		if n != 1 {
+			t.Fatalf("source CQE count = %d, want 1", n)
+		}
+		cqe := srcCQEs[0]
+		if cqe.Context() != ctx || cqe.Res != 0 {
+			t.Fatalf("source CQE: user_data=%#x, res=%d; want user_data=%#x, res=0", cqe.Context(), cqe.Res, ctx)
+		}
+		srcDone = true
 	}
 
 	if !srcDone {
-		// Cross-ring MSG_RING may not work on WSL2 due to EALREADY errors from io_uring_enter
-		// Self-messaging (TestMsgRingSelf) works, but cross-ring fails
-		t.Skip("Cross-ring MSG_RING did not complete - may be WSL2 limitation")
+		t.Fatal("MSG_RING source completion was not received")
 	}
 
 	// Wait for target ring to receive the CQE
@@ -1805,18 +1806,23 @@ func TestMsgRing(t *testing.T) {
 		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait (target): %v", err)
 		}
-		for i := 0; i < n; i++ {
-			res := dstCQEs[i].Res
-			if res == testResult {
-				t.Logf("Received MSG_RING CQE on target ring: res=%d", res)
-				dstDone = true
-			}
+		if n == 0 {
+			b.Wait()
+			continue
 		}
-		b.Wait()
+		b.Reset()
+		if n != 1 {
+			t.Fatalf("target CQE count = %d, want 1", n)
+		}
+		cqe := dstCQEs[0]
+		if cqe.Context().Raw() != uint64(testUserData) || cqe.Res != testResult {
+			t.Fatalf("target CQE: user_data=%#x, res=%d; want user_data=%#x, res=%d", cqe.Context(), cqe.Res, testUserData, testResult)
+		}
+		dstDone = true
 	}
 
 	if !dstDone {
-		t.Skip("Target ring did not receive MSG_RING CQE - may be WSL2 limitation")
+		t.Fatal("MSG_RING target completion was not received")
 	}
 	t.Log("MSG_RING cross-ring communication test passed")
 }
@@ -1841,31 +1847,25 @@ func TestMsgRingFD(t *testing.T) {
 	// Get target ring's FD
 	targetFD := dstRing.RingFD()
 	if targetFD < 0 {
-		t.Skip("RingFD not available")
+		t.Fatal("RingFD not available")
 	}
 	t.Logf("Target ring FD: %d", targetFD)
 
-	// Create a pipe to get a valid FD
+	// Use one socket endpoint as the registered descriptor to transfer.
 	fds, err := newUnixSocketPairForTest()
 	if err != nil {
 		t.Fatalf("socketpair: %v", err)
 	}
 	defer closeTestFds(fds)
 
-	// Register the pipe FD in source ring's fixed file table (slot 0)
+	// Register the socket in source ring's fixed file table (slot 0).
 	if err := srcRing.RegisterFiles([]int32{int32(fds[0])}); err != nil {
-		if errors.Is(err, uring.ErrExists) {
-			t.Skip("Files already registered (test environment issue)")
-		}
 		t.Fatalf("RegisterFiles (source): %v", err)
 	}
 	t.Log("Registered FD in source ring's fixed file table at slot 0")
 
 	// Register sparse file table in target ring (for receiving FD)
 	if err := dstRing.RegisterFilesSparse(4); err != nil {
-		if errors.Is(err, uring.ErrExists) {
-			t.Skip("Sparse files already registered (test environment issue)")
-		}
 		t.Fatalf("RegisterFilesSparse (target): %v", err)
 	}
 	t.Log("Registered sparse file table in target ring")
@@ -1892,26 +1892,24 @@ func TestMsgRingFD(t *testing.T) {
 		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait (source): %v", err)
 		}
-		for i := 0; i < n; i++ {
-			res := srcCQEs[i].Res
-			if res < 0 {
-				if res == -38 { // ENOSYS
-					t.Fatalf("MSG_RING_FD failed with ENOSYS on Linux 6.18+ baseline")
-				}
-				if res == -22 { // EINVAL
-					t.Skip("MSG_RING_FD not supported (check fixed file tables)")
-				}
-				t.Fatalf("MsgRingFD failed: res=%d", res)
-			}
-			srcDone = true
-			t.Logf("MsgRingFD completed on source ring: res=%d (dst slot index)", res)
+		if n == 0 {
+			b.Wait()
+			continue
 		}
-		b.Wait()
+		b.Reset()
+		if n != 1 {
+			t.Fatalf("source CQE count = %d, want 1", n)
+		}
+		cqe := srcCQEs[0]
+		// An explicit destination slot reports success as zero.
+		if cqe.Context() != ctx || cqe.Res != 0 {
+			t.Fatalf("source CQE: user_data=%#x, res=%d; want user_data=%#x, res=0", cqe.Context(), cqe.Res, ctx)
+		}
+		srcDone = true
 	}
 
 	if !srcDone {
-		// MsgRingFD may not complete on WSL2 due to cross-ring limitations
-		t.Skip("MsgRingFD did not complete - may be WSL2 limitation")
+		t.Fatal("MSG_RING_FD source completion was not received")
 	}
 
 	// Wait for target ring to receive the CQE notification
@@ -1925,18 +1923,23 @@ func TestMsgRingFD(t *testing.T) {
 		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait (target): %v", err)
 		}
-		for i := 0; i < n; i++ {
-			res := dstCQEs[i].Res
-			t.Logf("Target ring CQE: res=%d", res)
-			if res >= 0 {
-				dstDone = true
-			}
+		if n == 0 {
+			b.Wait()
+			continue
 		}
-		b.Wait()
+		b.Reset()
+		if n != 1 {
+			t.Fatalf("target CQE count = %d, want 1", n)
+		}
+		cqe := dstCQEs[0]
+		if cqe.Context().Raw() != uint64(testUserData) || cqe.Res != 0 {
+			t.Fatalf("target CQE: user_data=%#x, res=%d; want user_data=%#x, res=0", cqe.Context(), cqe.Res, testUserData)
+		}
+		dstDone = true
 	}
 
 	if !dstDone {
-		t.Log("Note: Target CQE not received (skipCQE=false, may be timing)")
+		t.Fatal("MSG_RING_FD target completion was not received")
 	}
 
 	t.Log("MSG_RING_FD cross-ring FD transfer test passed")
