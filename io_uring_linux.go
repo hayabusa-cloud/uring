@@ -397,8 +397,7 @@ func (ur *ioUring) registerBuffers(addr unsafe.Pointer, n, size int) error {
 		vectors = append(vectors, IoVec{Base: (*byte)(base), Len: uint64(size)})
 		buffers = append(buffers, unsafe.Slice((*byte)(base), size))
 	}
-	data := uintptr(unsafe.Pointer(unsafe.SliceData(vectors)))
-	reg := ioUringRSrcRegister{nr: uint32(n), data: uint64(data)}
+	reg := ioUringRSrcRegister{nr: uint32(n), data: unsafe.Pointer(unsafe.SliceData(vectors))}
 	regSize := uintptr(unsafe.Sizeof(reg))
 	_, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_REGISTER_BUFFERS2, unsafe.Pointer(&reg), regSize)
 	runtime.KeepAlive(vectors)
@@ -437,7 +436,7 @@ func (ur *ioUring) registerFiles(fds []int32) error {
 	// Use IORING_REGISTER_FILES2 with rsrc_register struct for consistency
 	reg := ioUringRSrcRegister{
 		nr:   uint32(len(fds)),
-		data: uint64(uintptr(unsafe.Pointer(unsafe.SliceData(fds)))),
+		data: unsafe.Pointer(unsafe.SliceData(fds)),
 	}
 	regSize := uintptr(unsafe.Sizeof(reg))
 	_, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_REGISTER_FILES2, unsafe.Pointer(&reg), regSize)
@@ -508,11 +507,11 @@ func (ur *ioUring) registerFilesUpdate(offset uint32, fds []int32) (int, error) 
 	type ioUringFilesUpdate struct {
 		offset uint32
 		resv   uint32
-		fds    uint64
+		fds    *int32
 	}
 	up := ioUringFilesUpdate{
 		offset: offset,
-		fds:    uint64(uintptr(unsafe.Pointer(unsafe.SliceData(fds)))),
+		fds:    unsafe.SliceData(fds),
 	}
 	result, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_REGISTER_FILES_UPDATE, unsafe.Pointer(&up), uintptr(len(fds)))
 	if errno != 0 {
@@ -1058,11 +1057,12 @@ func (ur *ioUring) bufRingHead(groupID uint16, head *uint16) int {
 
 // ioUringRSrcRegister mirrors struct io_uring_rsrc_register
 // from include/uapi/linux/io_uring.h (Linux 6.18).
+// Pointer fields remain visible to Go until the registration syscall.
 type ioUringRSrcRegister struct {
 	nr    uint32
 	flags uint32 // IORING_RSRC_REGISTER_* flags
 	resv2 uint64
-	data  uint64
+	data  unsafe.Pointer
 	tags  uint64
 }
 
@@ -1435,6 +1435,13 @@ type MemRegionReg struct {
 	_          [2]uint64
 }
 
+// ioUringMemRegionReg preserves Go pointer tracking with the MemRegionReg layout.
+type ioUringMemRegionReg struct {
+	region *RegionDesc
+	flags  uint64
+	_      [2]uint64
+}
+
 // ========================================
 // NAPI Support (Linux 6.9+; static tracking requires Linux 6.13+)
 // ========================================
@@ -1619,6 +1626,20 @@ type ZCRXIfqReg struct {
 	Resv      [3]uint64   // Reserved
 }
 
+// ioUringZCRXIfqReg preserves Go pointer tracking with the ZCRXIfqReg layout.
+type ioUringZCRXIfqReg struct {
+	ifIdx     uint32
+	ifRxq     uint32
+	rqEntries uint32
+	flags     uint32
+	area      *ZCRXAreaReg
+	region    *RegionDesc
+	offsets   ZCRXOffsets
+	zcrxID    uint32
+	rxBufLen  uint32
+	resv      [3]uint64
+}
+
 // ZCRXIfqRegistration is the observable result of ZCRX interface-queue registration.
 type ZCRXIfqRegistration struct {
 	ID        uint32
@@ -1639,7 +1660,7 @@ type ZCRXCtrl struct {
 
 // registerZCRXIfq registers a zero-copy receive interface queue.
 // This sets up ZCRX for a specific network interface RX queue.
-func (ur *ioUring) registerZCRXIfq(reg *ZCRXIfqReg) error {
+func (ur *ioUring) registerZCRXIfq(reg *ioUringZCRXIfqReg) error {
 	_, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_REGISTER_ZCRX_IFQ, unsafe.Pointer(reg), 1)
 	if errno != 0 {
 		return errFromErrno(errno)
@@ -1725,7 +1746,7 @@ func (ur *ioUring) querySCQ() (*QuerySCQ, error) {
 
 // registerMemRegion registers a memory region with the io_uring ring.
 // This enables shared memory regions between user space and kernel for data transfer.
-func (ur *ioUring) registerMemRegion(reg *MemRegionReg) error {
+func (ur *ioUring) registerMemRegion(reg *ioUringMemRegionReg) error {
 	_, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_REGISTER_MEM_REGION, unsafe.Pointer(reg), 1)
 	if errno != 0 {
 		return errFromErrno(errno)

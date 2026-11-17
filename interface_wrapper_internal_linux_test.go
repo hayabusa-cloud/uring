@@ -2072,24 +2072,24 @@ func TestRegisterZCRXIfqRequiresAdvertisedRxBufferLength(t *testing.T) {
 }
 
 func TestZCRXIfqRegistrationResultPreservesKernelMutations(t *testing.T) {
-	reg := ZCRXIfqReg{
-		RqEntries: 3,
-		Offsets: ZCRXOffsets{
+	reg := ioUringZCRXIfqReg{
+		rqEntries: 3,
+		offsets: ZCRXOffsets{
 			Head: 64,
 			Tail: 128,
 			Rqes: 256,
 		},
-		ZcrxID:   17,
-		RxBufLen: 8192,
+		zcrxID:   17,
+		rxBufLen: 8192,
 	}
 
 	// Linux replaces the requested cardinality with the effective value.
-	reg.RqEntries = 4
+	reg.rqEntries = 4
 	got := zcrxIfqRegistrationResult(&reg)
 	want := ZCRXIfqRegistration{
 		ID:        17,
 		RqEntries: 4,
-		Offsets:   reg.Offsets,
+		Offsets:   reg.offsets,
 		RxBufLen:  8192,
 	}
 	if got != want {

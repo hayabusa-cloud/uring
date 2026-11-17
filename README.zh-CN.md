@@ -1,7 +1,7 @@
 # uring
 
 [![Go Reference](https://pkg.go.dev/badge/code.hybscloud.com/uring.svg)](https://pkg.go.dev/code.hybscloud.com/uring)
-[![Benchmarks](https://github.com/hayabusa-cloud/uring/actions/workflows/public-benchmarks.yml/badge.svg)](https://github.com/hayabusa-cloud/uring/actions/workflows/public-benchmarks.yml)
+[![Benchmarks](https://github.com/hayabusa-cloud/uring/actions/workflows/benchmarks.yml/badge.svg)](https://github.com/hayabusa-cloud/uring/actions/workflows/benchmarks.yml)
 [![Codecov](https://codecov.io/gh/hayabusa-cloud/uring/graph/badge.svg)](https://codecov.io/gh/hayabusa-cloud/uring)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 

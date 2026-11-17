@@ -1246,6 +1246,8 @@ func (ur *Uring) Pipe(sqeCtx SQEContext, fds *[2]iofd.FD, pipeFlags uint32, opti
 
 // RegisterZCRXIfq registers a zero-copy receive interface queue.
 // region must describe the refill-ring memory (IORING_MEM_REGION_TYPE_USER).
+// The kernel reads and updates area and region during this call; their backing
+// memory must remain reachable and address-stable through all kernel use.
 // rqEntries is the requested refill queue size; the returned RqEntries is the
 // effective kernel value.
 // rxBufLen is the desired receive buffer chunk size; zero requests the system
@@ -1274,13 +1276,13 @@ func (ur *Uring) registerZCRXIfqWithFeatures(ifIdx, ifRxq uint32, rqEntries uint
 	if rxBufLen != 0 && features&ZCRX_FEATURE_RX_PAGE_SIZE == 0 {
 		return ZCRXIfqRegistration{}, ErrNotSupported
 	}
-	reg := ZCRXIfqReg{
-		IfIdx:     ifIdx,
-		IfRxq:     ifRxq,
-		RqEntries: rqEntries,
-		AreaPtr:   uint64(uintptr(unsafe.Pointer(area))),
-		RegionPtr: uint64(uintptr(unsafe.Pointer(region))),
-		RxBufLen:  rxBufLen,
+	reg := ioUringZCRXIfqReg{
+		ifIdx:     ifIdx,
+		ifRxq:     ifRxq,
+		rqEntries: rqEntries,
+		area:      area,
+		region:    region,
+		rxBufLen:  rxBufLen,
 	}
 	err := ur.registerZCRXIfq(&reg)
 	if err != nil {
@@ -1289,15 +1291,15 @@ func (ur *Uring) registerZCRXIfqWithFeatures(ifIdx, ifRxq uint32, rqEntries uint
 	return zcrxIfqRegistrationResult(&reg), nil
 }
 
-func zcrxIfqRegistrationResult(reg *ZCRXIfqReg) ZCRXIfqRegistration {
-	effectiveRxBufLen := reg.RxBufLen
+func zcrxIfqRegistrationResult(reg *ioUringZCRXIfqReg) ZCRXIfqRegistration {
+	effectiveRxBufLen := reg.rxBufLen
 	if effectiveRxBufLen == 0 {
 		effectiveRxBufLen = uint32(os.Getpagesize())
 	}
 	return ZCRXIfqRegistration{
-		ID:        reg.ZcrxID,
-		RqEntries: reg.RqEntries,
-		Offsets:   reg.Offsets,
+		ID:        reg.zcrxID,
+		RqEntries: reg.rqEntries,
+		Offsets:   reg.offsets,
 		RxBufLen:  effectiveRxBufLen,
 	}
 }
@@ -1371,6 +1373,7 @@ func (ur *Uring) registerBufferRing(entries int, groupID uint16, flags uint16) (
 // RegisterFiles registers file descriptors for use with IOSQE_FIXED_FILE flag.
 // Registered files bypass per-operation fget/fput kernel calls.
 // fds must have between 1 and 2^32-1 entries.
+// The call is synchronous; fds may be reused after it returns.
 //
 // Once registered, use the file index (0-based) instead of the fd in SQEs,
 // and set the IOSQE_FIXED_FILE flag.
@@ -1396,6 +1399,7 @@ func (ur *Uring) RegisterFilesSparse(count uint32) error {
 // Use -1 to clear a slot, or a valid fd to set it.
 // fds must have between 1 and 2^32-1 entries. The update range must fit
 // within the registered file table.
+// The call is synchronous; fds may be reused after it returns.
 // A nil error does not imply full completion: Linux can return a positive
 // partial count after a later descriptor fails. Full completion requires
 // updated == len(fds). When Linux stops after clearing a destination slot,
@@ -1403,8 +1407,8 @@ func (ur *Uring) RegisterFilesSparse(count uint32) error {
 // first-entry EBADF or ENOMEM failure. Values below -1 are rejected; the raw
 // IORING_REGISTER_FILES_SKIP sentinel is not part of this method's domain.
 //
-// This allows dynamic management of registered files without
-// unregistering and re-registering the entire table.
+// For an asynchronous update, use [Uring.FilesUpdate] and retain fds through
+// its completion.
 func (ur *Uring) RegisterFilesUpdate(offset uint32, fds []int32) (int, error) {
 	return ur.registerFilesUpdate(offset, fds)
 }
@@ -1451,12 +1455,14 @@ func (ur *Uring) QuerySCQ() (*QuerySCQ, error) {
 // ========================================
 
 // RegisterMemRegion registers a memory region with the io_uring ring.
-// Memory regions enable shared access between user space and kernel.
+// The kernel reads and updates region during this call. Caller-provided backing
+// memory must remain reachable and address-stable until ring teardown.
+// With IORING_MEM_REGION_REG_WAIT_ARG, call this before [Uring.Start].
 // Requires kernel 6.13+.
 func (ur *Uring) RegisterMemRegion(region *RegionDesc, flags uint64) error {
-	reg := MemRegionReg{
-		RegionUptr: uint64(uintptr(unsafe.Pointer(region))),
-		Flags:      flags,
+	reg := ioUringMemRegionReg{
+		region: region,
+		flags:  flags,
 	}
 	return ur.registerMemRegion(&reg)
 }

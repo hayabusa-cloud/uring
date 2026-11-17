@@ -81,6 +81,8 @@ func TestTCPAcceptConnectSendReceive(t *testing.T) {
 	if clientFD < 0 {
 		t.Fatal("Socket creation timed out")
 	}
+	clientSock := iofd.NewFD(int(clientFD))
+	defer clientSock.Close()
 
 	// Accept in background goroutine
 	acceptDone := make(chan net.Conn, 1)
@@ -138,7 +140,6 @@ func TestTCPAcceptConnectSendReceive(t *testing.T) {
 	// Send via io_uring
 	testData := []byte("Hello from io_uring!")
 	sendCtx := uring.PackDirect(uring.IORING_OP_SEND, 0, 0, clientFD)
-	clientSock := iofd.NewFD(int(clientFD))
 	if err := ring.Send(sendCtx, &clientSock, testData); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
