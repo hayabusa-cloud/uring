@@ -27,6 +27,12 @@ Registration methods return results synchronously. Separate the metadata passed 
 
 Integer fields such as `RegionDesc.UserAddr` and `ZCRXAreaReg.Addr` do not retain backing memory. With `IORING_MEM_REGION_REG_WAIT_ARG`, call `RegisterMemRegion` before `Start` enables the ring. Asynchronous `FilesUpdate` retains its array through operation completion.
 
+### Inter-Ring File Transfers
+
+`MsgRingFD` keeps the source slot registered and installs a reference in the target ring. An explicit destination slot replaces its current file; `IORING_FILE_INDEX_ALLOC` allocates a free slot. Successful source and target CQEs report zero for an explicit slot or the allocated index. `skipCQE` suppresses only the target CQE.
+
+A source CQE with `-EOVERFLOW` means the target file was installed but its notification could not be posted. Reconcile the target state before retrying: another transfer can replace a file or allocate another slot. See the [Linux implementation](https://github.com/torvalds/linux/blob/v6.18/io_uring/msg_ring.c#L176-L205).
+
 ## Provided Buffers
 
 `Add` stages; matching `Advance` publishes and transfers ownership to the kernel. Keep backing rooted and address-stable from staging through return. Do not mutate or reuse kernel-owned buffers. After ordinary return, the caller may retain the buffer; consuming data does not require immediate recycling.

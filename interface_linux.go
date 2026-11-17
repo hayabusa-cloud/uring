@@ -1821,19 +1821,20 @@ func (ur *Uring) MsgRing(sqeCtx SQEContext, userData int64, result int32, option
 	return ur.ioUring.msgRing(sqeCtx.OrFlags(flags), userData, result)
 }
 
-// MsgRingFD transfers a fixed file descriptor to another io_uring instance.
-// This is useful for multi-ring architectures where one ring accepts connections
-// and passes them to worker rings.
+// MsgRingFD installs a reference to a registered file in another io_uring instance.
+// sqeCtx.FD() selects the target ring; both rings need registered file tables.
+// srcFD is the source slot, which remains registered. dstSlot selects a target
+// slot, replacing its current file, or IORING_FILE_INDEX_ALLOC to allocate one.
+// userData identifies the target CQE; skipCQE suppresses only that CQE.
 //
-// Parameters:
-//   - sqeCtx: Context with target ring's FD (from RingFD())
-//   - srcFD: Fixed file index in the source ring (this ring)
-//   - dstSlot: Fixed file slot in the target ring, or IORING_FILE_INDEX_ALLOC
-//     to allocate a free target slot and return its index in the target CQE
-//   - userData: Value passed to the target ring's CQE
-//   - skipCQE: If true, no CQE is posted to the target ring
+// When posted, successful source and target CQEs report the same result:
 //
-// Both rings must have registered file tables.
+//	dstSlot                  Res
+//	Explicit slot            0
+//	IORING_FILE_INDEX_ALLOC  Allocated slot index
+//
+// If the source CQE reports -EOVERFLOW, the target file is already installed
+// but its CQE was not posted. Reconcile the target state before retrying.
 func (ur *Uring) MsgRingFD(sqeCtx SQEContext, srcFD uint32, dstSlot uint32, userData int64, skipCQE bool, options ...OpOptionFunc) error {
 	opFlags := ur.operationOptions(options)
 	var flags uint32
