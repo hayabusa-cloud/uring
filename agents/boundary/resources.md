@@ -27,6 +27,8 @@ Registration methods return results synchronously. Separate the metadata passed 
 
 Integer fields such as `RegionDesc.UserAddr` and `ZCRXAreaReg.Addr` do not retain backing memory. With `IORING_MEM_REGION_REG_WAIT_ARG`, call `RegisterMemRegion` before `Start` enables the ring. Asynchronous `FilesUpdate` retains its array through operation completion.
 
+`CloneBuffers` and `CloneBuffersFromRegistered` require Linux 6.18.3+ or a backport of the [buffer-cloning fix](https://github.com/torvalds/linux/commit/525916ce496615f531091855604eab9ca573b195) to preserve destination registrations after a replaced range. Unpatched kernels discard those registrations even when cloning succeeds.
+
 ### Inter-Ring File Transfers
 
 `MsgRingFD` keeps the source slot registered and installs a reference in the target ring. An explicit destination slot replaces its current file; `IORING_FILE_INDEX_ALLOC` allocates a free slot. Successful source and target CQEs report zero for an explicit slot or the allocated index. `skipCQE` suppresses only the target CQE.
