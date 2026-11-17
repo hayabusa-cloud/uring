@@ -57,6 +57,7 @@ Version strings alone establish no usable capability. ZCRX control/query records
 
 ## Registration
 
+- Preserve typed pointers in temporary registration records until the syscall; match the kernel ABI layout. Distinguish [metadata and backing lifetimes](resources.md#registration).
 - Preserve syscall counts and nested query result/size fields. A successful query syscall does not imply every record succeeded.
 - File-table updates may accept a prefix and clear the next slot before stopping. Mirror the kernel's changed slots, including that clear; do not mark the entire requested update successful. Descriptors below `-1` are invalid.
 - Clone buffers from a known source registration and preserve the destination's local view. A registered-ring index names a task-local binding; retain that task/source correspondence.

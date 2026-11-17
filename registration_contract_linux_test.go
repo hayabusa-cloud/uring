@@ -15,6 +15,27 @@ import (
 	"code.hybscloud.com/uring"
 )
 
+func TestRegisterMemRegionCopiesDescriptorOutput(t *testing.T) {
+	ring, err := uring.New(testMinimalBufferOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := ring.Stop(); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	// The kernel allocates the backing memory and writes its mmap offset here.
+	region := uring.RegionDesc{Size: uint64(os.Getpagesize())}
+	if err := ring.RegisterMemRegion(&region, uring.IORING_MEM_REGION_REG_WAIT_ARG); err != nil {
+		t.Fatal(err)
+	}
+	if region.MmapOffset == 0 || region.Size != uint64(os.Getpagesize()) {
+		t.Fatalf("region offset=%#x size=%d", region.MmapOffset, region.Size)
+	}
+}
+
 func TestRegisterFilesUpdateRejectionPreservesRegistration(t *testing.T) {
 	ring := newTestRing(t)
 	if n, err := ring.RegisterFilesUpdate(0, []int32{-1}); n != 0 || !errors.Is(err, uring.ErrNotFound) {

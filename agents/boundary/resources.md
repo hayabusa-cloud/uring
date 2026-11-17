@@ -15,6 +15,18 @@ Keep asynchronous storage reachable through typed Go roots, address-stable, and 
 
 `SendMsgHeader` submits caller-prepared metadata; `SendMsg` builds it from buffers and an address. Enable `NotifySucceed` without explicit success suppression when completion governs reuse. SQ consumption and a cancellation CQE do not release the target's storage.
 
+## Registration
+
+Registration methods return results synchronously. Separate the metadata passed to a call from the resources it registers:
+
+| Storage | Retain through |
+|---------|----------------|
+| `RegisterFiles` / `RegisterFilesUpdate` array | Method return; no CQE is needed to reuse the array |
+| `RegisterMemRegion` / `RegisterZCRXIfq` descriptors | Method return; read kernel-written fields then |
+| Caller-provided registered backing | All registrations and kernel uses; keep it reachable and address-stable |
+
+Integer fields such as `RegionDesc.UserAddr` and `ZCRXAreaReg.Addr` do not retain backing memory. With `IORING_MEM_REGION_REG_WAIT_ARG`, call `RegisterMemRegion` before `Start` enables the ring. Asynchronous `FilesUpdate` retains its array through operation completion.
+
 ## Provided Buffers
 
 `Add` stages; matching `Advance` publishes and transfers ownership to the kernel. Keep backing rooted and address-stable from staging through return. Do not mutate or reuse kernel-owned buffers. After ordinary return, the caller may retain the buffer; consuming data does not require immediate recycling.

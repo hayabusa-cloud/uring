@@ -6,6 +6,8 @@ Retain storage through every access; return it under its own protocol. [Boundary
 
 Choose ordinary, registered, provided, incremental, or zero-copy storage. Retain typed roots, stable addresses, and owning descriptors/registrations. SQ consumption can release copied submission metadata while payload access continues. `SendMsgHeader` and `RecvMsg` headers/referenced regions and `FilesUpdate` arrays remain caller-owned through completion; send storage remains immutable.
 
+Synchronous registration borrows metadata only until method return; follow the [registration lifetimes](../boundary/resources.md#registration) for arrays, descriptors, and backing memory.
+
 For provided buffers, `Add` stages; matching `Advance` publishes and transfers ownership. Retain backing from staging through return. Do not mutate or republish kernel-owned storage; returned buffers need not be recycled immediately.
 
 Bundles follow descriptor publication order. The standalone constructor requires consecutive IDs/compact backing and grants no managed recycle authority. Preserve application-selected tiers and group ownership.
