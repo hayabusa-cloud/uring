@@ -73,7 +73,7 @@ jobs:
           for benchmark_group in "${benchmark_groups[@]}"; do
             echo "### go test -bench ${benchmark_group}" | tee -a "$log"
             set +e
-            go test -run '^$' -bench "$benchmark_group" -benchmem -benchtime=100ms -count=10 -cpu=1 -timeout=120s . 2>&1 | tee -a "$log"
+            go test -run '^$' -bench "$benchmark_group" -benchmem -benchtime=200ms -count=10 -cpu=1 -timeout=120s . 2>&1 | tee -a "$log"
             group_status=${PIPESTATUS[0]}
             set -e
             if [ "$group_status" -ne 0 ]; then
@@ -121,7 +121,7 @@ jobs:
             echo
             echo "- Workflow: Benchmarks"
             echo "- Artifact: \`uring-public-benchmark-results\` contains \`summary.md\` and \`raw.txt\`."
-            echo "- Parameters: \`-benchmem -benchtime=100ms -count=10 -cpu=1\`, \`GOMAXPROCS=1\`."
+            echo "- Parameters: \`-benchmem -benchtime=200ms -count=10 -cpu=1\`, \`GOMAXPROCS=1\`."
             echo "- Go: $(go version)"
             echo "- Runner: $(uname -s)/$(uname -m) $(uname -r)"
             echo
