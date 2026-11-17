@@ -1528,12 +1528,11 @@ func (ur *Uring) UnregisterNAPI() error {
 // CloneBuffers clones registered buffers from another io_uring ring.
 // This enables buffer sharing between multiple rings.
 //
-// The source ring is also the userspace witness for the cloned buffer views.
-// On success, the destination's registered-buffer accessors correspond to the
-// cloned kernel table.
+// On success, the destination retains the cloned buffers and exposes their
+// slices through [Uring.RegisteredBuffer].
 //
 // Parameters:
-//   - src: source ring and registered-buffer view witness
+//   - src: source ring
 //   - srcOff: source buffer offset
 //   - dstOff: destination buffer offset
 //   - count: number of buffers to clone
@@ -1542,18 +1541,21 @@ func (ur *Uring) UnregisterNAPI() error {
 // A zero count clones the complete source table and requires both offsets to
 // be zero. Whole-table cloning requires Linux 6.12+; nonzero offsets or
 // replacement require Linux 6.13+.
+//
+// Preserving destination buffers after a replaced range requires Linux 6.18.3+
+// or a backport of the buffer-cloning fix. Earlier unpatched kernels discard
+// those registrations.
 func (ur *Uring) CloneBuffers(src *Uring, srcOff, dstOff, count uint32, replace bool) error {
 	return ur.cloneBuffersFrom(src, 0, false, srcOff, dstOff, count, replace)
 }
 
 // CloneBuffersFromRegistered clones buffers from src through a task-registered
-// ring index. src is the userspace buffer-view witness. srcRegisteredRingIdx
+// ring index. src supplies the buffer backing storage. srcRegisteredRingIdx
 // must identify src in the current Linux task's IORING_REGISTER_RING_FDS table.
 // Because that table is task-local, the caller must keep source registration,
 // this call, and source unregistration on the same OS thread.
 //
-// Whole-table cloning requires Linux 6.12+; nonzero offsets or replacement
-// require Linux 6.13+.
+// Cloning and replacement follow [Uring.CloneBuffers].
 func (ur *Uring) CloneBuffersFromRegistered(src *Uring, srcRegisteredRingIdx uint32, srcOff, dstOff, count uint32, replace bool) error {
 	return ur.cloneBuffersFrom(src, srcRegisteredRingIdx, true, srcOff, dstOff, count, replace)
 }
