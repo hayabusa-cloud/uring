@@ -643,7 +643,7 @@ En la raíz del paquete, [listener_example_test.go](./listener_example_test.go) 
 
 ## Soporte de plataforma
 
-`uring` apunta a Go 1.26+ y Linux 6.18+ en la ruta real respaldada por el kernel. La mayoría de los archivos de implementación y pruebas de ejemplo están protegidos con `//go:build linux`. Los archivos de Darwin proporcionan solo resguardos de compilación para la superficie compartida; las capacidades exclusivas de Linux siguen siendo exclusivas de Linux y no alteran la línea base de ejecución en Linux descrita arriba.
+`uring` apunta a Go 1.27+ y Linux 6.18+ en la ruta real respaldada por el kernel. La mayoría de los archivos de implementación y pruebas de ejemplo están protegidos con `//go:build linux`. Los archivos de Darwin proporcionan solo resguardos de compilación para la superficie compartida; las capacidades exclusivas de Linux siguen siendo exclusivas de Linux y no alteran la línea base de ejecución en Linux descrita arriba.
 
 ## Licencia
 

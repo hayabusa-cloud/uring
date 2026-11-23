@@ -56,7 +56,7 @@ type (
 	PollCloser = iofd.PollCloser
 )
 
-// Network family aliases.
+// Network family aliases use the target OS's address-family values.
 const (
 	NetworkUnix = sock.NetworkUnix
 	NetworkIPv4 = sock.NetworkIPv4

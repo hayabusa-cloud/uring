@@ -643,7 +643,7 @@ Idle → Active → Stopping → Retiring → Stopped
 
 ## 対応プラットフォーム
 
-`uring` の実カーネルパスは Go 1.26+ / Linux 6.18+ を対象としています。実装ファイルとテストの大半は `//go:build linux` で保護されており、Darwin 向けファイルは共有 API 面向けのコンパイルスタブのみを提供します。Linux 専用機能は引き続き Linux 専用であり、上述の Linux 実行時ベースラインを変えません。
+`uring` の実カーネルパスは Go 1.27+ / Linux 6.18+ を対象としています。実装ファイルとテストの大半は `//go:build linux` で保護されており、Darwin 向けファイルは共有 API 面向けのコンパイルスタブのみを提供します。Linux 専用機能は引き続き Linux 専用であり、上述の Linux 実行時ベースラインを変えません。
 
 ## ライセンス
 

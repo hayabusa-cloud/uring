@@ -643,7 +643,7 @@ Les tests exécutables de `examples/` enseignent initialisation → soumission �
 
 ## Support de plateforme
 
-`uring` cible Go 1.26+ et Linux 6.18+ pour le chemin réel adossé au noyau. La plupart des fichiers d'implémentation et des tests d'exemple portent la directive `//go:build linux` ; les fichiers Darwin fournissent uniquement des bouchons de compilation pour la surface partagée, et les capacités propres à Linux restent propres à Linux sans modifier en rien la base d'exécution Linux décrite ci-dessus.
+`uring` cible Go 1.27+ et Linux 6.18+ pour le chemin réel adossé au noyau. La plupart des fichiers d'implémentation et des tests d'exemple portent la directive `//go:build linux` ; les fichiers Darwin fournissent uniquement des bouchons de compilation pour la surface partagée, et les capacités propres à Linux restent propres à Linux sans modifier en rien la base d'exécution Linux décrite ci-dessus.
 
 ## Licence
 

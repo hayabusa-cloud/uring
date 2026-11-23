@@ -643,7 +643,7 @@ At the package root, [listener_example_test.go](./listener_example_test.go) demo
 
 ## Platform support
 
-`uring` targets Go 1.26+ and Linux 6.18+ on the real kernel-backed path. Most source files and example tests carry a `//go:build linux` guard. Darwin files provide compile stubs for the shared surface only; Linux-only capabilities remain Linux-only and do not change the Linux runtime baseline.
+`uring` targets Go 1.27+ and Linux 6.18+ on the real kernel-backed path. Most source files and example tests carry a `//go:build linux` guard. Darwin files provide compile stubs for the shared surface only; Linux-only capabilities remain Linux-only and do not change the Linux runtime baseline.
 
 ## License
 

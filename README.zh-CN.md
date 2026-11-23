@@ -643,7 +643,7 @@ Idle → Active → Stopping → Retiring → Stopped
 
 ## 平台支持
 
-`uring` 的真实内核路径面向 Go 1.26+ / Linux 6.18+。大部分实现文件与示例测试由 `//go:build linux` 约束；Darwin 文件仅为共享 API 表面提供编译桩，Linux 专属能力仍仅限 Linux，不会改变上述 Linux 运行时基线。
+`uring` 的真实内核路径面向 Go 1.27+ / Linux 6.18+。大部分实现文件与示例测试由 `//go:build linux` 约束；Darwin 文件仅为共享 API 表面提供编译桩，Linux 专属能力仍仅限 Linux，不会改变上述 Linux 运行时基线。
 
 ## 许可证
 

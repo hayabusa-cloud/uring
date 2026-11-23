@@ -2,7 +2,7 @@
 
 Kernel upgrade, memlock configuration, and failure resolution for `uring`.
 
-`uring` requires Linux 6.18+ and Go 1.26+. The examples below use Debian 13
+`uring` requires Linux 6.18+ and Go 1.27+. The examples below use Debian 13
 (trixie).
 
 ## Continuous integration
