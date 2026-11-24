@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"runtime"
 	"testing"
-	"time"
 	"unsafe"
 
 	"code.hybscloud.com/iofd"
@@ -20,29 +19,6 @@ import (
 	"code.hybscloud.com/uring"
 	"code.hybscloud.com/zcall"
 )
-
-func waitHeaderCQEs(t *testing.T, ring *uring.Uring, count int) []uring.CQEView {
-	t.Helper()
-	cqes := make([]uring.CQEView, count)
-	var backoff iox.Backoff
-	deadline := time.Now().Add(3 * time.Second)
-	for got := 0; got < count; {
-		n, err := ring.Wait(cqes[got:])
-		if err != nil && !iox.IsWouldBlock(err) {
-			t.Fatal(err)
-		}
-		if n == 0 {
-			if time.Now().After(deadline) {
-				t.Fatalf("received %d of %d completions", got, count)
-			}
-			backoff.Wait()
-			continue
-		}
-		backoff.Reset()
-		got += n
-	}
-	return cqes
-}
 
 func headerContext(t *testing.T, ring *uring.Uring, mode int, id uint16) uring.SQEContext {
 	t.Helper()
@@ -133,7 +109,7 @@ func TestSendMsgHeaderDatagrams(t *testing.T) {
 					want[id] = int32(n)
 				}
 				runtime.GC()
-				for _, cqe := range waitHeaderCQEs(t, ring, len(requests)) {
+				for _, cqe := range waitForCQEs(t, ring, len(requests)) {
 					id := cqe.Context().Raw()
 					n, ok := want[id]
 					if !ok || cqe.Res != n || cqe.Flags != 0 {
@@ -196,7 +172,7 @@ func TestSendMsgHeaderRejectionPreservesContexts(t *testing.T) {
 			if mode == 1 && *ctx.IndirectSQE() != indirect || mode == 2 && *ctx.ExtSQE() != extended {
 				t.Fatal("rejection mutated pointer-backed context")
 			}
-			for _, cqe := range waitHeaderCQEs(t, ring, capacity) {
+			for _, cqe := range waitForCQEs(t, ring, capacity) {
 				if cqe.Op() != uring.IORING_OP_NOP || cqe.Res != 0 {
 					t.Fatalf("rejected send was published: %+v", cqe)
 				}
@@ -204,7 +180,7 @@ func TestSendMsgHeaderRejectionPreservesContexts(t *testing.T) {
 			if err := ring.SendMsgHeader(ctx, -1, &msg); err != nil {
 				t.Fatal(err)
 			}
-			cqe := waitHeaderCQEs(t, ring, 1)[0]
+			cqe := waitForCQEs(t, ring, 1)[0]
 			want := ctx
 			if ctx.IsDirect() {
 				want = ctx.WithFD(-1).WithOp(uring.IORING_OP_SENDMSG)
@@ -233,7 +209,7 @@ func TestSendMsgHeaderFixedFileOptions(t *testing.T) {
 		uring.WithOffset(-1), uring.WithN(-1), uring.WithPersonality(65535)); err != nil {
 		t.Fatal(err)
 	}
-	cqe := waitHeaderCQEs(t, ring, 1)[0]
+	cqe := waitForCQEs(t, ring, 1)[0]
 	if cqe.Res != 0 || cqe.Context() != ctx || cqe.Context().Flags() != uring.IOSQE_FIXED_FILE|uring.IOSQE_ASYNC {
 		t.Fatalf("fixed send completion: %+v", cqe)
 	}
@@ -271,7 +247,7 @@ func TestSendMsgHeaderAncillary(t *testing.T) {
 	}
 	runtime.GC()
 	seen := map[uring.SQEContext]bool{}
-	for _, cqe := range waitHeaderCQEs(t, ring, 2) {
+	for _, cqe := range waitForCQEs(t, ring, 2) {
 		if cqe.Res != int32(len(payload)) || seen[cqe.Context()] || cqe.Context() != sendCtx && cqe.Context() != recvCtx {
 			t.Fatalf("message completion: %+v", cqe)
 		}
@@ -327,7 +303,7 @@ func TestSendMsgHeaderNotificationPolicy(t *testing.T) {
 					count++
 				}
 				seenSend, seenNop := false, false
-				for _, cqe := range waitHeaderCQEs(t, ring, count) {
+				for _, cqe := range waitForCQEs(t, ring, count) {
 					switch cqe.Op() {
 					case uring.IORING_OP_SENDMSG:
 						if cqe.Res != int32(len(payload)) || seenSend || !notify || explicit {
@@ -379,7 +355,7 @@ func TestSendMsgHeaderShortStream(t *testing.T) {
 	}
 	var sent int32
 	seenNop := false
-	for _, cqe := range waitHeaderCQEs(t, ring, 2) {
+	for _, cqe := range waitForCQEs(t, ring, 2) {
 		switch cqe.Op() {
 		case uring.IORING_OP_SENDMSG:
 			if cqe.Context() != ctx || cqe.Res <= 0 || cqe.Res >= int32(len(payload)) || sent != 0 {
@@ -435,7 +411,7 @@ func TestSendMsgHeaderDeferredCancellation(t *testing.T) {
 	if err := ring.Nop(uring.PackDirect(uring.IORING_OP_NOP, 0, 1, 0)); err != nil {
 		t.Fatal(err)
 	}
-	cqe := waitHeaderCQEs(t, ring, 1)[0]
+	cqe := waitForCQEs(t, ring, 1)[0]
 	if cqe.Op() != uring.IORING_OP_NOP || cqe.Res != 0 {
 		t.Fatalf("send completed without peer capacity: %+v", cqe)
 	}
@@ -446,7 +422,7 @@ func TestSendMsgHeaderDeferredCancellation(t *testing.T) {
 	}
 	runtime.GC()
 	seenTarget, seenCancel := false, false
-	for _, cqe := range waitHeaderCQEs(t, ring, 2) {
+	for _, cqe := range waitForCQEs(t, ring, 2) {
 		switch cqe.Context() {
 		case ctx:
 			if cqe.Res != -int32(zcall.ECANCELED) || seenTarget {
@@ -507,7 +483,7 @@ func TestMessageHeaderAllocations(t *testing.T) {
 								}
 							}
 						})
-						for _, cqe := range waitHeaderCQEs(t, ring, len(messages)) {
+						for _, cqe := range waitForCQEs(t, ring, len(messages)) {
 							if cqe.Res != -int32(zcall.EBADF) {
 								t.Fatalf("invalid descriptor completion: %+v", cqe)
 							}

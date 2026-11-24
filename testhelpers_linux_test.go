@@ -61,6 +61,29 @@ func newTestRing(t *testing.T, opts ...func(*uring.Options)) *uring.Uring {
 	return ring
 }
 
+func waitForCQEs(t *testing.T, ring *uring.Uring, count int) []uring.CQEView {
+	t.Helper()
+	cqes := make([]uring.CQEView, count)
+	var backoff iox.Backoff
+	deadline := time.Now().Add(3 * time.Second)
+	for got := 0; got < count; {
+		n, err := ring.Wait(cqes[got:])
+		if err != nil && !iox.IsWouldBlock(err) {
+			t.Fatal(err)
+		}
+		if n == 0 {
+			if time.Now().After(deadline) {
+				t.Fatalf("received %d of %d completions", got, count)
+			}
+			backoff.Wait()
+			continue
+		}
+		backoff.Reset()
+		got += n
+	}
+	return cqes
+}
+
 func waitForOp(t *testing.T, ring *uring.Uring, op uint8, timeout time.Duration) (uring.CQEView, bool) {
 	t.Helper()
 
