@@ -31,4 +31,4 @@ Choose optional [runtime roles](agents/runtime/INDEX.md) for continuation, conte
 <a id="workflow"></a>
 <a id="references"></a>
 
-After [environment setup](SETUP.md), run `make all` on native Linux 6.18+ with Go 1.26+ for vet and race tests. Follow [verification](agents/verify.md) for capability requirements, affected examples and comparison with equivalent direct code. [Focused proofs](proofs/README.md) document model assumptions and limits; ordinary Go builds do not require Lean. Use [primary sources](agents/references.md) for kernel contracts.
+After [environment setup](SETUP.md), run `make all` on native Linux 6.18+ with Go 1.27+ for vet and race tests. Follow [verification](agents/verify.md) for capability requirements, affected examples and comparison with equivalent direct code. [Focused proofs](proofs/README.md) document model assumptions and limits; ordinary Go builds do not require Lean. Use [primary sources](agents/references.md) for kernel contracts.

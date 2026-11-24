@@ -18,13 +18,13 @@ Go `io_uring` 内核接口包，面向 Linux 6.18+。
 核心类型：
 
 - `Uring`：活跃 ring 的句柄及操作方法集
-- `SQEContext`：通过 `user_data` 传递的提交标识
+- `SQEContext`：通过 `user_data` 传递的提交上下文
 - `CQEView`：`Wait` 返回的已复制完成描述符
 - 缓冲区供给：通过注册缓冲区与多尺寸缓冲区组实现
 
 ## 安装
 
-`uring` 要求 Linux 内核 6.18 或更高版本。先确认当前内核版本：
+构建 `uring` 需要 Go 1.27 或更高版本，使用内核的 `io_uring` 需要 Linux 6.18 或更高版本。先检查当前运行的内核版本。
 
 ```bash
 uname -r
@@ -48,9 +48,9 @@ Ring 创建可能返回 `ENOMEM`、`EPERM` 或 `ENOSYS`，分别对应 memlock �
 
 ## 调用方指南
 
-使用 `uring` 构建或审查运行时、协议栈或服务时，请从 [`AGENTS.md`](./AGENTS.md) 开始阅读。[调用方指南](./agents/INDEX.md) 涵盖提交、完成处理、请求标识、缓冲区所有权、生命周期、包集成和验证。
+[文件 I/O 示例](./examples/file_io_test.go#L30)展示了如何从 `Start` 到 `Stop` 直接驱动 ring。具体操作见[调用方指南](./agents/INDEX.md)，所有权和验证要求见[包说明](./AGENTS.md)。
 
-`uring` 提供内核操作和完成结果。调用方负责轮询、调度、重试与退避、完成路由及其注销、协议状态与解析、取消和超时策略、安全检查以及服务生命周期。组合这些操作时，应保留 `ErrWouldBlock`、`ErrMore`、`IORING_CQE_F_MORE`、所有权转移和能力检查失败的含义。
+批量提交可先接受部分请求，再对剩余请求返回 `iox.ErrWouldBlock`。匹配的 CQE 中，`Res` 给出操作结果，`IORING_CQE_F_MORE` 表示同一请求可能还有后续 CQE。是否将该标志解释为 `iox.ErrMore`，由调用方协议决定。内核操作可能已生效才报错。例如，`MsgRingFD` 在目标 ring 安装文件后，源 ring 的 CQE 仍可能报告 `-EOVERFLOW`。[文件传递后的恢复](./agents/boundary/resources.md#inter-ring-file-transfers)
 
 ## Ring 生命周期
 
@@ -103,6 +103,7 @@ cqe := cqes[0]
 if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
 	log.Fatalf("unexpected completion: op=%d fd=%d", cqe.Op(), cqe.FD())
 }
+runtime.KeepAlive(file) // 读取完成前，让持有该 FD 的 file 保持可达。
 completionErr := cqe.Err()
 if completionErr == nil {
 	handle(buf[:int(cqe.Res)])
@@ -125,7 +126,7 @@ if completionErr != nil {
 |-----------------------|----------------------------------|
 | `Uring`               | Ring 的初始化、提交、完成回收及操作方法           |
 | `Options`             | Ring 条目数、注册缓冲区预算、缓冲区组配置及完成事件可见性  |
-| `SQEContext`          | 存储于 `user_data` 的紧凑提交标识          |
+| `SQEContext`          | 存储于 `user_data` 的紧凑提交上下文 |
 | `CQEView`             | 已复制完成描述符，提供解码访问器；模式相关目标仍为借用 |
 | `ListenerOp`          | 监听器创建操作的句柄，持有 FD 并提供 accept 辅助方法 |
 | `BundleIterator`      | 遍历 bundle 接收中消耗的缓冲区              |
@@ -171,9 +172,9 @@ if completionErr != nil {
 
 `Multicast` 根据负载大小和目标数量自动选择普通发送或零拷贝发送；`MulticastZeroCopy` 使用更低的阈值，优先选择零拷贝。两者都要求 Direct 上下文并返回 `(submitted, error)`，其中 `submitted` 表示已接受的目标前缀长度。遇到背压后，从剩余目标继续提交。恢复调用可能选择不同的操作，因此应检查每个 CQE 的操作码和标志。`Multicast` 的普通发送遵循 `NotifySucceed`；选中的零拷贝发送和 `MulticastZeroCopy` 的两条路径都会保留完成证据，并拒绝显式的 `IOSQE_CQE_SKIP_SUCCESS`。
 
-已受理的流式发送仍可能只完成部分字节。跟踪普通发送的字节数时，应保留成功 CQE，并根据每个目标的数据结果只续传尚未发送的尾部。共享的零拷贝数据必须保持不变，直到所有已受理目标都满足释放条件。[multicast 示例](./examples/zerocopy_test.go)展示了如何分别跟踪字节进度和释放。
+流式发送只完成部分字节时，仅重试该次发送尚未传输的部分。若要跟踪普通发送的字节数，请启用成功 CQE。在所有已接受的发送都释放共享数据前，保持其内容不变。普通发送在完成时释放数据。对 `SEND_ZC`，应等到不带 `IORING_CQE_F_MORE` 的终结数据 CQE，或同时收到数据 CQE 和匹配的通知。[多目标发送示例](./examples/zerocopy_test.go)
 
-`SQEContext` 是本包的核心标识令牌。Direct 模式将 opcode、SQE flags、buffer-group ID 与文件描述符打包为一个 64 位值。
+Direct 模式将操作码、SQE 标志、缓冲区组 ID 和文件描述符打包为 64 位 `SQEContext`。若多个同时在途的发送具有相同字段，它们的 `user_data` 也相同。要将结果对应到具体发送，请串行执行这些发送，或逐个提交并使用各自独立且仍然有效的上下文。
 
 ```go
 sqeCtx := uring.ForFD(int32(fd)).
@@ -301,7 +302,7 @@ receiver := uring.NewIncrementalReceiver(ring, pool, groupID, bufSize, backing, 
 
 `IORING_CQE_F_BUF_MORE` 表示内核在请求完成后仍保留所选缓冲区。只有 CQE 包含 `IORING_CQE_F_BUFFER`、不含 `IORING_CQE_F_BUF_MORE`，且所有借用访问均已结束时，才能重新发布该缓冲区。零或负的结果也可能归还缓冲区。buffer-ring 的销毁由 `Uring.Stop` 负责。
 
-Fixed-buffer I/O 通过索引使用注册缓冲区。返回的切片属于 ring 内存；在 fixed 操作完成前保持其有效：
+`WriteFixed` 通过索引提交注册缓冲区中的数据。操作完成前，保持文件打开且不要修改已提交的字节。若依据 CQE 判断何时复用缓冲区，请启用 `NotifySucceed` 并保持 `IOSQE_CQE_SKIP_SUCCESS` 未设置。
 
 ```go
 buf := ring.RegisteredBuffer(0)
@@ -458,7 +459,7 @@ for i := range n {
 
 ### 类型化上下文承载连接状态
 
-扩展上下文可以在提交 → 完成的往返全程携带连接级引用，无需全局查找表：
+Extended 上下文可在发送期间携带连接状态。本例需要启用 `NotifySucceed` 且不设置 `IOSQE_CQE_SKIP_SUCCESS`，以便在 `Send` 成功后收到 CQE，再将上下文归还池中。
 
 ```go
 type ConnState struct {
@@ -481,7 +482,7 @@ if err := ring.Send(sqeCtx, &fd, payload); err != nil {
 }
 ```
 
-完成时通过同一类型化视图恢复状态：
+收到匹配的 `SEND` CQE 后，先复制连接引用和序列号，再将上下文归还池中。
 
 ```go
 ext := cqe.ExtSQE()
@@ -495,24 +496,26 @@ ring.PutExtSQE(ext)
 
 ### 截止时间组合
 
-`LinkTimeout` 通过 `IOSQE_IO_LINK` 链将截止时间附加到前一个 SQE 上。到期时会尝试取消关联操作，但该操作可能已经完成。必须检查两条 CQE 的结果；超时本身不能证明操作已被取消。
+`LinkTimeout` 为前一个带 `IOSQE_IO_LINK` 的 SQE 设置期限。在已启动且只有一个所有者的 ring 上，先检查容量，再连续提交两个 SQE，其间不插入其他提交或 `Wait`。下面的返回值记录调用方还需回收多少个请求的完成事件。传入非空的接收缓冲区，并在回收接收 CQE 前保持其地址稳定。
 
 ```go
-recvCtx := uring.ForFD(int32(fd)).
-	WithOp(uring.IORING_OP_RECV).
-	WithBufGroup(group)
-
-if err := ring.Receive(recvCtx, &fd, nil, uring.WithFlags(uring.IOSQE_IO_LINK)); err != nil {
-	return err
-}
-
-timeoutCtx := uring.PackDirect(uring.IORING_OP_LINK_TIMEOUT, 0, 0, 0)
-if err := ring.LinkTimeout(timeoutCtx, 5*time.Second); err != nil {
-	return err
+func queueReceiveWithTimeout(ring *uring.Uring, fd iofd.FD, buf []byte, d time.Duration) (int, error) {
+	if ring.SQAvailable() < 2 {
+		return 0, iox.ErrWouldBlock
+	}
+	recvCtx := uring.PackDirect(uring.IORING_OP_RECV, uring.IOSQE_IO_LINK, 0, int32(fd))
+	if err := ring.ReceiveFD(recvCtx, fd, buf); err != nil {
+		return 0, err
+	}
+	timeoutCtx := uring.PackDirect(uring.IORING_OP_LINK_TIMEOUT, 0, 0, 0)
+	if err := ring.LinkTimeout(timeoutCtx, d); err != nil {
+		return 1, err
+	}
+	return 2, nil
 }
 ```
 
-连续提交关联的 SQE，并将这对提交与其他提交和等待调用串行化。保留操作的缓冲区和上下文，直到该操作自身完成；结束前必须处理两条 CQE。
+若返回 `iox.ErrWouldBlock` 且没有请求入队，先驱动 ring，再重试这一对请求。若仅接收入队，先驱动 ring 将其提交给内核，再提交其他请求，并保留 `buf` 直到接收完成。若两者均已入队，则回收两条 CQE。期限届满时内核会尝试取消接收，实际接收结果以接收 CQE 为准。[关联超时示例](./examples/timeout_linux_test.go#L259)
 
 ## TCP 使用模式
 
@@ -578,7 +581,7 @@ if err := ring.Receive(recvCtx, &clientFD, buf); err != nil {
 // Wait for the RECV CQE before reading or reusing buf.
 ```
 
-每次提交后，使用 ring 生命周期一节中的 `Wait` 循环观察对应的完成事件，再执行依赖它的下一步操作。保持数据有效直到完成，短发送后只重试尚未发送的后缀。[socket_test.go](./examples/socket_test.go) 展示完整的客户端流程；[echo_test.go](./examples/echo_test.go) 进一步展示接收与回复。
+本例的 `Send` 需要启用 `NotifySucceed` 且不设置 `IOSQE_CQE_SKIP_SUCCESS`。用 `Wait` 取得匹配的 CQE 后，再执行依赖该结果的下一步。保持数据有效直到发送完成，短发送只重试尚未发送的部分。[TCP 客户端](./examples/socket_test.go) · [Echo 示例](./examples/echo_test.go)
 
 ## 零拷贝接收（ZCRX）
 
@@ -643,7 +646,7 @@ Idle → Active → Stopping → Retiring → Stopped
 
 ## 平台支持
 
-`uring` 的真实内核路径面向 Go 1.26+ / Linux 6.18+。大部分实现文件与示例测试由 `//go:build linux` 约束；Darwin 文件仅为共享 API 表面提供编译桩，Linux 专属能力仍仅限 Linux，不会改变上述 Linux 运行时基线。
+基于内核的实现需要 Go 1.27+ 和 Linux 6.18+。Darwin 构建包含用户态模拟器，可执行部分共享 API。CI 对 Darwin 目标进行编译，并在原生 Linux 上验证内核行为。
 
 ## 许可证
 

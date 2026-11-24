@@ -32,7 +32,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go-version: [ '1.26.x', 'stable' ]
+        go-version: [ '1.27.x', 'stable' ]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -128,7 +128,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go-version: [ '1.26.x', 'stable' ]
+        go-version: [ '1.27.x', 'stable' ]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -189,7 +189,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go-version: [ '1.26.x', 'stable' ]
+        go-version: [ '1.27.x', 'stable' ]
         target:
           - { goos: linux, goarch: arm64 }
           - { goos: darwin, goarch: amd64 }

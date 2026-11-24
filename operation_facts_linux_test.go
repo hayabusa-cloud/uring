@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"testing"
 	"time"
 
@@ -94,6 +95,36 @@ func TestBundleFollowsRecycledBufferOrder(t *testing.T) {
 	}
 }
 
+// Both ends use plain TCP so the kernel can select its TCP zero-copy path.
+func newTestTCPPair(t *testing.T) (iofd.FD, net.Conn) {
+	t.Helper()
+	var listenConfig net.ListenConfig
+	listenConfig.SetMultipathTCP(false)
+	listener, err := listenConfig.Listen(context.Background(), "tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	dialer := net.Dialer{Timeout: 2 * time.Second}
+	dialer.SetMultipathTCP(false)
+	peer, err := dialer.Dial("tcp4", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { peer.Close() })
+	sender, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sender.Close()
+	file, err := sender.(*net.TCPConn).File()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { file.Close() })
+	return iofd.FD(file.Fd()), peer
+}
+
 func TestZCTrackerDefaultNotifications(t *testing.T) {
 	for _, fixed := range []bool{false, true} {
 		name := "user"
@@ -102,38 +133,16 @@ func TestZCTrackerDefaultNotifications(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			ring := newTestRing(t) // NotifySucceed remains false.
-			var listenConfig net.ListenConfig
-			listenConfig.SetMultipathTCP(false)
-			ln, err := listenConfig.Listen(context.Background(), "tcp4", "127.0.0.1:0")
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer ln.Close()
-			dialer := net.Dialer{Timeout: 2 * time.Second}
-			dialer.SetMultipathTCP(false)
-			client, err := dialer.Dial("tcp4", ln.Addr().String())
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer client.Close()
-			server, err := ln.Accept()
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer server.Close()
-			file, err := server.(*net.TCPConn).File()
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer file.Close()
+			fd, client := newTestTCPPair(t)
 			payload := []byte("zero-copy completion is required")
 			tracker := uring.NewZCTracker(ring, uring.NewContextPools(2))
 			handler := &testZCHandler{}
+			var err error
 			if fixed {
 				copy(ring.RegisteredBuffer(0), payload)
-				err = tracker.SendZCFixed(iofd.FD(file.Fd()), 0, 0, len(payload), handler)
+				err = tracker.SendZCFixed(fd, 0, 0, len(payload), handler)
 			} else {
-				err = tracker.SendZC(iofd.FD(file.Fd()), payload, handler)
+				err = tracker.SendZC(fd, payload, handler)
 			}
 			if err != nil {
 				t.Fatal(err)
@@ -312,6 +321,125 @@ func TestMulticastAcceptedPrefix(t *testing.T) {
 	}
 	if string(got[:]) != "oneone" {
 		t.Fatalf("received %q", got)
+	}
+}
+
+func TestMulticastZeroCopyRetryChangesOpcode(t *testing.T) {
+	ring := newTestRing(t, func(o *uring.Options) {
+		o.Entries = uring.EntriesPico
+		o.NotifySucceed = true // Observe ordinary sends used to finish short writes.
+	})
+	var fds [4]iofd.FD
+	var peers [len(fds)]net.Conn
+	var sent [len(fds)]int
+	for i := range fds {
+		fds[i], peers[i] = newTestTCPPair(t)
+		sent[i] = -1 // No data CQE for this target yet.
+	}
+	var payload [1024]byte
+	for i := range payload {
+		payload[i] = byte(i % 251)
+	}
+	buf := ring.RegisteredBuffer(0)[:len(payload)]
+	copy(buf, payload[:])
+
+	const padding = uring.EntriesPico - 1
+	ctx := uring.ForFD(0)
+	for range padding {
+		if err := ring.Nop(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	accepted, err := ring.MulticastZeroCopy(ctx, &operationTargets{fds: fds[:]}, 0, 0, len(buf))
+	if accepted != 1 || !iox.IsWouldBlock(err) {
+		t.Fatalf("first call accepted %d targets, error %v", accepted, err)
+	}
+
+	nopsLeft, dataLeft := padding, len(fds)
+	var more, notified bool
+	dispatch := func(batch []uring.CQEView, admitted []iofd.FD) {
+		t.Helper()
+		for _, cqe := range batch {
+			if cqe.Op() == uring.IORING_OP_NOP {
+				if nopsLeft == 0 || cqe.Res != 0 {
+					t.Fatalf("unexpected padding CQE: %+v", cqe)
+				}
+				nopsLeft--
+				continue
+			}
+			i := slices.Index(admitted, cqe.FD())
+			if i < 0 {
+				t.Fatalf("completion for unaccepted FD %d", cqe.FD())
+			}
+			wantOp := uint8(uring.IORING_OP_SEND)
+			if i == 0 {
+				wantOp = uring.IORING_OP_SEND_ZC
+			}
+			if cqe.Op() != wantOp {
+				t.Fatalf("target %d opcode=%d, want %d", i, cqe.Op(), wantOp)
+			}
+			if cqe.IsNotification() {
+				if i != 0 || notified {
+					t.Fatalf("unexpected notification for target %d", i)
+				}
+				notified = true
+				continue
+			}
+			if sent[i] >= 0 || cqe.Res < 0 || int(cqe.Res) > len(buf) || (i != 0 && cqe.HasMore()) {
+				t.Fatalf("target %d previous result=%d, unexpected data CQE: %+v", i, sent[i], cqe)
+			}
+			sent[i] = int(cqe.Res)
+			dataLeft--
+			if i == 0 {
+				more = cqe.HasMore()
+			}
+		}
+	}
+
+	// Drive the first submission and account for every CQE reaped with the NOPs.
+	dispatch(waitForCQEs(t, ring, padding), fds[:accepted])
+	suffix := &operationTargets{fds: fds[accepted:]}
+	if available := ring.SQAvailable(); available < suffix.Count() {
+		t.Fatalf("available SQ entries=%d, need %d", available, suffix.Count())
+	}
+	n, err := ring.MulticastZeroCopy(ctx, suffix, 0, 0, len(buf))
+	if n != suffix.Count() || err != nil {
+		t.Fatalf("retry accepted %d of %d targets, error %v", n, suffix.Count(), err)
+	}
+	for {
+		pending := nopsLeft + dataLeft
+		if more && !notified {
+			pending++
+		}
+		if pending == 0 {
+			break
+		}
+		dispatch(waitForCQEs(t, ring, pending), fds[:])
+	}
+	t.Logf("SEND_ZC MORE=%t NOTIF=%t, initial byte counts=%v", more, notified, sent)
+
+	for i, fd := range fds {
+		// All original borrows have ended. Finish only this peer's unsent bytes.
+		for offset := sent[i]; offset < len(buf); {
+			if err := ring.SendFD(ctx, fd, buf[offset:]); err != nil {
+				t.Fatal(err)
+			}
+			cqe := waitForCQEs(t, ring, 1)[0]
+			if cqe.Op() != uring.IORING_OP_SEND || cqe.FD() != fd || cqe.HasMore() || cqe.IsNotification() || cqe.Res <= 0 || int(cqe.Res) > len(buf)-offset {
+				t.Fatalf("target %d suffix at %d: unexpected completion %+v", i, offset, cqe)
+			}
+			offset += int(cqe.Res)
+		}
+		if errno := zcall.Shutdown(uintptr(fd), zcall.SHUT_WR); errno != 0 {
+			t.Fatalf("target %d shutdown: %v", i, zcall.Errno(errno))
+		}
+		if err := peers[i].SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		got, err := io.ReadAll(io.LimitReader(peers[i], int64(len(payload)+1)))
+		if err != nil || !bytes.Equal(got, payload[:]) {
+			t.Fatalf("peer %d received %d bytes, want one matching payload of %d bytes: %v", i, len(got), len(payload), err)
+		}
 	}
 }
 

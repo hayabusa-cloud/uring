@@ -24,7 +24,7 @@ env:
 
 jobs:
   public-benchmarks:
-    name: Benchmarks (Linux/amd64, Go 1.26.x)
+    name: Benchmarks (Linux/amd64, Go 1.27.x)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -35,7 +35,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version: '1.26.x'
+          go-version: '1.27.x'
           check-latest: true
 
       - name: Check runner environment

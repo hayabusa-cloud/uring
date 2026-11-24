@@ -14,6 +14,8 @@ Request cancellation where permitted, then keep driving and dispatching. Cancell
 
 Dispatch original terminal and successfully queued cancellation CQEs, including after route retirement. Helpers own cancellation contexts; never return them manually. No-op/failed submission creates no new CQE obligation.
 
+For one target and one queued cancellation, a caller can pair two `tempo` contracts over the same CQE history. One records the target's terminal CQE and the other records the cancellation CQE. The caller matches and dispatches both. [`tempo.Both`](https://pkg.go.dev/code.hybscloud.com/tempo@v0.1.0#Both)
+
 Keep results, failures, terminality, and releases distinct. Neither terminal callbacks nor empty CQ establish that all work ended. Continue required service/wakeup paths; caller no-progress waits use adaptive backoff.
 
 ## Release Each Owner
@@ -28,7 +30,7 @@ Keep results, failures, terminality, and releases distinct. Neither terminal cal
 | Descriptor/registration | No operation or borrow can access it |
 | Ring | Work drained, CQEs reaped, subscriptions quiesced, caller serialized |
 
-Finalizers retain their own prerequisites. `takt.Loop.Drain` discards suspensions; `takt.SubscriptionLoop.Drain` requests cancellation and retires routes. Neither waits for kernel completion. Preserve backend dispatch for late CQEs. The `sess.Close` effect closes only the local protocol endpoint.
+Keep backend dispatch available for late CQEs after a [`takt` loop drains](../runtime/takt.md#drain-and-ownership) or `sess.Close` closes the local endpoint.
 
 `Uring.Stop` is the final destructor and synthesizes no terminal callbacks. `ZCRXReceiver.Stop` requests cancellation; `Close` additionally requires receiver retirement and owning-ring teardown. Keep single-issuer task affinity through final `Stop`.
 

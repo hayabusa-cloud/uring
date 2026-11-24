@@ -1827,122 +1827,117 @@ func TestMsgRing(t *testing.T) {
 	t.Log("MSG_RING cross-ring communication test passed")
 }
 
-// TestMsgRingFD tests cross-ring FD transfer via IORING_MSG_SEND_FD.
-// This operation transfers a fixed file descriptor from one ring to another.
+// TestMsgRingFD checks both completion results and the installed file reference.
 func TestMsgRingFD(t *testing.T) {
-	// Create source ring
-	srcRing, err := uring.New(testMinimalBufferOptions)
-	if err != nil {
-		t.Fatalf("New (source): %v", err)
-	}
-	mustStartRing(t, srcRing)
+	for _, tc := range []struct {
+		name       string
+		dstSlot    uint32
+		wantResult int32
+	}{
+		{"explicit_zero", 0, 0},
+		{"explicit_one", 1, 0},
+		{"allocate_one", uring.IORING_FILE_INDEX_ALLOC, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Slot zero keeps the default CQE policy. The nonzero cases also
+			// observe successful sends through both registrations.
+			checkFiles := tc.dstSlot != 0
+			options := func(o *uring.Options) { o.NotifySucceed = checkFiles }
+			src := newTestRing(t, options)
+			dst := newTestRing(t, options)
+			fds, err := newUnixSocketPairForTest()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer closeTestFds(fds)
+			if err := src.RegisterFiles([]int32{int32(fds[0])}); err != nil {
+				t.Fatalf("register source socket: %v", err)
+			}
+			if err := dst.RegisterFilesSparse(2); err != nil {
+				t.Fatalf("register target table: %v", err)
+			}
+			if checkFiles {
+				// Leave just slot 1 free for either kind of installation.
+				other, err := os.Open(os.DevNull)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer other.Close()
+				n, err := dst.RegisterFilesUpdate(0, []int32{int32(other.Fd())})
+				if err != nil || n != 1 {
+					t.Fatalf("occupy target slot 0: n=%d err=%v", n, err)
+				}
+			}
 
-	// Create target ring
-	dstRing, err := uring.New(testMinimalBufferOptions)
-	if err != nil {
-		t.Fatalf("New (target): %v", err)
-	}
-	mustStartRing(t, dstRing)
+			const messageID = 0xFD5E7D
+			targetFD := dst.RingFD()
+			if targetFD < 0 {
+				t.Fatal("target ring has no descriptor")
+			}
+			ctx := uring.PackDirect(uring.IORING_OP_MSG_RING, 0, 0, targetFD.Raw())
+			if err := src.MsgRingFD(ctx, 0, tc.dstSlot, messageID, false); err != nil {
+				t.Fatal(err)
+			}
+			requireMsgRingResult(t, src, ctx.Raw(), tc.wantResult)
+			reported := requireMsgRingResult(t, dst, messageID, tc.wantResult)
+			if !checkFiles {
+				return
+			}
+			slot := iofd.FD(tc.dstSlot)
+			if tc.dstSlot == uring.IORING_FILE_INDEX_ALLOC {
+				slot = iofd.FD(reported)
+			}
 
-	// Get target ring's FD
-	targetFD := dstRing.RingFD()
-	if targetFD < 0 {
-		t.Fatal("RingFD not available")
+			for _, send := range []struct {
+				ring   *uring.Uring
+				slot   iofd.FD
+				marker byte
+			}{
+				{src, 0, 'S'},
+				{dst, slot, 'T'},
+			} {
+				buf := send.ring.RegisteredBuffer(0)[:1]
+				buf[0] = send.marker
+				sendCtx := uring.PackDirect(uring.IORING_OP_SEND, uring.IOSQE_FIXED_FILE, 0, send.slot.Raw())
+				if err := send.ring.SendFD(sendCtx, send.slot, buf); err != nil {
+					t.Fatalf("send marker %c through slot %d: %v", send.marker, send.slot, err)
+				}
+				requireMsgRingResult(t, send.ring, sendCtx.Raw(), 1)
+				var got [1]byte
+				n, errno := zcall.Recvfrom(uintptr(fds[1]), got[:], zcall.MSG_DONTWAIT, nil, nil)
+				if errno != 0 || n != 1 || got[0] != send.marker {
+					t.Fatalf("peer read after sending %c: n=%d errno=%d byte=%q", send.marker, n, errno, got)
+				}
+			}
+		})
 	}
-	t.Logf("Target ring FD: %d", targetFD)
+}
 
-	// Use one socket endpoint as the registered descriptor to transfer.
-	fds, err := newUnixSocketPairForTest()
-	if err != nil {
-		t.Fatalf("socketpair: %v", err)
-	}
-	defer closeTestFds(fds)
-
-	// Register the socket in source ring's fixed file table (slot 0).
-	if err := srcRing.RegisterFiles([]int32{int32(fds[0])}); err != nil {
-		t.Fatalf("RegisterFiles (source): %v", err)
-	}
-	t.Log("Registered FD in source ring's fixed file table at slot 0")
-
-	// Register sparse file table in target ring (for receiving FD)
-	if err := dstRing.RegisterFilesSparse(4); err != nil {
-		t.Fatalf("RegisterFilesSparse (target): %v", err)
-	}
-	t.Log("Registered sparse file table in target ring")
-
-	// Transfer FD from source slot 0 to target slot 0
-	const testUserData int64 = 0xFD5E7D
-	srcFDSlot := uint32(0)
-	dstFDSlot := uint32(0)
-	ctx := uring.PackDirect(uring.IORING_OP_MSG_RING, 0, 0, targetFD.Raw())
-	err = srcRing.MsgRingFD(ctx, srcFDSlot, dstFDSlot, testUserData, false)
-	if err != nil {
-		t.Fatalf("MsgRingFD: %v", err)
-	}
-	t.Log("Submitted MsgRingFD operation")
-
-	// Wait for source ring completion
-	srcCQEs := make([]uring.CQEView, 4)
+func requireMsgRingResult(t *testing.T, ring *uring.Uring, userData uint64, want int32) int32 {
+	t.Helper()
+	var cqes [4]uring.CQEView
+	var backoff iox.Backoff
 	deadline := time.Now().Add(5 * time.Second)
-	srcDone := false
-	b := iox.Backoff{}
-
-	for time.Now().Before(deadline) && !srcDone {
-		n, err := srcRing.Wait(srcCQEs)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
-			t.Fatalf("Wait (source): %v", err)
+	for time.Now().Before(deadline) {
+		n, err := ring.Wait(cqes[:])
+		if err != nil && !iox.IsWouldBlock(err) {
+			t.Fatalf("wait for user_data=%#x: %v", userData, err)
 		}
 		if n == 0 {
-			b.Wait()
+			backoff.Wait()
 			continue
 		}
-		b.Reset()
 		if n != 1 {
-			t.Fatalf("source CQE count = %d, want 1", n)
+			t.Fatalf("received %d CQEs, want one for user_data=%#x", n, userData)
 		}
-		cqe := srcCQEs[0]
-		// An explicit destination slot reports success as zero.
-		if cqe.Context() != ctx || cqe.Res != 0 {
-			t.Fatalf("source CQE: user_data=%#x, res=%d; want user_data=%#x, res=0", cqe.Context(), cqe.Res, ctx)
+		cqe := cqes[0]
+		if cqe.Context().Raw() != userData || cqe.Res != want {
+			t.Fatalf("CQE user_data=%#x res=%d, want user_data=%#x res=%d", cqe.Context().Raw(), cqe.Res, userData, want)
 		}
-		srcDone = true
+		return cqe.Res
 	}
-
-	if !srcDone {
-		t.Fatal("MSG_RING_FD source completion was not received")
-	}
-
-	// Wait for target ring to receive the CQE notification
-	dstCQEs := make([]uring.CQEView, 4)
-	deadline = time.Now().Add(5 * time.Second)
-	dstDone := false
-	b = iox.Backoff{}
-
-	for time.Now().Before(deadline) && !dstDone {
-		n, err := dstRing.Wait(dstCQEs)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
-			t.Fatalf("Wait (target): %v", err)
-		}
-		if n == 0 {
-			b.Wait()
-			continue
-		}
-		b.Reset()
-		if n != 1 {
-			t.Fatalf("target CQE count = %d, want 1", n)
-		}
-		cqe := dstCQEs[0]
-		if cqe.Context().Raw() != uint64(testUserData) || cqe.Res != 0 {
-			t.Fatalf("target CQE: user_data=%#x, res=%d; want user_data=%#x, res=0", cqe.Context(), cqe.Res, testUserData)
-		}
-		dstDone = true
-	}
-
-	if !dstDone {
-		t.Fatal("MSG_RING_FD target completion was not received")
-	}
-
-	t.Log("MSG_RING_FD cross-ring FD transfer test passed")
+	t.Fatalf("timed out waiting for user_data=%#x", userData)
+	return 0
 }
 
 // TestNAPIRegistration tests NAPI busy polling registration (Linux 6.9+).

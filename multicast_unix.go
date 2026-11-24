@@ -24,8 +24,10 @@ type SendTargets interface {
 // 2 KiB for 512-4095, and 1.5 KiB for 4096 or more. These are workload heuristics;
 // MulticastZeroCopy uses lower thresholds to favor zero-copy.
 //
-// sqeCtx must use Direct mode so each target retains its own completion identity.
-// For pointer-based contexts, submit each send with a separate context instead.
+// sqeCtx must use Direct mode. Each send carries its target FD in user_data.
+// Overlapping sends with identical packed fields have the same user_data.
+// To match their results individually, serialize them or submit separate sends
+// with distinct live contexts.
 //
 // The return count is the accepted target prefix, not completed sends or bytes.
 // Submission stops at the first error, including ErrWouldBlock. Resume with the
@@ -34,9 +36,10 @@ type SendTargets interface {
 // enabled, inspect each target's result and resume only its unsent suffix.
 // Keep the payload valid and unmodified until all accepted sends release it.
 // Ordinary sends follow NotifySucceed. Selected zero-copy sends always request
-// completion evidence and reject explicit IOSQE_CQE_SKIP_SUCCESS; their borrows
-// end at notification or terminal data without MORE. Inspect each CQE's opcode
-// and flags: resuming with fewer targets can change the selected operation.
+// completion evidence and reject explicit IOSQE_CQE_SKIP_SUCCESS. Their borrows
+// end on terminal data without MORE or after both data and notification.
+// Inspect each CQE's opcode and flags. Resuming with fewer targets can change
+// the selected operation.
 func (ur *Uring) Multicast(sqeCtx SQEContext, targets SendTargets, bufIndex int, p []byte, offset int64, n int, options ...OpOptionFunc) (int, error) {
 	count := targets.Count()
 	if count == 0 {
@@ -104,10 +107,10 @@ func (ur *Uring) Multicast(sqeCtx SQEContext, targets SendTargets, bufIndex int,
 //
 // Both selected paths request completion evidence, independent of NotifySucceed.
 // Explicit IOSQE_CQE_SKIP_SUCCESS is invalid. Keep the buffer range immutable
-// until every accepted target's ordinary-send completion, or zero-copy
-// notification or terminal data CQE without MORE. Inspect each CQE's opcode
-// and flags; a resumed call can select a different operation. Kernel errors
-// remain visible; this helper does not retry a rejected zero-copy operation.
+// until each accepted ordinary send completes and each zero-copy send reports
+// terminal data without MORE or both data and notification. Inspect each CQE's
+// opcode and flags because a resumed call can select a different operation.
+// The caller decides whether to retry a rejected zero-copy operation.
 func (ur *Uring) MulticastZeroCopy(sqeCtx SQEContext, targets SendTargets, bufIndex int, offset int64, n int, options ...OpOptionFunc) (int, error) {
 	count := targets.Count()
 	if count == 0 {

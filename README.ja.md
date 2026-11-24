@@ -18,13 +18,13 @@ Go で Linux 6.18+ の `io_uring` カーネル境界を扱うパッケージ。
 主な API は以下のとおりです。
 
 - `Uring`: リングハンドルと操作メソッド群
-- `SQEContext`: `user_data` で運ばれる発行元識別子
+- `SQEContext` は `user_data` に格納する投入時のコンテキスト
 - `CQEView`: `Wait` が返すコピー済み完了記述子
 - 登録バッファおよびマルチサイズ buffer group によるバッファ供給
 
 ## インストール
 
-`uring` の動作には Linux カーネル 6.18 以上が必要です。まず動作中のカーネルバージョンを確認してください。
+`uring` のビルドには Go 1.27 以降、カーネルの `io_uring` を使うには Linux 6.18 以降が必要です。まず実行中のカーネルのバージョンを確認してください。
 
 ```bash
 uname -r
@@ -48,9 +48,9 @@ Debian 13 の安定版トラックが提供するカーネルは 6.12 です。`
 
 ## 呼び出し側向けガイド
 
-`uring` を使うランタイム、プロトコルスタック、サービスを実装またはレビューする際は、[`AGENTS.md`](./AGENTS.md) から読み始めてください。[呼び出し側向けガイド](./agents/INDEX.md) では、発行、完了処理、リクエストの識別、バッファ所有権、ライフサイクル、パッケージ連携、検証を説明しています。
+[ファイル I/O の例](./examples/file_io_test.go#L30)では、`Start` から `Stop` までリングを直接操作する流れを示します。操作別の手順は[呼び出し側向けガイド](./agents/INDEX.md)、所有権と検証の要件は[パッケージの指針](./AGENTS.md)を参照してください。
 
-`uring` はカーネル操作と完了結果を提供します。ポーリング、スケジューリング、再試行とバックオフ、完了ルーティングとルートの終了処理、プロトコル状態と解析、キャンセルとタイムアウトの方針、安全性チェック、サービスのライフサイクルは呼び出し側が管理します。操作を組み合わせる際も、`ErrWouldBlock`、`ErrMore`、`IORING_CQE_F_MORE`、所有権の移動、機能不足による失敗の意味を保ってください。
+一括投入では、一部の要求が受理された後、残りに対して `iox.ErrWouldBlock` が返ることがあります。対応する CQE の `Res` は操作結果を示し、`IORING_CQE_F_MORE` は同じ要求の CQE がさらに届く可能性を示します。このフラグを `iox.ErrMore` と解釈するかは呼び出し側のプロトコルで決まります。カーネルの操作がすでに反映された後でエラーが返ることもあります。例えば `MsgRingFD` では、転送先にファイルが登録された後、転送元の CQE に `-EOVERFLOW` が返る場合があります。[ファイル転送時の復旧](./agents/boundary/resources.md#inter-ring-file-transfers)
 
 ## リングのライフサイクル
 
@@ -103,6 +103,7 @@ cqe := cqes[0]
 if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
 	log.Fatalf("unexpected completion: op=%d fd=%d", cqe.Op(), cqe.FD())
 }
+runtime.KeepAlive(file) // 読み取りが完了するまで、FD を所有する file を生存させる。
 completionErr := cqe.Err()
 if completionErr == nil {
 	handle(buf[:int(cqe.Res)])
@@ -125,7 +126,7 @@ if completionErr != nil {
 |-----------------------|-------------------------------------------------|
 | `Uring`               | リングの初期化・発行・完了回収と操作メソッド                          |
 | `Options`             | リングエントリ数、登録バッファ予算、buffer group スケール、完了の可視性      |
-| `SQEContext`          | `user_data` に格納されるコンパクトな発行元識別子                  |
+| `SQEContext`          | `user_data` に格納する投入時のコンテキスト |
 | `CQEView`             | デコード済みアクセサを持つコピー済み完了記述子。モード依存の参照先は借用       |
 | `ListenerOp`          | リスナー作成操作のハンドル。FD の保持と accept ヘルパーを提供            |
 | `BundleIterator`      | バンドル受信で消費されたバッファの走査                             |
@@ -171,9 +172,9 @@ if completionErr != nil {
 
 `Multicast` はペイロードサイズと宛先数に応じて通常送信とゼロコピー送信を自動選択します。`MulticastZeroCopy` はより低いしきい値でゼロコピーを優先します。どちらも Direct コンテキストを要求し、`(submitted, error)` を返します。`submitted` は先頭から受理された宛先数です。バックプレッシャー時は残りの宛先から再開します。再開時に選択される操作が変わる場合があるため、各 CQE のオペコードとフラグを確認してください。`Multicast` の通常送信は `NotifySucceed` に従います。選択されたゼロコピー送信と `MulticastZeroCopy` の両経路は完了の観測を維持し、明示的な `IOSQE_CQE_SKIP_SUCCESS` を拒否します。
 
-受理されたストリーム送信でも、要求したバイト数より少ない転送で完了する場合があります。通常送信のバイト数を追跡する場合は成功 CQE を有効にし、宛先ごとのデータ結果から未送信の末尾部分だけを再送してください。共有するゼロコピーデータは、受理されたすべての宛先が解放条件に達するまで変更しないでください。[multicast の例](./examples/zerocopy_test.go)は、バイト単位の進捗と解放をそれぞれ追跡します。
+ストリーム送信が一部しか完了しなかった場合は、その送信の未送信部分だけを再送してください。通常送信のバイト数を追跡するには、成功時の CQE を有効にします。共有データは、受理されたすべての送信が解放するまで変更できません。通常送信では完了時に解放されます。`SEND_ZC` では `IORING_CQE_F_MORE` のない最終データ CQE、またはデータ CQE と対応する通知の両方が必要です。[複数の宛先への送信例](./examples/zerocopy_test.go)
 
-`SQEContext` はこのパッケージの主要な識別トークンです。direct モードでは opcode、SQE flags、buffer group ID、ファイルディスクリプタを 64 ビット値ひとつに格納します。
+Direct モードの `SQEContext` は、オペコード、SQE フラグ、バッファグループ ID、ファイル記述子を 64 ビットに格納します。これらの値が同じ送信が同時に進行すると、`user_data` も同じになります。結果を送信ごとに対応付けるには、そのような送信を直列化するか、それぞれ異なる有効なコンテキストで個別に投入してください。
 
 ```go
 sqeCtx := uring.ForFD(int32(fd)).
@@ -301,7 +302,7 @@ receiver := uring.NewIncrementalReceiver(ring, pool, groupID, bufSize, backing, 
 
 `IORING_CQE_F_BUF_MORE` は、リクエスト完了後も選択されたバッファをカーネルが保持していることを示します。`IORING_CQE_F_BUFFER` があり、`IORING_CQE_F_BUF_MORE` がない CQE を受け取り、借用中のアクセスがすべて終了してからバッファを再公開してください。結果がゼロまたは負でもバッファが返却されることがあります。buffer-ring の破棄は `Uring.Stop` が担当します。
 
-固定バッファ I/O は登録済みバッファをインデックスで参照します。返されるスライスはリング所有のメモリなので、固定操作が完了するまで有効に保ってください。
+`WriteFixed` は、インデックスで指定した登録済みバッファから書き込みます。完了まではファイルを開いたままにし、投入したバイト列を変更しないでください。CQE を見てバッファの再利用を判断する場合は、`NotifySucceed` を有効にし、`IOSQE_CQE_SKIP_SUCCESS` は指定しません。
 
 ```go
 buf := ring.RegisteredBuffer(0)
@@ -458,7 +459,7 @@ for i := range n {
 
 ### 型付きコンテキストによるコネクション状態
 
-拡張コンテキストは、グローバルルックアップテーブルを介さずに、発行 → 完了のラウンドトリップ全体にわたってコネクション単位の参照を伝搬します。
+Extended コンテキストは、送信時の接続状態を完了まで引き継げます。この例では、成功した `Send` の CQE を受け取ってからコンテキストをプールに返すため、`NotifySucceed` を有効にし、`IOSQE_CQE_SKIP_SUCCESS` は指定しません。
 
 ```go
 type ConnState struct {
@@ -481,7 +482,7 @@ if err := ring.Send(sqeCtx, &fd, payload); err != nil {
 }
 ```
 
-完了時に同じ型付きビューを通じて状態を復元します。
+対応する `SEND` の CQE を受け取ったら、接続状態への参照とシーケンス番号をコピーしてからコンテキストをプールに返します。
 
 ```go
 ext := cqe.ExtSQE()
@@ -495,24 +496,26 @@ ring.PutExtSQE(ext)
 
 ### デッドライン合成
 
-`LinkTimeout` は `IOSQE_IO_LINK` チェーンを通じて直前の SQE に期限を付与します。期限が切れるとリンク先の操作のキャンセルを試みますが、その操作はすでに完了している場合があります。両方の CQE の結果を確認してください。タイムアウトだけでは、操作がキャンセルされたとは判断できません。
+`LinkTimeout` は、直前の `IOSQE_IO_LINK` 付き SQE に期限を設定します。起動済みのリングを単一の所有者が操作し、空き数の確認から 2 つの SQE の投入までの間に、他の投入や `Wait` を挟まないようにします。次の例の戻り値は、完了を回収する必要のある要求の数です。空でない受信バッファを渡し、受信 CQE を回収するまでそのアドレスを固定してください。
 
 ```go
-recvCtx := uring.ForFD(int32(fd)).
-	WithOp(uring.IORING_OP_RECV).
-	WithBufGroup(group)
-
-if err := ring.Receive(recvCtx, &fd, nil, uring.WithFlags(uring.IOSQE_IO_LINK)); err != nil {
-	return err
-}
-
-timeoutCtx := uring.PackDirect(uring.IORING_OP_LINK_TIMEOUT, 0, 0, 0)
-if err := ring.LinkTimeout(timeoutCtx, 5*time.Second); err != nil {
-	return err
+func queueReceiveWithTimeout(ring *uring.Uring, fd iofd.FD, buf []byte, d time.Duration) (int, error) {
+	if ring.SQAvailable() < 2 {
+		return 0, iox.ErrWouldBlock
+	}
+	recvCtx := uring.PackDirect(uring.IORING_OP_RECV, uring.IOSQE_IO_LINK, 0, int32(fd))
+	if err := ring.ReceiveFD(recvCtx, fd, buf); err != nil {
+		return 0, err
+	}
+	timeoutCtx := uring.PackDirect(uring.IORING_OP_LINK_TIMEOUT, 0, 0, 0)
+	if err := ring.LinkTimeout(timeoutCtx, d); err != nil {
+		return 1, err
+	}
+	return 2, nil
 }
 ```
 
-リンクする SQE は連続して投入し、この一組の投入を他の投入・待機呼び出しと直列化してください。操作自身の完了までバッファとコンテキストを保持し、終了処理の前に両方の CQE を処理してください。
+投入数が 0 で `iox.ErrWouldBlock` が返ったら、リングを駆動してから 2 件とも再試行します。受信だけがキューに入った場合は、他の要求を追加する前にその受信をカーネルに渡し、完了まで `buf` を保持します。2 件とも入った場合は両方の CQE を回収します。期限切れはキャンセルを試みるためのもので、受信の結果は受信自身の CQE で確認します。[リンクタイムアウトの例](./examples/timeout_linux_test.go#L259)
 
 ## TCP の使用パターン
 
@@ -578,7 +581,7 @@ if err := ring.Receive(recvCtx, &clientFD, buf); err != nil {
 // Wait for the RECV CQE before reading or reusing buf.
 ```
 
-各発行後、リングのライフサイクル節の `Wait` ループで対応する完了を確認してから、結果に依存する次の操作へ進みます。完了までデータを保持し、短い送信結果では未送信部分だけを再発行してください。[socket_test.go](./examples/socket_test.go) はクライアントの一連の操作を、[echo_test.go](./examples/echo_test.go) は受信と応答も含む流れを示します。
+この例の `Send` では `NotifySucceed` を有効にし、`IOSQE_CQE_SKIP_SUCCESS` は指定しません。結果に依存する次の操作へ進む前に、`Wait` で対応する CQE を確認します。送信完了までデータを保持し、部分送信の場合は未送信部分だけを再送します。[TCP クライアント](./examples/socket_test.go) · [エコーの例](./examples/echo_test.go)
 
 ## ゼロコピー受信（ZCRX）
 
@@ -643,7 +646,7 @@ Idle → Active → Stopping → Retiring → Stopped
 
 ## 対応プラットフォーム
 
-`uring` の実カーネルパスは Go 1.26+ / Linux 6.18+ を対象としています。実装ファイルとテストの大半は `//go:build linux` で保護されており、Darwin 向けファイルは共有 API 面向けのコンパイルスタブのみを提供します。Linux 専用機能は引き続き Linux 専用であり、上述の Linux 実行時ベースラインを変えません。
+カーネルを使う実装には Go 1.27 以降と Linux 6.18 以降が必要です。Darwin ビルドには共有 API の一部を実行するユーザー空間のシミュレーターが含まれます。CI では Darwin 向けにコンパイルし、カーネルの動作はネイティブ Linux 上で検証します。
 
 ## ライセンス
 

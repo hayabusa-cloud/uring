@@ -13,7 +13,7 @@ Read [core contracts](core.md), select a task and its required sources, then fol
 | Task | Read |
 |------|------|
 | Add or repair an operation adapter | [One-shot](recipes/oneshot.md), [encoding](boundary/encoding.md) |
-| Drive a ring | [One-shot](recipes/oneshot.md), [takt](runtime/takt.md) |
+| Drive a ring directly | [One-shot](recipes/oneshot.md), [file write/read example](../examples/file_io_test.go#L30) |
 | Set up a listener | [Listener](recipes/listener.md) |
 | Cancel or drain a subscription | [Stream](recipes/stream.md), [lifecycle](recipes/lifecycle.md) |
 | Use buffers, registered files, or zero-copy | [Buffers](recipes/buffers.md) |

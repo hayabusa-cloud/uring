@@ -74,6 +74,7 @@ var platformSpecificConstantValues = map[string]struct{}{
 	"AF_LOCAL":            {},
 	"AF_INET":             {},
 	"AF_INET6":            {},
+	"NetworkIPv6":         {}, // sock.NetworkIPv6 follows the target's AF_INET6.
 	"SOCK_STREAM":         {},
 	"SOCK_DGRAM":          {},
 	"SOCK_RAW":            {},

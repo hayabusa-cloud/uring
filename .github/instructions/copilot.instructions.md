@@ -4,7 +4,7 @@ applyTo: "**"
 
 # Review uring
 
-`code.hybscloud.com/uring` is a Go 1.26+ boundary to Linux io_uring, targeting Linux 6.18+ with explicit capability checks. Review changes for concrete correctness, API, ownership, and performance consequences. Include code, examples, tests, and guidance when the change affects their contract.
+`code.hybscloud.com/uring` is a Go 1.27+ boundary to Linux io_uring, targeting Linux 6.18+ with explicit capability checks. Review changes for concrete correctness, API, ownership, and performance consequences. Include code, examples, tests, and guidance when the change affects their contract.
 
 ## Evidence and Findings
 
