@@ -18,13 +18,13 @@ Langue: [English](./README.md) | [简体中文](./README.zh-CN.md) | [Español](
 Les surfaces principales sont :
 
 - `Uring`, le handle du ring actif et son jeu d'opérations
-- `SQEContext`, l'identité de soumission acheminée dans `user_data`
+- `SQEContext`, le contexte de soumission transmis dans `user_data`
 - `CQEView`, le descripteur de complétion copié renvoyé par `Wait`
 - la fourniture de tampons, via tampons enregistrés et groupes de tampons multi-tailles
 
 ## Installation
 
-`uring` nécessite un noyau Linux 6.18 ou ultérieur. Vérifiez d'abord la version du noyau en cours d'exécution :
+La compilation de `uring` nécessite Go 1.27 ou une version ultérieure. Pour utiliser `io_uring` dans le noyau, il faut Linux 6.18 ou une version ultérieure. Vérifiez d’abord la version du noyau en cours d’exécution.
 
 ```bash
 uname -r
@@ -48,9 +48,9 @@ La création du ring peut renvoyer `ENOMEM`, `EPERM` ou `ENOSYS` selon les limit
 
 ## Guide du code appelant
 
-Commencez par [`AGENTS.md`](./AGENTS.md) pour développer ou relire des runtimes, piles de protocoles ou services utilisant `uring`. Le [guide du code appelant](./agents/INDEX.md) couvre la soumission, les complétions, l'identité des requêtes, la propriété des tampons, les durées de vie, l'intégration des packages et la vérification.
+L’[exemple d’E/S sur fichier](./examples/file_io_test.go#L30) montre comment piloter directement un ring de `Start` à `Stop`. Consultez le [guide du code appelant](./agents/INDEX.md) pour une opération précise et les [consignes du package](./AGENTS.md) pour les règles de propriété et de vérification.
 
-`uring` expose les opérations du noyau et leurs résultats. Le code appelant gère le polling, l'ordonnancement, les reprises et l'attente progressive, le routage des complétions et le retrait des routes, l'état et l'analyse du protocole, les politiques d'annulation et de délai, les contrôles de sécurité et le cycle de vie du service. Lors de la composition de ces opérations, préservez le sens de `ErrWouldBlock`, `ErrMore`, `IORING_CQE_F_MORE`, des transferts de propriété et des échecs de capacité.
+Une soumission par lot peut accepter une partie des requêtes, puis renvoyer `iox.ErrWouldBlock` pour les suivantes. Dans la CQE correspondante, `Res` donne le résultat de l’opération et `IORING_CQE_F_MORE` indique qu’une autre CQE peut suivre pour la même requête. L’interprétation de ce drapeau comme `iox.ErrMore` dépend du protocole de l’appelant. Le noyau peut avoir effectué l’opération avant de signaler une erreur. Par exemple, la CQE source de `MsgRingFD` peut signaler `-EOVERFLOW` après l’installation du fichier dans le ring cible. [Reprise après un transfert de fichier](./agents/boundary/resources.md#inter-ring-file-transfers)
 
 ## Cycle de vie du ring
 
@@ -103,6 +103,7 @@ cqe := cqes[0]
 if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
 	log.Fatalf("unexpected completion: op=%d fd=%d", cqe.Op(), cqe.FD())
 }
+runtime.KeepAlive(file) // Gardez le propriétaire du FD en vie jusqu’à la fin de la lecture.
 completionErr := cqe.Err()
 if completionErr == nil {
 	handle(buf[:int(cqe.Res)])
@@ -125,7 +126,7 @@ if completionErr != nil {
 |-----------------------|--------------------------------------------------------------------------------------------------------------|
 | `Uring`               | Initialisation du ring, soumission, récupération des complétions, et méthodes d'opération                    |
 | `Options`             | Entrées du ring, budget de tampons enregistrés, échelle des groupes de tampons et visibilité des complétions |
-| `SQEContext`          | Identité de soumission compacte stockée dans `user_data`                                                     |
+| `SQEContext` | Contexte de soumission encodé dans `user_data` |
 | `CQEView`             | Descripteur de complétion copié avec accesseurs décodés et cibles empruntées selon le mode                    |
 | `ListenerOp`          | Gestionnaire d'une opération de création d'écouteur avec FD et auxiliaires accept                            |
 | `BundleIterator`      | Itère sur les tampons consommés lors d'une réception groupée                                                 |
@@ -171,9 +172,9 @@ Opérations :
 
 `Multicast` choisit automatiquement un envoi ordinaire ou sans copie selon la taille du message et le nombre de destinations ; `MulticastZeroCopy` utilise des seuils plus bas pour favoriser le sans-copie. Les deux exigent un contexte Direct et renvoient `(submitted, error)` : `submitted` compte le préfixe de destinations accepté. En cas de contre-pression, reprendre avec les destinations restantes. Examiner le code d’opération et les indicateurs de chaque CQE, car une reprise peut sélectionner une autre opération. Les envois ordinaires de `Multicast` suivent `NotifySucceed` ; les envois sans copie sélectionnés et les deux chemins de `MulticastZeroCopy` conservent les observations de fin et rejettent `IOSQE_CQE_SKIP_SUCCESS` explicite.
 
-Chaque envoi accepté sur un socket de flux peut transférer moins d'octets que demandé. Gardez les CQE de succès activées pour suivre les octets des envois ordinaires, puis utilisez le résultat de données de chaque destination pour ne reprendre que le suffixe restant. Gardez les octets partagés sans copie immuables jusqu'à ce que chaque destination acceptée atteigne sa condition de libération. L'[exemple multicast](./examples/zerocopy_test.go) montre le suivi des octets transférés et de la libération.
+Après un envoi partiel sur un socket de flux, reprenez uniquement les octets restant à envoyer. Activez les CQE de succès pour suivre le nombre d’octets des envois ordinaires. Gardez les données partagées intactes jusqu’à leur libération par tous les envois acceptés. Un envoi ordinaire les libère à sa complétion. Pour `SEND_ZC`, attendez une CQE de données finale sans `IORING_CQE_F_MORE`, ou à la fois la CQE de données et sa notification. [Exemple d’envoi à plusieurs destinations](./examples/zerocopy_test.go)
 
-`SQEContext` est le jeton d'identité principal de ce package. En mode direct, il encode l'opcode, les fanions SQE, l'identifiant de groupe de tampons et le descripteur de fichier dans une seule valeur de 64 bits.
+En mode Direct, `SQEContext` encode l’opcode, les drapeaux de la SQE, l’identifiant du groupe de tampons et le descripteur de fichier sur 64 bits. Deux envois en cours dont ces champs sont identiques ont le même `user_data`. Pour attribuer chaque résultat à un envoi précis, sérialisez ces envois ou soumettez-les séparément avec des contextes distincts qui restent valides.
 
 ```go
 sqeCtx := uring.ForFD(int32(fd)).
@@ -301,7 +302,7 @@ receiver := uring.NewIncrementalReceiver(ring, pool, groupID, bufSize, backing, 
 
 `IORING_CQE_F_BUF_MORE` indique que le noyau conserve le tampon sélectionné même après la fin de la requête. Ne le recyclez qu'après une CQE indiquant `IORING_CQE_F_BUFFER` sans `IORING_CQE_F_BUF_MORE` et la fin de tout accès emprunté. Un résultat nul ou négatif peut aussi rendre un tampon. `Uring.Stop` assure la destruction du buffer-ring.
 
-L'I/O sur tampon fixe utilise un tampon enregistré par index. La tranche renvoyée appartient au ring ; gardez-la vivante jusqu'à la complétion de l'opération fixe :
+`WriteFixed` écrit les octets d’un tampon enregistré désigné par son indice. Gardez le fichier ouvert et les octets intacts jusqu’à la complétion. Si la CQE détermine le moment où le tampon est réutilisable, activez `NotifySucceed` et laissez `IOSQE_CQE_SKIP_SUCCESS` désactivé.
 
 ```go
 buf := ring.RegisteredBuffer(0)
@@ -458,7 +459,7 @@ Transmettez chaque CQE d'annulation soumise au `HandleCQE` de la même souscript
 
 ### État par connexion via des contextes typés
 
-Les contextes étendus transportent les références par connexion tout au long du cycle soumission → complétion, sans recourir à une table de correspondance globale :
+Un contexte Extended peut conserver une référence à l’état de la connexion pendant un envoi. Cet exemple nécessite `NotifySucceed` activé et `IOSQE_CQE_SKIP_SUCCESS` désactivé pour qu’un `Send` réussi produise la CQE qui permet de rendre le contexte au pool.
 
 ```go
 type ConnState struct {
@@ -481,7 +482,7 @@ if err := ring.Send(sqeCtx, &fd, payload); err != nil {
 }
 ```
 
-Au moment de la complétion, on récupère l'état par la même vue typée :
+À la réception de la CQE `SEND` correspondante, copiez la référence à la connexion et le numéro de séquence avant de rendre le contexte au pool.
 
 ```go
 ext := cqe.ExtSQE()
@@ -495,24 +496,26 @@ On maintient les racines de pointeurs Go actives accessibles en dehors de `UserD
 
 ### Composition de délais
 
-`LinkTimeout` attache une échéance au SQE précédent via une chaîne `IOSQE_IO_LINK`. À expiration, il tente d'annuler l'opération liée, qui peut déjà être terminée. Examinez les deux résultats de CQE ; l'expiration ne prouve pas que l'opération a été annulée.
+`LinkTimeout` fixe une échéance pour la SQE précédente marquée `IOSQE_IO_LINK`. Sur un ring démarré et géré par un seul propriétaire, vérifiez la capacité puis soumettez les deux SQE à la suite, avant toute autre soumission ou tout appel à `Wait`. Le nombre renvoyé ci-dessous indique combien de requêtes restent à traiter en complétion. Utilisez un tampon de réception non vide et gardez son adresse stable jusqu’à la CQE de réception.
 
 ```go
-recvCtx := uring.ForFD(int32(fd)).
-	WithOp(uring.IORING_OP_RECV).
-	WithBufGroup(group)
-
-if err := ring.Receive(recvCtx, &fd, nil, uring.WithFlags(uring.IOSQE_IO_LINK)); err != nil {
-	return err
-}
-
-timeoutCtx := uring.PackDirect(uring.IORING_OP_LINK_TIMEOUT, 0, 0, 0)
-if err := ring.LinkTimeout(timeoutCtx, 5*time.Second); err != nil {
-	return err
+func queueReceiveWithTimeout(ring *uring.Uring, fd iofd.FD, buf []byte, d time.Duration) (int, error) {
+	if ring.SQAvailable() < 2 {
+		return 0, iox.ErrWouldBlock
+	}
+	recvCtx := uring.PackDirect(uring.IORING_OP_RECV, uring.IOSQE_IO_LINK, 0, int32(fd))
+	if err := ring.ReceiveFD(recvCtx, fd, buf); err != nil {
+		return 0, err
+	}
+	timeoutCtx := uring.PackDirect(uring.IORING_OP_LINK_TIMEOUT, 0, 0, 0)
+	if err := ring.LinkTimeout(timeoutCtx, d); err != nil {
+		return 1, err
+	}
+	return 2, nil
 }
 ```
 
-Soumettez les SQE liés de façon contiguë, en sérialisant la paire avec les autres appels de soumission et d'attente. Gardez les tampons et le contexte de l'opération jusqu'à sa propre complétion, et traitez les deux CQE avant la fermeture.
+Si `iox.ErrWouldBlock` est renvoyé sans aucune admission, faites progresser le ring avant de réessayer la paire. Si seule la réception est en file, transmettez-la au noyau avant toute autre soumission et conservez `buf` jusqu’à sa complétion. Si les deux requêtes sont en file, relevez les deux CQE. À l’échéance, le noyau tente d’annuler la réception. Sa propre CQE en donne le résultat. [Exemple de délai lié](./examples/timeout_linux_test.go#L259)
 
 ## Parcours TCP courants
 
@@ -578,7 +581,7 @@ if err := ring.Receive(recvCtx, &clientFD, buf); err != nil {
 // Wait for the RECV CQE before reading or reusing buf.
 ```
 
-Après chaque soumission, utilisez la boucle `Wait` de la section sur le cycle de vie du ring pour observer la complétion correspondante avant l'opération suivante qui en dépend. Conservez les données jusqu'à la complétion et ne renvoyez que le suffixe restant après un envoi partiel. [socket_test.go](./examples/socket_test.go) montre la séquence complète du client ; [echo_test.go](./examples/echo_test.go) ajoute la réception et la réponse.
+Pour le `Send` de cette séquence, activez `NotifySucceed` et laissez `IOSQE_CQE_SKIP_SUCCESS` désactivé. Relevez la CQE correspondante avec `Wait` avant chaque opération qui dépend de son résultat. Conservez les données jusqu’à la complétion et, après un envoi partiel, reprenez uniquement les octets restants. [Client TCP](./examples/socket_test.go) · [Exemples d’écho](./examples/echo_test.go)
 
 ## Réception sans copie (ZCRX)
 
@@ -643,7 +646,7 @@ Les tests exécutables de `examples/` enseignent initialisation → soumission �
 
 ## Support de plateforme
 
-`uring` cible Go 1.27+ et Linux 6.18+ pour le chemin réel adossé au noyau. La plupart des fichiers d'implémentation et des tests d'exemple portent la directive `//go:build linux` ; les fichiers Darwin fournissent uniquement des bouchons de compilation pour la surface partagée, et les capacités propres à Linux restent propres à Linux sans modifier en rien la base d'exécution Linux décrite ci-dessus.
+L’implémentation qui utilise le noyau nécessite Go 1.27+ et Linux 6.18+. La version Darwin inclut un simulateur en espace utilisateur pour une partie de l’API commune. L’intégration continue compile les cibles Darwin et vérifie le comportement du noyau sur Linux natif.
 
 ## Licence
 

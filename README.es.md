@@ -18,13 +18,13 @@ El diseño sigue un principio de frontera explícita: la mecánica orientada al 
 Las superficies principales son:
 
 - `Uring`, el handle del ring activo y su conjunto de operaciones
-- `SQEContext`, la identidad de envío transportada en `user_data`
+- `SQEContext`, el contexto de envío que se transmite en `user_data`
 - `CQEView`, el descriptor copiado de completado que devuelve `Wait`
 - provisión de búferes mediante búferes registrados y grupos de búferes de varios tamaños
 
 ## Instalación
 
-`uring` requiere Linux 6.18 o posterior. Compruebe primero la versión del kernel en ejecución:
+Para compilar `uring` se necesita Go 1.27 o posterior. Para usar `io_uring` en el kernel se necesita Linux 6.18 o posterior. Compruebe primero la versión del kernel en ejecución.
 
 ```bash
 uname -r
@@ -48,9 +48,9 @@ La creación del ring puede devolver `ENOMEM`, `EPERM` o `ENOSYS` según los lí
 
 ## Guía para el código que usa uring
 
-Empiece por [`AGENTS.md`](./AGENTS.md) al desarrollar o revisar runtimes, pilas de protocolos o servicios con `uring`. La [guía de uso](./agents/INDEX.md) cubre el envío de operaciones, las finalizaciones, la identidad de las solicitudes, la propiedad de los búferes, los ciclos de vida, la integración de paquetes y la verificación.
+El [ejemplo de E/S de archivos](./examples/file_io_test.go#L30) muestra cómo gestionar un ring directamente desde `Start` hasta `Stop`. Consulte la [guía de uso](./agents/INDEX.md) para cada operación y las [instrucciones del paquete](./AGENTS.md) para los requisitos de propiedad y verificación.
 
-`uring` expone operaciones del kernel y sus resultados. El código que lo usa gestiona el sondeo, la planificación, los reintentos y la espera progresiva, el enrutamiento de finalizaciones y la retirada de rutas, el estado y análisis del protocolo, las políticas de cancelación y tiempo de espera, las comprobaciones de seguridad y el ciclo de vida del servicio. Al combinar estas operaciones, conserve el significado de `ErrWouldBlock`, `ErrMore`, `IORING_CQE_F_MORE`, las transferencias de propiedad y los fallos de capacidad.
+Un envío por lotes puede aceptar parte del trabajo y devolver `iox.ErrWouldBlock` para el resto. En la CQE correspondiente, `Res` indica el resultado y `IORING_CQE_F_MORE` señala que podría llegar otra CQE de la misma solicitud. Interpretar ese indicador como `iox.ErrMore` depende del protocolo del llamador. El kernel puede haber realizado la operación cuando informa de un error. Por ejemplo, la CQE de origen de `MsgRingFD` puede indicar `-EOVERFLOW` después de instalar el archivo en el ring de destino. [Recuperación tras una transferencia de archivo](./agents/boundary/resources.md#inter-ring-file-transfers)
 
 ## Ciclo de vida del ring
 
@@ -103,6 +103,7 @@ cqe := cqes[0]
 if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
 	log.Fatalf("unexpected completion: op=%d fd=%d", cqe.Op(), cqe.FD())
 }
+runtime.KeepAlive(file) // Mantenga vivo al propietario del FD hasta que termine la lectura.
 completionErr := cqe.Err()
 if completionErr == nil {
 	handle(buf[:int(cqe.Res)])
@@ -125,7 +126,7 @@ if completionErr != nil {
 |-----------------------|-------------------------------------------------------------------------------------------------------------------|
 | `Uring`               | Inicialización del anillo, envío, recolección de completados y métodos de operación                               |
 | `Options`             | Entradas del anillo, presupuesto de búferes registrados, escala de grupos de búferes y visibilidad de completados |
-| `SQEContext`          | Identidad compacta de envío almacenada en `user_data`                                                             |
+| `SQEContext` | Contexto de envío codificado en `user_data` |
 | `CQEView`             | Descriptor copiado de completado con accesores decodificados y objetivos prestados según el modo                  |
 | `ListenerOp`          | Manejador de una operación de creación de escucha con FD y auxiliares de accept                                   |
 | `BundleIterator`      | Itera sobre búferes consumidos en una recepción agrupada                                                          |
@@ -171,9 +172,9 @@ Operaciones:
 
 `Multicast` selecciona automáticamente envíos ordinarios o de copia cero según el tamaño del mensaje y el número de destinos; `MulticastZeroCopy` usa umbrales menores para favorecer la copia cero. Ambos requieren un contexto Direct y devuelven `(submitted, error)`: `submitted` cuenta el prefijo de destinos aceptado. Ante contrapresión, continúe con los destinos restantes. Examine el código de operación y los indicadores de cada CQE, ya que una llamada reanudada puede seleccionar otra operación. Los envíos ordinarios de `Multicast` siguen `NotifySucceed`; los envíos de copia cero seleccionados y ambas rutas de `MulticastZeroCopy` conservan la evidencia de finalización y rechazan `IOSQE_CQE_SKIP_SUCCESS` explícito.
 
-Cada envío aceptado sobre un socket de flujo puede completar menos bytes de los solicitados. Mantenga habilitadas las CQE de éxito para seguir el número de bytes de los envíos ordinarios y use el resultado de datos de cada destino para reenviar solo el sufijo pendiente. Mantenga inmutables los bytes compartidos de copia cero hasta que todos los destinos aceptados alcancen su condición de liberación. El [ejemplo multicast](./examples/zerocopy_test.go) muestra el seguimiento del progreso en bytes y de la liberación.
+Si un envío de flujo es parcial, reintente solo los bytes pendientes de ese envío. Habilite las CQE de éxito para conocer el número de bytes de los envíos ordinarios. Mantenga los datos compartidos sin cambios hasta que todos los envíos aceptados los liberen. Un envío ordinario los libera al completarse. `SEND_ZC` requiere una CQE de datos final sin `IORING_CQE_F_MORE`, o bien la CQE de datos y su notificación correspondiente. [Ejemplo de envío a varios destinos](./examples/zerocopy_test.go)
 
-`SQEContext` es el token de identidad principal en este paquete. En modo directo, empaqueta el opcode, las marcas del SQE, el identificador de grupo de búferes y el descriptor de archivo en un único valor de 64 bits.
+En modo Direct, `SQEContext` codifica el código de operación, los indicadores de la SQE, el ID del grupo de búferes y el descriptor de archivo en 64 bits. Dos envíos pendientes con los mismos campos tienen el mismo `user_data`. Para atribuir cada resultado a un envío concreto, serialice esos envíos o envíelos por separado con contextos distintos que sigan vigentes.
 
 ```go
 sqeCtx := uring.ForFD(int32(fd)).
@@ -301,7 +302,7 @@ receiver := uring.NewIncrementalReceiver(ring, pool, groupID, bufSize, backing, 
 
 `IORING_CQE_F_BUF_MORE` indica que el kernel retiene el búfer seleccionado incluso después de completar la solicitud. Recíclelo solo cuando una CQE indique `IORING_CQE_F_BUFFER` sin `IORING_CQE_F_BUF_MORE` y haya terminado el acceso prestado. Un resultado cero o negativo también puede devolver un búfer. `Uring.Stop` es responsable de desmontar el buffer-ring.
 
-El I/O con búfer fijo usa un búfer registrado por índice. La slice devuelta pertenece al ring; manténgala viva hasta que termine la operación fija:
+`WriteFixed` escribe los bytes de un búfer registrado que se selecciona por su índice. Mantenga el archivo abierto y los bytes sin cambios hasta que se complete la operación. Si la CQE determina cuándo puede reutilizar el búfer, active `NotifySucceed` y deje `IOSQE_CQE_SKIP_SUCCESS` desactivado.
 
 ```go
 buf := ring.RegisteredBuffer(0)
@@ -458,7 +459,7 @@ Dirija cada CQE de cancelación encolada al `HandleCQE` de la misma suscripción
 
 ### Estado por conexión con contextos tipados
 
-Los contextos extendidos transportan referencias por conexión a lo largo del ciclo completo envío → completado, sin necesidad de una tabla de búsqueda global:
+Un contexto Extended puede conservar una referencia al estado de la conexión durante un envío. Este ejemplo requiere `NotifySucceed` activado e `IOSQE_CQE_SKIP_SUCCESS` desactivado para que un `Send` exitoso produzca la CQE que permite devolver el contexto al pool.
 
 ```go
 type ConnState struct {
@@ -481,7 +482,7 @@ if err := ring.Send(sqeCtx, &fd, payload); err != nil {
 }
 ```
 
-En el momento de la finalización, se recupera el estado a través de la misma vista tipada:
+Al recibir la CQE de `SEND` correspondiente, copie la referencia a la conexión y el número de secuencia antes de devolver el contexto al pool.
 
 ```go
 ext := cqe.ExtSQE()
@@ -495,24 +496,26 @@ Mantenga las raíces de punteros Go activas accesibles fuera de `UserData`. El G
 
 ### Composición de plazos
 
-`LinkTimeout` adjunta un plazo al SQE anterior mediante una cadena `IOSQE_IO_LINK`. Al vencer, intenta cancelar la operación enlazada, que puede haber terminado ya. Examine ambos resultados de CQE; el vencimiento no demuestra que la operación se haya cancelado.
+`LinkTimeout` aplica un plazo a la SQE anterior marcada con `IOSQE_IO_LINK`. Con un ring ya iniciado y un único propietario, compruebe la capacidad y encole ambas SQE seguidas, antes de cualquier otro envío o llamada a `Wait`. El recuento devuelto indica cuántas solicitudes siguen pendientes de recogida. Use un búfer de recepción no vacío y mantenga estable su dirección hasta recibir la CQE de recepción.
 
 ```go
-recvCtx := uring.ForFD(int32(fd)).
-	WithOp(uring.IORING_OP_RECV).
-	WithBufGroup(group)
-
-if err := ring.Receive(recvCtx, &fd, nil, uring.WithFlags(uring.IOSQE_IO_LINK)); err != nil {
-	return err
-}
-
-timeoutCtx := uring.PackDirect(uring.IORING_OP_LINK_TIMEOUT, 0, 0, 0)
-if err := ring.LinkTimeout(timeoutCtx, 5*time.Second); err != nil {
-	return err
+func queueReceiveWithTimeout(ring *uring.Uring, fd iofd.FD, buf []byte, d time.Duration) (int, error) {
+	if ring.SQAvailable() < 2 {
+		return 0, iox.ErrWouldBlock
+	}
+	recvCtx := uring.PackDirect(uring.IORING_OP_RECV, uring.IOSQE_IO_LINK, 0, int32(fd))
+	if err := ring.ReceiveFD(recvCtx, fd, buf); err != nil {
+		return 0, err
+	}
+	timeoutCtx := uring.PackDirect(uring.IORING_OP_LINK_TIMEOUT, 0, 0, 0)
+	if err := ring.LinkTimeout(timeoutCtx, d); err != nil {
+		return 1, err
+	}
+	return 2, nil
 }
 ```
 
-Envíe los SQE enlazados de forma contigua, serializando el par con las demás llamadas de envío y espera. Mantenga los búferes y el contexto de la operación hasta su propia finalización, y procese ambas CQE antes del cierre.
+Si recibe `iox.ErrWouldBlock` y no se encoló ninguna solicitud, haga avanzar el ring antes de reintentar el par. Si solo se encoló la recepción, envíela al kernel antes de añadir otro trabajo y conserve `buf` hasta que termine. Si ambas se encolaron, recoja las dos CQE. Al vencer el plazo se intenta cancelar la recepción. El resultado de la recepción consta en su propia CQE. [Ejemplo de plazo enlazado](./examples/timeout_linux_test.go#L259)
 
 ## Patrones de uso en TCP
 
@@ -578,7 +581,7 @@ if err := ring.Receive(recvCtx, &clientFD, buf); err != nil {
 // Wait for the RECV CQE before reading or reusing buf.
 ```
 
-Después de cada envío, use el bucle `Wait` de la sección del ciclo de vida del ring para observar la finalización correspondiente antes de la siguiente operación dependiente. Conserve los datos hasta la finalización y reintente solo el sufijo pendiente tras un envío parcial. [socket_test.go](./examples/socket_test.go) muestra la secuencia completa del cliente; [echo_test.go](./examples/echo_test.go) añade la recepción y la respuesta.
+Para el `Send` de esta secuencia, active `NotifySucceed` y deje `IOSQE_CQE_SKIP_SUCCESS` desactivado. Use `Wait` para recoger cada CQE antes de la siguiente operación que dependa de ella. Conserve los datos hasta que termine el envío y reintente solo los bytes pendientes si el envío fue parcial. [Cliente TCP](./examples/socket_test.go) · [Ejemplos de eco](./examples/echo_test.go)
 
 ## Recepción de copia cero (ZCRX)
 
@@ -643,7 +646,7 @@ En la raíz del paquete, [listener_example_test.go](./listener_example_test.go) 
 
 ## Soporte de plataforma
 
-`uring` apunta a Go 1.27+ y Linux 6.18+ en la ruta real respaldada por el kernel. La mayoría de los archivos de implementación y pruebas de ejemplo están protegidos con `//go:build linux`. Los archivos de Darwin proporcionan solo resguardos de compilación para la superficie compartida; las capacidades exclusivas de Linux siguen siendo exclusivas de Linux y no alteran la línea base de ejecución en Linux descrita arriba.
+La implementación que usa el kernel requiere Go 1.27+ y Linux 6.18+. La versión para Darwin incluye un simulador en espacio de usuario para parte de la API compartida. La integración continua compila los destinos Darwin y verifica el comportamiento del kernel en Linux nativo.
 
 ## Licencia
 

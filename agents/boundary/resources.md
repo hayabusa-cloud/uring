@@ -33,7 +33,7 @@ Integer fields such as `RegionDesc.UserAddr` and `ZCRXAreaReg.Addr` do not retai
 
 `MsgRingFD` keeps the source slot registered and installs a reference in the target ring. An explicit destination slot replaces its current file; `IORING_FILE_INDEX_ALLOC` allocates a free slot. Successful source and target CQEs report zero for an explicit slot or the allocated index. `skipCQE` suppresses only the target CQE.
 
-A source CQE with `-EOVERFLOW` means the target file was installed but its notification could not be posted. Reconcile the target state before retrying: another transfer can replace a file or allocate another slot. See the [Linux implementation](https://github.com/torvalds/linux/blob/v6.18/io_uring/msg_ring.c#L176-L205).
+A source CQE with `-EOVERFLOW` means installation succeeded and the target notification failed. With `IORING_FILE_INDEX_ALLOC`, the sender also loses the allocated index from the result. Reconcile the target table before retrying. Another transfer can replace a file or allocate a second slot. [Linux implementation](https://github.com/torvalds/linux/blob/v6.18/io_uring/msg_ring.c#L176-L205)
 
 ## Provided Buffers
 
@@ -75,7 +75,9 @@ ZCRX starts with an empty refill ring; publish only kernel-delivered references.
 
 Both require Direct context and return `(accepted, err)`, stopping at the first submission error. An accepted prefix can precede would-block: resume at the first unaccepted target and retain every accepted operation's resources.
 
-Track target admission, per-target bytes, and release independently. Retry only each short stream send's unsent suffix; preserve datagram message boundaries. Shared bytes retain separate request identities and release conditions; await matching ZC evidence before mutation or recycling.
+Track the accepted target prefix and each send’s byte result separately. Retry only the unsent suffix of a short stream send. Preserve datagram boundaries. Direct context records the target FD. Overlapping sends with identical packed fields have the same `user_data`. If the caller needs to match each result to a specific send, serialize those sends or submit them individually with distinct live contexts.
+
+Keep shared bytes immutable until every accepted send releases them. An ordinary send releases on completion. A zero-copy send requires terminal data without `MORE`, or both data and its matching notification.
 
 ## Cancellation and Teardown
 

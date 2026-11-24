@@ -14,7 +14,6 @@ Use each package's own contracts and mechanisms. Make value and ownership transf
 | `framer` | Frame boundaries and codec operations |
 | `kont`, `cove`, `takt`, `sess` | Caller suspension, context, execution, and protocol mechanisms |
 | `tempo` | Pure temporal residuals and event observations; no clocks, scheduling or resource release |
-| `urex` | Concrete event loops, routes, admission and lifecycle policy above `uring` |
 
 ## Compose Through Public Contracts
 

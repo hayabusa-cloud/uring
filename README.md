@@ -18,13 +18,13 @@ The package keeps the boundary explicit: kernel mechanics and observable complet
 The primary surfaces are:
 
 - `Uring`, the live ring handle and operation set
-- `SQEContext`, the submission identity carried in `user_data`
+- `SQEContext`, the submission context carried in `user_data`
 - `CQEView`, the copied completion descriptor returned by `Wait`
 - buffer provisioning through registered buffers and multi-size buffer groups
 
 ## Installation
 
-`uring` requires Linux kernel 6.18 or later. Check the running kernel first:
+Building `uring` requires Go 1.27 or later. Running it against the kernel requires Linux 6.18 or later. Check the running kernel version first.
 
 ```bash
 uname -r
@@ -48,9 +48,9 @@ Ring creation may return `ENOMEM`, `EPERM`, or `ENOSYS` depending on memlock lim
 
 ## Caller guide
 
-Start with [`AGENTS.md`](./AGENTS.md) when building or reviewing runtimes, protocol stacks, or services with `uring`. The [caller guide](./agents/INDEX.md) covers submission, completions, request identity, buffer ownership, lifetimes, package integration, and verification.
+Start with the [file I/O example](./examples/file_io_test.go#L30) to drive a ring directly from `Start` through `Stop`. For a specific operation, follow the [caller guide](./agents/INDEX.md). The [package instructions](./AGENTS.md) summarize ownership and verification requirements.
 
-`uring` exposes kernel operations and completion results. Callers own polling, scheduling, retry and backoff, completion routing and route retirement, protocol state and parsing, cancellation and timeout policy, safety checks, and service lifecycle. Preserve `ErrWouldBlock`, `ErrMore`, `IORING_CQE_F_MORE`, ownership transfers, and capability failures when composing these operations.
+A batch can accept a prefix and return `iox.ErrWouldBlock` for the rest. On a matching CQE, `Res` reports the operation result and `IORING_CQE_F_MORE` signals a possible successor. Only the caller’s protocol can interpret that flag as `iox.ErrMore`. Some errors follow a kernel effect. For example, a `MsgRingFD` source CQE can report `-EOVERFLOW` after the target file was installed. [File-transfer recovery](./agents/boundary/resources.md#inter-ring-file-transfers)
 
 ## Ring lifecycle
 
@@ -103,6 +103,7 @@ cqe := cqes[0]
 if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
 	log.Fatalf("unexpected completion: op=%d fd=%d", cqe.Op(), cqe.FD())
 }
+runtime.KeepAlive(file) // Keep the owner of the borrowed FD live through the read.
 completionErr := cqe.Err()
 if completionErr == nil {
 	handle(buf[:int(cqe.Res)])
@@ -125,7 +126,7 @@ if completionErr != nil {
 |------|------|
 | `Uring` | Ring setup, submission, completion reaping, and operation methods |
 | `Options` | Ring entries, registered-buffer budget, buffer-group scale, and completion visibility |
-| `SQEContext` | Compact submission identity stored in `user_data` |
+| `SQEContext` | Packed submission context stored in `user_data` |
 | `CQEView` | Copied completion descriptor with decoded accessors and mode-sensitive borrowed targets |
 | `ListenerOp` | Handle to a listener creation operation with FD and accept helpers |
 | `BundleIterator` | Iterates over buffers consumed in a bundle receive |
@@ -171,9 +172,9 @@ Operations:
 
 `Multicast` automatically selects ordinary or zero-copy sends by payload size and target count; `MulticastZeroCopy` uses lower thresholds to favor zero-copy. Both require a Direct context and return `(submitted, error)`: `submitted` counts the accepted target prefix. Resume with the remaining targets after backpressure. Inspect each CQE's opcode and flags because a resumed call can select a different operation. Ordinary `Multicast` sends follow `NotifySucceed`; selected zero-copy sends and both `MulticastZeroCopy` paths retain completion evidence and reject explicit `IOSQE_CQE_SKIP_SUCCESS`.
 
-Each accepted stream send may complete with fewer bytes than requested. Keep success CQEs enabled when tracking ordinary-send byte counts, and use each target's data result to resume only its unsent suffix. Keep shared zero-copy bytes immutable until every accepted target reaches its release condition. The [multicast example](./examples/zerocopy_test.go) demonstrates both byte progress and release tracking.
+For a short stream send, retry only that send’s unsent bytes. Enable success CQEs when tracking ordinary-send byte counts. Keep shared bytes immutable until every accepted send releases them. An ordinary send releases on completion. `SEND_ZC` requires terminal data without `IORING_CQE_F_MORE`, or both the data CQE and its matching notification. [Multicast example](./examples/zerocopy_test.go)
 
-`SQEContext` is the primary identity token. In direct mode it packs the opcode, SQE flags, buffer-group ID, and file descriptor into a single 64-bit value.
+In Direct mode, `SQEContext` packs the opcode, SQE flags, buffer-group ID, and file descriptor into 64 bits. Overlapping sends with identical fields carry the same `user_data`. To match results to individual sends, serialize those sends or submit them separately with distinct live contexts.
 
 ```go
 sqeCtx := uring.ForFD(int32(fd)).
@@ -301,7 +302,7 @@ receiver := uring.NewIncrementalReceiver(ring, pool, groupID, bufSize, backing, 
 
 `IORING_CQE_F_BUF_MORE` retains the selected buffer even after the request completes. Recycle only after a CQE reports `IORING_CQE_F_BUFFER` without `IORING_CQE_F_BUF_MORE` and borrowed access has ended. A zero or negative result can also return a buffer. `Uring.Stop` owns buffer-ring teardown.
 
-Fixed-buffer I/O uses a registered buffer by index. The returned slice is ring-owned memory; keep it live until the fixed operation completes:
+`WriteFixed` submits bytes from a registered buffer by index. Keep the file open and the submitted bytes unchanged until completion. If the CQE determines when to reuse the buffer, enable `NotifySucceed` and leave `IOSQE_CQE_SKIP_SUCCESS` clear.
 
 ```go
 buf := ring.RegisteredBuffer(0)
@@ -458,7 +459,7 @@ Route every queued cancellation CQE through the same subscription's `HandleCQE` 
 
 ### Per-connection state with typed contexts
 
-Extended contexts carry per-connection references through the submit → complete round-trip without a global lookup table:
+An Extended context can carry connection state through a send. Enable `NotifySucceed` and leave `IOSQE_CQE_SKIP_SUCCESS` clear so the caller receives a CQE before returning the context to its pool, including when `Send` succeeds.
 
 ```go
 type ConnState struct {
@@ -481,7 +482,7 @@ if err := ring.Send(sqeCtx, &fd, payload); err != nil {
 }
 ```
 
-At completion time, recover the state through the same typed view:
+After receiving the matching `SEND` CQE, copy the connection reference and sequence number before returning the context to the pool.
 
 ```go
 ext := cqe.ExtSQE()
@@ -495,24 +496,26 @@ Keep live Go pointer roots reachable outside `UserData`. The GC does not trace t
 
 ### Deadline composition
 
-`LinkTimeout` attaches a deadline to the preceding SQE through an `IOSQE_IO_LINK` chain. Expiry attempts to cancel the linked operation, which may already have completed. Inspect both CQE results; a timeout does not prove that the operation was cancelled.
+`LinkTimeout` applies to the preceding SQE marked `IOSQE_IO_LINK`. On a started ring with a single owner, check capacity and queue the two SQEs together before any other submission or `Wait`. The return count below records how many requests the caller must still reap. Use a nonempty receive buffer and keep its address stable until the receive CQE.
 
 ```go
-recvCtx := uring.ForFD(int32(fd)).
-	WithOp(uring.IORING_OP_RECV).
-	WithBufGroup(group)
-
-if err := ring.Receive(recvCtx, &fd, nil, uring.WithFlags(uring.IOSQE_IO_LINK)); err != nil {
-	return err
-}
-
-timeoutCtx := uring.PackDirect(uring.IORING_OP_LINK_TIMEOUT, 0, 0, 0)
-if err := ring.LinkTimeout(timeoutCtx, 5*time.Second); err != nil {
-	return err
+func queueReceiveWithTimeout(ring *uring.Uring, fd iofd.FD, buf []byte, d time.Duration) (int, error) {
+	if ring.SQAvailable() < 2 {
+		return 0, iox.ErrWouldBlock
+	}
+	recvCtx := uring.PackDirect(uring.IORING_OP_RECV, uring.IOSQE_IO_LINK, 0, int32(fd))
+	if err := ring.ReceiveFD(recvCtx, fd, buf); err != nil {
+		return 0, err
+	}
+	timeoutCtx := uring.PackDirect(uring.IORING_OP_LINK_TIMEOUT, 0, 0, 0)
+	if err := ring.LinkTimeout(timeoutCtx, d); err != nil {
+		return 1, err
+	}
+	return 2, nil
 }
 ```
 
-Submit the linked SQEs contiguously, serializing the pair with other submit and wait calls. Keep the operation's buffers and context live until its own completion, and drain both CQEs before teardown.
+On `iox.ErrWouldBlock` with zero admissions, drive the ring before retrying the pair. If only the receive was queued, flush it before submitting other work and retain `buf` through its completion. Once both are queued, reap both CQEs. Expiry attempts cancellation. The receive CQE gives the receive result. [Linked timeout example](./examples/timeout_linux_test.go#L259)
 
 ## TCP usage patterns
 
@@ -578,7 +581,7 @@ if err := ring.Receive(recvCtx, &clientFD, buf); err != nil {
 // Wait for the RECV CQE before reading or reusing buf.
 ```
 
-After each submit, use the `Wait` loop from the ring lifecycle section to observe the matching completion before the next dependent operation. Keep payloads live through completion, and retry only the unsent suffix after a short send. [socket_test.go](./examples/socket_test.go) shows the complete client sequence; [echo_test.go](./examples/echo_test.go) adds receiving and replying.
+Enable `NotifySucceed` and leave `IOSQE_CQE_SKIP_SUCCESS` clear for the `Send` in this sequence. Use `Wait` to observe each matching CQE before the next dependent operation. Keep the payload valid through completion and retry only the unsent suffix of a short send. [TCP client](./examples/socket_test.go) · [Echo examples](./examples/echo_test.go)
 
 ## Zero-copy receive (ZCRX)
 
@@ -643,7 +646,7 @@ At the package root, [listener_example_test.go](./listener_example_test.go) demo
 
 ## Platform support
 
-`uring` targets Go 1.27+ and Linux 6.18+ on the real kernel-backed path. Most source files and example tests carry a `//go:build linux` guard. Darwin files provide compile stubs for the shared surface only; Linux-only capabilities remain Linux-only and do not change the Linux runtime baseline.
+The kernel-backed implementation requires Go 1.27+ and Linux 6.18+. The Darwin build includes a userspace simulator for a subset of the shared API. CI compiles the Darwin targets and verifies kernel behavior on native Linux.
 
 ## License
 

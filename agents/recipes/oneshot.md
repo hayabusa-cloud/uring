@@ -14,7 +14,7 @@ Check [opcode and setup requirements](../boundary/encoding.md). Go serialization
 2. On pre-admission would-block, keep the action and owners, drive its progress source, then retry. Bound pending storage and define its full-capacity outcome.
 3. For batches, record the accepted prefix immediately. Retry only the suffix; accepted items retain completion obligations.
 
-SQ pressure is not completion. `takt.Advance` retains its suspension on would-block/failure; `takt.Loop` discards on every submission error. Retryable asynchronous admission needs explicit pending state. Replaying a computation prefix can duplicate earlier effects.
+If a computation has already run to suspension, retry from that suspension only while the adapter preserves it. Restarting the computation can repeat earlier effects. Check the [selected `takt` surface](../runtime/takt.md#choose-the-execution-surface) before relying on retry.
 
 ## Observe and Deliver
 

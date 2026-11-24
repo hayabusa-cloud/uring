@@ -20,7 +20,7 @@ Match the request instance, including context/generation, through all required o
 
 ## Admission
 
-Retry only unaccepted work; retain its owners on retryable paths. Never replay an accepted prefix. Dispatch and asynchronous submission have different [admission contracts](runtime/takt.md#choose-the-execution-surface). [Boundary](boundary/sqe-cqe.md)
+Retry only unaccepted work and retain its owners. Once a request is admitted, its result and documented effects govern whether it is safe to issue another. For example, `MsgRingFD` can report an error after installing the target file. [Batch admission](recipes/oneshot.md#admission) · [Inter-ring file transfers](boundary/resources.md#inter-ring-file-transfers)
 
 ## Capabilities and Domains
 

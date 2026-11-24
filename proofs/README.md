@@ -93,7 +93,7 @@ The model assumes one ordered dispatch per CQE, matching registration, and arith
 | 32–61 | Signed 30-bit FD | Address |
 | 62–63 | Tag 0 | Tag 1 (indirect) or 2 (extended) |
 
-`pack` and the projections model `PackDirect` and its getters; `withFlags` models direct-mode `WithFlags`. `direct_roundtrip`, `direct_injective` and `flags_replacement` establish recovery, distinct encodings and field isolation. `signed_fd_roundtrip` requires `-2^29 ≤ fd < 2^29`; it does not promise recovery of every `int32` value.
+`pack` and the projections model `PackDirect` and its getters. `direct_roundtrip` recovers the packed fields, and `direct_injective` distinguishes different field tuples. Two live submissions with the same tuple have the same token. Matching a CQE to one of them requires independent identity or ordering evidence. `flags_replacement` models how Direct `WithFlags` replaces the flags and preserves the other fields. `signed_fd_roundtrip` covers `-2^29 ≤ fd < 2^29`.
 
 `pointer_roundtrip` and `modes_disjoint` cover addresses below `2^62`. Division, remainder and addition model masks, shifts and disjoint bitwise ORs; that arithmetic correspondence is reviewed, not mechanically translated from Go. The theorems establish neither pointer validity nor target lifetime.
 

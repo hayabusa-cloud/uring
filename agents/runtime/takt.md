@@ -2,7 +2,7 @@
 
 ## Use When
 
-The caller needs dispatch, asynchronous one-shot execution, or repeated stream routing. Choose by admission and completion contract.
+The caller needs dispatch, asynchronous one-shot execution, or repeated stream routing. The contracts below describe `takt` v0.2.0. Check submission and drain behavior against the version your caller selects.
 
 ## Owns
 
@@ -10,13 +10,14 @@ The caller needs dispatch, asynchronous one-shot execution, or repeated stream r
 
 ## Inputs and Preconditions
 
-Serialize loop methods. Keep identities unique while live and values valid through resumption. Copy borrowed context facts before invalidation; `Completion.ResumeValue()` and inline decoders cannot safely read recycled targets.
+Serialize loop methods. Keep identities unique while live. When building `Completion.Value` from a borrowed context, copy the facts the suspension needs before the context is recycled. Retain any referenced payload through resumption.
 
 ## Choose the Execution Surface
 
 | Surface | Contract |
 |---------|----------|
-| `Step`, `Advance`, `AdvanceSuspension` | Caller cadence; dispatch nil/`ErrMore` consumes the suspension and returns its successor; would-block/failure retains it |
+| `Step` | Evaluate to a result or the first suspension |
+| `Advance`, `AdvanceSuspension` | Dispatch the pending operation. `nil` or `ErrMore` resumes it. Would-block or failure returns the same suspension |
 | `Exec` conveniences | Caller-selected loop with retry/backoff |
 | `Loop` | One-shot submit/poll; every `Backend.Submit` error discards the suspension, including would-block |
 | `SubscriptionLoop` | Repeated events, correlated by token and generation |
@@ -27,7 +28,7 @@ Serialize loop methods. Keep identities unique while live and values valid throu
 
 Poll status differs from per-completion results. The backend forbids positive `n` with poll error; adapters must preserve observations while satisfying that rule.
 
-`Loop` resumes success/failure using `ResumeValue()`. Completion would-block re-arms the unconsumed operation under a fresh token; failed re-arm discards it. Completion `ErrMore` poisons the one-shot loop. `SubscriptionLoop` uses `More` to retain/retire routes independently of event error.
+`Loop` resumes success and failure with `Completion.Value`. On a would-block completion, it resubmits the unconsumed operation and tracks the token returned by the backend. A failed resubmission discards the suspension. Completion `ErrMore` fails the one-shot loop. `SubscriptionLoop` uses `More` to retain or retire a route independently of its event error.
 
 | Result storage | Lifetime |
 |----------------|----------|
@@ -40,7 +41,7 @@ Poll status differs from per-completion results. The backend forbids positive `n
 
 `Loop.Drain` discards suspensions and releases its completion slab. `SubscriptionLoop.Drain` requests cancellation of active routes, skips already-canceling routes, and retires routes. Neither waits for kernel retirement or establishes successful cancellation. Preserve backend dispatch for late required original/cancellation CQEs. [Lifecycle](../recipes/lifecycle.md)
 
-Use `Loop` only when its submit-error disposal fits. Retryable admission needs bounded caller state retaining the exact pending step; replaying a computation prefix can duplicate effects. [Admission](../recipes/oneshot.md#admission)
+If admission must survive would-block, choose a surface that retains the suspended operation. [Admission](../recipes/oneshot.md#admission)
 
 ## Cost Obligations
 
@@ -48,4 +49,4 @@ Count maps, slabs, result storage, decoding, synchronization, first use, and poo
 
 ## Sources
 
-Read `code.hybscloud.com/takt`: `step.go`, `loop.go`, `subscription.go`, backend interfaces, options, and completion-memory code. [Public API](https://pkg.go.dev/code.hybscloud.com/takt) · [Revision requirements](../verify.md#read-sources)
+Read `step.go`, `loop.go`, `subscription.go`, the backend interfaces, options and completion-memory code in the selected `takt` version. [v0.2.0 submission](https://github.com/hayabusa-cloud/takt/blob/v0.2.0/loop.go#L195-L200) · [v0.2.0 API](https://pkg.go.dev/code.hybscloud.com/takt@v0.2.0) · [Revision requirements](../verify.md#read-sources)

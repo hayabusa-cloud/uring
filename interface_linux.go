@@ -1835,8 +1835,9 @@ func (ur *Uring) MsgRing(sqeCtx SQEContext, userData int64, result int32, option
 //	Explicit slot            0
 //	IORING_FILE_INDEX_ALLOC  Allocated slot index
 //
-// If the source CQE reports -EOVERFLOW, the target file is already installed
-// but its CQE was not posted. Reconcile the target state before retrying.
+// A source CQE reporting -EOVERFLOW means installation succeeded and the target
+// notification failed. With IORING_FILE_INDEX_ALLOC, this result omits the
+// allocated slot index. Reconcile the target table before retrying.
 func (ur *Uring) MsgRingFD(sqeCtx SQEContext, srcFD uint32, dstSlot uint32, userData int64, skipCQE bool, options ...OpOptionFunc) error {
 	opFlags := ur.operationOptions(options)
 	var flags uint32
