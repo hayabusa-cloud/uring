@@ -418,5 +418,7 @@
 //   - [code.hybscloud.com/sock]: Socket types and address handling
 //   - [code.hybscloud.com/dwcas]: Memory barriers for ring synchronization
 //   - [code.hybscloud.com/spin]: Spin-wait primitives
-//   - [code.hybscloud.com/framer]: Message framing for length-prefix encoding
+//
+// The TCP broadcast test in the examples package uses [code.hybscloud.com/framer]
+// to encode and decode length-prefixed messages.
 package uring
