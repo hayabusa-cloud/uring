@@ -211,7 +211,9 @@ ring.PutExtSQE(ext)
 
 ### Despacho de completados con `CQEView`
 
-No existe un tipo separado de contexto de finalización. Use `cqe.Context()` para recuperar el token original, `cqe.Err()` para obtener el resultado de la petición y los indicadores para conocer el estado y la vida útil de los búferes. El error de `Wait` describe la recogida, no las peticiones individuales. Despache todos los CQE del lote, incluidos los fallos: un retorno anticipado descartaría registros ya retirados del ring.
+`Wait` informa de los errores al recoger el lote. Despache todas las CQE devueltas, incluidas las de solicitudes fallidas. En una solicitud local, `cqe.Context()` devuelve su token de envío. Use `cqe.Err()` para interpretar el resultado de una operación. En una notificación de envío sin copia, `Res` puede contener indicadores de uso. Los indicadores de la CQE describen la vida útil de la solicitud y de los búferes.
+
+El emisor y el receptor reservan `messageID` para `MsgRing`. En el anillo de este ejemplo, todos los demás identificadores corresponden a solicitudes locales. Compruebe primero `messageID` y pase al manejador de mensajes el valor con signo de `Res` que envió el emisor, incluso si es negativo.
 
 ```go
 var cqes [64]uring.CQEView
@@ -225,9 +227,12 @@ if n == 0 {
 
 for i := range n {
 	cqe := cqes[i]
-	// Res < 0 encodes -errno; flags describe buffers and request lifetime.
-	if err := cqe.Err(); err != nil {
-		fmt.Printf("completion failed: op=%d fd=%d: %v\n", cqe.Op(), cqe.FD(), err)
+	if cqe.Context().Raw() == uint64(messageID) {
+		handleMessage(cqe.Res)
+		continue
+	}
+	if !cqe.IsNotification() && cqe.Res < 0 {
+		fmt.Printf("completion failed: op=%d fd=%d: %v\n", cqe.Op(), cqe.FD(), cqe.Err())
 	}
 	if cqe.HasBuffer() {
 		fmt.Printf("buffer id=%d\n", cqe.BufID())

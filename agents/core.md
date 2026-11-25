@@ -8,7 +8,7 @@ Linux executes requests; `uring` exposes kernel facts and SQE/CQE mechanics. The
 
 ## Observations
 
-Keep counts, errors, flags, identity, and release evidence separate. Preserve the owning API's `nil`, `iox.ErrWouldBlock`, `iox.ErrMore`, and failure meanings; consume positive progress even when another step is required. Negative `CQE.Res` is `-errno`; `MORE` cannot make it successful. Distinguish request continuation from notification. [Completion contract](boundary/sqe-cqe.md#observation)
+Match the CQE's origin first. A negative result can be a local operation error or the sender's message value. For a local operation, interpret count, error, `MORE` and release evidence independently. Preserve positive progress and the owning API's `nil`, `iox.ErrWouldBlock`, `iox.ErrMore` and failure meanings. [Completion dispatch](boundary/sqe-cqe.md#completion-origin)
 
 ## Ownership
 
@@ -16,7 +16,7 @@ Give each context, descriptor, buffer, and borrow one owner and validity interva
 
 ## Identity
 
-Match the request instance, including context/generation, through all required original, cancellation, and notification observations. Numeric identity alone is insufficient. [Retention](boundary/sqe-cqe.md#completion-retention) · [Cancellation](boundary/resources.md#managed-cancellation)
+Give each request-specific action an unambiguous submission identity. A numeric token suffices while lookups for queued events, notifications and cancellations still select the originating request. [Completion origin](boundary/sqe-cqe.md#completion-origin) · [Managed cancellation](boundary/resources.md#managed-cancellation)
 
 ## Admission
 

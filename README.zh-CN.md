@@ -211,7 +211,9 @@ ring.PutExtSQE(ext)
 
 ### 通过 `CQEView` 分发完成事件
 
-没有独立的完成上下文类型。使用 `cqe.Context()` 获取原始提交标识，使用 `cqe.Err()` 获取请求结果，并检查标志以判断缓冲区状态和生命周期。`Wait` 返回的错误描述回收过程，而非单个请求。必须分发返回批次中的每个 CQE，包括失败的请求；提前返回会丢弃已从 ring 中回收的完成记录。
+`Wait` 报告收取这批 CQE 时发生的错误。请分派返回的每个 CQE，包括失败请求的 CQE。对于本地请求，`cqe.Context()` 返回提交时的标识。用 `cqe.Err()` 解析操作结果。零拷贝发送通知的 `Res` 字段可能包含使用情况标志。CQE 标志用于判断请求和缓冲区的生命周期。
+
+发送方和接收方约定将 `messageID` 专用于 `MsgRing`。本例的环上，其余标识都属于本地请求。先匹配 `messageID`，匹配后将发送方传入的有符号值 `Res` 原样交给消息处理函数，包括负值。
 
 ```go
 var cqes [64]uring.CQEView
@@ -225,9 +227,12 @@ if n == 0 {
 
 for i := range n {
 	cqe := cqes[i]
-	// Res < 0 encodes -errno; flags describe buffers and request lifetime.
-	if err := cqe.Err(); err != nil {
-		fmt.Printf("completion failed: op=%d fd=%d: %v\n", cqe.Op(), cqe.FD(), err)
+	if cqe.Context().Raw() == uint64(messageID) {
+		handleMessage(cqe.Res)
+		continue
+	}
+	if !cqe.IsNotification() && cqe.Res < 0 {
+		fmt.Printf("completion failed: op=%d fd=%d: %v\n", cqe.Op(), cqe.FD(), cqe.Err())
 	}
 	if cqe.HasBuffer() {
 		fmt.Printf("buffer id=%d\n", cqe.BufID())

@@ -11,7 +11,7 @@ import "code.hybscloud.com/iofd"
 // ExtCQE is a compact copied CQE for Extended mode operations.
 // It stores the completion result, CQE flags, and borrowed ExtSQE pointer.
 //
-// Use [Uring.WaitExtended] when every submitted operation uses [PackExtended].
+// Use [Uring.WaitExtended] when every incoming CQE carries a [PackExtended] context.
 //
 // Layout: 16 bytes on supported 64-bit platforms.
 type ExtCQE struct {
@@ -80,7 +80,8 @@ func (c *ExtCQE) FD() iofd.FD {
 
 // WaitExtended copies completion events into ExtCQE values containing the
 // result, CQE flags, and borrowed ExtSQE pointer.
-// Use it when every submitted operation uses Extended mode ([PackExtended]).
+// Use it when every incoming CQE carries a [PackExtended] context.
+// For rings receiving message IDs or Linux resource tags, use [Uring.Wait].
 //
 // On single-issuer rings it is not safe for concurrent use with submit, Wait,
 // WaitDirect, WaitExtended, Stop, or ResizeRings; caller must serialize those

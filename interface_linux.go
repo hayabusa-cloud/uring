@@ -340,34 +340,29 @@ func (ur *Uring) releaseRegisteredBufRings() error {
 	return err
 }
 
-// Wait flushes pending submissions, drives deferred task work when needed, and
-// collects completion events into cqes. On single-issuer rings it is not safe
-// for concurrent use with submit, Wait, WaitDirect, WaitExtended, Stop, or
-// ResizeRings; caller must serialize those operations. On IOPOLL rings Wait
-// also performs the nonblocking poll enter needed to make completions visible.
-// It returns the number of events received, ErrCQOverflow when the ring enters
-// CQ overflow and no CQEs are immediately claimable, or `iox.ErrWouldBlock` if
-// the CQ is empty.
+// Wait flushes pending submissions and copies the result, flags and raw user_data
+// of each observed CQE. Match incoming message IDs and Linux resource tags before
+// using request accessors. Serialize waits, submission, resize and teardown on a single-issuer ring.
+// On Linux, Wait also drives deferred task work and polls IOPOLL rings as needed.
+// After a successful enter, an empty destination returns (0, nil). With space
+// in the destination, an empty CQ returns iox.ErrWouldBlock, or ErrCQOverflow
+// on Linux if overflow is observed. Inspect every CQE in the returned count.
 //
-// CQEView provides direct field access to Res and Flags, and methods to access
-// the submission context based on mode (Direct, Indirect, Extended).
+// Here messageID is reserved for incoming messages. Every other CQE belongs to
+// a one-shot read with a context borrowed from ring.ExtSQE and a sequence in Val1.
 //
-// Example:
-//
-//	cqes := make([]CQEView, 64)
-//	n, err := ring.Wait(cqes)
+//	var cqes [64]CQEView
+//	n, err := ring.Wait(cqes[:])
 //	for i := range n {
 //	    cqe := &cqes[i]
-//	    if err := cqe.Err(); err != nil {
-//	        handleCompletionError(cqe.Op(), err)
+//	    if cqe.Context().Raw() == messageID {
+//	        handleMessage(cqe.Res)
 //	        continue
 //	    }
-//	    if cqe.Extended() {
-//	        ext := cqe.ExtSQE()
-//	        ctx := ViewCtx(ext).Vals1()
-//	        seq := ctx.Val1
-//	        handleCompletion(cqe.Res, seq)
-//	    }
+//	    ext := cqe.ExtSQE()
+//	    seq := ViewCtx(ext).Vals1().Val1
+//	    handleRead(seq, cqe.Res, cqe.Err())
+//	    ring.PutExtSQE(ext)
 //	}
 //	if err != nil {
 //	    return err
@@ -1815,9 +1810,11 @@ func (ur *Uring) FilesUpdate(sqeCtx SQEContext, fds []int32, offset int, options
 // Inter-Ring Messaging
 // ========================================
 
-// MsgRing sends a message to another io_uring instance.
-// The sqeCtx.FD() should be the target ring's file descriptor.
-// userData and result are passed to the target ring's CQE.
+// MsgRing sends a message to the ring identified by sqeCtx.FD(), which may be
+// this ring. The source CQE reports the send result. On the target CQE,
+// Context().Raw() contains the bits of userData and Res contains result,
+// including negative values. Use distinct message IDs and local request tokens
+// when both kinds of CQE share a ring.
 func (ur *Uring) MsgRing(sqeCtx SQEContext, userData int64, result int32, options ...OpOptionFunc) error {
 	flags := ur.operationOptions(options)
 	return ur.ioUring.msgRing(sqeCtx.OrFlags(flags), userData, result)

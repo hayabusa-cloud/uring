@@ -211,7 +211,9 @@ ring.PutExtSQE(ext)
 
 ### `CQEView` による完了ディスパッチ
 
-独立した完了コンテキスト型はありません。`cqe.Context()` で元の発行トークン、`cqe.Err()` でリクエストの結果を取得し、フラグでバッファとライフタイムの情報を確認します。`Wait` のエラーは回収処理の結果であり、個々のリクエストの結果ではありません。失敗したリクエストも含め、返されたバッチの全 CQE をディスパッチしてください。途中で戻ると、リングから回収済みの完了記録が失われます。
+`Wait` は CQE の回収時に発生したエラーを返します。失敗したリクエストの分も含め、返された CQE をすべて処理してください。ローカルのリクエストでは、`cqe.Context()` で発行時のトークンを取得できます。操作結果の判定には `cqe.Err()` を使います。ゼロコピー送信の通知では、`Res` にゼロコピーの使用状況を示すフラグが入ることがあります。CQE のフラグでリクエストとバッファのライフタイムを判断します。
+
+送信側と受信側は `messageID` を `MsgRing` 専用に予約します。この例のリングでは、それ以外の ID はすべてローカルのリクエストを表します。まず `messageID` を照合し、一致したら送信側が指定した符号付きの `Res` を、負の値も含めてそのままメッセージハンドラに渡します。
 
 ```go
 var cqes [64]uring.CQEView
@@ -225,9 +227,12 @@ if n == 0 {
 
 for i := range n {
 	cqe := cqes[i]
-	// Res < 0 encodes -errno; flags describe buffers and request lifetime.
-	if err := cqe.Err(); err != nil {
-		fmt.Printf("completion failed: op=%d fd=%d: %v\n", cqe.Op(), cqe.FD(), err)
+	if cqe.Context().Raw() == uint64(messageID) {
+		handleMessage(cqe.Res)
+		continue
+	}
+	if !cqe.IsNotification() && cqe.Res < 0 {
+		fmt.Printf("completion failed: op=%d fd=%d: %v\n", cqe.Op(), cqe.FD(), cqe.Err())
 	}
 	if cqe.HasBuffer() {
 		fmt.Printf("buffer id=%d\n", cqe.BufID())

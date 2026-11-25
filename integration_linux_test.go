@@ -1674,11 +1674,11 @@ func TestMsgRingSelf(t *testing.T) {
 	}
 	t.Logf("Self ring FD: %d", ringFD)
 
-	// Send message to self
-	const testUserData int64 = 0xDEADBEEF
-	const testResult int32 = 99
+	// Wait must preserve the opaque target ID even when it carries the Extended tag.
+	testUserData := uint64(uring.CtxModeExtended) | 0xDEADBEEF
+	const testResult int32 = -99 // Signed message payload on the target CQE.
 	ctx := uring.PackDirect(uring.IORING_OP_MSG_RING, 0, 0, ringFD.Raw())
-	err = ring.MsgRing(ctx, testUserData, testResult)
+	err = ring.MsgRing(ctx, int64(testUserData), testResult)
 	if err != nil {
 		t.Fatalf("MsgRing: %v", err)
 	}
@@ -1703,13 +1703,13 @@ func TestMsgRingSelf(t *testing.T) {
 		b.Reset()
 		for i := 0; i < n; i++ {
 			cqe := cqes[i]
-			switch cqe.Context() {
-			case ctx:
+			switch cqe.Context().Raw() {
+			case ctx.Raw():
 				if sendCompleted || cqe.Res != 0 {
 					t.Fatalf("unexpected source CQE: res=%d, duplicate=%t", cqe.Res, sendCompleted)
 				}
 				sendCompleted = true
-			case uring.SQEContext(testUserData):
+			case testUserData:
 				if recvCompleted || cqe.Res != testResult {
 					t.Fatalf("unexpected target CQE: res=%d, duplicate=%t; want res=%d", cqe.Res, recvCompleted, testResult)
 				}

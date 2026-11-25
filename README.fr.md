@@ -211,7 +211,9 @@ ring.PutExtSQE(ext)
 
 ### Dispatch des complétions avec `CQEView`
 
-Il n'existe pas de type distinct de contexte de complétion. Utilisez `cqe.Context()` pour retrouver le jeton initial, `cqe.Err()` pour obtenir le résultat de la requête et les indicateurs pour connaître l'état des tampons et leur durée de vie. L'erreur de `Wait` décrit la récolte, pas les requêtes individuelles. Distribuez tous les CQE du lot, y compris les échecs : un retour anticipé perdrait des observations déjà retirées du ring.
+`Wait` signale les erreurs survenues lors de la lecture du lot. Traitez chaque CQE renvoyée, y compris celles des requêtes en échec. Pour une requête locale, `cqe.Context()` renvoie son jeton de soumission. Utilisez `cqe.Err()` pour interpréter le résultat d’une opération. Dans une notification d’envoi sans copie, `Res` peut contenir des indicateurs d’utilisation. Les indicateurs de la CQE renseignent sur la durée de vie de la requête et des tampons.
+
+L’expéditeur et le destinataire réservent `messageID` à `MsgRing`. Sur l’anneau de cet exemple, tous les autres identifiants correspondent à des requêtes locales. Vérifiez d’abord `messageID` et transmettez au gestionnaire de messages la valeur signée de `Res` fournie par l’expéditeur, même si elle est négative.
 
 ```go
 var cqes [64]uring.CQEView
@@ -225,9 +227,12 @@ if n == 0 {
 
 for i := range n {
 	cqe := cqes[i]
-	// Res < 0 encodes -errno; flags describe buffers and request lifetime.
-	if err := cqe.Err(); err != nil {
-		fmt.Printf("completion failed: op=%d fd=%d: %v\n", cqe.Op(), cqe.FD(), err)
+	if cqe.Context().Raw() == uint64(messageID) {
+		handleMessage(cqe.Res)
+		continue
+	}
+	if !cqe.IsNotification() && cqe.Res < 0 {
+		fmt.Printf("completion failed: op=%d fd=%d: %v\n", cqe.Op(), cqe.FD(), cqe.Err())
 	}
 	if cqe.HasBuffer() {
 		fmt.Printf("buffer id=%d\n", cqe.BufID())

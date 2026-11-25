@@ -211,7 +211,9 @@ ring.PutExtSQE(ext)
 
 ### Completion dispatch with `CQEView`
 
-There is no separate completion-context type. Call `cqe.Context()` to recover the original submission token, `cqe.Err()` for the request result, and inspect its flags for buffer and lifetime information. The error returned by `Wait` describes reaping, not individual requests. Dispatch every CQE in the returned batch, including failures: returning early would discard observations already removed from the ring.
+`Wait` reports errors while reaping the batch. Dispatch every returned CQE, including failures. For a local request, `cqe.Context()` returns its submission token. Use `cqe.Err()` on an operation result. A zero-copy send notification can carry usage flags in `Res`. The CQE flags describe request and buffer lifetimes.
+
+The sender and receiver reserve `messageID` for `MsgRing`. Every other ID on this example's ring belongs to a local request. Match `messageID` first and pass the sender's signed `Res`, including negative values, to the message handler.
 
 ```go
 var cqes [64]uring.CQEView
@@ -225,9 +227,12 @@ if n == 0 {
 
 for i := range n {
 	cqe := cqes[i]
-	// Res < 0 encodes -errno; flags describe buffers and request lifetime.
-	if err := cqe.Err(); err != nil {
-		fmt.Printf("completion failed: op=%d fd=%d: %v\n", cqe.Op(), cqe.FD(), err)
+	if cqe.Context().Raw() == uint64(messageID) {
+		handleMessage(cqe.Res)
+		continue
+	}
+	if !cqe.IsNotification() && cqe.Res < 0 {
+		fmt.Printf("completion failed: op=%d fd=%d: %v\n", cqe.Op(), cqe.FD(), cqe.Err())
 	}
 	if cqe.HasBuffer() {
 		fmt.Printf("buffer id=%d\n", cqe.BufID())

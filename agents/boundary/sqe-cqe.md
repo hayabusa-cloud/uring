@@ -10,21 +10,36 @@ The default single-issuer mode requires one locked OS thread from before `Start`
 
 ## Observation
 
-Copy the CQE descriptor before advancing the CQ head. Interpret its fields independently:
+Copy the CQE descriptor before advancing the CQ head. Use `WaitDirect` or `WaitExtended` only when every incoming CQE carries the corresponding local context mode.
+
+### Completion Origin
+
+On a mixed ring, reserve distinct live IDs for sources that require different actions. Use `Wait` and match `cqe.Context().Raw()` before using request accessors or dispatching to a typed handler. A sender can choose an ID whose mode bits resemble a local context. [Mixed-ring test](../../integration_linux_test.go#L1663)
+
+| Matched source | How to handle the CQE |
+|----------------|-----------------------|
+| Local request | Decode its live submission context, then interpret the operation result or notification below. |
+| `MsgRing` target | Deliver `Res` as the sender's signed value, including negative values. |
+| [`MsgRingFD` target](resources.md#inter-ring-file-transfers) | Use the installation result for the selected destination mode. |
+| [Resource retirement tag](https://github.com/torvalds/linux/blob/v6.18/io_uring/rsrc.c#L512-L529) | Mark the identified registration retired. Its zero result and flags can also occur on a successful NOP. |
+
+### Local Results and Flags
+
+For a matched local request, interpret operation results, notifications and liveness separately.
 
 | Evidence | Meaning |
 |----------|---------|
 | Nonnegative operation `Res` | The observed step succeeded; the value retains its opcode-specific meaning |
-| `Res == -EAGAIN` | `iox.ErrWouldBlock`, even when `MORE` is present |
+| Operation `Res == -EAGAIN` | `iox.ErrWouldBlock`, even when `MORE` is present |
 | Other negative operation `Res` | The corresponding failure |
 | `IORING_CQE_F_MORE` | Same-request successor evidence; it does not change result classification or prove byte progress |
-| Notification CQE | Release evidence interpreted with the matching request history |
+| SEND_ZC notification (`IORING_CQE_F_NOTIF`) | Release evidence for the matched send. With `IORING_SEND_ZC_REPORT_USAGE`, test `uint32(Res) & IORING_NOTIF_USAGE_ZC_COPIED` for copy fallback or unused zero-copy. [Send buffer lifetime](resources.md#zero-copy-send-and-receive) |
 
-Only an explicit caller contract may translate request liveness into `iox.ErrMore`. Match the current request instance and individual completion; reused `user_data` alone is insufficient.
+Only an explicit caller contract may translate request liveness into `iox.ErrMore`. Match each observation to its current request instance before reusing a token.
 
 ## Completion Retention
 
-`Wait` copies `Res`, `Flags`, and packed `SQEContext`. Retention depends on context mode:
+`Wait` copies `Res`, `Flags`, and `user_data`. For a local request, retention depends on its context mode.
 
 | Mode | Retained submission facts |
 |------|---------------------------|

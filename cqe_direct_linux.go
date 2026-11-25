@@ -11,7 +11,7 @@ import "code.hybscloud.com/iofd"
 // DirectCQE is a compact copied CQE for Direct mode operations.
 // It stores the completion result, CQE flags, and decoded context fields.
 //
-// Use [Uring.WaitDirect] when every submitted operation uses [PackDirect].
+// Use [Uring.WaitDirect] when every incoming CQE carries a [PackDirect] context.
 //
 // Layout: 16 bytes on supported platforms.
 type DirectCQE struct {
@@ -62,7 +62,8 @@ func (c *DirectCQE) IsNotification() bool {
 
 // WaitDirect copies completion events into DirectCQE values, decoding the
 // packed context into the Op, SQEFlags, BufGroup, and FD fields.
-// Use it when every submitted operation uses Direct mode ([PackDirect]).
+// Use it when every incoming CQE carries a [PackDirect] context.
+// For rings receiving message IDs or Linux resource tags, use [Uring.Wait].
 //
 // On single-issuer rings it is not safe for concurrent use with submit, Wait,
 // WaitDirect, WaitExtended, Stop, or ResizeRings; caller must serialize those

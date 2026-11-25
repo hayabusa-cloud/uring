@@ -8,9 +8,11 @@ package uring
 
 import "code.hybscloud.com/iofd"
 
-// CQEView contains the completion result, flags, and submission context copied
-// by Wait. Direct-mode facts are inline; Indirect and Extended contexts still
-// reference shared targets. Copying a CQEView does not copy or root those targets.
+// CQEView contains the result, flags, and user_data copied by [Uring.Wait].
+// For local requests, user_data is the submission context. Direct fields are
+// inline. Indirect and Extended contexts borrow their targets without rooting them.
+// Match incoming message IDs and Linux resource tags with Context().Raw()
+// before using request accessors. [Uring.MsgRing] carries its signed value in Res.
 //
 // Caller must keep targets live and serialize access. Copy needed facts before
 // target mutation, reuse, or release; never dereference a released target.
@@ -27,14 +29,15 @@ import "code.hybscloud.com/iofd"
 //
 // # Usage
 //
-// Inspect every returned CQE, including failures; Wait has already removed
-// the entire batch from the ring.
+// This ring submits local reads and zero-copy sends. Inspect every returned
+// CQE, including notifications and failed requests.
 //
 //	n, err := ring.Wait(cqes)
 //	for i := range n {
 //	    cqe := cqes[i]
-//	    // Observe the kernel facts first.
-//	    if err := cqe.Err(); err != nil {
+//	    if cqe.IsNotification() {
+//	        fmt.Printf("send notification on fd=%d\n", cqe.FD())
+//	    } else if err := cqe.Err(); err != nil {
 //	        fmt.Printf("completion failed: op=%d fd=%d: %v\n", cqe.Op(), cqe.FD(), err)
 //	    } else {
 //	        fmt.Printf("completed op=%d on fd=%d with res=%d\n", cqe.Op(), cqe.FD(), cqe.Res)
@@ -74,8 +77,7 @@ func (c *CQEView) Extended() bool {
 	return c.ctx.Mode() == CtxModeExtended
 }
 
-// Op returns the IORING_OP_* opcode.
-// Always available (extracted from Direct mode context or from SQE in other modes).
+// Op returns the IORING_OP_* opcode from a local request's live context.
 //
 //go:nosplit
 func (c *CQEView) Op() uint8 {
@@ -89,8 +91,7 @@ func (c *CQEView) Op() uint8 {
 	}
 }
 
-// FD returns the file descriptor associated with the operation.
-// Always available.
+// FD returns the file descriptor or registered-file index from a local request's live context.
 //
 //go:nosplit
 func (c *CQEView) FD() iofd.FD {
@@ -129,8 +130,9 @@ func (c *CQEView) SQE() SQEView {
 	}
 }
 
-// Context returns the packed SQEContext.
-// Pointer modes retain the same borrowed target; this does not copy its fields.
+// Context returns the CQE's user_data as an SQEContext. For a local request,
+// pointer modes retain the same borrowed target. Context().Raw() also preserves
+// an incoming message ID or the tag of a retired Linux resource registration.
 //
 //go:nosplit
 func (c *CQEView) Context() SQEContext {
