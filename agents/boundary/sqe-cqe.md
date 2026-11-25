@@ -41,7 +41,13 @@ For a matched local request, interpret operation results, notifications and live
 | `IORING_CQE_F_MORE` | Same-request successor evidence; it does not change result classification or prove byte progress |
 | SEND_ZC notification (`IORING_CQE_F_NOTIF`) | Release evidence for the matched send. With `IORING_SEND_ZC_REPORT_USAGE`, test `uint32(Res) & IORING_NOTIF_USAGE_ZC_COPIED` for copy fallback or unused zero-copy. [Send buffer lifetime](resources.md#zero-copy-send-and-receive) |
 
-Only an explicit caller contract may translate request liveness into `iox.ErrMore`. Match each observation to its current request instance before reusing a token.
+Only an explicit caller contract may translate request liveness into `iox.ErrMore`.
+
+## Request Identity
+
+If two completions require different actions, the caller must be able to tell which submission produced each one. For example, two `FutexWait` requests on different words can produce identical Direct contexts, results and flags. Serialize those requests or give each a distinct live context. CQ order alone cannot distinguish them.
+
+For deferred dispatch, bind the event to its originating request when reaping or preserve the original token binding through delivery. Reuse a token only once late CQEs, notifications and outstanding cancellation lookups can no longer resolve to the new request. Copy borrowed fields while their target is valid. [Completion retention](#completion-retention) · [Managed cancellation](resources.md#managed-cancellation)
 
 ## Completion Retention
 

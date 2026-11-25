@@ -16,7 +16,7 @@ Give each context, descriptor, buffer, and borrow one owner and validity interva
 
 ## Identity
 
-Give each request-specific action an unambiguous submission identity. A numeric token suffices while lookups for queued events, notifications and cancellations still select the originating request. [Completion origin](boundary/sqe-cqe.md#completion-origin) · [Managed cancellation](boundary/resources.md#managed-cancellation)
+Give each request-specific action an unambiguous submission identity. A numeric token suffices while lookups for queued events, notifications and cancellations still select the originating request. [Request identity](boundary/sqe-cqe.md#request-identity) · [Managed cancellation](boundary/resources.md#managed-cancellation)
 
 ## Admission
 

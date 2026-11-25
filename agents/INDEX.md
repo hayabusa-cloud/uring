@@ -15,6 +15,7 @@ Read [core contracts](core.md), select a task and its required sources, then fol
 | Add or repair an operation adapter | [One-shot](recipes/oneshot.md), [encoding](boundary/encoding.md) |
 | Drive a ring directly | [One-shot](recipes/oneshot.md), [file write/read example](../examples/file_io_test.go#L30) |
 | Choose a wait or dispatch a mixed CQ | [Wait modes](boundary/sqe-cqe.md#observation), [completion origin](boundary/sqe-cqe.md#completion-origin) |
+| Bind a CQE to a request or retain it for later | [Request identity](boundary/sqe-cqe.md#request-identity), [retained fields](boundary/sqe-cqe.md#completion-retention) |
 | Set up a listener | [Listener](recipes/listener.md) |
 | Cancel or drain a subscription | [Stream](recipes/stream.md), [lifecycle](recipes/lifecycle.md) |
 | Use buffers, registered files, or zero-copy | [Buffers](recipes/buffers.md) |
