@@ -10,11 +10,10 @@ Declare compatible peer actions, payload ownership, choices, recursion, and term
 
 ## Drive One Action
 
-1. Match the request and copy required context facts.
-2. Consume reported progress, including partial results; retain parser input/output suffixes.
-3. Check current route generation, buffer ownership, descriptor state, protocol phase, and shutdown epoch as needed. Retaining context performs no automatic checks.
-4. Attempt the selected endpoint action. On local `ErrWouldBlock`, retain that unconsumed action and payload; drive the peer or wait. Local transport does not admit `ErrMore`.
-5. On success, retain the successor and transfer/release only resources consumed by the step.
+1. Match the request and copy required context facts. For a successful ordinary stream `RECV` into `buf` with flags zero, consume `buf[:Res]`. For a partial stream write, keep the unsent suffix.
+2. For [framed input](../boundary/protocols.md#stream-framing), keep one decoder per ordered stream. At each `framer.Decoder.Decode`, advance by `consumed` and handle the returned chunk even on `ErrMore`. Accumulate payload until `Chunk.End` for a whole-message endpoint. Copy borrowed bytes or retain their backing through the last use. [Decoder contract](https://github.com/hayabusa-cloud/framer/blob/v0.1.7/decoder.go#L59-L75)
+3. Check the current route, buffer ownership, descriptor, protocol phase and shutdown state as needed before each endpoint attempt.
+4. On local `ErrWouldBlock`, keep the same pending action, payload and unread input suffix. Retry the action after peer progress. A successful `sess.Advance` consumes the suspension. Keep its successor and continue with the unread bytes. [Session step](https://github.com/hayabusa-cloud/sess/blob/v0.1.7/step.go#L17-L36)
 
 Use `cove` transition and step-index checks when the property requires them, preserving the [strict pattern's premises](../runtime/cove.md#strict-verification-pattern). Failed guards, invalid transitions, insufficient fuel, and unfinished traces require caller handling, not invented kernel errors.
 
@@ -28,4 +27,4 @@ Handle peer failure and paired-execution errors before interpreting unresolved r
 
 [Network examples](../../examples/echo_test.go) cover TCP/UDP and framed broadcast, not `sess`/`cove` integration proofs. Validate adapters against selected module revisions and [runtime contracts](../runtime/INDEX.md).
 
-Check would-block without replay, partial frames, context changes during suspension, peer failure, exhausted capacity, and close with outstanding I/O. Name scheduler, fairness, peer, and failure assumptions for progress claims.
+Check a frame split across receives, several frames in one receive, an empty frame, and EOF inside a header or body. Fill the endpoint between two frames and check that the peer receives each message once and in order. Also check context changes during suspension, peer failure and close with outstanding I/O. Name the scheduler, fairness and peer assumptions for progress claims.
