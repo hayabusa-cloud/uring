@@ -15,12 +15,12 @@ import "code.hybscloud.com/iofd"
 //
 // Layout: 16 bytes on supported 64-bit platforms.
 type ExtCQE struct {
-	Res   int32   // Completion result (bytes transferred or negative errno)
+	Res   int32   // Raw CQE result
 	Flags uint32  // CQE flags (IORING_CQE_F_*)
 	Ext   *ExtSQE // Borrowed ExtSQE with full context
 }
 
-// IsSuccess reports whether the operation completed successfully.
+// IsSuccess reports whether Res is nonnegative. Use it on a matched operation result.
 //
 //go:nosplit
 func (c *ExtCQE) IsSuccess() bool {

@@ -13,12 +13,12 @@ import (
 
 // ExtCQE is a compact copied CQE for Extended mode operations.
 type ExtCQE struct {
-	Res   int32
+	Res   int32 // Raw CQE result
 	Flags uint32
 	Ext   *ExtSQE
 }
 
-// IsSuccess reports whether the operation completed successfully.
+// IsSuccess reports whether Res is nonnegative. Use it on a matched operation result.
 func (c *ExtCQE) IsSuccess() bool { return cqeIsSuccess(c.Res) }
 
 // HasMore reports IORING_CQE_F_MORE: the request has further completions,

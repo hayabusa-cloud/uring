@@ -43,7 +43,8 @@ func TestZCTrackerNotificationUsesStoredCompletionResult(t *testing.T) {
 	ctx := asZCCtx(ext)
 
 	completed := CQEView{Res: 23, Flags: IORING_CQE_F_MORE}
-	notified := CQEView{Res: -7, Flags: IORING_CQE_F_NOTIF}
+	usage := uint32(IORING_NOTIF_USAGE_ZC_COPIED)
+	notified := CQEView{Res: int32(usage), Flags: IORING_CQE_F_NOTIF}
 
 	if !tracker.dispatchCQE(completed, ext, ctx, h) {
 		t.Fatal("completed CQE was not handled")

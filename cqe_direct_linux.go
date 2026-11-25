@@ -15,7 +15,7 @@ import "code.hybscloud.com/iofd"
 //
 // Layout: 16 bytes on supported platforms.
 type DirectCQE struct {
-	Res      int32  // Completion result (bytes transferred or negative errno)
+	Res      int32  // Raw CQE result
 	Flags    uint32 // CQE flags (IORING_CQE_F_*)
 	Op       uint8  // IORING_OP_* opcode
 	SQEFlags uint8  // SQE flags (IOSQE_*)
@@ -23,7 +23,7 @@ type DirectCQE struct {
 	FD       iofd.FD
 }
 
-// IsSuccess reports whether the operation completed successfully.
+// IsSuccess reports whether Res is nonnegative. Use it on a matched operation result.
 //
 //go:nosplit
 func (c *DirectCQE) IsSuccess() bool {

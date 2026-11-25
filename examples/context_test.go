@@ -208,9 +208,8 @@ func TestSQEContextExtended(t *testing.T) {
 	}
 }
 
-// CQEView.Res contains the operation result or negative errno; Flags contains
-// IORING_CQE_F_* completion flags. Context recovers the submission context;
-// Indirect and Extended views borrow their retained targets.
+// CQEView copies Res, Flags and user_data. On this ring, Context identifies
+// the submitted request. Indirect and Extended views borrow their targets.
 //
 //	Completion flag       Meaning (IORING_CQE_F_ prefix omitted)
 //	BUFFER                Upper flag bits identify a selected buffer
@@ -218,9 +217,9 @@ func TestSQEContextExtended(t *testing.T) {
 //	NOTIF                 Buffer-release notification for a zero-copy send
 //	BUF_MORE              The kernel retains an incremental buffer
 //
-// MORE concerns the request; BUF_MORE concerns the buffer. Neither is a byte
-// count. Interpret Res by opcode: for example, NOP returns 0 and READ returns
-// bytes read, while a negative result encodes an errno.
+// MORE describes the request and BUF_MORE describes the selected buffer.
+// A successful NOP returns zero. READ reports a byte count or negative errno.
+// A SEND_ZC notification can carry usage flags in Res.
 func TestCQEViewAccess(t *testing.T) {
 	runtime.LockOSThread()
 	t.Cleanup(runtime.UnlockOSThread)
