@@ -465,43 +465,38 @@ func TestIntegrationCQEFlagHelpers(t *testing.T) {
 	}
 }
 
-// TestIntegrationContextModes tests all three SQEContext modes.
+// TestIntegrationContextModes checks each context after a real NOP completion.
 func TestIntegrationContextModes(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	mustStartRing(t, ring)
-
-	pool := uring.NewContextPools(int(uring.EntriesSmall))
-
-	// Test Direct mode
-	directCtx := uring.PackDirect(uring.IORING_OP_NOP, 0, 0, 0)
-	if !directCtx.IsDirect() {
-		t.Error("Direct context should report IsDirect() = true")
+	ring := newTestRing(t)
+	indirect, extended := ring.IndirectSQE(), ring.ExtSQE()
+	if indirect == nil || extended == nil {
+		t.Fatal("context pool exhausted")
 	}
 
-	// Test Indirect mode
-	indirect := pool.Indirect()
-	if indirect == nil {
-		t.Fatal("Indirect returned nil")
+	for _, tc := range []struct {
+		mode uring.SQEContext
+		ctx  uring.SQEContext
+		fd   iofd.FD
+	}{
+		{uring.CtxModeDirect, uring.ForFD(0), -1 << 29},
+		{uring.CtxModeIndirect, uring.PackIndirect(indirect), 1<<31 - 1},
+		{uring.CtxModeExtended, uring.PackExtended(extended), -1 << 31},
+	} {
+		ctx := tc.ctx.WithFD(tc.fd)
+		if err := ring.Nop(ctx); err != nil {
+			t.Fatalf("NOP with fd %d: %v", tc.fd, err)
+		}
+		cqe := waitForCQEs(t, ring, 1)[0]
+		if got := cqe.Context(); got != ctx || got.Mode() != tc.mode {
+			t.Fatalf("context = %#x (mode %#x), want %#x (mode %#x)", got.Raw(), got.Mode(), ctx.Raw(), tc.mode)
+		}
+		if cqe.Res != 0 || cqe.Flags != 0 {
+			t.Fatalf("NOP with fd %d: res=%d flags=%#x", tc.fd, cqe.Res, cqe.Flags)
+		}
+		if op, fd := cqe.Op(), cqe.FD(); op != uring.IORING_OP_NOP || fd != tc.fd {
+			t.Errorf("op=%d fd=%d, want NOP with fd %d", op, fd, tc.fd)
+		}
 	}
-	indirectCtx := uring.PackIndirect(indirect)
-	if !indirectCtx.IsIndirect() {
-		t.Error("Indirect context should report IsIndirect() = true")
-	}
-	pool.PutIndirect(indirect)
-
-	// Test Extended mode
-	extended := pool.Extended()
-	if extended == nil {
-		t.Fatal("Extended returned nil")
-	}
-	extendedCtx := uring.PackExtended(extended)
-	if !extendedCtx.IsExtended() {
-		t.Error("Extended context should report IsExtended() = true")
-	}
-	pool.PutExtended(extended)
+	ring.PutIndirectSQE(indirect)
+	ring.PutExtSQE(extended)
 }
