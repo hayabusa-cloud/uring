@@ -260,11 +260,11 @@ func (ur *Uring) Stop() error {
 	return err
 }
 
-// Wait flushes pending submissions and collects completion events into cqes.
+// Wait copies completions from the Darwin worker queue into cqes.
 // On single-issuer rings it is not safe for concurrent use with submit, Wait,
 // WaitDirect, WaitExtended, or Stop; caller must serialize those operations.
-// It returns the number of events received, or `iox.ErrWouldBlock` if the CQ
-// is empty.
+// A zero-length destination returns (0, nil) and consumes no CQEs.
+// With a nonempty destination, an empty CQ returns iox.ErrWouldBlock.
 func (ur *Uring) Wait(cqes []CQEView) (n int, err error) {
 	err = ur.ioUring.enter()
 	if err != nil {

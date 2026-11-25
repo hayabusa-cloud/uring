@@ -68,11 +68,9 @@ func (c *DirectCQE) IsNotification() bool {
 // On single-issuer rings it is not safe for concurrent use with submit, Wait,
 // WaitDirect, WaitExtended, Stop, or ResizeRings; caller must serialize those
 // operations.
-// On IOPOLL rings WaitDirect also performs the nonblocking poll enter needed
-// to make completions visible.
-// Returns the number of CQEs retrieved, ErrCQOverflow when the ring enters CQ
-// overflow and no CQEs are immediately claimable, or iox.ErrWouldBlock if none
-// are available.
+// WaitDirect drives pending submissions on Linux. After a successful enter,
+// a zero-length destination returns (0, nil) and consumes no CQEs.
+// With a nonempty destination, polling and empty-CQ errors follow [Uring.Wait].
 func (ur *Uring) WaitDirect(cqes []DirectCQE) (int, error) {
 	if err := ur.ioUring.enter(); err != nil {
 		return 0, err

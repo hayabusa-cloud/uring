@@ -343,10 +343,11 @@ func (ur *Uring) releaseRegisteredBufRings() error {
 // Wait flushes pending submissions and copies the result, flags and raw user_data
 // of each observed CQE. Match incoming message IDs and Linux resource tags before
 // using request accessors. Serialize waits, submission, resize and teardown on a single-issuer ring.
-// On Linux, Wait also drives deferred task work and polls IOPOLL rings as needed.
-// After a successful enter, an empty destination returns (0, nil). With space
-// in the destination, an empty CQ returns iox.ErrWouldBlock, or ErrCQOverflow
-// on Linux if overflow is observed. Inspect every CQE in the returned count.
+// On Linux, Wait also drives deferred task work. After a successful enter, a
+// zero-length destination returns (0, nil) and consumes no CQEs.
+// With a nonempty destination, Wait polls an empty Linux IOPOLL ring as needed.
+// If no CQEs are available, Wait returns iox.ErrWouldBlock or, on Linux,
+// ErrCQOverflow if overflow is observed. Inspect every CQE in the returned count.
 //
 // Here messageID is reserved for incoming messages. Every other CQE belongs to
 // a one-shot read with a context borrowed from ring.ExtSQE and a sequence in Val1.

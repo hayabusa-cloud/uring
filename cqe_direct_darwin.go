@@ -41,6 +41,8 @@ func (c *DirectCQE) IsNotification() bool { return cqeIsNotification(c.Flags) }
 // WaitDirect copies completion events into DirectCQE values (Darwin stub).
 // On single-issuer rings it is not safe for concurrent use with submit, Wait,
 // WaitDirect, WaitExtended, or Stop; caller must serialize those operations.
+// A zero-length destination returns (0, nil) and consumes no CQEs.
+// With a nonempty destination, an empty CQ returns iox.ErrWouldBlock.
 func (ur *Uring) WaitDirect(cqes []DirectCQE) (int, error) {
 	if err := ur.ioUring.enter(); err != nil {
 		return 0, err

@@ -49,6 +49,8 @@ func (c *ExtCQE) FD() iofd.FD { return iofd.FD(c.Ext.SQE.fd) }
 // WaitDirect, WaitExtended, or Stop; caller must serialize those operations.
 // Return Ext to its owning pool only after all request completions, including
 // zero-copy notifications, and borrowed access finish; see [Uring.PutExtSQE].
+// A zero-length destination returns (0, nil) and consumes no CQEs.
+// With a nonempty destination, an empty CQ returns iox.ErrWouldBlock.
 func (ur *Uring) WaitExtended(cqes []ExtCQE) (int, error) {
 	if err := ur.ioUring.enter(); err != nil {
 		return 0, err

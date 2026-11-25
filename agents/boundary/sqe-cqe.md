@@ -10,7 +10,13 @@ The default single-issuer mode requires one locked OS thread from before `Start`
 
 ## Observation
 
-Copy the CQE descriptor before advancing the CQ head. Use `WaitDirect` or `WaitExtended` only when every incoming CQE carries the corresponding local context mode.
+Choose the wait by the contexts that can arrive on the ring. All three waits drive pending submissions on Linux. After a successful enter, a zero-length destination returns `(0, nil)` and consumes no CQEs. Supply a nonempty destination to reap completions. On Linux, each wait copies its records before advancing the CQ head. [Partial-drain test](../../cq_pending_linux_test.go)
+
+| Wait | Incoming CQEs | What the caller receives |
+|------|---------------|--------------------------|
+| [Wait](../../interface_linux.go) | Local contexts, message IDs or Linux resource tags | Raw result, flags and all 64 bits of `user_data`. A local pointer-mode context borrows its target. |
+| [WaitDirect](../../cqe_direct_linux.go) | Direct contexts only | Result, CQE flags, opcode, SQE flags, buffer group and signed descriptor, all copied by value. |
+| [WaitExtended](../../cqe_extended_linux.go) | Extended contexts only | Result, CQE flags and a borrowed `ExtSQE`. Return a pooled context to its originating pool after final use. |
 
 ### Completion Origin
 
