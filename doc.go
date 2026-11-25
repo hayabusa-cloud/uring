@@ -61,6 +61,7 @@
 //	if cqe.Op() != uring.IORING_OP_READ || cqe.FD() != fd {
 //	    log.Fatalf("unexpected completion: op=%d fd=%d", cqe.Op(), cqe.FD())
 //	}
+//	runtime.KeepAlive(file) // Keep the owner of the borrowed FD live through the read.
 //	completionErr := cqe.Err()
 //	if completionErr == nil {
 //	    handle(buf[:int(cqe.Res)])
@@ -212,17 +213,22 @@
 //
 // # Runtime Boundary
 //
-// Multicast automatically selects ordinary or zero-copy sends by payload size
-// and target count. MulticastZeroCopy favors zero-copy with lower thresholds.
-// Inspect each CQE's opcode and flags; retrying fewer targets can change selection.
-// Both require Direct contexts and return an accepted target count separately
-// from the error. Retry starts at the first unaccepted target. Each accepted
-// stream send may still complete partially. Keep success CQEs enabled when
-// tracking ordinary-send byte counts, and use each target's data result to
-// decide which byte suffix remains. Keep shared bytes immutable until every
-// zero-copy borrow ends. Zero-copy sends retain required completions
-// independently of NotifySucceed; MulticastZeroCopy also retains completions
-// when its heuristic selects ordinary sends.
+// [Uring.Multicast] and [Uring.MulticastZeroCopy] require Direct contexts and
+// return the accepted target count, even when submission stops on an error.
+// If retrying, resume at the first unaccepted target. For registered buffers,
+// payload size and target count determine the send opcode. MulticastZeroCopy
+// uses lower zero-copy thresholds. A retry with fewer targets can change the
+// opcode. Check [CQEView.Op] and [CQEView.IsNotification] on each completion.
+// Only a data CQE reports the send result. For a short stream send, retry
+// only that target's unsent suffix.
+//
+// Keep shared bytes immutable until every accepted send releases them. An
+// ordinary send releases them on its data CQE. A zero-copy send releases them
+// on a data CQE without MORE, or after both a data CQE with MORE and its
+// matching notification, in either order. To observe ordinary Multicast
+// successes, enable NotifySucceed and leave IOSQE_CQE_SKIP_SUCCESS clear.
+// The Multicast zero-copy path and both MulticastZeroCopy paths retain success
+// CQEs regardless of NotifySucceed and reject explicit success suppression.
 //
 // uring is a kernel boundary, not a scheduler. It owns SQE encoding, CQE
 // observation, `user_data` identity, capability exposure, and kernel-facing
@@ -250,6 +256,7 @@
 // result. Finish borrowed payload access before republishing the buffer.
 //
 //	opts := uring.OptionsForBudget(256 * uring.MiB)
+//	opts.NotifySucceed = true // Observe the fixed write's byte count.
 //	runtime.LockOSThread()
 //	defer runtime.UnlockOSThread()
 //
@@ -263,15 +270,16 @@
 //	if err := ring.Start(); err != nil {
 //	    return err
 //	}
-//	defer ring.Stop()
+//	defer ring.Stop() // The caller drains admitted work before this runs.
 //
 //	cfg, scale := uring.BufferConfigForBudget(256 * uring.MiB)
 //	fmt.Printf("buffer tiers=%+v scale=%d\n", cfg, scale)
 //
-// A registered fixed buffer is ring-owned memory addressed by index. Keep the
-// buffer live until the fixed operation completes.
+// Here fd is a caller-owned [iofd.FD] and the payload fits in registered
+// buffer 0. Keep fd open and the buffer unchanged through the matching write
+// CQE. Check [CQEView.Err] before using Res as the number of bytes written.
+// A successful write can be short.
 //
-//	fd := iofd.FD(file.Fd()) // Borrowed; file owns Close.
 //	buf := ring.RegisteredBuffer(0)
 //	copy(buf, payload)
 //
