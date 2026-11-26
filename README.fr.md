@@ -651,7 +651,7 @@ Les tests exécutables de `examples/` enseignent initialisation → soumission �
 - La configuration par défaut `MultiIssuers=false` demande `SINGLE_ISSUER` + `DEFER_TASKRUN` et évite la synchronisation des soumissions partagées. Le propriétaire doit appeler `runtime.LockOSThread` avant `Start`, rester attaché au même thread jusqu'à `Stop` et sérialiser les soumissions, les attentes, le redimensionnement et la libération du ring. Choisissez explicitement `MultiIssuers=true` (`COOP_TASKRUN`) pour partager les soumissions ou permettre la migration entre threads du système.
 - `EpollWait` exige que `timeout` vaille `0` ; utilisez `LinkTimeout` si vous avez besoin d'une échéance.
 - Restituez les contextes au pool seulement après le traitement de toutes les complétions de la requête et la fin des accès empruntés.
-- `ListenerOp.Close` ferme le FD de l'écouteur immédiatement. Si un CQE de mise en place est encore en attente, drainez-le d'abord, puis rappelez `Close` pour restituer le `ExtSQE` emprunté au pool.
+- Après `ListenerOp.Close`, `FD()` renvoie `-1`. Une opération `BIND` ou `LISTEN` en attente garde le socket ouvert jusqu’au décodage de sa CQE. Traitez toute CQE de mise en place en attente avec `HandleCQE`, puis rappelez `Close` pour rendre le contexte `ExtSQE` emprunté au pool. [Traitement manuel](agents/recipes/listener.md)
 
 ## Support de plateforme
 

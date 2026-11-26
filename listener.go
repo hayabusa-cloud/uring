@@ -310,6 +310,9 @@ func (op *ListenerOp) closeFD() {
 //
 //go:nosplit
 func (op *ListenerOp) FD() iofd.FD {
+	if op.closed.Load() {
+		return -1
+	}
 	return iofd.FD(op.fd.Load())
 }
 
@@ -344,8 +347,8 @@ func (op *ListenerOp) Ext() *ExtSQE {
 // advancement; the caller retains cleanup responsibility.
 //
 // After an earlier Close, this method drains pending setup CQEs without callbacks
-// and closes any late socket result. Call Close again after draining to release
-// the context. Drain all operations using the listener FD before final Close.
+// and closes the setup socket. Call Close again after draining to release the
+// context.
 func (op *ListenerOp) HandleCQE(cqe CQEView) (bool, error) {
 	if op.ext == nil || !cqe.Extended() || cqe.ExtSQE() != op.ext {
 		return false, nil
@@ -384,19 +387,20 @@ func (op *ListenerOp) HandleCQE(cqe CQEView) (bool, error) {
 	return true, op.ring.SubmitExtended(PackExtended(step.Ext))
 }
 
-// Close releases resources. If the listener has an open FD, it is closed.
-// When a listener setup SQE is still in flight, Close keeps the pooled ExtSQE
-// borrowed until the caller drains that CQE and calls Close again.
-// Caller must drain all in-flight operations before calling Close.
-// Close is not safe for concurrent use.
-// Caller must serialize Close and only perform final cleanup after draining
-// pending listener setup CQEs.
+// Close stops setup callbacks and makes FD return -1. A pending BIND or LISTEN
+// keeps the socket open until its completion is decoded. With no pending setup
+// request, Close releases the socket and pooled context immediately.
+//
+// Serialize Close with setup dispatch and drain other users of the listener FD
+// before calling it. After an early Close, use [ListenerOp.HandleCQE] to drain
+// the pending step, then call Close again to return the context. With manual
+// decoding, pass a successful SOCKET result to [ListenerOp.SetFD] for closure.
 func (op *ListenerOp) Close() {
 	op.closed.Store(true)
-	op.closeFD()
 	if op.pending.Load() != 0 {
 		return
 	}
+	op.closeFD()
 	op.releaseExt()
 }
 
@@ -499,6 +503,9 @@ func listenerTrackCompletion(ext *ExtSQE, opCode uint8) {
 			return
 		}
 		if op.pending.CompareAndSwap(pending, pending-1) {
+			if pending == 1 && op.closed.Load() {
+				op.closeFD()
+			}
 			return
 		}
 	}

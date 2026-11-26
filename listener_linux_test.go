@@ -77,7 +77,7 @@ func assertListenerFDClosed(t *testing.T, fd iofd.FD) {
 	if raw < 0 {
 		t.Fatalf("expected valid listener fd, got %d", raw)
 	}
-	if errno := zcall.Close(uintptr(raw)); errno != uintptr(zcall.EBADF) {
+	if _, errno := zcall.Syscall4(iofd.SYS_FCNTL, uintptr(raw), iofd.F_GETFD, 0, 0); errno != uintptr(zcall.EBADF) {
 		t.Fatalf("expected listener fd %d to be closed, errno=%d", raw, errno)
 	}
 }

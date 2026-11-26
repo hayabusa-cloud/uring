@@ -21,9 +21,9 @@ Retry only the prepared submission. Replaying the CQE repeats its callback and t
 
 Serialize dispatch, retry, and close. Callbacks must not reenter dispatch or modify the prepared SQE. A false callback result or a callback's `Close` stops advancement and leaves cleanup with the caller. Keep the context and sockaddr alive through their pending requests. Use caller-owned `iox.Backoff` when waiting makes no progress.
 
-After an early `Close`, dispatch the pending setup CQE to retire it and close any late socket result; callbacks are suppressed. Call `Close` again after draining to return the context. Drain accept and other FD users before final close.
+During setup, `Close` makes `FD()` return `-1` and suppresses callbacks in `HandleCQE`. Decoding the pending `BIND` or `LISTEN` completion releases its socket. If `SOCKET` was pending, `HandleCQE` closes the returned fd on success. Call `Close` again after dispatch to return the pooled context.
 
-For manual control, use `DecodeListenerCQE`, `SetFD`, the `PrepareListener*` helpers, and `SetListenerReady`. Consume each CQE exactly once through manual decoding or `HandleCQE`.
+For manual control, use `DecodeListenerCQE`, `SetFD`, the `PrepareListener*` helpers, and `SetListenerReady`. On a mixed ring, match local setup completions before calling the decoder. After `Close`, skip callbacks and successor submissions. Pass a successful `SOCKET` result to `SetFD` to close the returned fd. Consume each setup CQE once through manual decoding or `HandleCQE`. [Completion origin](../boundary/sqe-cqe.md#completion-origin)
 
 ## Accept Connections
 

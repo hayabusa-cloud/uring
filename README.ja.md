@@ -651,7 +651,7 @@ Idle → Active → Stopping → Retiring → Stopped
 - デフォルトの `MultiIssuers=false` は `SINGLE_ISSUER` + `DEFER_TASKRUN` を要求し、共有発行の同期処理を省きます。所有者は `Start` の前に `runtime.LockOSThread` を呼び、`Stop` まで同じ OS スレッドに固定したまま、発行、待機、リサイズ、終了処理を直列化します。発行を共有する場合や OS スレッド間の移動を許す場合は、`MultiIssuers=true`（`COOP_TASKRUN`）を明示的に選択します。
 - `EpollWait` の `timeout` は `0` のままにすること。期限が必要な場合は `LinkTimeout` を使う。
 - リクエストの全完了処理と借用アクセスが終了してから、プールのコンテキストを返却すること。
-- `ListenerOp.Close` はリスナー FD を即座に閉じる。構築中の CQE が未回収の場合は、その CQE を回収してから再度 `Close` を呼び出し、借用中の `ExtSQE` をプールに返却する。
+- `ListenerOp.Close` を呼ぶと `FD()` は `-1` を返す。処理中の `BIND` または `LISTEN` が使うソケットは、その CQE をデコードするまで開いたままになる。保留中のセットアップ CQE を `HandleCQE` で処理してから、再度 `Close` を呼んで借用中の `ExtSQE` をプールに返す。[手動での処理](agents/recipes/listener.md)
 
 ## 対応プラットフォーム
 

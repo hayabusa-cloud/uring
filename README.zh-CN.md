@@ -651,7 +651,7 @@ Idle → Active → Stopping → Retiring → Stopped
 - 默认的 `MultiIssuers=false` 请求 `SINGLE_ISSUER` + `DEFER_TASKRUN`，避免共享提交同步。所有者须在 `Start` 前调用 `runtime.LockOSThread`，保持线程绑定直到 `Stop`，并串行执行提交、等待、扩缩容和销毁。需要共享提交或在 OS 线程之间迁移时，显式选择 `MultiIssuers=true`（`COOP_TASKRUN`）。
 - `EpollWait` 要求 `timeout` 为 `0`；如需设置截止时间，使用 `LinkTimeout`。
 - 所有请求完成处理和借用访问结束后，才能归还池化上下文。
-- `ListenerOp.Close` 会立即关闭监听 FD。若仍有设置 CQE 待处理，需先回收该 CQE，再调用 `Close` 将借用的 `ExtSQE` 归还池中。
+- 调用 `ListenerOp.Close` 后，`FD()` 返回 `-1`。待处理的 `BIND` 或 `LISTEN` 会保持套接字打开，直到对应的 CQE 被解码。用 `HandleCQE` 处理待分派的设置 CQE，再次调用 `Close` 将借用的 `ExtSQE` 归还池中。[手动分派](agents/recipes/listener.md)
 
 ## 平台支持
 

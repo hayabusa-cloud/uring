@@ -651,7 +651,7 @@ At the package root, [listener_example_test.go](./listener_example_test.go) demo
 - The default `MultiIssuers=false` requests `SINGLE_ISSUER` + `DEFER_TASKRUN` and avoids shared-submit synchronization. Lock the owner with `runtime.LockOSThread` before `Start`, remain pinned through `Stop`, and serialize submissions, waits, resize, and teardown. Select `MultiIssuers=true` (`COOP_TASKRUN`) for shared submission or OS-thread migration.
 - `EpollWait` requires `timeout` to remain `0`; use `LinkTimeout` when you need a deadline.
 - Return pooled contexts only after all request completions and borrowed access have finished.
-- `ListenerOp.Close` closes the listener FD immediately. If a setup CQE is still pending, drain it first, then call `Close` again to return the borrowed `ExtSQE` to the pool.
+- After `ListenerOp.Close`, `FD()` returns `-1`. A pending `BIND` or `LISTEN` keeps the socket open until its CQE is decoded. Dispatch any pending setup CQE with `HandleCQE`, then call `Close` again to return the borrowed `ExtSQE` to the pool. [Manual dispatch](agents/recipes/listener.md)
 
 ## Platform support
 

@@ -651,7 +651,7 @@ En la raíz del paquete, [listener_example_test.go](./listener_example_test.go) 
 - La configuración predeterminada `MultiIssuers=false` solicita `SINGLE_ISSUER` + `DEFER_TASKRUN` y evita la sincronización de envíos compartidos. El propietario debe llamar a `runtime.LockOSThread` antes de `Start`, permanecer fijado al hilo hasta `Stop` y serializar los envíos, las esperas, el redimensionamiento y la liberación del ring. Seleccione `MultiIssuers=true` (`COOP_TASKRUN`) para compartir los envíos o permitir la migración entre hilos del sistema operativo.
 - `EpollWait` requiere que `timeout` sea `0`; use `LinkTimeout` cuando necesite un plazo.
 - Devuelva los contextos al pool solo cuando hayan terminado todas las finalizaciones de la petición y los accesos prestados.
-- `ListenerOp.Close` cierra el FD del escucha de inmediato. Si aún hay un CQE de configuración pendiente, drene ese CQE y vuelva a llamar a `Close` para devolver el `ExtSQE` prestado al pool.
+- Tras llamar a `ListenerOp.Close`, `FD()` devuelve `-1`. Una operación `BIND` o `LISTEN` pendiente mantiene abierto el socket hasta que se decodifique su CQE. Procese con `HandleCQE` cualquier CQE de configuración pendiente y vuelva a llamar a `Close` para devolver el `ExtSQE` prestado al pool. [Despacho manual](agents/recipes/listener.md)
 
 ## Soporte de plataforma
 
