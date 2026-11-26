@@ -40,6 +40,8 @@ During `Loop.Poll`, a backend submission error means the backend accepted no wor
 
 For a successful operation or ordinary operation error, `Completion.ResumeValue()` must supply the suspension's reply, including any operation error. Report completion-level would-block for retry only after the old request has retired without a reply or hidden partial progress. Completion `ErrMore` fails the one-shot loop. [Backend contract](https://github.com/hayabusa-cloud/takt/blob/v0.3.0/backend.go#L63-L87)
 
+If a suspension needs the byte count from a stream `SendMsgHeader`, request the send’s own CQE and pass its matched `Res` in the reply. A linked NOP can succeed after a short send. [Suppressed completions](../boundary/sqe-cqe.md#suppressed-completions)
+
 Set `StreamCompletion.More` from request liveness. Stream EOF and a terminal empty UDP datagram can both give `RouteOutcome() == iox.OutcomeOK`. For a payload consumer, set `HasValue` for the datagram. `SubscriptionLoop.Poll` retires the route before returning its final event. Inspect `HasValue` and `EventErr` even when `Final` is true. Give a reused token a fresh generation while an old handle or completion can still reach the loop. [Stream completion and identity](https://github.com/hayabusa-cloud/takt/blob/v0.3.0/subscription_backend.go#L61-L112) · [Terminal event dispatch](https://github.com/hayabusa-cloud/takt/blob/v0.3.0/subscription.go#L126-L148)
 
 | Result storage | Lifetime |

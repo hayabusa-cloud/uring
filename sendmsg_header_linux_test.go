@@ -333,52 +333,79 @@ func TestSendMsgHeaderNotificationPolicy(t *testing.T) {
 }
 
 func TestSendMsgHeaderShortStream(t *testing.T) {
-	fds, err := newUnixSocketPairForTest()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer closeTestFds(fds)
-	size := int32(4096)
-	if errno := zcall.Setsockopt(uintptr(fds[0]), zcall.SOL_SOCKET, zcall.SO_SNDBUF, unsafe.Pointer(&size), unsafe.Sizeof(size)); errno != 0 {
-		t.Fatal(zcall.Errno(errno))
-	}
-	ring := newTestRing(t, func(o *uring.Options) { o.NotifySucceed = true })
-	payload := bytes.Repeat([]byte("x"), 65536)
-	iov := uring.IoVec{Base: &payload[0], Len: uint64(len(payload))}
-	msg := uring.Msghdr{Iov: &iov, Iovlen: 1, Flags: zcall.MSG_WAITALL}
-	ctx := uring.PackDirect(uring.IORING_OP_SENDMSG, uring.IOSQE_IO_LINK, 1, int32(fds[0]))
-	if err := ring.SendMsgHeader(ctx, fds[0], &msg); err != nil {
-		t.Fatal(err)
-	}
-	if err := ring.Nop(uring.PackDirect(uring.IORING_OP_NOP, 0, 2, 0)); err != nil {
-		t.Fatal(err)
-	}
-	var sent int32
-	seenNop := false
-	for _, cqe := range waitForCQEs(t, ring, 2) {
-		switch cqe.Op() {
-		case uring.IORING_OP_SENDMSG:
-			if cqe.Context() != ctx || cqe.Res <= 0 || cqe.Res >= int32(len(payload)) || sent != 0 {
-				t.Fatalf("expected one short send: %+v", cqe)
+	payload := bytes.Repeat([]byte("send"), 16384)
+	for _, tc := range []struct {
+		name       string
+		sendBuffer int32
+		notify     bool
+		wantShort  bool
+	}{
+		{"short-reported", 4096, true, true},
+		{"short-suppressed", 4096, false, true},
+		{"full-reported", 65536, true, false},
+		{"full-suppressed", 65536, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fds, err := newUnixSocketPairForTest()
+			if err != nil {
+				t.Fatal(err)
 			}
-			sent = cqe.Res
-		case uring.IORING_OP_NOP:
-			if cqe.Res != 0 || seenNop {
-				t.Fatalf("ordinary short send broke its link: %+v", cqe)
+			defer closeTestFds(fds)
+			if errno := zcall.Setsockopt(uintptr(fds[0]), zcall.SOL_SOCKET, zcall.SO_SNDBUF, unsafe.Pointer(&tc.sendBuffer), unsafe.Sizeof(tc.sendBuffer)); errno != 0 {
+				t.Fatal(zcall.Errno(errno))
 			}
-			seenNop = true
-		default:
-			t.Fatalf("unexpected completion: %+v", cqe)
-		}
+			ring := newTestRing(t, func(o *uring.Options) { o.NotifySucceed = tc.notify })
+			iov := uring.IoVec{Base: &payload[0], Len: uint64(len(payload))}
+			msg := uring.Msghdr{Iov: &iov, Iovlen: 1, Flags: zcall.MSG_WAITALL}
+			send := uring.PackDirect(uring.IORING_OP_SENDMSG, uring.IOSQE_IO_LINK, 1, int32(fds[0]))
+			nop := uring.PackDirect(uring.IORING_OP_NOP, 0, 2, 0)
+			if err := ring.SendMsgHeader(send, fds[0], &msg); err != nil {
+				t.Fatal(err)
+			}
+			if err := ring.Nop(nop); err != nil {
+				t.Fatal(err)
+			}
+			wantCQEs := 1
+			if tc.notify {
+				wantCQEs++
+			}
+			reported := int32(-1)
+			seenNop := false
+			for _, cqe := range waitForCQEs(t, ring, wantCQEs) {
+				switch cqe.Context() {
+				case send:
+					if !tc.notify || reported >= 0 || cqe.Res <= 0 {
+						t.Fatalf("unexpected send CQE: %+v", cqe)
+					}
+					reported = cqe.Res
+				case nop:
+					if seenNop || cqe.Res != 0 || cqe.Flags != 0 {
+						t.Fatalf("linked NOP: %+v", cqe)
+					}
+					seenNop = true
+				default:
+					t.Fatalf("unexpected completion: %+v", cqe)
+				}
+			}
+			if !seenNop || ring.CQPending() != 0 {
+				t.Fatal("unexpected completion count for linked send")
+			}
+			// Read through EOF to measure the prefix independently of the send CQE.
+			if errno := zcall.Shutdown(uintptr(fds[0]), zcall.SHUT_WR); errno != 0 {
+				t.Fatal(zcall.Errno(errno))
+			}
+			buf := make([]byte, len(payload)+1)
+			n, errno := zcall.Recvfrom(uintptr(fds[1]), buf, zcall.MSG_WAITALL, nil, nil)
+			if errno != 0 || n == 0 || n > uintptr(len(payload)) || !bytes.Equal(buf[:n], payload[:n]) {
+				t.Fatalf("received prefix: %d bytes, errno %d", n, errno)
+			}
+			if short := n < uintptr(len(payload)); short != tc.wantShort || tc.notify && int32(n) != reported {
+				t.Fatalf("offered %d, peer received %d, send CQE count %d", len(payload), n, reported)
+			}
+			t.Logf("peer received %d of %d bytes, %d CQEs", n, len(payload), wantCQEs)
+			runtime.KeepAlive(&msg)
+		})
 	}
-	if sent == 0 || !seenNop {
-		t.Fatal("missing send or linked completion")
-	}
-	buf := make([]byte, len(payload))
-	if n, errno := zcall.Read(uintptr(fds[1]), buf); errno != 0 || n != uintptr(sent) || !bytes.Equal(buf[:n], payload[:sent]) {
-		t.Fatalf("short send prefix: %d bytes, errno %d; want %d", n, errno, sent)
-	}
-	runtime.KeepAlive(&msg)
 }
 
 func TestSendMsgHeaderDeferredCancellation(t *testing.T) {

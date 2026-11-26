@@ -43,6 +43,12 @@ For a matched local request, interpret operation results, notifications and live
 
 Only an explicit caller contract may translate request liveness into `iox.ErrMore`.
 
+### Suppressed Completions
+
+With the default `NotifySucceed=false`, an ordinary stream `SendMsgHeader` soft-linked to an unsuppressed NOP in the same submission can produce just the NOP’s zero CQE. Both a short send and a full send can give that result. To retry the unsent suffix or issue a byte-count receipt, set `NotifySucceed=true` when creating the ring, leave `IOSQE_CQE_SKIP_SUCCESS` clear on the send and use its matched `Res`. [Linux SENDMSG](https://github.com/torvalds/linux/blob/v6.18/io_uring/net.c#L538-L581) · [Full and short send test](../../sendmsg_header_linux_test.go#L335)
+
+If a request carrying `IOSQE_CQE_SKIP_SUCCESS` fails and breaks an `IOSQE_IO_LINK` chain, Linux reports the failure and can omit the canceled successors’ CQEs, including an unsuppressed NOP. A linked timeout follows its own skip flag. On a ring that uses `IOSQE_IO_DRAIN`, keep `IOSQE_CQE_SKIP_SUCCESS` clear on every SQE. Enable `NotifySucceed` if that ring issues ordinary write-like operations. [Link and drain rules](https://github.com/axboe/liburing/blob/liburing-2.13/man/io_uring_enter.2#L1673-L1702) · [Write-like defaults](../../interface_linux.go#L115-L125)
+
 ## Request Identity
 
 If two completions require different actions, the caller must be able to tell which submission produced each one. For example, two `FutexWait` requests on different words can produce identical Direct contexts, results and flags. Serialize those requests or give each a distinct live context. CQ order alone cannot distinguish them.
