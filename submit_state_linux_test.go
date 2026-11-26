@@ -1310,11 +1310,11 @@ func TestCloseAfterFatalResizeClosesRingState(t *testing.T) {
 		submit: submitState{
 			keepAlive: []submitKeepAlive{{active: true, bytes1: []byte("x")}},
 		},
-		ringFd:   -1,
-		pollerFd: -1,
-		bufs:     [][]byte{{1}},
-		files:    []int32{1},
-		ops:      []ioUringProbeOp{{op: IORING_OP_NOP}},
+		ringFd:    -1,
+		pollerFd:  -1,
+		bufs:      [][]byte{{1}},
+		fileSlots: 1,
+		ops:       []ioUringProbeOp{{op: IORING_OP_NOP}},
 		sq: ioUringSq{
 			sqeStride: unsafe.Sizeof(ioUringSqe{}),
 			sqeMapSz:  unsafe.Sizeof(ioUringSqe{}),
@@ -1331,7 +1331,7 @@ func TestCloseAfterFatalResizeClosesRingState(t *testing.T) {
 	if ur.submit.keepAlive != nil {
 		t.Fatal("closeAfterFatalResize did not clear keepAlive state")
 	}
-	if ur.bufs != nil || ur.files != nil || ur.ops != nil {
+	if ur.bufs != nil || ur.fileSlots != 0 || ur.ops != nil {
 		t.Fatal("closeAfterFatalResize did not clear userspace state")
 	}
 	if ur.sq.sqesPtr != nil || ur.sq.sqeStride != 0 || ur.sq.sqeMapSz != 0 || ur.sq.kHead != nil || ur.cq.cqes != nil {

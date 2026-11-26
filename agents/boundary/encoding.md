@@ -59,19 +59,19 @@ Version strings alone establish no usable capability. ZCRX control/query records
 
 ### Resize a Live Ring
 
-For live resize on Linux 6.18.15 and 6.19.14, create the ring with `MultiIssuers=false` and `HybridPolling=false`. Resize requires `IORING_SETUP_DEFER_TASKRUN`. Hybrid polling clears that flag, so even an empty ring returns `EINVAL` and keeps its original size. [Ring setup](../../interface_linux.go#L162-L183) · [Hybrid polling flags](../../io_uring_linux.go#L1288-L1293) · [Linux resize check](https://github.com/gregkh/linux/blob/v6.18.15/io_uring/register.c#L410-L412)
+For live resize, leave `MultiIssuers` and `HybridPolling` at their default `false` values. This enables `IORING_SETUP_DEFER_TASKRUN`, which `ResizeRings` requires. [Ring setup](../../interface_linux.go#L162-L183) · [Resize requirements](https://github.com/axboe/liburing/blob/liburing-2.13/man/io_uring_resize_rings.3#L50-L55)
 
-Call `ResizeRings(sq, cq)` from the OS thread that called `Start`. Serialize resize with submission, waits and `Stop`. Resolve any CQ overflow first. Zero `sq` keeps the current SQ size. Zero `cq` requests twice the resulting SQ size. On success, read the effective sizes from `Features.SQEntries` and `Features.CQEntries`. Context pools keep their original capacities. [ResizeRings](../../interface_linux.go#L1611)
+Call `ResizeRings(sq, cq)` from the OS thread that called `Start`. Serialize resize with submission, waits and `Stop`. Resolve any CQ overflow first. Zero `sq` keeps the current SQ size. Zero `cq` requests twice the resulting SQ size. On success, read the effective sizes from `Features.SQEntries` and `Features.CQEntries`. Context pools keep their original capacities. [ResizeRings](../../interface_linux.go#L1603)
 
 A successful resize preserves pending submissions and completions, their entry widths and request identities in both SQ layouts. A shrink rejected because pending entries would no longer fit leaves those entries on the original ring. Continue driving them there. [Pending submissions](../../resize_linux_test.go#L55) · [Pending completions](../../resize_completion_linux_test.go#L14) · [Rejected shrink](../../resize_linux_test.go#L178)
 
-If the kernel omits the indirect SQ array offset, changing CQ capacity requires a temporary disabled ring to obtain the new layout. A remap failure after the kernel commits the resize closes the ring. [Indirect array layout](../../resize_internal_linux_test.go#L19)
+If remapping fails after Linux commits the resize, `uring` closes the ring. [Failure handling](../../submit_state_linux_test.go#L1307)
 
 ## Registration
 
 - Preserve typed pointers in temporary registration records until the syscall; match the kernel ABI layout. Distinguish [metadata and backing lifetimes](resources.md#registration).
 - Preserve syscall counts and nested query result/size fields. A successful query syscall does not imply every record succeeded.
-- File-table updates may accept a prefix and clear the next slot before stopping. Mirror the kernel's changed slots, including that clear; do not mark the entire requested update successful. Descriptors below `-1` are invalid.
+- For synchronous `RegisterFilesUpdate`, validate a nonempty range against table capacity and reject descriptors below `-1`. Linux owns slot contents. Return its processed count. [Partial updates and first-entry failures](files.md#updating-slots)
 - Clone buffers from a known source registration and preserve the destination's local view. A registered-ring index names a task-local binding; retain that task/source correspondence.
 - NAPI unregister uses `nr_args=1`; ZCRX control uses `nr_args=0`. Do not infer one registration's calling convention from another.
 - Keep registered storage live through all kernel access and unregister/teardown. ZCRX refills must originate from delivered references; receive page size requires explicit feature support.

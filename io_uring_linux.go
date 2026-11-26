@@ -177,12 +177,12 @@ type ioUring struct {
 	closed        atomic.Bool
 	params        *ioUringParams
 
-	sq     ioUringSq
-	cq     ioUringCq
-	ringFd int
-	bufs   [][]byte
-	files  []int32 // registered file descriptors
-	ops    []ioUringProbeOp
+	sq        ioUringSq
+	cq        ioUringCq
+	ringFd    int
+	fileSlots int // capacity of the kernel's registered file table
+	bufs      [][]byte
+	ops       []ioUringProbeOp
 
 	pollerFd int
 }
@@ -422,79 +422,36 @@ func (ur *ioUring) unregisterBuffers() error {
 	return nil
 }
 
-// registerFiles registers file descriptors for use with IOSQE_FIXED_FILE.
-// Using registered files reduces per-operation overhead by avoiding
-// file reference management on each I/O operation.
-func (ur *ioUring) registerFiles(fds []int32) error {
-	if len(ur.files) > 0 {
+func (ur *ioUring) registerFileTable(count int, fds []int32, flags uint32) error {
+	if ur.fileSlots != 0 {
 		return ErrExists
 	}
-	if len(fds) < 1 || uint(len(fds)) > math.MaxUint32 {
-		return ErrInvalidParam
-	}
-
-	// Use IORING_REGISTER_FILES2 with rsrc_register struct for consistency
-	reg := ioUringRSrcRegister{
-		nr:   uint32(len(fds)),
-		data: unsafe.Pointer(unsafe.SliceData(fds)),
-	}
-	regSize := uintptr(unsafe.Sizeof(reg))
-	_, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_REGISTER_FILES2, unsafe.Pointer(&reg), regSize)
-	if errno != 0 {
-		return errFromErrno(errno)
-	}
-
-	// Store a copy of the file descriptors
-	ur.files = make([]int32, len(fds))
-	copy(ur.files, fds)
-
-	return nil
-}
-
-// registerFilesSparse allocates a sparse file table of the given size.
-// Entries are initially empty (-1) and can be populated with registerFilesUpdate.
-// Sparse registration allows dynamic file management without pre-populating all entries.
-func (ur *ioUring) registerFilesSparse(count uint32) error {
-	if len(ur.files) > 0 {
-		return ErrExists
-	}
-	if count < 1 {
+	if count < 1 || uint(count) > math.MaxUint32 {
 		return ErrInvalidParam
 	}
 
 	reg := ioUringRSrcRegister{
-		nr:    count,
-		flags: IORING_RSRC_REGISTER_SPARSE,
+		nr:    uint32(count),
+		flags: flags,
+		data:  unsafe.Pointer(unsafe.SliceData(fds)),
 	}
 	regSize := uintptr(unsafe.Sizeof(reg))
 	_, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_REGISTER_FILES2, unsafe.Pointer(&reg), regSize)
+	runtime.KeepAlive(fds)
 	if errno != 0 {
 		return errFromErrno(errno)
 	}
-
-	// Initialize sparse table with -1 (empty slots)
-	ur.files = make([]int32, count)
-	for i := range ur.files {
-		ur.files[i] = -1
-	}
-
+	ur.fileSlots = count
 	return nil
 }
 
 // registerFilesUpdate updates registered files at the specified offset.
 // Use -1 to clear a slot, or a valid fd to set it.
 func (ur *ioUring) registerFilesUpdate(offset uint32, fds []int32) (int, error) {
-	if len(ur.files) < 1 {
+	if ur.fileSlots == 0 {
 		return 0, ErrNotFound
 	}
-	if len(fds) < 1 || uint(len(fds)) > math.MaxUint32 {
-		return 0, ErrInvalidParam
-	}
-	if uint64(offset) > uint64(len(ur.files)) {
-		return 0, ErrInvalidParam
-	}
-	start := int(offset)
-	if len(fds) > len(ur.files)-start {
+	if len(fds) == 0 || uint64(offset)+uint64(len(fds)) > uint64(ur.fileSlots) {
 		return 0, ErrInvalidParam
 	}
 	for _, fd := range fds {
@@ -514,33 +471,23 @@ func (ur *ioUring) registerFilesUpdate(offset uint32, fds []int32) (int, error) 
 		fds:    unsafe.SliceData(fds),
 	}
 	result, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_REGISTER_FILES_UPDATE, unsafe.Pointer(&up), uintptr(len(fds)))
+	runtime.KeepAlive(fds)
 	if errno != 0 {
-		// Linux clears the destination before acquiring the replacement file.
-		if errno == uintptr(zcall.EBADF) || errno == ENOMEM {
-			ur.files[start] = -1
-		}
 		return 0, errFromErrno(errno)
 	}
-
-	updated := int(result)
-	copy(ur.files[start:start+updated], fds[:updated])
-	if updated < len(fds) {
-		ur.files[start+updated] = -1
-	}
-
-	return updated, nil
+	return int(result), nil
 }
 
 // unregisterFiles removes all registered file descriptors.
 func (ur *ioUring) unregisterFiles() error {
-	if len(ur.files) < 1 {
+	if ur.fileSlots == 0 {
 		return ErrNotFound
 	}
 	_, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_UNREGISTER_FILES, nil, 0)
 	if errno != 0 {
 		return errFromErrno(errno)
 	}
-	ur.files = nil
+	ur.fileSlots = 0
 
 	return nil
 }
@@ -688,7 +635,7 @@ func (ur *ioUring) cleanupCoreRingResources() error {
 	}
 
 	ur.bufs = nil
-	ur.files = nil
+	ur.fileSlots = 0
 	ur.ops = nil
 
 	ur.unmapRings()

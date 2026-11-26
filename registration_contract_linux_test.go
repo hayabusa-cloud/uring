@@ -8,11 +8,14 @@ package uring_test
 
 import (
 	"errors"
+	"math"
 	"os"
+	"runtime"
 	"testing"
 	"time"
 
 	"code.hybscloud.com/uring"
+	"code.hybscloud.com/zcall"
 )
 
 func TestRegisterMemRegionCopiesDescriptorOutput(t *testing.T) {
@@ -83,6 +86,107 @@ func TestRegisterFilesUpdateRejectionPreservesRegistration(t *testing.T) {
 	cqe, ok := waitForOp(t, ring, uring.IORING_OP_READ, 2*time.Second)
 	if !ok || cqe.Res != int32(len(payload)) || string(buf) != payload {
 		t.Fatalf("registered read: present=%v result=%d data=%q", ok, cqe.Res, buf)
+	}
+}
+
+func registeredTestFD(t *testing.T, marker byte) int32 {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "registered-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.Close() })
+	if _, err := f.WriteAt([]byte{marker}, 0); err != nil {
+		t.Fatal(err)
+	}
+	return int32(f.Fd())
+}
+
+func TestRegisterFilesUpdateFailedReplacement(t *testing.T) {
+	a, b := registeredTestFD(t, 'A'), registeredTestFD(t, 'B')
+	ring := newTestRing(t)
+	if err := ring.RegisterFiles([]int32{a, a, a}); err != nil {
+		t.Fatal(err)
+	}
+	dst := ring.RegisteredBuffer(0)[:1]
+	checkSlot := func(slot int32, wantResult int32, wantByte byte) {
+		t.Helper()
+		dst[0] = 0
+		ctx := uring.PackDirect(uring.IORING_OP_READ, uring.IOSQE_FIXED_FILE, 0, slot)
+		if err := ring.Read(ctx, dst); err != nil {
+			t.Fatal(err)
+		}
+		cqe := waitForCQEs(t, ring, 1)[0]
+		if cqe.Context() != ctx || cqe.Res != wantResult || dst[0] != wantByte {
+			t.Fatalf("slot %d: context=%#x result=%d byte=%q, want %#x, %d, %q",
+				slot, cqe.Context().Raw(), cqe.Res, dst[0], ctx.Raw(), wantResult, wantByte)
+		}
+	}
+
+	const badFD = math.MaxInt32
+	if n, err := ring.RegisterFilesUpdate(0, []int32{b, badFD, b}); n != 1 || err != nil {
+		t.Fatalf("partial update = (%d, %v), want (1, nil)", n, err)
+	}
+	checkSlot(0, 1, 'B')
+	checkSlot(1, -int32(zcall.EBADF), 0)
+	checkSlot(2, 1, 'A')
+
+	if n, err := ring.RegisterFilesUpdate(2, []int32{badFD}); n != 0 || !errors.Is(err, zcall.Errno(zcall.EBADF)) {
+		t.Fatalf("first replacement = (%d, %v), want (0, EBADF)", n, err)
+	}
+	checkSlot(2, -int32(zcall.EBADF), 0)
+	if got := ring.RegisteredFileCount(); got != 3 {
+		t.Fatalf("RegisteredFileCount = %d, want 3", got)
+	}
+}
+
+func TestRegisterFilesUpdateBeforeLinkedRead(t *testing.T) {
+	a, b := registeredTestFD(t, 'A'), registeredTestFD(t, 'B')
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { reader.Close(); writer.Close() })
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+	ring := newTestRing(t, func(o *uring.Options) { o.MultiIssuers = false })
+	if err := ring.RegisterFiles([]int32{a}); err != nil {
+		t.Fatal(err)
+	}
+
+	gate := uring.PackDirect(uring.IORING_OP_POLL_ADD, uring.IOSQE_IO_LINK, 0, int32(reader.Fd()))
+	read := uring.PackDirect(uring.IORING_OP_READ, uring.IOSQE_FIXED_FILE, 0, 0)
+	dst := ring.RegisteredBuffer(0)[:1]
+	if err := ring.PollAdd(gate, uring.EPOLLIN); err != nil {
+		t.Fatal(err)
+	}
+	if err := ring.Read(read, dst); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ring.Wait(nil); err != nil {
+		t.Fatal(err)
+	}
+	if free, pending := ring.SQAvailable(), ring.CQPending(); free != ring.Features.SQEntries || pending != 0 {
+		t.Fatalf("before replacement: SQ space %d/%d, CQ pending %d", free, ring.Features.SQEntries, pending)
+	}
+	if n, err := ring.RegisterFilesUpdate(0, []int32{b}); n != 1 || err != nil {
+		t.Fatalf("replacement = (%d, %v), want (1, nil)", n, err)
+	}
+	if _, err := writer.Write([]byte{1}); err != nil {
+		t.Fatal(err)
+	}
+
+	var pollCQE, readCQE uring.CQEView
+	for _, cqe := range waitForCQEs(t, ring, 2) {
+		switch cqe.Context() {
+		case gate:
+			pollCQE = cqe
+		case read:
+			readCQE = cqe
+		}
+	}
+	if pollCQE.Res <= 0 || pollCQE.Res&uring.EPOLLIN == 0 || readCQE.Res != 1 || dst[0] != 'B' {
+		t.Fatalf("poll result=%d, fixed read result=%d byte=%q, want readable pipe and one byte 'B'", pollCQE.Res, readCQE.Res, dst[0])
 	}
 }
 

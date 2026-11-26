@@ -27,7 +27,7 @@ On a mixed ring, reserve distinct live IDs for sources that require different ac
 | Local request | Decode its live submission context, then interpret the operation result or notification below. |
 | `MsgRing` target | Deliver `Res` as the sender's signed value, including negative values. |
 | [`MsgRingFD` target](resources.md#inter-ring-file-transfers) | Use the installation result for the selected destination mode. |
-| [Resource retirement tag](https://github.com/torvalds/linux/blob/v6.18/io_uring/rsrc.c#L512-L529) | Mark the identified registration retired. Its zero result and flags can also occur on a successful NOP. |
+| [Resource retirement tag](files.md#retirement-tags) | Mark the identified registration retired. Its zero result and flags can also occur on a successful NOP. |
 
 ### Local Results and Flags
 

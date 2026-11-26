@@ -20,6 +20,7 @@ Read [core contracts](core.md), select a task and its required sources, then fol
 | Set up a listener | [Listener](recipes/listener.md) |
 | Cancel or drain a subscription | [Stream](recipes/stream.md), [lifecycle](recipes/lifecycle.md) |
 | Set a deadline or start, update or remove a timer | [Independent timers and linked deadlines](recipes/lifecycle.md#timers-and-linked-deadlines), [updates and removal](recipes/lifecycle.md#update-or-remove-a-timer) |
+| Register files, replace a slot or track its retirement | [Fixed-file lookup](boundary/files.md#fixed-file-lookup), [slot updates](boundary/files.md#updating-slots), [retirement tags](boundary/files.md#retirement-tags) |
 | Use buffers, registered files, or zero-copy | [Buffers](recipes/buffers.md), [receive-bundle handoff](recipes/buffers.md#hand-off-a-receive-bundle) |
 | Use incremental receive | [Incremental receive](recipes/buffers.md#incremental-receive) |
 | Retain completion data | [Retained completions](recipes/buffers.md#retained-completions) |

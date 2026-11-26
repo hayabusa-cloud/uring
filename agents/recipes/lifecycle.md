@@ -73,6 +73,8 @@ To reschedule an armed `LinkTimeout`, target the deadline’s ID and pass `uring
 | Provided/incremental buffer | Matching return, no kernel retention, caller borrows finished |
 | SEND_ZC payload | Complete data/notification history or valid no-notification fallback |
 | ZCRX reference | Refill publication or documented EOF path; blocked release stays owned |
+| [Registered file slot](../boundary/files.md#fixed-file-lookup) | Every request that needs this binding has acquired its file or finished |
+| [Tagged registration](../boundary/files.md#retirement-tags) | Its own matched retirement CQE, when using nonzero Linux resource tags |
 | Descriptor/registration | No operation or borrow can access it |
 | Ring | Work drained, CQEs reaped, subscriptions quiesced, caller serialized |
 

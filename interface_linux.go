@@ -1366,28 +1366,20 @@ func (ur *Uring) registerBufferRing(entries int, groupID uint16, flags uint16) (
 // Fixed Files
 // ========================================
 
-// RegisterFiles registers file descriptors for use with IOSQE_FIXED_FILE flag.
-// Registered files bypass per-operation fget/fput kernel calls.
-// fds must have between 1 and 2^32-1 entries.
-// The call is synchronous; fds may be reused after it returns.
+// RegisterFiles registers 1 to 2^32-1 process fds for IOSQE_FIXED_FILE.
+// Use -1 for an empty slot. The slice can be reused on return. An existing
+// table yields ErrExists until [Uring.UnregisterFiles] succeeds.
 //
-// Once registered, use the file index (0-based) instead of the fd in SQEs,
-// and set the IOSQE_FIXED_FILE flag.
-//
-// Returns ErrExists if files are already registered.
-// Use UnregisterFiles before re-registering.
+// A fixed read or poll looks up a zero-based slot in the ring's table, saving
+// a process-fd lookup. A linked request can reach that slot after SQ consumption.
 func (ur *Uring) RegisterFiles(fds []int32) error {
-	return ur.registerFiles(fds)
+	return ur.registerFileTable(len(fds), fds, 0)
 }
 
-// RegisterFilesSparse allocates a sparse file table of the given size.
-// All entries are initially empty (-1) and can be populated dynamically
-// using RegisterFilesUpdate.
-//
-// Sparse registration is useful for applications that manage a dynamic
-// set of file descriptors (e.g., connection pools, file caches).
+// RegisterFilesSparse registers a table of count empty file slots.
+// Use [Uring.RegisterFilesUpdate] to populate slots by index.
 func (ur *Uring) RegisterFilesSparse(count uint32) error {
-	return ur.registerFilesSparse(count)
+	return ur.registerFileTable(int(count), nil, IORING_RSRC_REGISTER_SPARSE)
 }
 
 // RegisterFilesUpdate updates registered files at the specified offset and
@@ -1395,13 +1387,11 @@ func (ur *Uring) RegisterFilesSparse(count uint32) error {
 // Use -1 to clear a slot, or a valid fd to set it.
 // fds must have between 1 and 2^32-1 entries. The update range must fit
 // within the registered file table.
-// The call is synchronous; fds may be reused after it returns.
-// A nil error does not imply full completion: Linux can return a positive
-// partial count after a later descriptor fails. Full completion requires
-// updated == len(fds). When Linux stops after clearing a destination slot,
-// the first entry excluded from updated is empty; this also occurs on a
-// first-entry EBADF or ENOMEM failure. Values below -1 are rejected; the raw
-// IORING_REGISTER_FILES_SKIP sentinel is not part of this method's domain.
+// The call is synchronous. fds may be reused after it returns.
+// Linux can return a positive prefix count with a nil error. Full completion
+// requires updated == len(fds). If Linux clears a slot and encounters EBADF or
+// ENOMEM acquiring the replacement, that slot stays empty even when updated is zero.
+// Values below -1, including IORING_REGISTER_FILES_SKIP, yield ErrInvalidParam.
 //
 // For an asynchronous update, use [Uring.FilesUpdate] and retain fds through
 // its completion.
@@ -1416,9 +1406,11 @@ func (ur *Uring) UnregisterFiles() error {
 	return ur.unregisterFiles()
 }
 
-// RegisteredFileCount returns the number of registered files, or 0 if none.
+// RegisteredFileCount returns the table size established by [Uring.RegisterFiles]
+// or [Uring.RegisterFilesSparse], including empty slots. It returns zero when
+// the ring has no such table.
 func (ur *Uring) RegisteredFileCount() int {
-	return len(ur.files)
+	return ur.fileSlots
 }
 
 // ========================================

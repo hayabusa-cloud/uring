@@ -374,7 +374,9 @@ func (ur *Uring) UnregisterFiles() error {
 	return ur.unregisterFiles()
 }
 
-// RegisteredFileCount returns the number of registered files, or 0 if none.
+// RegisteredFileCount returns the table size established by [Uring.RegisterFiles]
+// or [Uring.RegisterFilesSparse], including empty slots. It returns zero when
+// the ring has no such table.
 func (ur *Uring) RegisteredFileCount() int {
 	return len(ur.files)
 }

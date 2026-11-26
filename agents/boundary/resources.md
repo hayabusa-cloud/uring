@@ -10,7 +10,6 @@ Keep asynchronous storage reachable through typed Go roots, address-stable, and 
 |---------|----------------|
 | Submission metadata | Its kernel consumption; payload use may continue |
 | `SendMsgHeader` / `RecvMsg` header and referenced regions | Target completion; send storage remains immutable |
-| `FilesUpdate` array | Operation completion; allocation mode can write indexes |
 | Context facts | Copy before target mutation, reuse, or release; see [completion retention](sqe-cqe.md#completion-retention) |
 
 `SendMsgHeader` submits caller-prepared metadata; `SendMsg` builds it from buffers and an address. Enable `NotifySucceed` without explicit success suppression when completion governs reuse. SQ consumption and a cancellation CQE do not release the target's storage.
@@ -21,13 +20,18 @@ Registration methods return results synchronously. Separate the metadata passed 
 
 | Storage | Retain through |
 |---------|----------------|
-| `RegisterFiles` / `RegisterFilesUpdate` array | Method return; no CQE is needed to reuse the array |
+| `RegisterFiles` / `RegisterFilesUpdate` array | Return from the synchronous method |
+| Asynchronous `FilesUpdate` array | The operation's completion. Keep the array rooted, address-stable and unmodified by the caller. Allocation mode writes indexes back. |
 | `RegisterMemRegion` / `RegisterZCRXIfq` descriptors | Method return; read kernel-written fields then |
 | Caller-provided registered backing | All registrations and kernel uses; keep it reachable and address-stable |
 
-Integer fields such as `RegionDesc.UserAddr` and `ZCRXAreaReg.Addr` do not retain backing memory. With `IORING_MEM_REGION_REG_WAIT_ARG`, call `RegisterMemRegion` before `Start` enables the ring. Asynchronous `FilesUpdate` retains its array through operation completion.
+Integer fields such as `RegionDesc.UserAddr` and `ZCRXAreaReg.Addr` do not retain backing memory. With `IORING_MEM_REGION_REG_WAIT_ARG`, call `RegisterMemRegion` before `Start` enables the ring.
 
 `CloneBuffers` and `CloneBuffersFromRegistered` require Linux 6.18.3+ or a backport of the [buffer-cloning fix](https://github.com/torvalds/linux/commit/525916ce496615f531091855604eab9ca573b195) to preserve destination registrations after a replaced range. Unpatched kernels discard those registrations even when cloning succeeds.
+
+### Fixed-File Lookup
+
+Keep each slot bound to the intended file until every request that needs it has acquired its file or finished. [Lookup and replacement](files.md#fixed-file-lookup)
 
 ### Inter-Ring File Transfers
 
