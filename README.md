@@ -11,9 +11,11 @@ Language: **English** | [简体中文](./README.zh-CN.md) | [Español](./README.
 
 ## Overview
 
-`uring` is the kernel-facing boundary for Linux `io_uring`. It creates and starts rings, prepares SQEs, decodes CQEs, carries submission identity through `user_data`, and exposes buffer registration, multishot operations, and listener-setup primitives without becoming a scheduler.
+`uring` creates and starts Linux `io_uring` rings, prepares submission queue entries (SQEs), and copies completion queue entries (CQEs). It carries submission identity in `user_data` and provides buffer registration, multishot operations, and listener setup.
 
-The package keeps the boundary explicit: kernel mechanics and observable completion facts live here; policy and composition live in caller-side layers. Caller-side runtime code owns completion routing, route retirement, retry/backoff, handler and session routing, connection lifecycle, safety checks, and terminal resource release.
+`uring` follows the proactor model. For a read, the caller publishes an SQE, Linux performs the I/O, and the caller reaps the CQE with `Wait`. The caller matches `user_data` before deciding whether to retry, cancel, or advance a session. A multishot subscription retains its pooled context through dispatch of the original terminal CQE and any queued cancellation CQE.
+
+`code.hybscloud.com/iox` describes nonblocking results. The count records work already done. `iox.ErrWouldBlock` means further progress needs readiness or capacity. An application can use `iox.ErrMore` when its logical operation remains active. [Outcome rules](./AGENTS.md#outcome-discipline)
 
 The primary surfaces are:
 
@@ -365,19 +367,15 @@ The implementation sits at this boundary:
 
 1. `New` builds a disabled kernel ring, constructs context pools, and selects a buffer strategy.
 2. `Start` registers buffers and enables the ring for the 6.18+ baseline.
-3. Operation methods express intent by writing SQEs.
-4. `Wait` flushes submissions and returns copied CQE descriptors.
-5. Caller-side runtime code decides scheduling, retries, parking, connection/session routing, route retirement, safety checks, and terminal resource policy.
+3. Queued operations reserve an SQ slot, fill the SQE, and publish it.
+4. `Wait` drives pending submissions and copies CQEs before releasing their slots.
+5. The caller dispatches those completions, handles retries, and drains live work before `Stop`.
 
-This keeps `code.hybscloud.com/uring` focused on kernel-facing mechanics and preserves completion meaning across the boundary.
+Synchronous registration calls report their results on return. For example, `RegisterFilesUpdate` can return a short count with a nil error.
 
 ## Runtime boundary
 
-Runtime layers above `code.hybscloud.com/uring` should use it as the kernel backend, not as a scheduler. The boundary is one-way: `code.hybscloud.com/uring` prepares SQEs, reaps CQEs, preserves `user_data`, exposes CQE `res` and flags, and reports ownership facts; caller-side runtime code correlates those observations with its own tokens, applies retry/backoff, routes handlers and sessions, batches submissions, retires routes, and releases terminal resources.
-
-A runtime bridge can consume Extended-mode CQEs when abstract execution needs completion facts. A connection-scoped runtime can also poll raw Extended CQEs directly when it needs the CQE result, flags, buffer ID, and encoded token before reducing the event to handler callbacks.
-
-Context and abstract-execution layers above this boundary do not change `code.hybscloud.com/uring`'s kernel-boundary role.
+On a mixed completion queue, use `Wait` and match `cqe.Context().Raw()` before interpreting `Res` or reading a local request context. A target `MsgRing` CQE can carry a negative application value. On an Extended-only queue, `WaitExtended` returns the result, flags, and a borrowed `ExtSQE`. Copy any context fields needed later before the target is reused. [Completion contracts](agents/boundary/sqe-cqe.md#observation)
 
 ## Application-layer patterns
 

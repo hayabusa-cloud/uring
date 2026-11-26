@@ -27,23 +27,15 @@ Registration methods return results synchronously. Separate the metadata passed 
 
 Integer fields such as `RegionDesc.UserAddr` and `ZCRXAreaReg.Addr` do not retain backing memory. With `IORING_MEM_REGION_REG_WAIT_ARG`, call `RegisterMemRegion` before `Start` enables the ring.
 
-`CloneBuffers` and `CloneBuffersFromRegistered` require Linux 6.18.3+ or a backport of the [buffer-cloning fix](https://github.com/torvalds/linux/commit/525916ce496615f531091855604eab9ca573b195) to preserve destination registrations after a replaced range. Unpatched kernels discard those registrations even when cloning succeeds.
+With `replace` set, `CloneBuffers` and `CloneBuffersFromRegistered` install the source buffers in the requested destination slots and preserve registrations outside that range. [Buffer cloning](https://github.com/axboe/liburing/blob/liburing-2.13/man/io_uring_clone_buffers.3#L128-L132)
 
 ## File Lifetimes
 
 | Resource | Caller action |
 |----------|---------------|
 | <a id="accepted-sockets"></a>[Accepted socket](files.md#accepted-sockets) | Transfer or close every successful accept, including after callback withdrawal. Use the accept mode to identify the process fd or ring slot. |
-
-### Fixed-File Lookup
-
-Keep each slot bound to the intended file until every request that needs it has acquired its file or finished. [Lookup and replacement](files.md#fixed-file-lookup)
-
-### Inter-Ring File Transfers
-
-`MsgRingFD` keeps the source slot registered and installs a reference in the target ring. An explicit destination slot replaces its current file; `IORING_FILE_INDEX_ALLOC` allocates a free slot. Successful source and target CQEs report zero for an explicit slot or the allocated index. `skipCQE` suppresses only the target CQE.
-
-A source CQE with `-EOVERFLOW` means installation succeeded and the target notification failed. With `IORING_FILE_INDEX_ALLOC`, the sender also loses the allocated index from the result. Reconcile the target table before retrying. Another transfer can replace a file or allocate a second slot. [Linux implementation](https://github.com/torvalds/linux/blob/v6.18/io_uring/msg_ring.c#L176-L205)
+| <a id="fixed-file-lookup"></a>[Fixed-file slot](files.md#fixed-file-lookup) | Preserve the intended binding until the dependent requests have acquired it or finished. |
+| <a id="inter-ring-file-transfers"></a>[`MsgRingFD` target](files.md#inter-ring-file-transfers) | Account for the installed reference. On a source `-EOVERFLOW`, reconcile the target before retrying. |
 
 ## Provided Buffers
 
@@ -99,7 +91,9 @@ Keep shared bytes immutable until every accepted send releases them. An ordinary
 
 Cancellation and timeout race with the original operation. Observe their results and any remaining original CQEs before releasing the original request context.
 
-Serialize final `Close` and `Uring.Stop` after draining work, reaping CQEs, and quiescing subscriptions. `Uring.Stop` neither synthesizes terminal callbacks nor drains live operations. Requesting shutdown grants no early destruction permission.
+`Uring.Close` submits a close for one process fd, or one registered slot with `IOSQE_FIXED_FILE`. Submit it after the target's last use. Leave `IOSQE_CQE_SKIP_SUCCESS` clear to observe the result. On a full SQ, the caller still owns the close. Drive the ring and retry. A nil return admits the request. Stop using the target and reap the matched close CQE. Success reports zero. [Close encoding](../../operations_linux.go#L437-L456) · [File close example](../../examples/file_lifecycle_test.go#L150-L174)
+
+Call `Uring.Stop` on the serialized ring owner after draining accepted work, reaping outstanding CQEs and quiescing subscriptions. It tears down the ring without driving pending closes or invoking terminal callbacks. [Ring teardown](../../io_uring_linux.go#L602-L618)
 
 `ZCRXReceiver.Stop` requests cancellation. Its `Close` releases the mapped area only after receiver retirement and owning-ring teardown.
 

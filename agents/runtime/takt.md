@@ -62,9 +62,11 @@ Copy retained elements before the borrow expires. Copies share any referenced pa
 
 ### Drain and Ownership
 
-`Loop.Drain` discards suspensions and releases its completion slab. `SubscriptionLoop.Drain` requests cancellation of active routes, skips already-canceling routes, and retires routes. Neither waits for kernel retirement or establishes successful cancellation. Preserve backend dispatch for late required original/cancellation CQEs. [Lifecycle](../recipes/lifecycle.md)
+`Loop.Drain` discards suspensions and releases its completion slab.
 
-If admission must survive would-block, choose a surface that retains the suspended operation. [Admission](../recipes/oneshot.md#admission)
+`SubscriptionLoop.Cancel` returns a backend refusal and leaves the route active. If a full SQ refuses `AsyncCancel`, drive the ring and retry while the original request is live. Once the backend accepts cancellation, further calls on that live route return `nil` without another offer. [Cancel](https://github.com/hayabusa-cloud/takt/blob/v0.3.0/subscription.go#L151-L173)
+
+`SubscriptionLoop.Drain` returns the number of local routes it retired, including routes already canceling. It offers cancellation once for each other active route. A full SQ can leave a kernel poll delivering `MORE` after `Drain()` returns 1 and `Pending()` falls to zero. Record the refusal in the backend so its native owner can drive the ring and retry while the poll is live. Retain request identities and buffers through their release conditions and dispatch late CQEs. [Drain](https://github.com/hayabusa-cloud/takt/blob/v0.3.0/subscription.go#L186-L226) · [Poll cancellation](../recipes/lifecycle.md#request-and-observe)
 
 ## Cost Obligations
 

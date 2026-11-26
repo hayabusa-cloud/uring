@@ -27,3 +27,9 @@ The Go registration methods use zero file tags. If you supply a nonzero tag thro
 | `AcceptDirect` or `SubmitAcceptDirectMultishot` with `IORING_FILE_INDEX_ALLOC` | Allocated slot index | The socket in that ring slot |
 
 Give every success an owner, including a final CQE and any accept reaped after application delivery stops. A successful cancellation can also return zero. Match the original accept before acting. A socket already transferred stays with its recipient. [Linux accept](https://github.com/torvalds/linux/blob/v6.18/io_uring/net.c#L1679-L1703) · [liburing accept manual](https://man7.org/linux/man-pages/man3/io_uring_prep_accept.3.html) · [Withdrawing an accept handler](../recipes/stream.md#cancel-and-retire)
+
+## Inter-Ring File Transfers
+
+`MsgRingFD` keeps the source slot registered and installs a reference in the target ring. For an explicit destination, it replaces that slot and success reports zero. With `IORING_FILE_INDEX_ALLOC`, success reports the allocated target index. Both source and target CQEs carry that result when posted. `skipCQE` suppresses only the target CQE. [Transfer tests](../../integration_linux_test.go#L1791)
+
+A source CQE with `-EOVERFLOW` means the file was installed but the target notification failed. In allocation mode, the sender also loses the allocated index from the result. Reconcile the target table before retrying. Another transfer can replace a file or allocate a second slot. [Linux message-ring implementation](https://github.com/torvalds/linux/blob/v6.18/io_uring/msg_ring.c#L176-L205)

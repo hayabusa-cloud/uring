@@ -11,9 +11,11 @@ Langue: [English](./README.md) | [简体中文](./README.zh-CN.md) | [Español](
 
 ## Vue d'ensemble
 
-`uring` est le package Go qui expose l'interface noyau Linux `io_uring`. Il crée et démarre les rings, prépare les SQE, décode les CQE, achemine l'identité de soumission via `user_data` et fournit l'enregistrement de tampons, les opérations multishot ainsi que les primitives de mise en place des écouteurs, sans pour autant devenir un ordonnanceur.
+`uring` crée et démarre les rings Linux `io_uring`, prépare les entrées de la file de soumission (SQE) et copie les entrées de la file de complétion (CQE). Il conserve l'identité de la soumission dans `user_data` et permet d'enregistrer des tampons, d'utiliser les opérations multishot et de configurer des sockets d'écoute.
 
-`uring` repose sur une conception à interface explicite : la mécanique côté noyau et les faits de complétion observables se situent au bord de l'API, tandis que la politique et la composition relèvent des couches appelantes. Le code d'exécution côté appelant possède le routage des complétions, le retrait des routes, les reprises et l'attente progressive, le routage des gestionnaires et des sessions, les contrôles de sécurité, le cycle de vie des connexions et la libération terminale des ressources.
+`uring` suit le modèle Proactor. Pour une lecture, l’appelant publie une SQE, Linux effectue l’E/S et l’appelant recueille la CQE avec `Wait`. Il identifie la requête à l’aide de `user_data` avant de décider s’il doit réessayer, annuler ou faire avancer une session. Un abonnement multishot conserve son contexte issu du pool jusqu’au traitement de la CQE terminale de la requête initiale et de toute CQE d’annulation en attente.
+
+`code.hybscloud.com/iox` décrit les résultats des opérations non bloquantes. Le nombre renvoyé indique la quantité de travail déjà effectuée. `iox.ErrWouldBlock` indique qu’il faut attendre que la ressource soit prête ou que de la capacité se libère. L’application peut utiliser `iox.ErrMore` si son opération logique reste active. [Interprétation des résultats](./AGENTS.md#outcome-discipline)
 
 Les surfaces principales sont :
 
@@ -365,19 +367,15 @@ L'implémentation se structure autour des couches suivantes :
 
 1. `New` construit un ring noyau désactivé, crée les pools de contexte et détermine la stratégie de tampons.
 2. `Start` enregistre les tampons et active le ring conformément à la base fixe Linux 6.18+.
-3. Les méthodes d'opération publient l'intention en écrivant des SQE.
-4. `Wait` purge les soumissions et renvoie des descripteurs CQE copiés.
-5. Le code d'exécution côté appelant décide de l'ordonnancement, des reprises, de l'attente, du routage connexion/session, du retrait des routes, des contrôles de sécurité et de la politique terminale des ressources.
+3. Les opérations mises en file réservent une place dans la SQ, remplissent la SQE et la publient.
+4. `Wait` fait avancer les soumissions en attente et copie les CQE avant de libérer leurs places dans la file.
+5. L’appelant distribue ces complétions, gère les nouvelles tentatives et draine les opérations en cours avant d’appeler `Stop`.
 
-De cette manière, `code.hybscloud.com/uring` reste focalisé sur la mécanique côté noyau tout en préservant la sémantique des complétions au travers de l'interface.
+Les appels d’enregistrement synchrones renvoient directement leur résultat. Par exemple, `RegisterFilesUpdate` peut renvoyer un nombre d’entrées inférieur au nombre demandé avec une erreur `nil`.
 
 ## Frontière d'exécution
 
-Les couches d'exécution au-dessus de `code.hybscloud.com/uring` doivent l'utiliser comme backend noyau, pas comme ordonnanceur. La frontière est unidirectionnelle : `code.hybscloud.com/uring` prépare les SQE, récupère les CQE, préserve `user_data`, expose `res` et fanions des CQE, et rapporte les faits de propriété ; le code d'exécution côté appelant corrèle ces observations avec ses propres jetons, applique les reprises et l'attente progressive, achemine les gestionnaires et sessions, regroupe les soumissions, retire les routes et libère les ressources terminales.
-
-Un pont d'exécution peut consommer les CQE en mode Extended lorsque l'exécution abstraite a besoin des faits de complétion. Un environnement d'exécution par connexion peut aussi sonder directement les CQE Extended bruts lorsqu'il a besoin du résultat CQE, des fanions, de l'ID de tampon et du jeton encodé avant de réduire l'événement en rappels de gestionnaire.
-
-Les couches de contexte et d'exécution abstraite au-dessus de cette frontière ne modifient pas le rôle de frontière noyau de `code.hybscloud.com/uring`.
+Sur une file de complétion de sources mixtes, utilisez `Wait` et identifiez la source avec `cqe.Context().Raw()` avant d’interpréter `Res` ou de lire le contexte d’une requête locale. Une CQE `MsgRing` sur le ring destinataire peut contenir une valeur applicative négative. Sur une file réservée au mode Extended, `WaitExtended` renvoie le résultat, les indicateurs et un `ExtSQE` emprunté. Copiez les champs du contexte dont vous aurez besoin avant sa réutilisation. [Contrats de complétion](agents/boundary/sqe-cqe.md#observation)
 
 ## Patrons pour la couche applicative
 

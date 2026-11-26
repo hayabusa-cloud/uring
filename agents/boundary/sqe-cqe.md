@@ -1,12 +1,12 @@
 # SQE/CQE Boundary
 
-An adapter exposes one kernel-facing action and its observations. Apply the [encoding contract](encoding.md); preserve the independent completion facts below.
-
 ## Submission
 
-Check public and opcode-specific input domains before narrowing, indexing, or writing the SQE. Initialize required fields and clear rejected fields. Retain identity through completion, release, and outstanding [cancellation lookups](resources.md#managed-cancellation).
+Check the opcode's fields and the ring's issuer requirements before submission. [Encoding](encoding.md) · [Ring setup](encoding.md#setup-and-capabilities)
 
-The default single-issuer mode requires one locked OS thread from before `Start` through `Stop`, with serialized ring operations. Select `MultiIssuers=true` for shared submission or OS-thread migration. Goroutine serialization alone does not establish Linux task identity.
+Publishing the SQE admits the request. A full SQ returns `iox.ErrWouldBlock` before publication. For a batch returning `(accepted, err)`, keep the accepted prefix live even on error. Only the unaccepted suffix remains to submit. [Slot reservation and publication](../../submit_state.go) · [Counted multicast](../../multicast_unix.go)
+
+A local operation CQE with `Res == -EAGAIN` reports an admitted attempt. Check the opcode's effects before reissuing accepted work. When release requires a success CQE, choose a submission path and flags that produce it. [Inter-ring file transfers](files.md#inter-ring-file-transfers) · [Resource lifetimes](resources.md#retain-before-submit)
 
 ## Observation
 
@@ -26,7 +26,7 @@ On a mixed ring, reserve distinct live IDs for sources that require different ac
 |----------------|-----------------------|
 | Local request | Decode its live submission context, then interpret the operation result or notification below. |
 | `MsgRing` target | Deliver `Res` as the sender's signed value, including negative values. |
-| [`MsgRingFD` target](resources.md#inter-ring-file-transfers) | Use the installation result for the selected destination mode. |
+| [`MsgRingFD` target](files.md#inter-ring-file-transfers) | Use the installation result for the selected destination mode. |
 | [Resource retirement tag](files.md#retirement-tags) | Mark the identified registration retired. Its zero result and flags can also occur on a successful NOP. |
 
 ### Local Results and Flags
@@ -75,7 +75,7 @@ To change only the readiness mask, pass zero for `newUserData` and select `IORIN
 
 | Change | Retention obligation |
 |--------|----------------------|
-| `WithOp`, `WithFlags`, `WithBufGroup`, `WithFD`, `OrFlags` | These mutate pointer-backed targets; copy needed facts first |
+| `WithOp`, `WithFlags`, `WithBufGroup`, `WithFD`, `OrFlags` | Copy needed facts before these setters mutate a pointer-backed target, even if the next submission is refused |
 | Later submission | Replaces the retained base SQE, even without pool return |
 | Target reuse or release | Copy needed facts before invalidation; a packed context copy shares storage |
 
@@ -86,6 +86,8 @@ For example, save a READ's `Off()` before preparing a NOP on the same target. Re
 Sources: [publication](../../submit_state.go), [context setters](../../ctx.go), [CQE views](../../cqe_view.go), [SQE views](../../sqe_view.go). [Resource lifetimes](resources.md) govern retention.
 
 ## Batch and Hot-Path Obligations
+
+The wait methods consume every entry they return before caller dispatch begins. If dispatch stops at `dst[i]`, keep the action still owed for that entry. Each CQE in `dst[i+1:n]` also needs dispatch or cleanup. An accepted socket in that suffix needs an owner to take or close it. Before reusing `dst`, preserve the fields, live routes and resources needed for deferred dispatch. [Batch copy and head advance](../../io_uring_linux.go) · [Completion retention](#completion-retention) · [Accepted sockets](files.md#accepted-sockets)
 
 A batch reap with capacity and a visible CQE makes positive progress once it claims the copy. Shared consumers claim through CAS and `spin.Wait`, independently of submission locking. Copy before publishing the kernel head; publish before admitting the next consumer. Bound counts before narrowing, handle wrap without skips/repeats, and report overflow at the empty boundary.
 

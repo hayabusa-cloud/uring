@@ -11,9 +11,11 @@ Idioma: [English](./README.md) | [简体中文](./README.zh-CN.md) | **Español*
 
 ## Descripción general
 
-`uring` es el paquete Go que expone la interfaz de `io_uring` frente al kernel de Linux. Crea y arranca rings, prepara SQE, decodifica CQE, transporta la identidad de envío a través de `user_data` y ofrece registro de búferes, operaciones multishot y primitivas de configuración de escuchas, sin convertirse en un planificador.
+`uring` crea y arranca rings de Linux `io_uring`, prepara entradas de la cola de envío (SQE) y copia entradas de la cola de finalización (CQE). Conserva la identidad del envío en `user_data` y permite registrar búferes, usar operaciones multishot y configurar sockets de escucha.
 
-El diseño sigue un principio de frontera explícita: la mecánica orientada al kernel y los hechos observables de completado permanecen en el borde de la API, mientras que la política y la composición quedan en las capas del llamador. El código de ejecución del llamador posee el enrutamiento de finalizaciones, la retirada de rutas, los reintentos y la espera progresiva, el enrutamiento de manejadores y sesiones, las comprobaciones de seguridad, el ciclo de vida de conexiones y la liberación terminal de recursos.
+`uring` sigue el modelo Proactor. Para una lectura, el llamador publica una SQE, Linux realiza la E/S y el llamador recoge la CQE con `Wait`. Identifica la solicitud mediante `user_data` antes de decidir si debe reintentar, cancelar o avanzar la sesión. Una suscripción multishot conserva su contexto del pool hasta que se hayan despachado la CQE terminal de la solicitud original y cualquier CQE de cancelación encolada.
+
+`code.hybscloud.com/iox` describe los resultados de las operaciones no bloqueantes. El recuento indica cuánto trabajo se ha realizado. `iox.ErrWouldBlock` indica que para avanzar hay que esperar a que el recurso esté listo o tenga capacidad disponible. La aplicación puede usar `iox.ErrMore` si su operación lógica sigue activa. [Reglas de los resultados](./AGENTS.md#outcome-discipline)
 
 Las superficies principales son:
 
@@ -365,19 +367,15 @@ La frontera de implementación se define así:
 
 1. `New` construye un ring del kernel deshabilitado, crea los pools de contexto y elige la estrategia de búferes.
 2. `Start` registra los búferes y habilita el ring para la línea base fija de Linux 6.18+.
-3. Los métodos de operación declaran intención escribiendo SQE.
-4. `Wait` vacía los envíos y devuelve descriptores CQE copiados.
-5. El código de ejecución del llamador decide planificación, reintentos, espera, enrutamiento de conexión/sesión, retirada de rutas, comprobaciones de seguridad y política terminal de recursos.
+3. Las operaciones encoladas reservan una entrada en la SQ, rellenan la SQE y la publican.
+4. `Wait` impulsa los envíos pendientes y copia las CQE antes de liberar sus entradas en la cola.
+5. El llamador despacha esas finalizaciones, gestiona los reintentos y drena las operaciones en curso antes de llamar a `Stop`.
 
-De este modo, `code.hybscloud.com/uring` se mantiene centrado en la mecánica frente al kernel y preserva el significado de los completados a través de la frontera.
+Las llamadas de registro síncronas devuelven el resultado al terminar. Por ejemplo, `RegisterFilesUpdate` puede devolver un recuento inferior al solicitado con un error `nil`.
 
 ## Frontera de ejecución
 
-Las capas de ejecución por encima de `code.hybscloud.com/uring` deben usarlo como backend del kernel, no como planificador. La frontera es unidireccional: `code.hybscloud.com/uring` prepara SQEs, recoge CQEs, preserva `user_data`, expone `res` y marcas de CQE, e informa hechos de propiedad; el código de ejecución del llamador correlaciona esas observaciones con sus propios tokens, aplica reintentos y espera progresiva, enruta manejadores y sesiones, agrupa envíos, retira rutas y libera recursos terminales.
-
-Un puente de ejecución puede consumir CQEs en modo Extended cuando la ejecución abstracta necesita hechos de completado. Un entorno de ejecución por conexión también puede sondear CQEs Extended sin procesar directamente cuando necesita el resultado de CQE, las marcas, el ID de búfer y el token codificado antes de reducir el evento a devoluciones de llamada de manejador.
-
-Las capas de contexto y ejecución abstracta por encima de esta frontera no cambian el rol de `code.hybscloud.com/uring` como frontera del kernel.
+En una cola de finalización con eventos de distintos orígenes, use `Wait` e identifique el origen mediante `cqe.Context().Raw()` antes de interpretar `Res` o leer el contexto de una solicitud local. Una CQE de `MsgRing` en el ring de destino puede contener un valor negativo de la aplicación. En una cola reservada al modo Extended, `WaitExtended` devuelve el resultado, los indicadores y un `ExtSQE` prestado. Copie los campos del contexto que necesite más tarde antes de que se reutilice. [Contratos de finalización](agents/boundary/sqe-cqe.md#observation)
 
 ## Patrones para la capa de aplicación
 

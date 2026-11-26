@@ -1,16 +1,16 @@
 # Verify a Caller Contract
 
-State the operation, caller decision, retained resources and release evidence. Check the smallest complete contract, then implement and validate it.
+Verify the selected operation from admission through final release. Use the evidence appropriate to the claim.
 
 ## Read Sources
 
-Start with [core contracts](core.md) and the selected [task](INDEX.md). Read the current `iox` outcome contract and the complete relevant implementation and consumers in each [owning package](boundary/integration.md). Inspect the exact kernel ABI and capability path when the change depends on them.
+Read the `iox` outcome contract at the selected revision and trace the operation through its implementation and consumers in each owning package. For kernel-dependent behavior, inspect the applicable ABI, implementation and capability path. [Package ownership](boundary/integration.md) · [Primary sources](references.md)
 
-Record module versions or commits, relevant local changes, compiler/flags, architecture and kernel capabilities. Reuse evidence only for unchanged sources under the same assumptions. Resolve dependency sources through their published modules.
+Record module versions or commits, local changes, compiler flags, architecture and kernel capabilities. Resolve dependencies through their published modules. Reuse earlier results only for the same sources and assumptions.
 
 ## Design and Review
 
-Keep kernel observations separate from caller policy. Identify input domains before narrowing, one owner per resource, borrowed intervals, accepted prefixes, pending state and final release conditions. Preserve positive progress, failures, request liveness and protocol state independently.
+Identify input domains before narrowing, accepted prefixes, pending work, borrowed intervals, owners and release conditions. Trace positive progress, failures, request liveness and protocol state independently. [Core contracts](core.md)
 
 Simplify state storage, retry and lifecycle transitions only when the resulting contract remains valid. Preserve failed-CAS retries and contention backoff unless ownership, publication, lock scope and measured cost justify a change. Serialization alone is insufficient.
 
@@ -22,10 +22,10 @@ Check the implementation against the chosen contract, including failed guards, e
 |----------|-----------------|
 | Go | Format, build, static checks, behavior/races and applicable escape/allocation checks |
 | Example | Compile against selected APIs; exercise visible ownership and control flow |
-| Guide | Source correspondence, assumptions, links and consistency |
+| Guide | Check the task routes, anchors, source correspondence and assumptions under [guide checks](#guide-checks) |
 | Formal claim | Reviewed specification, model, theorem, assumptions, proof build and transitive axioms |
 
-Run Linux behavior on native Linux; cross-builds establish compatibility. Record commands, results, skips and unresolved claims. Source inspection, finite tests, proved models, implementation proofs and measurements are distinct evidence.
+For runtime changes, `make all` runs vet and race tests on native Linux 6.18+ with Go 1.27+. Cross-builds check compilation. Record commands, results, skips and unresolved claims. Distinguish source inspection, finite tests, model proofs, implementation proofs and measurements. [Setup](../SETUP.md) · [Makefile](../Makefile)
 
 ## Race and Waiting Rule
 
@@ -39,13 +39,13 @@ Measure initialization, first use, pool miss, steady state, cancellation and tea
 
 ## Guide Checks
 
-When reorganizing the guide, preserve every contract, assumption, formal statement, source reference and useful anchor. Record the previous revision so removed material remains traceable. Document the prerequisites and commands needed to reproduce each check.
+For a reorganization, record the starting revision and local edits. Follow each changed route from the [task index](INDEX.md#choose-a-task) to its contract or recipe. Check each section's inventory and local links. Follow existing fragments to confirm that their landing text still answers the original question or links directly to the answer.
 
-Read every page listed under [guide review](INDEX.md#review-the-guide). Check local links and anchors, and verify technical claims against the cited sources.
+Compare the result with the starting guide for preserved contracts, assumptions, formal statements and source references. Check technical claims against the owning implementation and document the prerequisites and commands for each check.
 
 Format and compile runnable examples with the selected dependencies (`go test -c ./examples`); run affected native cases. Compilation and feature skips establish no lifetime guarantee. Label pseudocode.
 
-For formal claims, use the [proof project](../proofs/README.md). Check the theorem statement and source mapping, not just a successful build. Document remaining implementation, kernel and environmental obligations.
+For formal claims, check the theorem statement, assumptions and source mapping. Record outstanding implementation, kernel and environment obligations. [Proof project](../proofs/README.md)
 
 ## Before Submitting Changes
 

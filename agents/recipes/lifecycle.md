@@ -6,7 +6,7 @@ Retire each owner without losing late observations. [Resource contract](../bound
 
 Account for accepted requests, live subscriptions, pending cancellations, borrowed contexts/payloads, ZC notifications, and ZCRX credits. Reuse existing owner state; this requires no additional runtime table.
 
-Stop admission before teardown. Retain unaccepted suffixes and pending protocol actions; accepted prefixes remain live after later submission failure.
+Stop accepting new application work. Keep driving accepted prefixes and submit the cancellations and file closes that teardown requires. Retain any unaccepted suffixes and pending protocol actions until their owner retries or discards them.
 
 ## Request and Observe
 
@@ -60,9 +60,7 @@ Link direction also matters. If an ordinary `Timeout` itself carries `IOSQE_IO_L
 
 Pass the timer’s submitted `user_data` to `TimeoutUpdate` or `TimeoutRemove`. Give each outstanding update or removal its own `IORING_OP_TIMEOUT_REMOVE` context. Leave `IOSQE_CQE_SKIP_SUCCESS` clear to observe its zero result on success. Successful removal gives the timer a separate terminal `-ECANCELED`. If the control reports `-ENOENT` or `-EALREADY` during expiry, keep routing the original timer through its terminal CQE. [Update and removal tests](../../integration_linux_test.go#L357) · [Control results](https://github.com/axboe/liburing/blob/liburing-2.13/man/io_uring_prep_timeout_update.3#L61-L78)
 
-On Linux 6.18.15 and 6.19.14, updating a standalone `Timeout` clears its count. A one-shot then waits for time alone. A periodic timer can continue past its original limit. To preserve a finite total, remove the old timer and count all expiries through its terminal CQE. Start a new timer only if a positive count remains. [Linux 6.18.15 update](https://github.com/gregkh/linux/blob/v6.18.15/io_uring/timeout.c#L420-L440) · [Linux 6.19.14 update](https://github.com/gregkh/linux/blob/v6.19.14/io_uring/timeout.c#L424-L444)
-
-To reschedule an armed `LinkTimeout`, target the deadline’s ID and pass `uring.WithTimeoutFlags(uring.IORING_LINK_TIMEOUT_UPDATE)` to `TimeoutUpdate`. Account for the update, the linked deadline and the operation it guards. [Linked timeout lookup](https://github.com/gregkh/linux/blob/v6.18.15/io_uring/timeout.c#L488-L502)
+To reschedule an armed `LinkTimeout`, target the deadline’s ID and pass `uring.WithTimeoutFlags(uring.IORING_LINK_TIMEOUT_UPDATE)` to `TimeoutUpdate`. Account for the update, the linked deadline and the operation it guards. [Linked timeout lookup](https://github.com/torvalds/linux/blob/v6.18/io_uring/timeout.c#L494-L502)
 
 ## Release Each Owner
 
@@ -73,14 +71,18 @@ To reschedule an armed `LinkTimeout`, target the deadline’s ID and pass `uring
 | Provided/incremental buffer | Matching return, no kernel retention, caller borrows finished |
 | SEND_ZC payload | Complete data/notification history or valid no-notification fallback |
 | ZCRX reference | Refill publication or documented EOF path; blocked release stays owned |
+| Process fd | Its remaining direct users have finished or ownership has transferred |
 | [Registered file slot](../boundary/files.md#fixed-file-lookup) | Every request that needs this binding has acquired its file or finished |
 | [Tagged registration](../boundary/files.md#retirement-tags) | Its own matched retirement CQE, when using nonzero Linux resource tags |
-| Descriptor/registration | No operation or borrow can access it |
+| [Registered backing memory](../boundary/resources.md#registration) | All registrations and kernel uses of that memory have ended |
+| [Accepted socket](../boundary/files.md#accepted-sockets) | Transfer to an owner or close each successful result, including after application delivery stops |
 | Ring | Work drained, CQEs reaped, subscriptions quiesced, caller serialized |
 
-Keep backend dispatch available for late CQEs after a [`takt` loop drains](../runtime/takt.md#drain-and-ownership) or `sess.Close` closes the local endpoint.
+Keep backend dispatch available for late CQEs after a `takt` loop drains or a session signals protocol termination. [Loop drain](../runtime/takt.md#drain-and-ownership) · [Session close](../runtime/sess.md#outputs-and-ownership)
 
-`Uring.Stop` is the final destructor and synthesizes no terminal callbacks. `ZCRXReceiver.Stop` requests cancellation; `Close` additionally requires receiver retirement and owning-ring teardown. Keep single-issuer task affinity through final `Stop`.
+When closing a file through `Uring.Close`, leave `IOSQE_CQE_SKIP_SUCCESS` clear. After admission, stop using the fd or slot and reap the close result before the final `Uring.Stop`. Keep single-issuer task affinity through `Stop`. [Close and ring teardown](../boundary/resources.md#cancellation-and-teardown)
+
+`ZCRXReceiver.Stop` requests cancellation. Call `ZCRXReceiver.Close` after the receiver retires and its ring has stopped.
 
 ## Validate
 

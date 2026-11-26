@@ -11,9 +11,11 @@ Go `io_uring` 内核接口包，面向 Linux 6.18+。
 
 ## 概述
 
-`uring` 是 Linux `io_uring` 的内核侧边界：负责创建并启动 ring、填充 SQE、解码 CQE，借助 `user_data` 传递提交标识，并提供缓冲区注册、multishot 操作及监听器初始化等原语，本身并不充当调度器。
+`uring` 负责创建并启动 Linux `io_uring` 实例，准备提交队列条目（SQE），并复制完成队列条目（CQE）。它通过 `user_data` 传递提交标识，并提供缓冲区注册、multishot 操作和监听套接字初始化功能。
 
-设计原则是明确划分边界：内核侧的机制与可观测的完成事实留在本 API 层面，调度策略与组合逻辑由调用方层负责。调用方运行时代码负责完成路由、路由退役、重试与退避、处理器与会话路由、连接生命周期、安全检查以及终态资源释放。
+`uring` 采用 Proactor 模型。以读取为例，调用方发布 SQE，Linux 执行 I/O，调用方通过 `Wait` 取回 CQE，再根据 `user_data` 找到对应的请求，决定是否重试、取消或推进会话。multishot 订阅持有从池中取得的上下文，直到调用方处理完原请求的终止 CQE 和所有已入队的取消 CQE。
+
+`code.hybscloud.com/iox` 描述非阻塞操作的结果。返回的计数表示已经完成的工作量。`iox.ErrWouldBlock` 表示需要等待资源就绪或出现可用空间才能继续。如果应用层的逻辑操作仍在进行，可以用 `iox.ErrMore` 表示。[结果判读规则](./AGENTS.md#outcome-discipline)
 
 核心类型：
 
@@ -365,19 +367,15 @@ CQE 路由仍由调用方负责。`ListenerOp.HandleCQE` 推进 SOCKET → BIND 
 
 1. `New` 创建处于禁用状态的内核 ring，构造上下文池，选定缓冲区策略。
 2. `Start` 注册缓冲区并启用 ring（固定 Linux 6.18+ 基线）。
-3. 操作方法通过写入 SQE 表达提交意图。
-4. `Wait` 刷新提交并返回已复制的 CQE 描述符。
-5. 调用方运行时代码负责调度、重试、挂起、连接与会话路由、路由退役、安全检查以及终态资源策略。
+3. 通过提交队列执行的操作会预留一个 SQ 槽位，填充 SQE 后将其发布。
+4. `Wait` 推进待处理的提交，并在释放 CQ 槽位前复制 CQE。
+5. 调用方分派这些 CQE，处理重试，并在调用 `Stop` 前排空在途操作。
 
-如此分工使 `code.hybscloud.com/uring` 专注于内核侧机制，同时在边界上保持清晰的完成语义。
+同步注册调用会在返回时给出结果。例如，`RegisterFilesUpdate` 返回的已处理条目数可能小于请求数，即使错误为 `nil`。
 
 ## 运行时边界
 
-`code.hybscloud.com/uring` 之上的运行时层应将其用作内核后端，而不是调度器。边界是单向的：`code.hybscloud.com/uring` 准备 SQE、回收 CQE、保留 `user_data`、暴露 CQE `res` 与标志，并报告所有权事实；调用方运行时代码将这些观测与自身令牌关联，应用重试与退避，路由处理器与会话，批量提交，退役路由，并释放终态资源。
-
-当抽象执行需要完成事实时，运行时桥接层可以消费 Extended 模式 CQE。连接级运行时也可以在需要 CQE 结果、标志、缓冲区 ID 与编码令牌时直接轮询原始 Extended CQE，然后再将事件归约为处理器回调。
-
-位于该边界之上的上下文层与抽象执行层不会改变 `code.hybscloud.com/uring` 的内核边界职责。
+当同一完成队列接收多种来源的事件时，使用 `Wait`，先根据 `cqe.Context().Raw()` 确认来源，再解释 `Res` 或读取本地请求的上下文。目标 ring 收到的 `MsgRing` CQE 可以携带应用定义的负值。如果队列只接收 Extended 模式的完成事件，`WaitExtended` 会返回结果、标志和借用的 `ExtSQE`。在上下文被复用前，复制后续仍需读取的字段。[完成契约](agents/boundary/sqe-cqe.md#observation)
 
 ## 应用层设计模式
 
