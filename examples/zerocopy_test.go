@@ -9,6 +9,7 @@ package examples_test
 import (
 	"bytes"
 	"runtime"
+	"slices"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"code.hybscloud.com/iox"
 	"code.hybscloud.com/sock"
 	"code.hybscloud.com/uring"
+	"code.hybscloud.com/zcall"
 )
 
 // A send result and permission to reuse its buffer are separate observations:
@@ -126,25 +128,27 @@ func (fds fdSliceTargets) Count() int       { return len(fds) }
 func (fds fdSliceTargets) FD(i int) iofd.FD { return fds[i] }
 
 // Multicast shares one immutable payload across independent target sends.
-// The returned count is accepted targets; each data CQE reports bytes for one
-// target. Reuse the shared buffer only after every accepted target releases it.
+// Advance by the accepted target count even on backpressure. Each data CQE
+// reports bytes for one peer. Keep the buffer until every send releases it.
 func TestMulticastZeroCopy(t *testing.T) {
-	// Automatic selection uses SEND for small payloads and SEND_ZC for larger
-	// ones. SEND_ZC still permits kernel copying; its CQE flags govern release.
+	// At 1024 bytes, four targets select SEND_ZC and a retry with three
+	// selects SEND. A SEND_ZC can still use kernel copying.
 	for _, tc := range []struct {
-		name    string
-		payload []byte
-		op      uint8
+		name       string
+		payload    []byte
+		queuedNops int
+		wantZC     int
 	}{
-		{"copy", []byte("one immutable buffer, four independent sends"), uring.IORING_OP_SEND},
-		{"zero_copy", bytes.Repeat([]byte("x"), 2048), uring.IORING_OP_SEND_ZC},
+		{"copy", []byte("one immutable buffer, four independent sends"), uring.EntriesPico, 0},
+		{"zero_copy", bytes.Repeat([]byte("x"), 2048), 0, 4},
+		{"partial_retry", bytes.Repeat([]byte("x"), 1024), uring.EntriesPico - 1, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			runtime.LockOSThread()
 			t.Cleanup(runtime.UnlockOSThread)
 
 			ring, err := uring.New(func(opt *uring.Options) {
-				opt.Entries = uring.EntriesNano
+				opt.Entries = uring.EntriesPico
 				opt.LockedBufferMem = uring.BufferSizeLarge
 				opt.ReadBufferNum = 64
 				opt.NotifySucceed = true
@@ -167,65 +171,84 @@ func TestMulticastZeroCopy(t *testing.T) {
 				fds[i], clients[i] = tcpPair(t)
 			}
 			payload := tc.payload
-			buf := ring.RegisteredBuffer(0)
+			buf := ring.RegisteredBuffer(0)[:len(payload)]
 			copy(buf, payload)
 			ctx := uring.ForFD(0)
-			accepted, submitErr := ring.MulticastZeroCopy(ctx, fdSliceTargets(fds[:]), 0, 0, len(payload))
-			// Even if a later submission fails, the accepted prefix still owns borrows.
-			var states [4]struct {
+			// Occupy SQ slots without adding successful NOPs to the send CQEs.
+			for range tc.queuedNops {
+				if err := ring.Nop(ctx, uring.WithFlags(uring.IOSQE_CQE_SKIP_SUCCESS)); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			var states [len(fds)]struct {
 				data, more, notification, released bool
 				result                             int32
 			}
-			remaining := accepted
-			for remaining > 0 {
-				var cqes [1]uring.CQEView
-				var backoff iox.Backoff
-				deadline := time.Now().Add(exampleTimeout)
-				for {
-					n, err := ring.Wait(cqes[:])
+			var cqes [1]uring.CQEView
+			var backoff iox.Backoff
+			var submitErr error
+			deadline := time.Now().Add(exampleTimeout)
+			accepted, released, zeroCopy := 0, 0, 0
+			for released < len(fds) {
+				if accepted < len(fds) && submitErr == nil {
+					n, err := ring.MulticastZeroCopy(ctx, fdSliceTargets(fds[accepted:]), 0, 0, len(buf))
+					accepted += n
 					if err != nil && !iox.IsWouldBlock(err) {
-						t.Fatalf("Wait: %v", err)
+						submitErr = err // Drain the accepted sends before reporting the failure.
 					}
-					if n > 0 {
-						backoff.Reset()
-						break
-					}
+				}
+				if submitErr != nil && released == accepted {
+					t.Fatalf("accepted %d targets: %v", accepted, submitErr)
+				}
+				// Wait flushes pending submissions. SQ space can open even when
+				// the CQ is empty, so return to admission after an empty poll.
+				n, err := ring.Wait(cqes[:])
+				if err != nil && !iox.IsWouldBlock(err) {
+					t.Fatalf("Wait: %v", err)
+				}
+				if n == 0 {
 					if time.Now().After(deadline) {
-						t.Fatal("timed out waiting for completion")
+						t.Fatalf("timed out: accepted=%d released=%d", accepted, released)
 					}
 					backoff.Wait()
+					continue
 				}
+				backoff.Reset()
 				cqe := cqes[0]
-				if cqe.Op() != tc.op {
-					t.Fatalf("opcode=%d, want %d", cqe.Op(), tc.op)
-				}
-				i := 0
-				for i < accepted && fds[i] != cqe.FD() {
-					i++
-				}
-				if i == accepted {
+				i := slices.Index(fds[:accepted], cqe.FD())
+				if i < 0 {
 					t.Fatalf("unknown target %d", cqe.FD())
 				}
 				s := &states[i]
 				if cqe.IsNotification() {
-					if s.notification {
-						t.Fatal("duplicate notification")
+					if cqe.Op() != uring.IORING_OP_SEND_ZC || s.notification {
+						t.Fatalf("target %d: unexpected notification %+v", i, cqe)
 					}
 					s.notification = true
 				} else {
 					if s.data {
-						t.Fatal("duplicate data completion")
+						t.Fatalf("target %d: duplicate data completion", i)
+					}
+					switch cqe.Op() {
+					case uring.IORING_OP_SEND:
+						if cqe.HasMore() {
+							t.Fatalf("target %d: ordinary SEND promised another completion", i)
+						}
+					case uring.IORING_OP_SEND_ZC:
+						zeroCopy++
+					default:
+						t.Fatalf("target %d: unexpected opcode %d", i, cqe.Op())
 					}
 					s.data, s.more, s.result = true, cqe.HasMore(), cqe.Res
 				}
 				if !s.released && s.data && (!s.more || s.notification) {
 					s.released = true
-					remaining--
+					released++
 				}
 			}
-			// All accepted targets have released the registered buffer.
-			if submitErr != nil || accepted != len(fds) {
-				t.Fatalf("accepted=%d err=%v", accepted, submitErr)
+			if zeroCopy != tc.wantZC {
+				t.Fatalf("got %d SEND_ZC data completions, want %d", zeroCopy, tc.wantZC)
 			}
 			for i := range clients {
 				sent := int(states[i].result)
@@ -235,7 +258,7 @@ func TestMulticastZeroCopy(t *testing.T) {
 				// Target admission does not promise a full stream write. Once every
 				// ZC borrow has ended, this caller chooses ordinary SEND for suffixes.
 				for sent < len(payload) {
-					if err := ring.SendFD(uring.ForFD(int32(fds[i])), fds[i], buf[sent:len(payload)]); err != nil {
+					if err := ring.SendFD(uring.ForFD(int32(fds[i])), fds[i], buf[sent:]); err != nil {
 						t.Fatalf("SendFD target %d: %v", i, err)
 					}
 					var cqes [1]uring.CQEView
@@ -261,16 +284,14 @@ func TestMulticastZeroCopy(t *testing.T) {
 					}
 					sent += int(cqe.Res)
 				}
-				got := make([]byte, len(payload))
-				for received := 0; received < len(got); {
-					n, err := clients[i].Read(got[received:])
-					received += n
-					if err != nil && received < len(got) {
-						t.Fatalf("target %d Read: received=%d err=%v", i, received, err)
-					}
+				// Read through EOF so replaying a target would also fail this check.
+				if errno := zcall.Shutdown(uintptr(fds[i]), zcall.SHUT_WR); errno != 0 {
+					t.Fatalf("target %d shutdown: %v", i, zcall.Errno(errno))
 				}
-				if !bytes.Equal(got, payload) {
-					t.Fatalf("target %d received %q", i, got)
+				var got bytes.Buffer
+				n, err := iox.Copy(&got, clients[i])
+				if err != nil || !bytes.Equal(got.Bytes(), payload) {
+					t.Fatalf("target %d received %d bytes, want one matching %d-byte payload: %v", i, n, len(payload), err)
 				}
 			}
 		})

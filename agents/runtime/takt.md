@@ -26,6 +26,8 @@ Serialize loop methods. Give each live one-shot submission a unique token. Copy 
 
 ### Drive a Deferred Request
 
+A `Backend.Submit` error means the backend accepted no work for that offer.
+
 | Where the offer stopped | Who retries |
 |-------------------------|-------------|
 | A full loop refuses `Submit` or `SubmitExpr` with `iox.ErrWouldBlock` | The caller can resubmit when a slot opens. The loop ran no part of the computation. |
@@ -34,9 +36,15 @@ Serialize loop methods. Give each live one-shot submission a unique token. Copy 
 
 With only deferred work, a healthy loop can report `Pending() > 0` and `Ready() == false`. Arrange a backend wake or retry deadline before parking the ring owner. [Local admission](https://github.com/hayabusa-cloud/takt/blob/v0.3.0/loop.go#L75-L125) · [Readiness and polling](https://github.com/hayabusa-cloud/takt/blob/v0.3.0/loop.go#L135-L148)
 
+### Submit Multicast as One Operation
+
+Use one operation per target when each send needs its own reply. For a single group reply, reserve the group’s token and tracking state before submitting any sends. Suppose `Multicast` returns `(1, iox.ErrWouldBlock)` for targets A and B. Return the group token and `nil` from `Backend.Submit`. The backend accounts for A’s send and offers only B when SQ space opens. Returning would-block here lets the loop send to A twice.
+
+Keep the remaining targets and payload valid across polls. Report send failures in the group reply. If it needs ordinary send byte counts, set `NotifySucceed` and leave `IOSQE_CQE_SKIP_SUCCESS` clear. [Multicast results and lifetimes](../boundary/resources.md#multicast) · [Backend submission contract](https://github.com/hayabusa-cloud/takt/blob/v0.3.0/backend.go#L63-L73)
+
 ### Completion Results
 
-During `Loop.Poll`, a backend submission error means the backend accepted no work for that offer. Submission errors other than would-block abort the loop. Return a valid completion batch with a nil poll error before reporting any subsequent poll failure.
+Backend submission errors other than would-block abort the loop. Return a valid completion batch with a nil poll error before reporting any subsequent poll failure.
 
 For a successful operation or ordinary operation error, `Completion.ResumeValue()` must supply the suspension's reply, including any operation error. Report completion-level would-block for retry only after the old request has retired without a reply or hidden partial progress. Completion `ErrMore` fails the one-shot loop. [Backend contract](https://github.com/hayabusa-cloud/takt/blob/v0.3.0/backend.go#L63-L87)
 

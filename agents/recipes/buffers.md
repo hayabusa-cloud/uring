@@ -35,7 +35,7 @@ For ZCRX, publish refills only after kernel delivery. `ZCRXBuffer.Release` retur
 
 ## Multiple Targets
 
-`Multicast` selects copy/zero-copy automatically; `MulticastZeroCopy` favors zero-copy at lower thresholds. Both require Direct context. Inspect opcode/flags; a smaller resumed target set can change selection. Advance by the accepted count even with an error; retry only the unaccepted targets. Track byte progress per target; a short stream send leaves its own unsent suffix. Preserve datagram message boundaries. Shared payload reuse waits for every applicable release.
+Submit `Multicast` or `MulticastZeroCopy` with Direct context. Advance the target list by the accepted count even on error. When retrying fewer targets, check each CQE's opcode and flags because the selected send operation can change. For a short stream send, retry that target's unsent byte suffix. Preserve datagram boundaries. Keep shared bytes intact while any target still needs them for submission or any accepted send still borrows them. [Multicast selection and release](../boundary/resources.md#multicast) · [One group reply in takt](../runtime/takt.md#submit-multicast-as-one-operation)
 
 ## Validate
 
