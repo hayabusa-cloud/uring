@@ -28,7 +28,7 @@ type OpOption struct {
 	Fadvise         int
 	Offset          int64 // File position or socket-buffer byte offset; see [WithOffset].
 	N               *int  // Optional byte limit; nil uses the operation's default. See [WithN].
-	Count           int   // Timeout completion count; values must fit uint32.
+	Count           int   // Timeout count. See [WithCount].
 	TimeoutFlags    uint32
 	SpliceFlags     uint32
 	FsyncFlags      uint32
@@ -154,8 +154,10 @@ func WithFadvise(advice int) OpOptionFunc {
 	}
 }
 
-// WithCount sets the timeout completion count.
-// Values must be in the inclusive uint32 domain.
+// WithCount sets the Linux timeout count. The default is one.
+// For a one-shot timer, zero waits for time alone. For a multishot timer,
+// a positive value limits expirations and zero allows it to repeat until stopped.
+// The count must fit uint32.
 func WithCount(cnt int) OpOptionFunc {
 	return func(opt *OpOption) {
 		opt.Count = cnt
@@ -176,7 +178,8 @@ func WithWriteBufferSize(n int) OpOptionFunc {
 	}
 }
 
-// WithTimeoutFlags sets timeout clock and behavior flags.
+// WithTimeoutFlags replaces the Linux timeout flags. A timer accepts at most
+// one clock selector. IORING_TIMEOUT_MULTISHOT requires a relative interval.
 func WithTimeoutFlags(flags uint32) OpOptionFunc {
 	return func(opt *OpOption) {
 		opt.TimeoutFlags = flags
@@ -204,14 +207,16 @@ func WithTimeoutRealTime() OpOptionFunc {
 	}
 }
 
-// WithTimeoutEtimeSuccess converts -ETIME into success.
+// WithTimeoutEtimeSuccess sets the Linux flag that preserves the soft-linked
+// successor on timer expiry. The Linux timer CQE still reports -ETIME.
 func WithTimeoutEtimeSuccess() OpOptionFunc {
 	return func(opt *OpOption) {
 		opt.TimeoutFlags |= IORING_TIMEOUT_ETIME_SUCCESS
 	}
 }
 
-// WithTimeoutMultishot makes the timeout fire repeatedly.
+// WithTimeoutMultishot selects a repeating relative timer on Linux.
+// [WithCount] sets the expiration limit.
 func WithTimeoutMultishot() OpOptionFunc {
 	return func(opt *OpOption) {
 		opt.TimeoutFlags |= IORING_TIMEOUT_MULTISHOT

@@ -20,7 +20,7 @@ Choose the wait by the contexts that can arrive on the ring. All three waits dri
 
 ### Completion Origin
 
-On a mixed ring, reserve distinct live IDs for sources that require different actions. Use `Wait` and match `cqe.Context().Raw()` before using request accessors or dispatching to a typed handler. A sender can choose an ID whose mode bits resemble a local context. [Mixed-ring test](../../integration_linux_test.go#L1663)
+On a mixed ring, reserve distinct live IDs for sources that require different actions. Use `Wait` and match `cqe.Context().Raw()` before using request accessors or dispatching to a typed handler. A sender can choose an ID whose mode bits resemble a local context. [Mixed-ring test](../../integration_linux_test.go#L1623)
 
 | Matched source | How to handle the CQE |
 |----------------|-----------------------|
@@ -37,7 +37,7 @@ For a matched local request, interpret operation results, notifications and live
 |----------|---------|
 | Nonnegative operation `Res` | The observed step succeeded; the value retains its opcode-specific meaning |
 | Operation `Res == -EAGAIN` | `iox.ErrWouldBlock`, even when `MORE` is present |
-| Other negative operation `Res` | The corresponding failure |
+| Other negative operation `Res` | Interpret the errno for that opcode. For example, `-ETIME` on a one-shot `Timeout` reports expiry. [Timer results](../recipes/lifecycle.md#timers-and-linked-deadlines) |
 | `IORING_CQE_F_MORE` | Same-request successor evidence; it does not change result classification or prove byte progress |
 | SEND_ZC notification (`IORING_CQE_F_NOTIF`) | Release evidence for the matched send. With `IORING_SEND_ZC_REPORT_USAGE`, test `uint32(Res) & IORING_NOTIF_USAGE_ZC_COPIED` for copy fallback or unused zero-copy. [Send buffer lifetime](resources.md#zero-copy-send-and-receive) |
 
@@ -48,6 +48,12 @@ Only an explicit caller contract may translate request liveness into `iox.ErrMor
 If two completions require different actions, the caller must be able to tell which submission produced each one. For example, two `FutexWait` requests on different words can produce identical Direct contexts, results and flags. Serialize those requests or give each a distinct live context. CQ order alone cannot distinguish them.
 
 For deferred dispatch, bind the event to its originating request when reaping or preserve the original token binding through delivery. Reuse a token only once late CQEs, notifications and outstanding cancellation lookups can no longer resolve to the new request. Copy borrowed fields while their target is valid. [Completion retention](#completion-retention) · [Managed cancellation](resources.md#managed-cancellation)
+
+### Change a Poll ID
+
+For a multishot poll using Direct contexts, bind a fresh `next` to the poll before calling `ring.PollUpdate(update, old.Raw(), next.Raw(), 0, uring.IORING_POLL_UPDATE_USER_DATA)`. Give `update` its own `IORING_OP_POLL_REMOVE` context. Its zero result acknowledges the change. The rearmed poll uses `next`. CQEs already generated under `old` keep that ID through deferred dispatch. To remove the live poll, target `next.Raw()`. Removal by `old.Raw()` can report `-ENOENT` while the poll is still active. [Go encoding](../../operations_linux.go#L222) · [Linux poll update and rearm](https://github.com/gregkh/linux/blob/v6.18.15/io_uring/poll.c#L925-L960)
+
+To change only the readiness mask, pass zero for `newUserData` and select `IORING_POLL_UPDATE_EVENTS`. The rearmed poll keeps its ID and multishot mode. A later ID-only update preserves that mask. [Poll update regression](../../integration_linux_test.go#L2405)
 
 ## Completion Retention
 

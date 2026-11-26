@@ -15,9 +15,10 @@ Read [core contracts](core.md), select a task and its required sources, then fol
 | Add or repair an operation adapter | [One-shot](recipes/oneshot.md), [encoding](boundary/encoding.md) |
 | Drive a ring directly | [One-shot](recipes/oneshot.md), [file write/read example](../examples/file_io_test.go#L30) |
 | Choose a wait or dispatch a mixed CQ | [Wait modes](boundary/sqe-cqe.md#observation), [completion origin](boundary/sqe-cqe.md#completion-origin) |
-| Bind a CQE to a request or retain it for later | [Request identity](boundary/sqe-cqe.md#request-identity), [retained fields](boundary/sqe-cqe.md#completion-retention) |
+| Bind a CQE to a request or retain it for later | [Request identity](boundary/sqe-cqe.md#request-identity), [changing a poll ID](boundary/sqe-cqe.md#change-a-poll-id), [retained fields](boundary/sqe-cqe.md#completion-retention) |
 | Set up a listener | [Listener](recipes/listener.md) |
 | Cancel or drain a subscription | [Stream](recipes/stream.md), [lifecycle](recipes/lifecycle.md) |
+| Set a deadline or start, update or remove a timer | [Independent timers and linked deadlines](recipes/lifecycle.md#timers-and-linked-deadlines), [updates and removal](recipes/lifecycle.md#update-or-remove-a-timer) |
 | Use buffers, registered files, or zero-copy | [Buffers](recipes/buffers.md) |
 | Use incremental receive | [Incremental receive](recipes/buffers.md#incremental-receive) |
 | Retain completion data | [Retained completions](recipes/buffers.md#retained-completions) |

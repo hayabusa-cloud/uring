@@ -11,7 +11,7 @@ Validate the operation's semantic domain and the destination field width before 
 | READV/WRITEV and fixed variants | `1..1024` iovecs; message operations permit `0..1024` |
 | Read/write offset | Nonnegative signed 64-bit offset, or `-1` for current position where the API permits it |
 | FileAdvise, Fallocate, SyncFileRange offset | Nonnegative; no current-position sentinel. Fallocate length is positive signed 64-bit |
-| Timeout completion count | Unsigned 32-bit even though its SQE field is 64-bit |
+| Timeout count | Unsigned 32-bit in a 64-bit SQE field. It counts qualifying completions for a one-shot timeout and limits expirations for a multishot timeout. [Timer modes](../recipes/lifecycle.md#timers-and-linked-deadlines) |
 | FUTEX_WAITV | `1..128` entries; operation flags zero |
 | EPOLL_WAIT | Positive signed 32-bit event count; inline timeout stays zero |
 | Socket domain/type/protocol and listen backlog | Nonnegative signed 32-bit values; operation-specific flags still apply |

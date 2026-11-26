@@ -277,155 +277,115 @@ func TestUringIntrospection(t *testing.T) {
 	t.Logf("Completed %d operations", completed)
 }
 
-func TestUringTimeoutCycle(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.NotifySucceed = true // Request a CQE for every successful operation.
-		opt.MultiIssuers = true  // Exercise the shared-submit configuration.
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	mustStartRing(t, ring)
-
-	ctx := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, 0, 0)
-	if err := ring.Timeout(ctx, 20*time.Millisecond, uring.WithCount(0)); err != nil {
-		t.Fatalf("Timeout: %v", err)
-	}
-
-	ev, ok := waitForOp(t, ring, uring.IORING_OP_TIMEOUT, time.Second)
-	if !ok {
-		t.Fatal("Timeout operation did not complete")
-	}
-	if ev.Res != -int32(zcall.ETIME) {
-		t.Fatalf("timeout result = %d, want -ETIME", ev.Res)
+func requireTerminalResults(t *testing.T, ring *uring.Uring, want map[uring.SQEContext]int32) {
+	t.Helper()
+	for _, cqe := range waitForCQEs(t, ring, len(want)) {
+		ctx := cqe.Context()
+		res, ok := want[ctx]
+		if !ok || cqe.Res != res || cqe.HasMore() {
+			t.Fatalf("CQE context=%#x result=%d flags=%#x, pending=%v", ctx.Raw(), cqe.Res, cqe.Flags, want)
+		}
+		delete(want, ctx)
 	}
 }
 
-// TestTimeoutUpdate validates the IORING_TIMEOUT_UPDATE flag.
-// Timeout update allows modifying an existing timeout's expiration in-place.
-func TestTimeoutUpdate(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions)
-	if err != nil {
-		t.Fatalf("New: %v", err)
+func TestUringTimeoutCycle(t *testing.T) {
+	nop := uring.PackDirect(uring.IORING_OP_NOP, 0, 1, 0)
+	timer := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, 2, 0)
+	linkedTimer := timer.OrFlags(uring.IOSQE_IO_LINK)
+	for _, tc := range []struct {
+		name    string
+		ctx     uring.SQEContext
+		delay   time.Duration
+		opts    []uring.OpOptionFunc
+		wantRes int32
+		wantNOP int32
+	}{
+		{name: "count reached", ctx: timer, delay: time.Hour},
+		{
+			name: "time only", ctx: timer, delay: time.Millisecond,
+			opts: []uring.OpOptionFunc{uring.WithCount(0)}, wantRes: -int32(zcall.ETIME),
+		},
+		{
+			name: "expiry cancels successor", ctx: linkedTimer, delay: time.Millisecond,
+			opts: []uring.OpOptionFunc{uring.WithCount(0)}, wantRes: -int32(zcall.ETIME), wantNOP: -int32(zcall.ECANCELED),
+		},
+		{
+			name: "successor runs", ctx: linkedTimer, delay: time.Millisecond,
+			opts: []uring.OpOptionFunc{uring.WithCount(0), uring.WithTimeoutEtimeSuccess()}, wantRes: -int32(zcall.ETIME),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ring := newTestRing(t, func(o *uring.Options) { o.NotifySucceed = true })
+			if err := ring.Timeout(tc.ctx, tc.delay, tc.opts...); err != nil {
+				t.Fatal(err)
+			}
+			if err := ring.Nop(nop); err != nil {
+				t.Fatal(err)
+			}
+			requireTerminalResults(t, ring, map[uring.SQEContext]int32{tc.ctx: tc.wantRes, nop: tc.wantNOP})
+		})
 	}
-	mustStartRing(t, ring)
+}
 
-	const targetUserData = uint16(42)
-
-	// Submit a long timeout (60s) that we'll update to be shorter
-	timeoutCtx := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, targetUserData, 0)
-	if err := ring.Timeout(timeoutCtx, 60*time.Second); err != nil {
-		t.Fatalf("Timeout: %v", err)
-	}
-	t.Log("Submitted 60s timeout with userData=42")
-
-	// Update the timeout to 10ms
-	updateCtx := uring.PackDirect(uring.IORING_OP_TIMEOUT_REMOVE, 0, 1, 0)
-	if err := ring.TimeoutUpdate(updateCtx, timeoutCtx.Raw(), 10*time.Millisecond, false); err != nil {
-		t.Fatalf("TimeoutUpdate: %v", err)
-	}
-	t.Log("Submitted TimeoutUpdate to change to 10ms")
-
-	// Collect CQEs - should get update result and eventually the timeout
-	cqes := make([]uring.CQEView, 8)
-	start := time.Now()
-
-	updateFound := false
-	for i := 0; i < 10; i++ {
-		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
-			t.Fatalf("Wait: %v", err)
-		}
-		for j := 0; j < n; j++ {
-			op := cqes[j].Op()
-			res := cqes[j].Res
-			t.Logf("CQE: op=%d res=%d", op, res)
-
-			if op == uring.IORING_OP_TIMEOUT_REMOVE {
-				if res == 0 {
-					updateFound = true
-					t.Log("TimeoutUpdate succeeded")
-				} else if res < 0 {
-					const ENOENT = 2
-					if -res == ENOENT {
-						t.Log("Timeout already expired or not found")
-					} else {
-						t.Logf("TimeoutUpdate error: %d", res)
-					}
+func TestTimeoutMultishot(t *testing.T) {
+	ring := newTestRing(t)
+	timer := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, 1, 0)
+	for _, tc := range []struct {
+		name string
+		want int
+		opts []uring.OpOptionFunc
+	}{
+		{"default", 1, []uring.OpOptionFunc{uring.WithTimeoutMultishot()}},
+		{"three expirations", 3, []uring.OpOptionFunc{uring.WithTimeoutMultishot(), uring.WithCount(3)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := ring.Timeout(timer, time.Millisecond, tc.opts...); err != nil {
+				t.Fatal(err)
+			}
+			for i, cqe := range waitForCQEs(t, ring, tc.want) {
+				wantMore := i+1 < tc.want
+				if cqe.Context() != timer || cqe.Res != -int32(zcall.ETIME) || cqe.HasMore() != wantMore {
+					t.Fatalf("expiry %d: context=%#x result=%d more=%t, want context=%#x result=-ETIME more=%t",
+						i+1, cqe.Context().Raw(), cqe.Res, cqe.HasMore(), timer.Raw(), wantMore)
 				}
 			}
-		}
-		if updateFound {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
+		})
 	}
+}
 
-	elapsed := time.Since(start)
-	t.Logf("Elapsed: %v", elapsed)
-
-	// Verify the API signature works
-	t.Run("APISignature", func(t *testing.T) {
-		ctx := uring.PackDirect(uring.IORING_OP_TIMEOUT_REMOVE, 0, 1, 0)
-		// Test both relative and absolute modes
-		_ = ring.TimeoutUpdate(ctx, 0, time.Second, false) // relative
-		_ = ring.TimeoutUpdate(ctx, 0, time.Second, true)  // absolute
-		t.Log("API signature verified")
-	})
+func TestTimeoutUpdate(t *testing.T) {
+	ring := newTestRing(t, func(o *uring.Options) { o.NotifySucceed = true })
+	timer := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, 42, 0)
+	update := uring.PackDirect(uring.IORING_OP_TIMEOUT_REMOVE, 0, 1, 0)
+	for _, absolute := range []bool{false, true} {
+		t.Run(fmt.Sprintf("absolute=%t", absolute), func(t *testing.T) {
+			if err := ring.Timeout(timer, time.Hour, uring.WithCount(0), uring.WithTimeoutRealTime()); err != nil {
+				t.Fatal(err)
+			}
+			deadline := time.Millisecond
+			if absolute {
+				deadline = time.Duration(time.Now().UnixNano())
+			}
+			if err := ring.TimeoutUpdate(update, timer.Raw(), deadline, absolute); err != nil {
+				t.Fatal(err)
+			}
+			requireTerminalResults(t, ring, map[uring.SQEContext]int32{update: 0, timer: -int32(zcall.ETIME)})
+		})
+	}
 }
 
 func TestTimeoutRemove(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.NotifySucceed = true
-		opt.MultiIssuers = true
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
+	ring := newTestRing(t, func(o *uring.Options) { o.NotifySucceed = true })
+	timer := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, 0, 0)
+	remove := uring.PackDirect(uring.IORING_OP_TIMEOUT_REMOVE, 0, 1, 0)
+	if err := ring.Timeout(timer, time.Minute, uring.WithCount(0)); err != nil {
+		t.Fatal(err)
 	}
-	mustStartRing(t, ring)
-
-	timeoutCtx := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, 0, 0)
-	if err := ring.Timeout(timeoutCtx, time.Minute); err != nil {
-		t.Fatalf("Timeout: %v", err)
+	if err := ring.TimeoutRemove(remove, timer.Raw()); err != nil {
+		t.Fatal(err)
 	}
-
-	removeCtx := uring.PackDirect(uring.IORING_OP_TIMEOUT_REMOVE, 0, 0, 0)
-	if err := ring.TimeoutRemove(removeCtx, timeoutCtx.Raw()); err != nil {
-		t.Fatalf("TimeoutRemove: %v", err)
-	}
-
-	cqes := make([]uring.CQEView, 8)
-	deadline := time.Now().Add(time.Second)
-	timeoutRemoved := false
-	timeoutCanceled := false
-	b := iox.Backoff{}
-
-	for time.Now().Before(deadline) && (!timeoutRemoved || !timeoutCanceled) {
-		n, err := ring.Wait(cqes)
-		if err != nil &&
-			!errors.Is(err, iox.ErrWouldBlock) {
-			t.Fatalf("Wait: %v", err)
-		}
-		for i := 0; i < n; i++ {
-			switch cqes[i].Op() {
-			case uring.IORING_OP_TIMEOUT_REMOVE:
-				if cqes[i].Res != 0 {
-					t.Fatalf("TimeoutRemove CQE res = %d, want 0", cqes[i].Res)
-				}
-				timeoutRemoved = true
-			case uring.IORING_OP_TIMEOUT:
-				if cqes[i].Res != -int32(zcall.ECANCELED) {
-					t.Fatalf("Timeout CQE res = %d, want %d", cqes[i].Res, -int32(zcall.ECANCELED))
-				}
-				timeoutCanceled = true
-			}
-		}
-		b.Wait()
-	}
-
-	if !timeoutRemoved || !timeoutCanceled {
-		t.Fatalf("timeout removal incomplete: remove=%t timeout=%t", timeoutRemoved, timeoutCanceled)
-	}
+	requireTerminalResults(t, ring, map[uring.SQEContext]int32{remove: 0, timer: -int32(zcall.ECANCELED)})
 }
 
 func TestUringLinkTimeoutCycle(t *testing.T) {
@@ -2442,106 +2402,62 @@ func TestPollModes(t *testing.T) {
 	})
 }
 
-// TestPollUpdate validates the IORING_OP_POLL_REMOVE with update flags.
-// Poll update allows modifying an existing poll's events or userData in-place.
 func TestPollUpdate(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
-	})
+	ring := newTestRing(t)
+	fds, err := newUnixSocketPairForTest()
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatal(err)
 	}
-	mustStartRing(t, ring)
+	defer closeTestFds(fds)
 
-	// Create pipe using zcall
-	var fds [2]int32
-	errno := zcall.Pipe2(&fds, zcall.O_NONBLOCK|zcall.O_CLOEXEC)
-	if errno != 0 {
-		t.Fatalf("Pipe2: %v", zcall.Errno(errno))
-	}
-	readFD, writeFD := uintptr(fds[0]), uintptr(fds[1])
-	defer zcall.Close(readFD)
-	defer zcall.Close(writeFD)
+	old := uring.PackDirect(uring.IORING_OP_POLL_ADD, 0, 1, int32(fds[0]))
+	next := old.WithBufGroup(2)
+	changeMask := uring.PackDirect(uring.IORING_OP_POLL_REMOVE, 0, 3, 0)
+	changeID := changeMask.WithBufGroup(4)
+	removeOld := changeMask.WithBufGroup(5)
+	removeNext := changeMask.WithBufGroup(6)
 
-	const originalUserData = uint16(100)
-	const updatedUserData = uint64(200)
-
-	// Submit initial poll on read end
-	pollCtx := uring.PackDirect(uring.IORING_OP_POLL_ADD, 0, originalUserData, int32(readFD))
-	if err := ring.PollAddMultishot(pollCtx, uring.EPOLLIN); err != nil {
-		t.Fatalf("PollAddMultishot: %v", err)
-	}
-	if _, err := ring.Wait(nil); err != nil {
-		t.Fatalf("Wait(nil): %v", err)
-	}
-
-	// Submit PollUpdate to change userData
-	updateCtx := uring.PackDirect(uring.IORING_OP_POLL_REMOVE, 0, 1, int32(readFD))
-	oldUserData := pollCtx.Raw() // The packed userData of the original poll
-	updateFlags := uring.IORING_POLL_UPDATE_USER_DATA
-	if err := ring.PollUpdate(updateCtx, oldUserData, updatedUserData, 0, updateFlags); err != nil {
-		t.Fatalf("PollUpdate: %v", err)
-	}
-
-	// Collect CQEs
-	cqes := make([]uring.CQEView, 8)
-	deadline := time.Now().Add(2 * time.Second)
-	b := iox.Backoff{}
-	n := 0
-	for time.Now().Before(deadline) {
-		n, err = ring.Wait(cqes)
-		if err != nil {
-			if errors.Is(err, iox.ErrWouldBlock) {
-				b.Wait()
-				continue
-			}
-			t.Fatalf("Wait: %v", err)
-		}
-		break
-	}
-	if n == 0 {
-		t.Fatal("PollUpdate did not complete")
-	}
-
-	// Analyze results
-	t.Logf("Got %d CQEs", n)
-	updateFound := false
-	for i := 0; i < n; i++ {
-		res := cqes[i].Res
-		t.Logf("CQE %d: res=%d", i, res)
-		// Check if this is the update CQE
-		if res == 0 {
-			updateFound = true
-		} else if res < 0 {
-			// ENOENT (-2) means poll not found
-			// EINVAL (-22) indicates that the current host rejected the operation
-			const ENOENT = 2
-			const EINVAL = 22
-			absRes := -res
-			if absRes == ENOENT {
-				t.Log("Poll not found (ENOENT) - may have already completed")
-			} else if absRes == EINVAL {
-				t.Fatalf("PollUpdate returned EINVAL on Linux 6.18+ baseline")
-			} else {
-				t.Logf("Error result: %d", res)
-			}
+	requireReady := func(want uring.SQEContext, events int32) {
+		t.Helper()
+		cqe := waitForCQEs(t, ring, 1)[0]
+		if cqe.Context() != want || cqe.Res != events || !cqe.HasMore() {
+			t.Fatalf("poll CQE context=%#x result=%#x flags=%#x, want context=%#x events=%#x with F_MORE",
+				cqe.Context().Raw(), cqe.Res, cqe.Flags, want.Raw(), events)
 		}
 	}
 
-	if updateFound {
-		t.Log("PollUpdate succeeded")
+	if err := ring.PollAddMultishot(old, uring.EPOLLOUT); err != nil {
+		t.Fatal(err)
+	}
+	requireReady(old, uring.EPOLLOUT)
+
+	// The socket is writable but has no data to read until the peer writes.
+	if err := ring.PollUpdate(changeMask, old.Raw(), 0, uring.EPOLLIN, uring.IORING_POLL_UPDATE_EVENTS); err != nil {
+		t.Fatal(err)
+	}
+	requireTerminalResults(t, ring, map[uring.SQEContext]int32{changeMask: 0})
+	if err := ring.PollUpdate(changeID, old.Raw(), next.Raw(), 0, uring.IORING_POLL_UPDATE_USER_DATA); err != nil {
+		t.Fatal(err)
+	}
+	requireTerminalResults(t, ring, map[uring.SQEContext]int32{changeID: 0})
+
+	if n, errno := writeTestFD(fds[1], []byte{1}); n != 1 || errno != 0 {
+		t.Fatalf("peer write: n=%d errno=%v", n, zcall.Errno(errno))
+	}
+	requireReady(next, uring.EPOLLIN)
+	var buf [1]byte
+	if n, errno := readTestFD(fds[0], buf[:]); n != 1 || errno != 0 {
+		t.Fatalf("read: n=%d errno=%v", n, zcall.Errno(errno))
 	}
 
-	// Verify the API signature is correct - this is a compile-time check
-	t.Run("APISignature", func(t *testing.T) {
-		ctx := uring.PackDirect(uring.IORING_OP_POLL_REMOVE, 0, 1, 0)
-		// Test all parameter combinations compile
-		_ = ring.PollUpdate(ctx, 0, 0, 0, 0)
-		_ = ring.PollUpdate(ctx, 0, 0, 0, uring.IORING_POLL_UPDATE_EVENTS)
-		_ = ring.PollUpdate(ctx, 0, 0, 0, uring.IORING_POLL_UPDATE_USER_DATA)
-		_ = ring.PollUpdate(ctx, 0, 0, 0, uring.IORING_POLL_UPDATE_EVENTS|uring.IORING_POLL_UPDATE_USER_DATA)
-		t.Log("API signature verified")
-	})
+	if err := ring.PollRemove(removeOld, old.Raw()); err != nil {
+		t.Fatal(err)
+	}
+	requireTerminalResults(t, ring, map[uring.SQEContext]int32{removeOld: -int32(zcall.ENOENT)})
+	if err := ring.PollRemove(removeNext, next.Raw()); err != nil {
+		t.Fatal(err)
+	}
+	requireTerminalResults(t, ring, map[uring.SQEContext]int32{removeNext: 0, next: -int32(zcall.ECANCELED)})
 }
 
 // =============================================================================
