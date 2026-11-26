@@ -211,7 +211,7 @@ ring.PutExtSQE(ext)
 
 ### 通过 `CQEView` 分发完成事件
 
-`Wait` 报告收取这批 CQE 时发生的错误。请分派返回的每个 CQE，包括失败请求的 CQE。对于本地请求，`cqe.Context()` 返回提交时的标识。用 `cqe.Err()` 解析操作结果。零拷贝发送通知的 `Res` 字段可能包含使用情况标志。CQE 标志用于判断请求和缓冲区的生命周期。
+`Wait` 返回 `iox.ErrWouldBlock` 表示当前没有可收取的 CQE。成功时，分派全部 `n` 个 CQE，包括失败请求的 CQE。对于本地请求，`cqe.Context()` 返回提交时的标识。用 `cqe.Err()` 解析操作结果。零拷贝发送通知的 `Res` 字段可能包含使用情况标志。CQE 标志用于判断请求和缓冲区的生命周期。
 
 发送方和接收方约定将 `messageID` 专用于 `MsgRing`。本例的环上，其余标识都属于本地请求。先匹配 `messageID`，匹配后将发送方传入的有符号值 `Res` 原样交给消息处理函数，包括负值。
 
@@ -220,9 +220,6 @@ var cqes [64]uring.CQEView
 n, err := ring.Wait(cqes[:])
 if err != nil {
 	return err
-}
-if n == 0 {
-	return iox.ErrWouldBlock
 }
 
 for i := range n {
@@ -388,42 +385,35 @@ CQE 路由仍由调用方负责。`ListenerOp.HandleCQE` 推进 SOCKET → BIND 
 
 ### Ring 所有者事件循环
 
-默认 ring 的事件循环应由在 `Start` 前绑定到 OS 线程的 goroutine 执行，并保持绑定直到 `Stop`。该循环串行执行 ring 操作、提交待处理工作，在 `Wait` 没有返回可观察进展时使用调用方持有的 `iox.Backoff`，并分发完成事件。
+在 `Start` 前将默认 ring 的所有者 goroutine 锁定到一个 OS 线程，直到 `Stop` 结束后再解锁。提交请求后，所有者调用 `Wait` 收取完成事件。
 
 ```go
-func runLoop(ring *uring.Uring, stop <-chan struct{}) error {
-	cqes := make([]uring.CQEView, 64)
-	var backoff iox.Backoff
-	for {
-		select {
-		case <-stop:
-			// The caller must still cancel and drain live requests before ring.Stop.
-			return nil
-		default:
-		}
+cqes := make([]uring.CQEView, 64)
+var backoff iox.Backoff
+for {
+	select {
+	case <-stop:
+		// 调用方在停止 ring 前取消仍在执行的请求，并收完剩余的 CQE。
+		return nil
+	default:
+	}
 
-		n, err := ring.Wait(cqes)
-		switch iox.Classify(err) {
-		case iox.OutcomeWouldBlock:
-			backoff.Wait()
-			continue
-		case iox.OutcomeFailure:
-			return err
-		}
-		if n == 0 {
-			backoff.Wait()
-			continue
-		}
-
+	n, err := ring.Wait(cqes)
+	switch iox.Classify(err) {
+	case iox.OutcomeOK:
 		backoff.Reset()
 		for i := range n {
 			dispatch(ring, cqes[i])
 		}
+	case iox.OutcomeWouldBlock:
+		backoff.Wait()
+	case iox.OutcomeFailure:
+		return err
 	}
 }
 ```
 
-所有 ring 方法，包括 `Send`、`Receive`、`AcceptMultishot` 和 `Wait`，均在该 goroutine 上执行。来自其他 goroutine 的工作应通过调用方持有的工作邮箱（例如 `code.hybscloud.com/lfq`）进入循环，不可直接调用 ring 方法。`iox.Backoff` 由调用方持有：当 `Wait` 返回的错误被分类为 `iox.OutcomeWouldBlock`，或一次 `Wait` 没有回收到任何 CQE 时，调用 `backoff.Wait()`；回收到 `n > 0` 的 CQE 批次后，调用 `backoff.Reset()`。
+即使 `Wait` 成功，批次中也可能有操作失败的 CQE，因此要分发全部 `n` 个条目。如果还有提交请求需要重试，即使 CQ 为空，也应在两次轮询之间检查这些请求。[重试托管的 accept](agents/recipes/stream.md#rearm-a-managed-accept)
 
 ### Multishot 订阅生命周期
 
@@ -441,7 +431,7 @@ handler := uring.NewMultishotSubscriber().
 	}).
 	OnStop(func(err error, cancelled bool) {
 		if !cancelled {
-			resubscribeAccept()
+			queueAcceptRetry(err)
 		}
 	})
 
@@ -459,6 +449,8 @@ for i := range n {
 	dispatch(ring, cqes[i])
 }
 ```
+
+`queueAcceptRetry` 为 ring 所有者记录终止结果。执行 `OnStop` 时，旧订阅可能仍持有最后一个 Extended 上下文。分发完 CQE 后，所有者根据终止结果和监听套接字的状态决定是否再次提交 accept。如果 `AcceptMultishot` 返回 `iox.ErrWouldBlock`，则保留这次重试。[重新提交托管的 accept](agents/recipes/stream.md#rearm-a-managed-accept)
 
 每一次 `OnStep` 回调观察一个 `MultishotStep`：返回 `MultishotContinue` 保持流活跃，或返回 `MultishotStop` 请求取消。如果回调一直保持启用直到终态观察，`OnStop` 至多以最终错误及 `cancelled` 标志触发一次；在步骤自身上，`step.Cancelled` 在边界处把内核的 `-ECANCELED` 判定与其他失败明确区分开。这两个回调分别对应 `MultishotHandler.OnMultishotStep` 和 `MultishotHandler.OnMultishotStop`；也可以直接实现该接口。`HandleCQE` 用于调用方串行化完成循环内的立即 dispatch；若调用方在该循环之后保留复制 CQE，则需维护自己的 route state，并拒绝已退役订阅的观察。在默认的单提交者 ring（`MultiIssuers=false`）上，应从固定于 OS 线程的 ring 所有者调用 `Cancel` / `Unsubscribe`，并将其与提交、`Wait`、`WaitDirect`、`WaitExtended`、`Stop` 以及 `ResizeRings` 串行化。`MultiIssuers=true` 的 ring 通过共享提交路径串行化取消 SQE。
 

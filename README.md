@@ -211,7 +211,7 @@ ring.PutExtSQE(ext)
 
 ### Completion dispatch with `CQEView`
 
-`Wait` reports errors while reaping the batch. Dispatch every returned CQE, including failures. For a local request, `cqe.Context()` returns its submission token. Use `cqe.Err()` on an operation result. A zero-copy send notification can carry usage flags in `Res`. The CQE flags describe request and buffer lifetimes.
+`iox.ErrWouldBlock` from `Wait` means no CQE is ready. On success, dispatch all `n` CQEs, including those for failed requests. For a local request, `cqe.Context()` returns its submission token. Use `cqe.Err()` on an operation result. A zero-copy send notification can carry usage flags in `Res`. The CQE flags describe request and buffer lifetimes.
 
 The sender and receiver reserve `messageID` for `MsgRing`. Every other ID on this example's ring belongs to a local request. Match `messageID` first and pass the sender's signed `Res`, including negative values, to the message handler.
 
@@ -220,9 +220,6 @@ var cqes [64]uring.CQEView
 n, err := ring.Wait(cqes[:])
 if err != nil {
 	return err
-}
-if n == 0 {
-	return iox.ErrWouldBlock
 }
 
 for i := range n {
@@ -388,42 +385,35 @@ Context and abstract-execution layers above this boundary do not change `code.hy
 
 ### Ring-owning event loop
 
-Run the default ring's event loop on the goroutine locked before `Start`, keeping it locked through `Stop`. The loop serializes ring operations, submits pending work, applies caller-owned `iox.Backoff` when `Wait` reports no observable progress, and dispatches completions:
+Pin the default ring’s owner goroutine to its OS thread before `Start` and keep it pinned through `Stop`. Once requests are submitted, the owner calls `Wait` to reap their completions.
 
 ```go
-func runLoop(ring *uring.Uring, stop <-chan struct{}) error {
-	cqes := make([]uring.CQEView, 64)
-	var backoff iox.Backoff
-	for {
-		select {
-		case <-stop:
-			// The caller must still cancel and drain live requests before ring.Stop.
-			return nil
-		default:
-		}
+cqes := make([]uring.CQEView, 64)
+var backoff iox.Backoff
+for {
+	select {
+	case <-stop:
+		// The caller cancels and drains live requests before stopping the ring.
+		return nil
+	default:
+	}
 
-		n, err := ring.Wait(cqes)
-		switch iox.Classify(err) {
-		case iox.OutcomeWouldBlock:
-			backoff.Wait()
-			continue
-		case iox.OutcomeFailure:
-			return err
-		}
-		if n == 0 {
-			backoff.Wait()
-			continue
-		}
-
+	n, err := ring.Wait(cqes)
+	switch iox.Classify(err) {
+	case iox.OutcomeOK:
 		backoff.Reset()
 		for i := range n {
 			dispatch(ring, cqes[i])
 		}
+	case iox.OutcomeWouldBlock:
+		backoff.Wait()
+	case iox.OutcomeFailure:
+		return err
 	}
 }
 ```
 
-All ring methods, including `Send`, `Receive`, `AcceptMultishot`, and `Wait`, run on this goroutine. Work from other goroutines should enter the loop through a caller-owned mailbox such as `code.hybscloud.com/lfq`, not by calling ring methods directly. `iox.Backoff` stays caller-owned: call `backoff.Wait()` on `iox.OutcomeWouldBlock` or when `Wait` returns no CQEs, and `backoff.Reset()` after any batch with `n > 0`.
+A successful `Wait` can include a CQE for a failed operation, so dispatch all `n` entries. If the owner also has submissions to retry, check them between polls, even when the CQ is empty. [Retrying a managed accept](agents/recipes/stream.md#rearm-a-managed-accept)
 
 ### Multishot subscription lifecycle
 
@@ -441,7 +431,7 @@ handler := uring.NewMultishotSubscriber().
 	}).
 	OnStop(func(err error, cancelled bool) {
 		if !cancelled {
-			resubscribeAccept()
+			queueAcceptRetry(err)
 		}
 	})
 
@@ -459,6 +449,8 @@ for i := range n {
 	dispatch(ring, cqes[i])
 }
 ```
+
+`queueAcceptRetry` records the terminal result for the ring owner. During `OnStop`, the old subscription can still hold the last Extended context. After dispatch, the owner checks whether the result and listener state warrant another accept. If `AcceptMultishot` returns `iox.ErrWouldBlock`, the retry stays pending. [Rearming a managed accept](agents/recipes/stream.md#rearm-a-managed-accept)
 
 Each `OnStep` callback observes one `MultishotStep`: return `MultishotContinue` to keep the stream live, or `MultishotStop` to request cancellation. If callbacks remain enabled until the terminal observation, `OnStop` runs at most once with the final error and a `cancelled` flag; on the step itself, `step.Cancelled` distinguishes the specific `-ECANCELED` kernel verdict from other failures at the boundary. These callbacks correspond to `MultishotHandler.OnMultishotStep` and `MultishotHandler.OnMultishotStop`; you can also implement that interface directly. `HandleCQE` is for immediate dispatch in the caller's serialized completion loop; if caller code stores copied CQEs beyond that loop, it must keep its own route state and reject observations for retired subscriptions. On default single-issuer rings (`MultiIssuers=false`), call `Cancel` / `Unsubscribe` from the OS-thread-pinned ring owner and serialize them with submit, `Wait`, `WaitDirect`, `WaitExtended`, `Stop`, and `ResizeRings`. `MultiIssuers=true` rings serialize cancel SQEs through the shared-submit path.
 

@@ -17,6 +17,31 @@ Give the request a persistent route. A caller may use `takt.SubscriptionLoop` fo
 
 With `takt.SubscriptionLoop`, copy retained events before the next `Poll` or `Drain` and keep referenced payloads through their last use. If a full `sess` endpoint delays the final value, retain its pending send after the native route retires. When the peer frees a slot, recheck any delivery permission and retry that same send. [Result storage](../runtime/takt.md#completion-results) · [Endpoint retry](../runtime/sess.md#outputs-and-ownership)
 
+## Rearm a Managed Accept
+
+Record the terminal result in `OnStop`. With submission and dispatch serialized on the ring owner, the helper still holds its Extended context during the callback. A pending cancellation can keep it in use after the callback returns. If the result warrants another accept, mark a retry pending. Call `servicePending` at the start of each owner turn, before `Wait`, even if the last poll found the CQ empty.
+
+```go
+servicePending := func(ring *uring.Uring) (bool, error) {
+	switch {
+	case !retryPending:
+		return false, nil
+	case !accepting:
+		retryPending = false
+		return true, nil
+	}
+	next, err := ring.AcceptMultishot(acceptCtx, handler.Handler())
+	if err != nil {
+		return false, err
+	}
+	trackSubscription(next)
+	retryPending = false
+	return true, nil
+}
+```
+
+On `iox.ErrWouldBlock`, keep the retry pending and still call `Wait` that turn. Back off only when the helper reports no progress and the poll reaps zero CQEs. Route an admitted replacement through its own `HandleCQE` and keep the old subscription available for any outstanding cancellation CQE. [Waiting and backoff](../boundary/integration.md#waiting-and-backoff)
+
 ## Cancel and Retire
 
 Cancellation races with natural completion. A queued cancellation owns a separate completion and helper context. Dispatch original and cancellation CQEs even after the original route ends. Failed submission or documented no-op cancellation creates no new CQE obligation.

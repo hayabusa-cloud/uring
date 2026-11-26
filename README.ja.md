@@ -211,7 +211,7 @@ ring.PutExtSQE(ext)
 
 ### `CQEView` による完了ディスパッチ
 
-`Wait` は CQE の回収時に発生したエラーを返します。失敗したリクエストの分も含め、返された CQE をすべて処理してください。ローカルのリクエストでは、`cqe.Context()` で発行時のトークンを取得できます。操作結果の判定には `cqe.Err()` を使います。ゼロコピー送信の通知では、`Res` にゼロコピーの使用状況を示すフラグが入ることがあります。CQE のフラグでリクエストとバッファのライフタイムを判断します。
+`Wait` が `iox.ErrWouldBlock` を返したら、回収できる CQE はありません。成功したら、失敗したリクエストの分も含め、`n` 件の CQE をすべて処理してください。ローカルのリクエストでは、`cqe.Context()` で発行時のトークンを取得できます。操作結果の判定には `cqe.Err()` を使います。ゼロコピー送信の通知では、`Res` にゼロコピーの使用状況を示すフラグが入ることがあります。CQE のフラグでリクエストとバッファのライフタイムを判断します。
 
 送信側と受信側は `messageID` を `MsgRing` 専用に予約します。この例のリングでは、それ以外の ID はすべてローカルのリクエストを表します。まず `messageID` を照合し、一致したら送信側が指定した符号付きの `Res` を、負の値も含めてそのままメッセージハンドラに渡します。
 
@@ -220,9 +220,6 @@ var cqes [64]uring.CQEView
 n, err := ring.Wait(cqes[:])
 if err != nil {
 	return err
-}
-if n == 0 {
-	return iox.ErrWouldBlock
 }
 
 for i := range n {
@@ -388,42 +385,35 @@ CQE のルーティングは呼び出し側が担当します。`ListenerOp.Hand
 
 ### リング所有イベントループ
 
-デフォルトのリングのイベントループは、`Start` の前に OS スレッドへ固定した goroutine で実行し、`Stop` まで固定を保ちます。ループはリング操作を直列化して保留中の処理を発行し、`Wait` が観測可能な進展を返さないときは呼び出し側の `iox.Backoff` を適用して、完了を振り分けます。
+デフォルトのリングを所有する goroutine は、`Start` の前に OS スレッドに固定し、`Stop` が終わるまで固定を維持します。要求を送信した後、所有者は `Wait` を呼んで完了を回収します。
 
 ```go
-func runLoop(ring *uring.Uring, stop <-chan struct{}) error {
-	cqes := make([]uring.CQEView, 64)
-	var backoff iox.Backoff
-	for {
-		select {
-		case <-stop:
-			// The caller must still cancel and drain live requests before ring.Stop.
-			return nil
-		default:
-		}
+cqes := make([]uring.CQEView, 64)
+var backoff iox.Backoff
+for {
+	select {
+	case <-stop:
+		// 呼び出し側はリングを停止する前に、実行中の要求をキャンセルし、残りの完了を回収する。
+		return nil
+	default:
+	}
 
-		n, err := ring.Wait(cqes)
-		switch iox.Classify(err) {
-		case iox.OutcomeWouldBlock:
-			backoff.Wait()
-			continue
-		case iox.OutcomeFailure:
-			return err
-		}
-		if n == 0 {
-			backoff.Wait()
-			continue
-		}
-
+	n, err := ring.Wait(cqes)
+	switch iox.Classify(err) {
+	case iox.OutcomeOK:
 		backoff.Reset()
 		for i := range n {
 			dispatch(ring, cqes[i])
 		}
+	case iox.OutcomeWouldBlock:
+		backoff.Wait()
+	case iox.OutcomeFailure:
+		return err
 	}
 }
 ```
 
-`Send`、`Receive`、`AcceptMultishot`、`Wait` などのリングメソッドはすべてこの goroutine 上で実行します。他の goroutine からの作業は、`code.hybscloud.com/lfq` のように呼び出し側が所有する作業メールボックスを経由してループに渡します。リングメソッドを直接呼び出してはなりません。`iox.Backoff` は呼び出し側が所有します。`Wait` が `iox.OutcomeWouldBlock` に分類された場合、または CQE を 1 件も回収できなかった場合は `backoff.Wait()` を呼び、`n > 0` のバッチを回収できたら `backoff.Reset()` を呼びます。
+`Wait` が成功しても、バッチには失敗した操作の CQE が含まれることがあります。`n` 件すべてをディスパッチしてください。再試行する要求がある場合は、CQ が空でもポーリングの合間に確認します。[管理された accept の再試行](agents/recipes/stream.md#rearm-a-managed-accept)
 
 ### マルチショットサブスクリプションのライフサイクル
 
@@ -441,7 +431,7 @@ handler := uring.NewMultishotSubscriber().
 	}).
 	OnStop(func(err error, cancelled bool) {
 		if !cancelled {
-			resubscribeAccept()
+			queueAcceptRetry(err)
 		}
 	})
 
@@ -459,6 +449,8 @@ for i := range n {
 	dispatch(ring, cqes[i])
 }
 ```
+
+`queueAcceptRetry` はリング所有者のために終了結果を記録します。`OnStop` の実行中は、終了したサブスクリプションが最後の Extended コンテキストをまだ保持していることがあります。CQE のディスパッチ後、所有者は終了結果とリスナーの状態から accept を再発行するか判断します。`AcceptMultishot` が `iox.ErrWouldBlock` を返した場合は、再試行を保留します。[管理された accept の再発行](agents/recipes/stream.md#rearm-a-managed-accept)
 
 `OnStep` コールバックは 1 件の `MultishotStep` を観察します。ストリームを維持するなら `MultishotContinue` を、キャンセルを要求するなら `MultishotStop` を返します。コールバックが終端観察まで有効なままなら、`OnStop` は最終エラーと `cancelled` フラグを伴って高々一度だけ実行されます。ステップ自身の `step.Cancelled` は、境界上でカーネルが `-ECANCELED` を返した判定をその他の失敗と明示的に区別します。これらのコールバックはそれぞれ `MultishotHandler.OnMultishotStep` と `MultishotHandler.OnMultishotStop` に対応します。インタフェースを直接実装することもできます。`HandleCQE` は呼び出し側の直列化された完了ループ内で即時 dispatch するための補助です。コピー済み CQE をそのループの後も保持する場合、呼び出し側が独自の route state を保持し、すでに解放されたサブスクリプションの観察を拒否してください。デフォルトの単一発行者リング（`MultiIssuers=false`）では、OS スレッドに固定したリング所有者から `Cancel` / `Unsubscribe` を呼び、発行、`Wait`、`WaitDirect`、`WaitExtended`、`Stop`、`ResizeRings` と直列化してください。`MultiIssuers=true` のリングでは、共有発行パスがキャンセル SQE を直列化します。
 

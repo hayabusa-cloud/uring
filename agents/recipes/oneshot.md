@@ -18,7 +18,7 @@ If a computation has already run to suspension, retry from that suspension only 
 
 ## Observe and Deliver
 
-Drive submission and CQ reap under caller cadence. Empty `Wait` or would-block uses `iox.Backoff`; reset after `n > 0`, before dispatch. Empty CQ does not discharge deferred kernel work or service obligations.
+Drive submission and reap into a nonempty destination. An empty poll leaves deferred work with the caller. Revisit due submissions before the next poll. Use the caller's `iox.Backoff` when the turn advances no work and reaps zero CQEs. [Wait modes](../boundary/sqe-cqe.md#observation) · [Backoff](../boundary/integration.md#waiting-and-backoff)
 
 Match the request instance; retain result, flags, and count. Copy Indirect/Extended facts before target mutation, reuse, or pool return, and retain payloads independently. Check dynamic context before protocol use or resumption.
 

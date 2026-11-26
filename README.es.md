@@ -211,7 +211,7 @@ ring.PutExtSQE(ext)
 
 ### Despacho de completados con `CQEView`
 
-`Wait` informa de los errores al recoger el lote. Despache todas las CQE devueltas, incluidas las de solicitudes fallidas. En una solicitud local, `cqe.Context()` devuelve su token de envío. Use `cqe.Err()` para interpretar el resultado de una operación. En una notificación de envío sin copia, `Res` puede contener indicadores de uso. Los indicadores de la CQE describen la vida útil de la solicitud y de los búferes.
+Si `Wait` devuelve `iox.ErrWouldBlock`, no hay ninguna CQE lista. Si tiene éxito, despache las `n` CQE, incluidas las de solicitudes fallidas. En una solicitud local, `cqe.Context()` devuelve su token de envío. Use `cqe.Err()` para interpretar el resultado de una operación. En una notificación de envío sin copia, `Res` puede contener indicadores de uso. Los indicadores de la CQE describen la vida útil de la solicitud y de los búferes.
 
 El emisor y el receptor reservan `messageID` para `MsgRing`. En el anillo de este ejemplo, todos los demás identificadores corresponden a solicitudes locales. Compruebe primero `messageID` y pase al manejador de mensajes el valor con signo de `Res` que envió el emisor, incluso si es negativo.
 
@@ -220,9 +220,6 @@ var cqes [64]uring.CQEView
 n, err := ring.Wait(cqes[:])
 if err != nil {
 	return err
-}
-if n == 0 {
-	return iox.ErrWouldBlock
 }
 
 for i := range n {
@@ -388,42 +385,35 @@ Las capas de contexto y ejecución abstracta por encima de esta frontera no camb
 
 ### Bucle de eventos propietario del ring
 
-Ejecute el bucle de eventos del ring predeterminado en la goroutine fijada a un hilo antes de `Start`, manteniéndola en ese hilo hasta `Stop`. El bucle serializa las operaciones del ring, envía el trabajo pendiente, aplica un `iox.Backoff` del llamador cuando `Wait` no informa progreso observable y despacha las finalizaciones:
+Fije la goroutine propietaria del ring predeterminado a un hilo del sistema antes de `Start` y manténgala en ese hilo hasta que termine `Stop`. Una vez enviadas las solicitudes, el propietario llama a `Wait` para recoger sus resultados.
 
 ```go
-func runLoop(ring *uring.Uring, stop <-chan struct{}) error {
-	cqes := make([]uring.CQEView, 64)
-	var backoff iox.Backoff
-	for {
-		select {
-		case <-stop:
-			// The caller must still cancel and drain live requests before ring.Stop.
-			return nil
-		default:
-		}
+cqes := make([]uring.CQEView, 64)
+var backoff iox.Backoff
+for {
+	select {
+	case <-stop:
+		// El llamador cancela y drena las solicitudes activas antes de detener el ring.
+		return nil
+	default:
+	}
 
-		n, err := ring.Wait(cqes)
-		switch iox.Classify(err) {
-		case iox.OutcomeWouldBlock:
-			backoff.Wait()
-			continue
-		case iox.OutcomeFailure:
-			return err
-		}
-		if n == 0 {
-			backoff.Wait()
-			continue
-		}
-
+	n, err := ring.Wait(cqes)
+	switch iox.Classify(err) {
+	case iox.OutcomeOK:
 		backoff.Reset()
 		for i := range n {
 			dispatch(ring, cqes[i])
 		}
+	case iox.OutcomeWouldBlock:
+		backoff.Wait()
+	case iox.OutcomeFailure:
+		return err
 	}
 }
 ```
 
-Todos los métodos del ring, incluidos `Send`, `Receive`, `AcceptMultishot` y `Wait`, se ejecutan en esta goroutine. El trabajo procedente de otras goroutines debe entrar en el bucle por un buzón de trabajo propiedad del llamador, como `code.hybscloud.com/lfq`, no mediante llamadas directas a los métodos del ring. `iox.Backoff` sigue siendo propiedad del llamador: use `backoff.Wait()` cuando `Wait` se clasifique como `iox.OutcomeWouldBlock` o no recoja ningún CQE, y `backoff.Reset()` tras cualquier lote con `n > 0`.
+Aunque `Wait` tenga éxito, el lote puede contener un CQE de una operación fallida. Despache los `n` CQE. Si hay solicitudes que reintentar, revíselas entre sondeos, incluso cuando la CQ esté vacía. [Reintentar un accept gestionado](agents/recipes/stream.md#rearm-a-managed-accept)
 
 ### Ciclo de vida de suscripciones multishot
 
@@ -441,7 +431,7 @@ handler := uring.NewMultishotSubscriber().
 	}).
 	OnStop(func(err error, cancelled bool) {
 		if !cancelled {
-			resubscribeAccept()
+			queueAcceptRetry(err)
 		}
 	})
 
@@ -459,6 +449,8 @@ for i := range n {
 	dispatch(ring, cqes[i])
 }
 ```
+
+`queueAcceptRetry` registra el resultado final para el propietario del ring. Durante `OnStop`, la suscripción anterior aún puede retener el último contexto Extended. Tras procesar el lote de CQE, el propietario decide si el resultado y el estado del listener justifican otro accept. Si `AcceptMultishot` devuelve `iox.ErrWouldBlock`, el reintento queda pendiente. [Reactivar un accept gestionado](agents/recipes/stream.md#rearm-a-managed-accept)
 
 Cada llamada a `OnStep` observa un `MultishotStep`: devuelva `MultishotContinue` para mantener el flujo activo o `MultishotStop` para solicitar la cancelación. Si las devoluciones de llamada permanecen habilitadas hasta la observación terminal, `OnStop` se ejecuta como máximo una vez con el error final y la bandera `cancelled`; en el propio paso, `step.Cancelled` distingue en el límite el veredicto específico `-ECANCELED` del kernel del resto de fallos. Estas funciones corresponden a `MultishotHandler.OnMultishotStep` y `MultishotHandler.OnMultishotStop`; también puede implementar esa interfaz directamente. `HandleCQE` sirve para el despacho inmediato en el bucle de finalización serializado del llamador; si el código llamador conserva CQE copiadas más allá de ese bucle, debe mantener su propio estado de ruta y rechazar observaciones de suscripciones ya retiradas. En los rings predeterminados de emisor único (`MultiIssuers=false`), llame a `Cancel` / `Unsubscribe` desde el propietario fijado a un hilo del sistema operativo y serialícelos con envío, `Wait`, `WaitDirect`, `WaitExtended`, `Stop` y `ResizeRings`. Los rings con `MultiIssuers=true` serializan los SQE de cancelación mediante la ruta de envío compartida.
 

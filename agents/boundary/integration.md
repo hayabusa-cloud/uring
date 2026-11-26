@@ -27,7 +27,7 @@ Check the adapter's generated code, escapes, allocations, and synchronization. F
 
 | Wait source | Mechanism and contract |
 |-------------|------------------------|
-| Caller I/O | Prefer `iox.Backoff`: `Wait()` after successful empty ring `Wait` or `iox.ErrWouldBlock`; `Reset()` after reaping `n > 0`, before dispatch |
+| Caller I/O | Service pending caller work and poll into a nonempty destination. Use `iox.Backoff.Wait()` when the turn advances no caller work and reaps zero CQEs. On progress from either source, call `Reset()` before dispatch. |
 | Socket retry | Leave it inside `sock`; no public `sock.Backoff` exists |
 | Local contention | Prefer `spin.Wait` or `spin` locks; reread state after failed CAS and preserve pause-before-yield retries |
 
