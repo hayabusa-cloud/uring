@@ -1614,7 +1614,7 @@ func (ur *Uring) cloneBuffersFrom(src *Uring, srcRegisteredRingIdx uint32, regis
 // submissions, Wait, WaitDirect, WaitExtended, and Stop.
 //
 // Requirements:
-//   - MultiIssuers must be false so New requests IORING_SETUP_DEFER_TASKRUN
+//   - MultiIssuers and HybridPolling must both be false to retain IORING_SETUP_DEFER_TASKRUN
 //   - The caller must remain locked to one OS thread from before Start through Stop
 //   - The ring must not be in CQ overflow condition
 //
@@ -1624,6 +1624,8 @@ func (ur *Uring) cloneBuffersFrom(src *Uring, srcRegisteredRingIdx uint32, regis
 //
 // Nonzero sizes are rounded up to powers of two and clamped to kernel limits.
 // The resulting CQ size must be at least the resulting SQ size.
+// With IndirectSubmissionQueue, changing CQ capacity may require a temporary
+// ring descriptor on kernels that omit the SQ array offset during resize.
 // If remapping fails after the kernel commits the resize, the ring is closed.
 // Supported on Linux 6.18+.
 func (ur *Uring) ResizeRings(newSQSize, newCQSize uint32) error {

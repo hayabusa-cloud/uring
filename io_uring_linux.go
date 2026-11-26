@@ -1795,6 +1795,30 @@ func (ur *ioUring) cloneBuffers(clone *CloneBuffers) error {
 // Resize Rings Methods
 // ========================================
 
+func (ur *ioUring) remapResizedRings(params *ioUringParams) error {
+	// Some kernels omit sq_off.array on resize. The array follows the CQ
+	// with kernel-specific alignment. SETUP reports its offset for that CQ
+	// geometry even with a single SQ entry.
+	if params.flags&IORING_SETUP_NO_SQARRAY == 0 && params.sqOff.array == 0 {
+		if params.cqEntries == ur.params.cqEntries {
+			params.sqOff.array = ur.params.sqOff.array
+		} else {
+			const cqLayoutFlags = IORING_SETUP_CQE32 | IORING_SETUP_CQE_MIXED
+			layout := ioUringParams{
+				cqEntries: params.cqEntries,
+				flags:     IORING_SETUP_R_DISABLED | IORING_SETUP_CQSIZE | (params.flags & cqLayoutFlags),
+			}
+			fd, err := ioUringSetup(1, &layout)
+			if err != nil {
+				return fmt.Errorf("get resized SQ array offset: %w", err)
+			}
+			zcall.Close(uintptr(fd))
+			params.sqOff.array = layout.sqOff.array
+		}
+	}
+	return ur.remapRings(params)
+}
+
 // resizeRings replaces the SQ/CQ mappings while preserving pending entries
 // and their submission storage.
 //
@@ -1847,7 +1871,7 @@ func (ur *ioUring) resizeRings(newSQSize, newCQSize uint32) error {
 	defer zcall.Munmap(oldSqesPtr, oldSqeMapSz)
 	defer zcall.Munmap(oldRingPtr, oldRingMapSz)
 	ur.clearRingViews()
-	if err := ur.remapRings(&params); err != nil {
+	if err := ur.remapResizedRings(&params); err != nil {
 		return ur.closeAfterFatalResize(fmt.Errorf("remap resized rings: %w", err))
 	}
 	// Registration freezes the old CQ. Preserve complete entries, including

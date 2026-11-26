@@ -16,6 +16,50 @@ import (
 	"code.hybscloud.com/zcall"
 )
 
+func TestResizeRingsIndirectArray(t *testing.T) {
+	for _, width := range []struct {
+		name string
+		flag uint32
+	}{{"CQE16", 0}, {"CQE32", IORING_SETUP_CQE32}} {
+		t.Run(width.name, func(t *testing.T) {
+			runtime.LockOSThread()
+			defer runtime.UnlockOSThread()
+			ring, err := newIoUring(8, func(p *ioUringParams) {
+				p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN | width.flag
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ring.stop()
+			for _, size := range []struct{ sq, cq uint32 }{{1, 1}, {1, 2}, {2, 2}, {8, 32}} {
+				layout := ioUringParams{flags: IORING_SETUP_CQSIZE | width.flag, cqEntries: size.cq}
+				fd, err := ioUringSetup(size.sq, &layout)
+				if err != nil {
+					t.Fatal(err)
+				}
+				zcall.Close(uintptr(fd))
+				if err := ring.resizeRings(size.sq, size.cq); err != nil {
+					t.Fatal(err)
+				}
+				if got := ring.params.sqOff.array; got != layout.sqOff.array {
+					t.Fatalf("resize to %d/%d: SQ array offset %d, setup returned %d", size.sq, size.cq, got, layout.sqOff.array)
+				}
+				ctx := PackDirect(IORING_OP_NOP, 0, 0, int32(size.sq+size.cq))
+				if err := ring.nop(ctx); err != nil {
+					t.Fatal(err)
+				}
+				var cqes [1]CQEView
+				if err := ring.enter(); err != nil {
+					t.Fatal(err)
+				}
+				if n, err := ring.waitBatch(cqes[:]); err != nil || n != 1 || cqes[0].Context() != ctx || cqes[0].Res != 0 {
+					t.Fatalf("resize to %d/%d: first completion count %d, CQE %+v, error %v", size.sq, size.cq, n, cqes[0], err)
+				}
+			}
+		})
+	}
+}
+
 // Inspect the actual mapped ABI on a real ring. Invalid-FD command completion
 // permits checking all 80 command bytes without requiring a particular device.
 func TestResizeRingsPendingStorage(t *testing.T) {

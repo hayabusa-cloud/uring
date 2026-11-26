@@ -53,9 +53,19 @@ WAITID accepts `P_ALL`, `P_PID`, `P_PGID`, or `P_PIDFD`. IDs fit signed 32-bit: 
 
 The default `MultiIssuers=false` requires one owner locked to an OS thread from before `Start` through `Stop`, including submission, enter/wait and resize. `New` creates a disabled ring; `Start` binds the issuer when enabling it. This mode avoids shared-submit synchronization. Select `MultiIssuers=true` for shared submission or Linux-task migration. Never treat wrong-issuer `EEXIST` as success or would-block.
 
-Probe opcode, setup and registration support separately; verify wrapper support too. Optional SQE128 changes the SQE stride. Context retention still copies only the 64-byte base SQE; Extended user bytes are not the SQE128 extension. Resize must preserve pending entries and their width. A remap failure after the kernel commits resize is terminal.
+Probe opcode, setup and registration support separately; verify wrapper support too. Optional SQE128 changes the SQE stride. Context retention still copies only the 64-byte base SQE; Extended user bytes are not the SQE128 extension.
 
 Version strings alone establish no usable capability. ZCRX control/query records and receive-page sizing depend on the actual kernel feature result and wrapper path.
+
+### Resize a Live Ring
+
+For live resize on Linux 6.18.15 and 6.19.14, create the ring with `MultiIssuers=false` and `HybridPolling=false`. Resize requires `IORING_SETUP_DEFER_TASKRUN`. Hybrid polling clears that flag, so even an empty ring returns `EINVAL` and keeps its original size. [Ring setup](../../interface_linux.go#L162-L183) · [Hybrid polling flags](../../io_uring_linux.go#L1288-L1293) · [Linux resize check](https://github.com/gregkh/linux/blob/v6.18.15/io_uring/register.c#L410-L412)
+
+Call `ResizeRings(sq, cq)` from the OS thread that called `Start`. Serialize resize with submission, waits and `Stop`. Resolve any CQ overflow first. Zero `sq` keeps the current SQ size. Zero `cq` requests twice the resulting SQ size. On success, read the effective sizes from `Features.SQEntries` and `Features.CQEntries`. Context pools keep their original capacities. [ResizeRings](../../interface_linux.go#L1611)
+
+A successful resize preserves pending submissions and completions, their entry widths and request identities in both SQ layouts. A shrink rejected because pending entries would no longer fit leaves those entries on the original ring. Continue driving them there. [Pending submissions](../../resize_linux_test.go#L55) · [Pending completions](../../resize_completion_linux_test.go#L14) · [Rejected shrink](../../resize_linux_test.go#L178)
+
+If the kernel omits the indirect SQ array offset, changing CQ capacity requires a temporary disabled ring to obtain the new layout. A remap failure after the kernel commits the resize closes the ring. [Indirect array layout](../../resize_internal_linux_test.go#L19)
 
 ## Registration
 
