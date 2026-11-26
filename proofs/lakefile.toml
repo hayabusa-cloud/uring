@@ -1,6 +1,6 @@
 name = "uring_proofs"
 version = "0.1.0"
-defaultTargets = ["ZeroCopy", "Cancellation", "Incremental", "CompletionQueue", "Context"]
+defaultTargets = ["ZeroCopy", "Cancellation", "Incremental", "CompletionQueue", "Context", "Bundle"]
 
 [leanOptions]
 warningAsError = true
@@ -19,3 +19,6 @@ name = "CompletionQueue"
 
 [[lean_lib]]
 name = "Context"
+
+[[lean_lib]]
+name = "Bundle"

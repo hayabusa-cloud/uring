@@ -31,6 +31,8 @@ Classify kernel stream events before choosing an endpoint action. Session transp
 
 On `iox.ErrWouldBlock`, `Advance` returns the same suspension. Keep it and its payload. Give the peer a turn or let it run independently. Its `Recv` frees a data slot for `Send`. Its `Offer` frees a choice slot for `SelectL` or `SelectR`. Recheck any publication grant before retrying. [Choice operations](https://github.com/hayabusa-cloud/sess/blob/v0.2.0/op.go#L89-L131) · [Write-receipt example](../recipes/protocol.md#deliver-a-write-receipt)
 
+`sess.Send` enqueues a slice by value. A peer receiving `[]byte` shares the backing bytes. With `[][]byte` it also shares the outer array of slice headers. Keep borrowed storage intact through the last consumer's use. [Send and receive](https://github.com/hayabusa-cloud/sess/blob/v0.2.0/op.go#L11-L50) · [Bundle handoff](../recipes/buffers.md#hand-off-a-receive-bundle)
+
 `sess.Close{}` signals protocol termination by incrementing the pair's shared close counter. The caller enforces the protocol after close and retires descriptors, requests, buffers and the ring through their own release conditions. [Close operation](https://github.com/hayabusa-cloud/sess/blob/v0.2.0/op.go#L53-L66) · [I/O release conditions](../recipes/lifecycle.md#release-each-owner)
 
 ## Cost Obligations

@@ -754,8 +754,8 @@ func (ur *Uring) SubmitReceiveMultishotFD(sqeCtx SQEContext, fd iofd.FD, b []byt
 
 // ReceiveBundle submits a receive that can consume multiple provided buffers
 // in publication order. A nil return means the request was queued.
-// A successful CQE reports the total bytes received; use [Uring.BundleIterator]
-// to visit the consumed buffers.
+// The CQE reports the receive result. Use [Uring.BundleIterator] to visit
+// returned slots, including a selected slot carrying zero bytes.
 func (ur *Uring) ReceiveBundle(sqeCtx SQEContext, pollFD PollFd, options ...OpOptionFunc) error {
 	ctx := sqeCtx.WithFD(iofd.FD(pollFD.Fd()))
 	flags, ioprio, bufSize, bufGroup := ur.receiveWithBufferSelectOptions(pollFD, options)
@@ -776,9 +776,9 @@ func (ur *Uring) SubmitReceiveBundleMultishot(sqeCtx SQEContext, pollFD PollFd, 
 }
 
 // BundleIterator constructs an iterator for one bundle receive CQE from a
-// package-managed buffer group. The group must match the receive's registered
-// group ID. It returns a zero BundleIterator and false if the group is not
-// package-managed or the CQE has no data.
+// package-managed buffer group. Pass the registered group of the matched receive.
+// It requires F_BUFFER and a whole-slot return from that group. At EOF or on
+// error, a returned slot yields one empty slice and still requires Recycle.
 //
 // The returned iterator borrows ring-owned backing memory. Process the buffers
 // before calling Recycle. Call Recycle exactly once across all copies of the

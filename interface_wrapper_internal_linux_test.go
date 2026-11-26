@@ -1099,7 +1099,7 @@ func TestBundleIteratorWrapperUsesRegisteredGroup(t *testing.T) {
 
 	cqe := CQEView{
 		Res:   96,
-		Flags: 1 << IORING_CQE_BUFFER_SHIFT,
+		Flags: 1<<IORING_CQE_BUFFER_SHIFT | IORING_CQE_F_BUFFER,
 	}
 
 	iter, ok := ring.BundleIterator(cqe, groupID)

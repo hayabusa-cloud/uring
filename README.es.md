@@ -335,7 +335,7 @@ if cqe.HasBuffer() {
 }
 ```
 
-Las recepciones agrupadas usan el mismo almacenamiento de búferes provistos, pero pueden consumir más de un búfer en un solo CQE. Procese el iterador y después recicle los slots consumidos. Llame a `Recycle` exactamente una vez entre todas las copias de un iterador; después de que retorne, no lea los búferes producidos:
+Una recepción agrupada puede consumir varios búferes provistos en una sola CQE. En un socket de flujo como el de este ejemplo, el kernel puede devolver un slot sin datos al llegar a EOF o producirse un error. Termine de leer la carga útil y llame a `Recycle` una sola vez entre todas las copias del iterador para devolver los slots consumidos.
 
 ```go
 if err := ring.ReceiveBundle(recvCtx, &socketFD, uring.WithReadBufferSize(uring.BufferSizeSmall)); err != nil {
@@ -343,8 +343,10 @@ if err := ring.ReceiveBundle(recvCtx, &socketFD, uring.WithReadBufferSize(uring.
 }
 
 if it, ok := ring.BundleIterator(cqe, cqe.BufGroup()); ok {
-	for buf := range it.All() {
-		handle(buf)
+	if it.TotalBytes() > 0 {
+		for buf := range it.All() {
+			handle(buf)
+		}
 	}
 	if err := it.Recycle(ring); err != nil {
 		return err

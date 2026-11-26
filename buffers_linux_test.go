@@ -886,7 +886,7 @@ func TestBufferRingsBundleIteratorRecycle(t *testing.T) {
 
 	cqe := CQEView{
 		Res:   2 * bufSize,
-		Flags: 0 << IORING_CQE_BUFFER_SHIFT,
+		Flags: IORING_CQE_F_BUFFER,
 	}
 
 	if _, ok := rings.bundleIterator(cqe, group-1); ok {
@@ -963,7 +963,7 @@ func TestBufferRingsBundleIteratorSparseGroupIdentity(t *testing.T) {
 		Options:     &Options{},
 		bufferRings: rings,
 	}
-	cqe := CQEView{Res: bufSize}
+	cqe := CQEView{Res: bufSize, Flags: IORING_CQE_F_BUFFER}
 
 	allocs := testing.AllocsPerRun(1000, func() {
 		if _, ok := ur.BundleIterator(cqe, targetGroup); !ok {

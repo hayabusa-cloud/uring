@@ -20,7 +20,7 @@ Read [core contracts](core.md), select a task and its required sources, then fol
 | Set up a listener | [Listener](recipes/listener.md) |
 | Cancel or drain a subscription | [Stream](recipes/stream.md), [lifecycle](recipes/lifecycle.md) |
 | Set a deadline or start, update or remove a timer | [Independent timers and linked deadlines](recipes/lifecycle.md#timers-and-linked-deadlines), [updates and removal](recipes/lifecycle.md#update-or-remove-a-timer) |
-| Use buffers, registered files, or zero-copy | [Buffers](recipes/buffers.md) |
+| Use buffers, registered files, or zero-copy | [Buffers](recipes/buffers.md), [receive-bundle handoff](recipes/buffers.md#hand-off-a-receive-bundle) |
 | Use incremental receive | [Incremental receive](recipes/buffers.md#incremental-receive) |
 | Retain completion data | [Retained completions](recipes/buffers.md#retained-completions) |
 | Build a continuation adapter | [One-shot](recipes/oneshot.md), [kont](runtime/kont.md), [takt](runtime/takt.md) |
@@ -29,7 +29,7 @@ Read [core contracts](core.md), select a task and its required sources, then fol
 | Receive UDP datagrams and their metadata | [Truncation, empty datagrams and header reuse](boundary/protocols.md#datagram-receives), [deliver a final value under backpressure](recipes/stream.md#dispatch-each-observation) |
 | Submit to multiple targets | [Multiple targets](recipes/buffers.md#multiple-targets) |
 | Review performance | [Cost](verify.md#cost), [waiting](boundary/integration.md#waiting-and-backoff) |
-| Change zero-copy, cancellation, incremental buffers, CQ ownership or context packing | [Models, proofs and source mappings](../proofs/README.md) |
+| Change zero-copy, cancellation, bundle or incremental buffers, CQ ownership or context packing | [Models, proofs and source mappings](../proofs/README.md) |
 | Rewrite or audit the guide | [Review the guide](#review-the-guide) |
 
 <a id="establish-scope"></a>

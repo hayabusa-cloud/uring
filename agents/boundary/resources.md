@@ -43,7 +43,13 @@ Match the current request, submitted group, registration and selected ID before 
 
 ### Bundles
 
-A bundle follows descriptor publication order, not necessarily consecutive IDs. Managed traversal records that order; the standalone constructor requires consecutive IDs and compact backing, and grants no recycle authority.
+For a matched ordinary bundle with `Res > 0`, check that `F_BUFFER` is set and `F_BUF_MORE` is clear. With uniform slots of `s > 0` bytes filled in order, integer division gives `1 + (Res - 1) / s` consumed slots, including an exactly full final slot. Pass the receive's registered group to `ring.BundleIterator`. Its `AllWithSlotID()` yields each ID and its valid bytes in publication order, starting at the CQE's first ID. IDs can be nonconsecutive. [Receive-bundle manual](https://github.com/axboe/liburing/blob/liburing-2.13/man/io_uring_prep_recv.3#L85-L104) · [Reordered buffers](../../operation_facts_linux_test.go#L26)
+
+`Collect()` allocates the outer slice and borrows the payload bytes. After every borrower finishes, call `it.Recycle(ring)` exactly once across all copies of the managed iterator. Use the originating ring and serialize recycling with its other buffer returns and publication. [Bundle handoff](../recipes/buffers.md#hand-off-a-receive-bundle)
+
+At stream EOF, on an empty datagram, or on a receive error, inspect `F_BUFFER` before leaving the receive path. An empty datagram still delivers a message. An ordinary group can return one slot with zero payload bytes. With `F_BUFFER` set and `F_BUF_MORE` clear, `ring.BundleIterator` gives its ID, `Count() == 1` and `TotalBytes() == 0`. Recycle it once. A clear `F_BUFFER` returns no slot. `CQEView.BundleCount` counts payload segments, so it reports zero in both cases. [Linux buffer selection](https://github.com/gregkh/linux/blob/v6.18.15/io_uring/kbuf.c#L158-L209) · [Receive regression](../../bundle_test.go#L541) · [Slot accounting](../../proofs/README.md#ordinary-receive-bundles)
+
+On Linux, `NewBundleIterator` assumes buffer ID `i` starts at byte `i*bufSize` in the backing slice and IDs were published consecutively modulo the ring size. Calling `Recycle` on that standalone view returns `ErrInvalidParam`. [Iterator contracts](../../bundle_iter.go)
 
 ### Incremental Receive
 

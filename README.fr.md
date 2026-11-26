@@ -335,7 +335,7 @@ if cqe.HasBuffer() {
 }
 ```
 
-Les réceptions groupées utilisent le même stockage de tampons fournis, mais peuvent consommer plusieurs tampons avec un seul CQE. Traitez l'itérateur, puis recyclez les slots consommés. Appelez `Recycle` exactement une fois pour l'ensemble des copies d'un itérateur ; après son retour, ne lisez plus les tampons produits :
+Une réception groupée peut consommer plusieurs tampons fournis dans une seule CQE. Sur un socket de flux comme dans cet exemple, le noyau peut rendre un slot sans données en fin de flux ou en cas d’erreur. Terminez la lecture des données, puis appelez `Recycle` une seule fois pour l’ensemble des copies de l’itérateur afin de rendre tous les slots consommés.
 
 ```go
 if err := ring.ReceiveBundle(recvCtx, &socketFD, uring.WithReadBufferSize(uring.BufferSizeSmall)); err != nil {
@@ -343,8 +343,10 @@ if err := ring.ReceiveBundle(recvCtx, &socketFD, uring.WithReadBufferSize(uring.
 }
 
 if it, ok := ring.BundleIterator(cqe, cqe.BufGroup()); ok {
-	for buf := range it.All() {
-		handle(buf)
+	if it.TotalBytes() > 0 {
+		for buf := range it.All() {
+			handle(buf)
+		}
 	}
 	if err := it.Recycle(ring); err != nil {
 		return err

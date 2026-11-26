@@ -10,7 +10,12 @@ Synchronous registration borrows metadata only until method return; follow the [
 
 For provided buffers, `Add` stages; matching `Advance` publishes and transfers ownership. Retain backing from staging through return. Do not mutate or republish kernel-owned storage; returned buffers need not be recycled immediately.
 
-Bundles follow descriptor publication order. The standalone constructor requires consecutive IDs/compact backing and grants no managed recycle authority. Preserve application-selected tiers and group ownership.
+## Hand Off a Receive Bundle
+
+At stream EOF or on error, recycle any slot returned by `ring.BundleIterator`. For an empty UDP datagram, keep an independently owned empty value for delivery and recycle any selected slot. For a nonempty bundle, choose how to hand off its bytes. [Bundle completions](../boundary/resources.md#bundles) · [Datagram receives](../boundary/protocols.md#datagram-receives)
+
+- **Copy the payload.** Give `it.CopyTo(dst)` independent storage of at least `it.TotalBytes()` bytes to retain the whole bundle. A shorter destination receives only a prefix. Once the copy finishes and all borrows end, recycle the bundle. A blocked delivery can retry with the same owned bytes.
+- **Lend the payload.** Slices from `it.All()` or `it.Collect()` borrow the returned buffers. Keep them through a blocked send, time in the queue and the consumer's last read. Have the consumer signal when it finishes so the ring owner can recycle once. [Session delivery](../runtime/sess.md#outputs-and-ownership)
 
 ## Retained Completions
 
@@ -35,3 +40,5 @@ For ZCRX, publish refills only after kernel delivery. `ZCRXBuffer.Release` retur
 ## Validate
 
 Use [fixed-buffer](../../examples/fixed_buffers_test.go), [bundle/incremental](../../examples/buffer_ring_test.go), and [zero-copy](../../examples/zerocopy_test.go) examples. Check interleaved IDs, zero/error buffer returns, delayed notifications, blocked refill, partial target admission, retained facts, and teardown. Feature skips leave that runtime evidence open.
+
+To check recycling, shut down the peer's write side and repeat `ReceiveBundle` with `IOSQE_ASYNC` more times than the group has slots. Recycle any selected slot. Each receive should still report EOF. On an unconnected stream socket, each should report `-ENOTCONN`. [Kernel regression](../../bundle_test.go#L541)

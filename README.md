@@ -335,7 +335,7 @@ if cqe.HasBuffer() {
 }
 ```
 
-Bundle receives use the same provided-buffer storage but may consume more than one buffer in a single CQE. Process the iterator, then recycle the consumed slots. Call `Recycle` exactly once across all copies of an iterator; after it returns, do not read the yielded buffers:
+A receive bundle can consume several provided buffers in one CQE. On a stream socket, as in this example, EOF or an error can return one slot with zero bytes. Finish reading the payload, then call `Recycle` exactly once across all copies of the iterator to return every consumed slot.
 
 ```go
 if err := ring.ReceiveBundle(recvCtx, &socketFD, uring.WithReadBufferSize(uring.BufferSizeSmall)); err != nil {
@@ -343,8 +343,10 @@ if err := ring.ReceiveBundle(recvCtx, &socketFD, uring.WithReadBufferSize(uring.
 }
 
 if it, ok := ring.BundleIterator(cqe, cqe.BufGroup()); ok {
-	for buf := range it.All() {
-		handle(buf)
+	if it.TotalBytes() > 0 {
+		for buf := range it.All() {
+			handle(buf)
+		}
 	}
 	if err := it.Recycle(ring); err != nil {
 		return err

@@ -335,7 +335,7 @@ if cqe.HasBuffer() {
 }
 ```
 
-捆绑接收使用同一套提供缓冲区存储，但一个 CQE 可能消耗多个缓冲区。处理迭代器后，将消耗的槽位回收。在迭代器的所有副本中，`Recycle` 只能调用一次；调用返回后，不得再读取已生成的缓冲区：
+一次批量接收可以在一个 CQE 中返回多个提供缓冲区。下面的示例使用流式套接字。遇到 EOF 或接收错误时，内核仍可能返回一个不含数据的槽位。读完数据后，所有迭代器副本合计只调用一次 `Recycle`，归还已消耗的全部槽位。
 
 ```go
 if err := ring.ReceiveBundle(recvCtx, &socketFD, uring.WithReadBufferSize(uring.BufferSizeSmall)); err != nil {
@@ -343,8 +343,10 @@ if err := ring.ReceiveBundle(recvCtx, &socketFD, uring.WithReadBufferSize(uring.
 }
 
 if it, ok := ring.BundleIterator(cqe, cqe.BufGroup()); ok {
-	for buf := range it.All() {
-		handle(buf)
+	if it.TotalBytes() > 0 {
+		for buf := range it.All() {
+			handle(buf)
+		}
 	}
 	if err := it.Recycle(ring); err != nil {
 		return err

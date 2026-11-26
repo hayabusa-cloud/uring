@@ -155,7 +155,7 @@ func (c *CQEView) BundleStartID() uint16 {
 	return uint16(c.Flags >> IORING_CQE_BUFFER_SHIFT)
 }
 
-// BundleCount derives the receive-bundle buffer count from Res, rounding up.
+// BundleCount counts buffers containing payload bytes from Res, rounding up.
 // bufferSize must be the uniform published buffer size. It returns zero when
 // Res or bufferSize is non-positive.
 func (c *CQEView) BundleCount(bufferSize int) int {
@@ -165,10 +165,18 @@ func (c *CQEView) BundleCount(bufferSize int) int {
 	return 1 + (int(c.Res)-1)/bufferSize
 }
 
-// BundleBuffers returns the first buffer ID and the consumed buffer count.
-// bufferSize must be the uniform published buffer size. The remaining IDs
-// follow publication order and cannot be inferred by adding to startID.
-// Use Uring.BundleIterator for package-managed buffer rings.
+// BundleBuffers returns the first ID and the slot count for an ordinary receive
+// bundle with uniform bufferSize. At EOF or on error, F_BUFFER can return one
+// slot with zero payload. F_BUF_MORE requires incremental buffer accounting.
+// The remaining IDs follow publication order. See [Uring.BundleIterator].
 func (c *CQEView) BundleBuffers(bufferSize int) (startID uint16, count int) {
-	return c.BundleStartID(), c.BundleCount(bufferSize)
+	startID = c.BundleStartID()
+	switch {
+	case bufferSize <= 0 || c.HasBufferMore():
+		return startID, 0
+	case c.Res <= 0 && c.HasBuffer():
+		return startID, 1
+	default:
+		return startID, c.BundleCount(bufferSize)
+	}
 }

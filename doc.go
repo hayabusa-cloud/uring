@@ -302,17 +302,19 @@
 //	}
 //
 // Bundle receives may consume more than one provided buffer in one CQE.
-// Process the iterator and then recycle the consumed slots. Call Recycle
-// exactly once across all copies of an iterator; after it returns, do not read
-// the yielded buffers.
+// A selected slot can accompany EOF or an error and yields one empty slice.
+// Finish all borrowed reads, then call Recycle exactly once across all copies
+// of the iterator to return the slots to the kernel.
 //
 //	if err := ring.ReceiveBundle(recvCtx, &socketFD, uring.WithReadBufferSize(uring.BufferSizeSmall)); err != nil {
 //	    return err
 //	}
 //
 //	if it, ok := ring.BundleIterator(cqe, cqe.BufGroup()); ok {
-//	    for buf := range it.All() {
-//	        handle(buf)
+//	    if it.TotalBytes() > 0 {
+//	        for buf := range it.All() {
+//	            handle(buf)
+//	        }
 //	    }
 //	    if err := it.Recycle(ring); err != nil {
 //	        return err

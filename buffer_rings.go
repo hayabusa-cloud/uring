@@ -350,6 +350,9 @@ func (rings *uringBufferRings) reset() {
 // registered group ID. gids is sorted in registration order, while the
 // parallel ring storage is dense even when group IDs are sparse.
 func (rings *uringBufferRings) bundleIterator(cqe CQEView, group uint16) (BundleIterator, bool) {
+	if !cqe.HasBuffer() {
+		return BundleIterator{}, false
+	}
 	index, ok := slices.BinarySearch(rings.gids, group)
 	if !ok || index >= len(rings.rings) {
 		return BundleIterator{}, false

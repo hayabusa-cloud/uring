@@ -335,7 +335,7 @@ if cqe.HasBuffer() {
 }
 ```
 
-バンドル受信は同じ提供バッファストレージを使いますが、1 つの CQE で複数のバッファを消費することがあります。イテレータを処理したら、消費したスロットを回収してください。`Recycle` はイテレータのすべてのコピーを通じて正確に 1 回だけ呼び出し、返った後は生成されたバッファを読み取らないでください。
+バンドル受信では、1 件の CQE で複数の提供バッファを消費することがあります。この例のようなストリームソケットでは、EOF や受信エラーでも、選択済みのスロットがデータ長 0 で返る場合があります。データを読み終えたら、イテレータのコピー全体で `Recycle` を 1 回だけ呼び、消費したスロットをすべて返します。
 
 ```go
 if err := ring.ReceiveBundle(recvCtx, &socketFD, uring.WithReadBufferSize(uring.BufferSizeSmall)); err != nil {
@@ -343,8 +343,10 @@ if err := ring.ReceiveBundle(recvCtx, &socketFD, uring.WithReadBufferSize(uring.
 }
 
 if it, ok := ring.BundleIterator(cqe, cqe.BufGroup()); ok {
-	for buf := range it.All() {
-		handle(buf)
+	if it.TotalBytes() > 0 {
+		for buf := range it.All() {
+			handle(buf)
+		}
 	}
 	if err := it.Recycle(ring); err != nil {
 		return err

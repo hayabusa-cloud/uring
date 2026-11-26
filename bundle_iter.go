@@ -69,6 +69,8 @@ func (it BundleIterator) nextID(id uint16) uint16 {
 //
 // bufBacking must remain alive for the iterator's lifetime and must cover at
 // least bufSize*ringEntries bytes.
+// For a kernel CQE, match the receive and check [CQEView.HasBuffer] before
+// passing its byte count and first buffer ID to this constructor.
 // This constructor requires buffers to have been published in consecutive ID
 // order modulo ringEntries, with buffer ID i stored at offset i*bufSize.
 // A CQE alone cannot recover arbitrary publication order. For package-managed
@@ -78,10 +80,10 @@ func (it BundleIterator) nextID(id uint16) uint16 {
 // Recycle returns ErrInvalidParam for it. Use [Uring.BundleIterator] when the
 // consumed buffers belong to a package-managed ring and must be recycled.
 //
-// Returns a zero BundleIterator and false if the CQE indicates no data was
-// received or if the constructor arguments are invalid.
+// A selected slot returned at EOF or on error yields one empty slice. It
+// returns false for invalid geometry or when there are no whole slots to visit.
 func NewBundleIterator(cqe CQEView, bufBacking []byte, bufSize int, ringEntries int) (BundleIterator, bool) {
-	if cqe.Res <= 0 || bufSize <= 0 || ringEntries <= 0 || ringEntries >= 1<<16 || ringEntries&(ringEntries-1) != 0 {
+	if bufSize <= 0 || ringEntries <= 0 || ringEntries >= 1<<16 || ringEntries&(ringEntries-1) != 0 {
 		return BundleIterator{}, false
 	}
 	if ringEntries > maxInt/bufSize || len(bufBacking) < ringEntries*bufSize {
@@ -101,7 +103,7 @@ func newBundleIterator(cqe CQEView, bufBacking unsafe.Pointer, bufSize int, ring
 		bufSize:    bufSize,
 		count:      count,
 		ringIndex:  -1,
-		totalBytes: cqe.Res,
+		totalBytes: max(cqe.Res, 0),
 		startID:    startID,
 		ringMask:   ringMask,
 	}, true
