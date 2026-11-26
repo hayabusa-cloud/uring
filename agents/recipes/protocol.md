@@ -10,7 +10,7 @@ Declare compatible peer actions, payload ownership, choices, recursion, and term
 
 ## Drive One Action
 
-1. Match the request and copy required context facts. For a successful ordinary stream `RECV` into `buf` with flags zero, consume `buf[:Res]`. For a partial stream write, keep the unsent suffix.
+1. Match the request and copy the context fields needed later. For a stream `ReceiveFD` into caller storage, decode the first `Res` bytes of the submitted range when the result is positive. A call with `WithOffset(4)` and `Res == 3` supplies `buf[4:7]`. For a partial stream write, keep the unsent suffix. [Receive shape](../boundary/encoding.md#receive-shape)
 2. For [framed input](../boundary/protocols.md#stream-framing), keep one decoder per ordered stream. At each `framer.Decoder.Decode`, advance by `consumed` and handle the returned chunk even on `ErrMore`. Accumulate payload until `Chunk.End` for a whole-message endpoint. Copy borrowed bytes or retain their backing through the last use. [Decoder contract](https://github.com/hayabusa-cloud/framer/blob/v0.1.7/decoder.go#L59-L75)
 3. Before each endpoint attempt, check the route, buffer ownership, descriptor, protocol phase and shutdown state that the action requires. Keep those conditions valid through dispatch.
 4. On local `iox.ErrWouldBlock`, keep the same pending action, payload and unread input suffix. After peer progress, recheck the conditions and retry that action. A successful `sess.Advance` consumes the suspension. Keep any successor and continue with the unread bytes. [Session step](https://github.com/hayabusa-cloud/sess/blob/v0.2.0/step.go#L18-L38)
@@ -58,3 +58,5 @@ After frame delivery, endpoint close or continuation disposal, keep each descrip
 Exercise the adapter with the module revisions it uses. The network examples cover TCP, UDP and framed broadcast. The `takt` example checks write permission before each dispatch to a bounded in-memory buffer. [Network examples](../../examples/echo_test.go) · [Guarded partial write](https://github.com/hayabusa-cloud/takt/blob/v0.3.0/write_session_example_test.go) · [Runtime contracts](../runtime/INDEX.md)
 
 Check a frame split across receives, several frames in one receive, an empty frame, and EOF inside a header or body. Fill the endpoint between two frames and check that the peer receives each message once and in order. Also check context changes during suspension, peer failure and close with outstanding I/O. Name the scheduler, fairness and peer assumptions for progress claims.
+
+For [UDP input](../boundary/protocols.md#datagram-receives), check an empty datagram, an exact fit and a truncated payload. When the caller reuses a header, follow a receive with no control data by one that needs it.

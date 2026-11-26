@@ -29,7 +29,9 @@ An explicit direct slot `n` encodes as `n+1`. `IORING_FILE_INDEX_ALLOC` passes t
 
 ### Receive Shape
 
-Multishot RECV uses buffer selection, zero address, zero message flags and a nonnegative signed 32-bit cap. Raw receive helpers require a nil buffer and select the FD/size-derived group; zero configured size selects the default group size. Managed `ReceiveMultishot` uses the context's group and zero cap.
+`Receive` and `ReceiveFD` with a nonempty caller buffer use `MSG_WAITALL`. `WithOffset(off)` sets the start within the slice. The requested length defaults to `len(buf)-off`. Use `WithN(n)` for an explicit length, including zero. A nil buffer selects a provided-buffer group with zero message flags. [ReceiveFD](../../interface_linux.go#L715) · [Socket options](../../interface_internal.go#L225)
+
+Multishot RECV uses buffer selection, zero address, zero message flags and a nonnegative signed 32-bit cap. `SubmitReceiveMultishot` and its FD variant take a nil buffer and derive the group from the fd and size. `WithReadBufferSize(0)` selects the default size class with no per-completion byte cap. Managed `ReceiveMultishot` takes the group from its context and submits a zero cap.
 
 Incremental receive is a one-shot selected-buffer RECV with positive signed 32-bit length, zero address and zero message flags. Its per-ID offsets belong to one receiver bound before the group's first receive. Bundles follow publication order. See [buffer ownership](resources.md#provided-buffers).
 

@@ -6,16 +6,16 @@ Retain the request through repeated events, terminality, and dependent release. 
 
 Validate multishot support, setup, groups, and zero fields. Retain identity/generation while live. Bound event storage and define the slow-consumer response.
 
-Use a subscription such as `takt.SubscriptionLoop`; one `kont.Suspension` cannot serve repeated events. The caller owns route policy; the backend maps routes to kernel identities.
+Give the request a persistent route. A caller may use `takt.SubscriptionLoop` for this role. The backend maps the original route to the kernel request. Reserve one-shot suspensions for individual resumptions.
 
 ## Dispatch Each Observation
 
-1. Match identity/generation; copy required context facts while valid.
+1. Match the [completion origin](../boundary/sqe-cqe.md#completion-origin) and route generation. Copy required context fields while valid.
 2. Interpret the result separately from `MORE`, buffer flags, and releases. Negative results with `MORE` remain failure/would-block observations with a live successor.
-3. Deliver once; account separately for acquired FDs, buffers, and credits.
-4. Retain live routes. At original terminality, follow runtime retirement rules and preserve outstanding backend dispatch obligations.
+3. Deliver each accepted value once, including a value on the final CQE. Give every acquired FD, buffer or credit an owner even if the caller discards the event.
+4. Keep the native request identifiable through its final CQE and any outstanding cancellation that refers to it.
 
-`SubscriptionLoop.Poll` returns borrowed storage; copy retained events before poll/run reuse. Keep retention bounded under deliberate caller service policy.
+With `takt.SubscriptionLoop`, copy retained events before the next `Poll` or `Drain` and keep referenced payloads through their last use. If a full `sess` endpoint delays the final value, retain its pending send after the native route retires. When the peer frees a slot, recheck any delivery permission and retry that same send. [Result storage](../runtime/takt.md#completion-results) · [Endpoint retry](../runtime/sess.md#outputs-and-ownership)
 
 ## Cancel and Retire
 
@@ -28,3 +28,5 @@ For `MultishotSubscription`, use `HandleCQE` or its extended handler. `Subscript
 [Multishot examples](../../examples/multishot_test.go) cover accept, selected-buffer receive, and callback-requested cancellation. See [cancellation](../../cancel_linux_test.go) and [helper](../../multishot_internal_linux_test.go) tests.
 
 Check live success/error, terminal events, stale generations, both completion/cancellation orders, late dispatch, and bounded consumer capacity. Progress claims require kernel, peer, fairness, and service assumptions.
+
+On UDP loopback, queue an empty datagram followed by `X`. With the local endpoint full, reap the final empty message. Free one endpoint slot and check that the peer receives the empty message exactly once. A fresh receive on the socket should then deliver `X`. [Datagram receives](../boundary/protocols.md#datagram-receives)

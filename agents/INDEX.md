@@ -25,6 +25,7 @@ Read [core contracts](core.md), select a task and its required sources, then fol
 | Build a continuation adapter | [One-shot](recipes/oneshot.md), [kont](runtime/kont.md), [takt](runtime/takt.md) |
 | Check context across suspension | [Protocol](recipes/protocol.md), [cove](runtime/cove.md) |
 | Deliver a framed message or a write receipt | [Protocol recipe](recipes/protocol.md), [stream framing](boundary/protocols.md#stream-framing), [write receipt](recipes/protocol.md#deliver-a-write-receipt) |
+| Receive UDP datagrams and their metadata | [Truncation, empty datagrams and header reuse](boundary/protocols.md#datagram-receives), [deliver a final value under backpressure](recipes/stream.md#dispatch-each-observation) |
 | Submit to multiple targets | [Multiple targets](recipes/buffers.md#multiple-targets) |
 | Review performance | [Cost](verify.md#cost), [waiting](boundary/integration.md#waiting-and-backoff) |
 | Change zero-copy, cancellation, incremental buffers, CQ ownership or context packing | [Models, proofs and source mappings](../proofs/README.md) |
