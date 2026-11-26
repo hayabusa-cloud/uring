@@ -420,17 +420,22 @@ for {
 マルチショット操作は、カーネルが最終 CQE（`IORING_CQE_F_MORE` なし）を送るまで CQE のストリームを生成します。呼び出し側ランタイムコードは各 CQE を返されたサブスクリプションへ先にルーティングしてから残りのディスパッチャへ渡します。
 
 ```go
+accepting := true
 handler := uring.NewMultishotSubscriber().
 	OnStep(func(step uring.MultishotStep) uring.MultishotAction {
 		if step.Err != nil {
 			return uring.MultishotStop
 		}
 		connFD := iofd.FD(step.CQE.Res)
-		registerConnection(connFD)
+		if accepting {
+			registerConnection(connFD)
+		} else if err := connFD.Close(); err != nil {
+			log.Print(err)
+		}
 		return uring.MultishotContinue
 	}).
 	OnStop(func(err error, cancelled bool) {
-		if !cancelled {
+		if accepting && !cancelled {
 			queueAcceptRetry(err)
 		}
 	})
@@ -455,6 +460,8 @@ for i := range n {
 `OnStep` コールバックは 1 件の `MultishotStep` を観察します。ストリームを維持するなら `MultishotContinue` を、キャンセルを要求するなら `MultishotStop` を返します。コールバックが終端観察まで有効なままなら、`OnStop` は最終エラーと `cancelled` フラグを伴って高々一度だけ実行されます。ステップ自身の `step.Cancelled` は、境界上でカーネルが `-ECANCELED` を返した判定をその他の失敗と明示的に区別します。これらのコールバックはそれぞれ `MultishotHandler.OnMultishotStep` と `MultishotHandler.OnMultishotStop` に対応します。インタフェースを直接実装することもできます。`HandleCQE` は呼び出し側の直列化された完了ループ内で即時 dispatch するための補助です。コピー済み CQE をそのループの後も保持する場合、呼び出し側が独自の route state を保持し、すでに解放されたサブスクリプションの観察を拒否してください。デフォルトの単一発行者リング（`MultiIssuers=false`）では、OS スレッドに固定したリング所有者から `Cancel` / `Unsubscribe` を呼び、発行、`Wait`、`WaitDirect`、`WaitExtended`、`Stop`、`ResizeRings` と直列化してください。`MultiIssuers=true` のリングでは、共有発行パスがキャンセル SQE を直列化します。
 
 投入済みのキャンセル CQE は、`SubscriptionStopped` または `OnStop` の後も、同じサブスクリプションの `HandleCQE` またはその拡張ハンドラへ渡してください。投入の失敗や何もしない呼び出しでは、新たなキャンセル CQE の処理義務は生じません。サブスクリプションは両コンテキストを所有し、元の終端 CQE の処理、キャンセルの dispatch、キャンセル投入処理がすべて終わってから、元のコンテキストをプールへ返します。これらのコンテキストを手動で返さないでください。[受信の例](./examples/multishot_test.go)は、自然な完了とハンドラからのキャンセルを示します。
+
+接続の受け入れを終了するには、ループの所有者が `accepting = false` に設定してから `sub.Cancel()` を呼びます。その後に受理したソケットはステップハンドラが閉じます。`Unsubscribe` でコールバックが抑止された場合、そのコールバックが受け取るはずだった各ソケットはディスパッチャが引き受けます。[受理済みソケット](agents/boundary/resources.md#accepted-sockets)
 
 ### 型付きコンテキストによるコネクション状態
 
@@ -530,12 +537,15 @@ func queueReceiveWithTimeout(ring *uring.Uring, fd iofd.FD, buf []byte, d time.D
 `ListenerManager` は最初の SOCKET リクエストを投入します。構築中の各 CQE を `listenerOp.HandleCQE` に渡すと、コールバックの呼び出しと BIND、LISTEN の投入が自動的に行われます。`iox.ErrWouldBlock` が返った場合はリングを駆動し、`ring.SubmitExtended(uring.PackExtended(listenerOp.Ext()))` で準備済み SQE の投入を再試行してください。同じ CQE を再処理してはいけません。`OnListening` が成功を通知した後に接続の受け付けを開始します。
 
 ```go
-// OnListening has reported successful setup for listenerOp.
 acceptSub, err := listenerOp.AcceptMultishot(acceptHandler)
 if err != nil {
 	return err
 }
+```
 
+リスナーのディスパッチループで `acceptSub` を保持します。接続の受け付けに成功したら、その接続の所有者が `iofd.FD(step.CQE.Res)` を `clientFD` として保持します。受信の投入が `iox.ErrWouldBlock` を返した場合は、その FD を保持したまま受信の投入だけを再試行します。接続を破棄する場合は FD を閉じます。
+
+```go
 recvCtx := uring.ForFD(int32(clientFD)).WithBufGroup(readGroup)
 recvSub, err := ring.ReceiveMultishot(recvCtx, recvHandler)
 if err != nil {
@@ -543,7 +553,7 @@ if err != nil {
 }
 ```
 
-サブスクリプションを停止するときは `Cancel` を呼び、終端 CQE と、キャンセルを投入した場合はその CQE を処理するまでディスパッチを続けてください。両方のサブスクリプションをドレインしてから FD を閉じ、リングを停止します。[リスナーの例](./listener_example_test.go) はセットアップから終了処理までを示し、[multishot の例](./examples/multishot_test.go) と [echo の例](./examples/echo_test.go) は接続処理を示します。
+サブスクリプションを停止するときは `Cancel` を呼び、終端 CQE と、キャンセルを投入した場合はその CQE を処理するまでディスパッチを続けてください。各サブスクリプションをドレインしてから、対応する FD を閉じます。リングを停止する前に、投入済みのすべてのサブスクリプションをドレインします。[リスナーの例](./listener_example_test.go) はセットアップから終了処理までを示し、[multishot の例](./examples/multishot_test.go) と [echo の例](./examples/echo_test.go) は接続処理を示します。
 
 ### TCP クライアント
 

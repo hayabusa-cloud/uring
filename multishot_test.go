@@ -8,8 +8,8 @@ package uring_test
 
 import (
 	"errors"
+	"io"
 	"net"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,69 +19,98 @@ import (
 	"code.hybscloud.com/zcall"
 )
 
-// testMultishotHandler implements MultishotHandler for testing.
-type testMultishotHandler struct {
-	resultCount  atomic.Int32
-	errorCount   atomic.Int32
-	stoppedCount atomic.Int32
-	lastRes      atomic.Int32
-	shouldStop   atomic.Bool
+func multishotListener(t *testing.T) (uring.SQEContext, string) {
+	t.Helper()
+	ln, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	file, err := ln.File()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { file.Close() })
+	return uring.ForFD(int32(file.Fd())), ln.Addr().String()
 }
 
-func (h *testMultishotHandler) OnMultishotStep(step uring.MultishotStep) uring.MultishotAction {
-	if step.Err == nil {
-		h.resultCount.Add(1)
-		h.lastRes.Store(step.CQE.Res)
-		if h.shouldStop.Load() {
-			return uring.MultishotStop
+// One cancellation was admitted for this accept on a listener with no waiting
+// peers. Its terminal and cancellation CQEs can arrive in either order.
+func checkAcceptCancellation(t *testing.T, ring *uring.Uring, sub *uring.MultishotSubscription) {
+	t.Helper()
+	var terminal, control bool
+	for _, cqe := range waitForCQEs(t, ring, 2) {
+		switch cqe.Op() {
+		case uring.IORING_OP_ACCEPT:
+			terminal = !cqe.HasMore() && errors.Is(cqe.Err(), uring.ErrCanceled)
+		case uring.IORING_OP_ASYNC_CANCEL:
+			control = cqe.Res == 0
 		}
-		return uring.MultishotContinue
+		if !sub.HandleCQE(cqe) {
+			t.Fatal("unhandled completion")
+		}
 	}
-	if !step.Cancelled {
-		h.errorCount.Add(1)
+	if !terminal || !control || sub.Active() {
+		t.Fatalf("terminal=%v control=%v state=%v", terminal, control, sub.State())
 	}
-	return uring.MultishotStop
 }
 
-func (h *testMultishotHandler) OnMultishotStop(error, bool) {
-	h.stoppedCount.Add(1)
-}
-
-// TestMultishotSubscriptionCreate tests subscription creation via Uring factory methods.
 func TestMultishotSubscriptionCreate(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
-	})
+	ring := newTestRing(t)
+	ctx, _ := multishotListener(t)
+	sub, err := ring.AcceptMultishot(ctx, nil)
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatal(err)
 	}
-	mustStartRing(t, ring)
+	if sub == nil || sub.State() != uring.SubscriptionActive {
+		t.Fatal("expected an active subscription")
+	}
+	if err := sub.Cancel(); err != nil {
+		t.Fatal(err)
+	}
+	checkAcceptCancellation(t, ring, sub)
+}
 
-	// Create listener for test
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+func TestMultishotAcceptAfterUnsubscribe(t *testing.T) {
+	ring := newTestRing(t)
+	ctx, addr := multishotListener(t)
+	handler := uring.NewMultishotSubscriber().
+		OnStep(func(uring.MultishotStep) uring.MultishotAction {
+			t.Error("step callback after unsubscribe")
+			return uring.MultishotContinue
+		}).
+		OnStop(func(error, bool) { t.Error("stop callback after unsubscribe") })
+	sub, err := ring.AcceptMultishot(ctx, handler)
 	if err != nil {
-		t.Fatalf("Listen: %v", err)
+		t.Fatal(err)
 	}
-	defer ln.Close()
-
-	lnFile, err := ln.(*net.TCPListener).File()
+	peer, err := net.DialTimeout("tcp4", addr, 3*time.Second)
 	if err != nil {
-		t.Fatalf("File: %v", err)
+		t.Fatal(err)
 	}
-	defer lnFile.Close()
-	fd := int32(lnFile.Fd())
+	defer peer.Close()
 
-	handler := &testMultishotHandler{}
-	sqeCtx := uring.ForFD(fd)
-
-	// Factory is on Uring now
-	sub, err := ring.AcceptMultishot(sqeCtx, handler)
-	if err != nil {
-		t.Logf("AcceptMultishot: %v (may be unsupported)", err)
-		return
+	// Withdraw on the same owner, after reaping the success and before dispatch.
+	accepted := waitForCQEs(t, ring, 1)[0]
+	if accepted.Op() != uring.IORING_OP_ACCEPT || accepted.Res < 0 || !accepted.HasMore() {
+		t.Fatalf("expected live accept, got op=%d res=%d flags=%#x", accepted.Op(), accepted.Res, accepted.Flags)
 	}
-	if sub == nil {
-		t.Fatal("AcceptMultishot returned nil subscription")
+	fd := iofd.NewFD(int(accepted.Res))
+	sub.Unsubscribe()
+	if !sub.HandleCQE(accepted) {
+		t.Fatal("unhandled accept")
+	}
+	if err := fd.Close(); err != nil {
+		t.Fatal(err)
+	}
+	checkAcceptCancellation(t, ring, sub)
+
+	if err := peer.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var buf [1]byte
+	if n, err := peer.Read(buf[:]); n != 0 || err != io.EOF {
+		t.Fatalf("peer read after closing accepted fd = (%d, %v), want (0, EOF)", n, err)
 	}
 }
 
@@ -349,183 +378,92 @@ func TestSubmitReceiveMultishot(t *testing.T) {
 	}
 }
 
-// TestMultishotHandlerStopRequest tests handler-initiated stop.
 func TestMultishotHandlerStopRequest(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
-	})
+	ring := newTestRing(t)
+	ctx, addr := multishotListener(t)
+	var successes, stops int
+	handler := uring.NewMultishotSubscriber().
+		OnStep(func(step uring.MultishotStep) uring.MultishotAction {
+			if step.Err == nil {
+				successes++
+				fd := iofd.NewFD(int(step.CQE.Res))
+				if err := fd.Close(); err != nil {
+					t.Fatal(err)
+				}
+			} else if !step.Cancelled {
+				t.Errorf("accept: %v", step.Err)
+			}
+			return uring.MultishotStop
+		}).
+		OnStop(func(err error, cancelled bool) {
+			stops++
+			if !cancelled || !errors.Is(err, uring.ErrCanceled) {
+				t.Errorf("stop: err=%v cancelled=%v", err, cancelled)
+			}
+		})
+	sub, err := ring.AcceptMultishot(ctx, handler)
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatal(err)
 	}
-	mustStartRing(t, ring)
-
-	// Create listener
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	peer, err := net.DialTimeout("tcp4", addr, 3*time.Second)
 	if err != nil {
-		t.Fatalf("Listen: %v", err)
+		t.Fatal(err)
 	}
-	defer ln.Close()
-	addr := ln.Addr().(*net.TCPAddr)
+	defer peer.Close()
 
-	lnFile, err := ln.(*net.TCPListener).File()
-	if err != nil {
-		t.Fatalf("File: %v", err)
+	if !sub.HandleCQE(waitForCQEs(t, ring, 1)[0]) || sub.State() != uring.SubscriptionCancelling {
+		t.Fatalf("handler stop left state %v", sub.State())
 	}
-	defer lnFile.Close()
-	fd := int32(lnFile.Fd())
-
-	handler := &testMultishotHandler{}
-	handler.shouldStop.Store(true) // Handler will request stop on first result
-	sqeCtx := uring.ForFD(fd)
-
-	sub, err := ring.AcceptMultishot(sqeCtx, handler)
-	if err != nil {
-		t.Logf("AcceptMultishot returned error: %v", err)
-		return
+	checkAcceptCancellation(t, ring, sub)
+	if successes != 1 || stops != 1 {
+		t.Fatalf("successful steps=%d stops=%d, want one of each", successes, stops)
 	}
-
-	// Connect a client
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		conn, err := net.DialTimeout("tcp", addr.String(), 2*time.Second)
-		if err == nil {
-			conn.Close()
-		}
-	}()
-
-	// Wait for completion
-	cqes := make([]uring.CQEView, 16)
-	deadline := time.Now().Add(3 * time.Second)
-	b := iox.Backoff{}
-
-	for time.Now().Before(deadline) {
-		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
-			t.Fatalf("Wait: %v", err)
-		}
-
-		for i := 0; i < n; i++ {
-			dispatchSimplifiedMultishotCQE(handler, cqes[i])
-		}
-
-		if handler.resultCount.Load() > 0 {
-			break
-		}
-		b.Wait()
-	}
-
-	// After handler returns false, subscription should no longer be active
-	if handler.resultCount.Load() > 0 && sub.Active() {
-		// May still be active while cancellation is in progress
-		t.Logf("Subscription still active after handler stop request (cancellation in progress)")
-	}
-
-	t.Logf("results: %d, errors: %d, stopped: %d",
-		handler.resultCount.Load(),
-		handler.errorCount.Load(),
-		handler.stoppedCount.Load())
 }
 
-// TestMultishotPoolExhaustion tests pool exhaustion returns ErrWouldBlock.
 func TestMultishotPoolExhaustion(t *testing.T) {
-	// Create ring with minimal pool capacity (2 entries)
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = 2 // Minimal entries for pool exhaustion test
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	mustStartRing(t, ring)
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Listen: %v", err)
-	}
-	defer ln.Close()
-
-	lnFile, err := ln.(*net.TCPListener).File()
-	if err != nil {
-		t.Fatalf("File: %v", err)
-	}
-	defer lnFile.Close()
-	fd := int32(lnFile.Fd())
-
-	handler := &testMultishotHandler{}
-	sqeCtx := uring.ForFD(fd)
-
-	// Exhaust the pool
-	subs := make([]*uring.MultishotSubscription, 0, 2)
-	for i := 0; i < 2; i++ {
-		sub, err := ring.AcceptMultishot(sqeCtx, handler)
+	ring := newTestRing(t, func(opt *uring.Options) { opt.Entries = 2 })
+	ctx, _ := multishotListener(t)
+	var subs [2]*uring.MultishotSubscription
+	for i := range subs {
+		sub, err := ring.AcceptMultishot(ctx, nil)
 		if err != nil {
-			t.Logf("AcceptMultishot[%d]: %v", i, err)
-			continue
+			t.Fatal(err)
 		}
-		subs = append(subs, sub)
+		subs[i] = sub
 	}
-
-	// Next operation should return ErrWouldBlock
-	_, err = ring.AcceptMultishot(sqeCtx, handler)
-	if !errors.Is(err, iox.ErrWouldBlock) {
-		t.Errorf("expected ErrWouldBlock when pool exhausted, got: %v", err)
+	// Submit both accepts so only context capacity can limit a third request.
+	var cqes [1]uring.CQEView
+	if n, err := ring.Wait(cqes[:]); n != 0 || (err != nil && !iox.IsWouldBlock(err)) {
+		t.Fatalf("unexpected listener activity: completions=%d err=%v", n, err)
 	}
-
-	// Cancel all subscriptions before ring teardown
+	if _, err := ring.AcceptMultishot(ctx, nil); !iox.IsWouldBlock(err) {
+		t.Fatalf("expected exhausted context pool, got %v", err)
+	}
 	for _, sub := range subs {
-		sub.Cancel()
+		if err := sub.Cancel(); err != nil {
+			t.Fatal(err)
+		}
+		checkAcceptCancellation(t, ring, sub)
 	}
 }
 
-// TestMultishotCancelIdempotent tests that Cancel is idempotent.
 func TestMultishotCancelIdempotent(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
-	})
+	ring := newTestRing(t)
+	ctx, _ := multishotListener(t)
+	sub, err := ring.AcceptMultishot(ctx, nil)
 	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	mustStartRing(t, ring)
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Listen: %v", err)
-	}
-	defer ln.Close()
-
-	lnFile, err := ln.(*net.TCPListener).File()
-	if err != nil {
-		t.Fatalf("File: %v", err)
-	}
-	defer lnFile.Close()
-	fd := int32(lnFile.Fd())
-
-	handler := &testMultishotHandler{}
-	sqeCtx := uring.ForFD(fd)
-	sub, err := ring.AcceptMultishot(sqeCtx, handler)
-	if err != nil {
-		t.Logf("AcceptMultishot returned error: %v", err)
-		return
+		t.Fatal(err)
 	}
 
-	// Cancel multiple times should be safe (idempotent)
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		if err := sub.Cancel(); err != nil {
-			t.Logf("Cancel[%d] returned error: %v", i, err)
+			t.Fatal(err)
 		}
 	}
-
-	// Drain terminal CQE to verify lifecycle convergence
-	cqes := make([]uring.CQEView, 16)
-	deadline := time.Now().Add(3 * time.Second)
-	b := iox.Backoff{}
-	for time.Now().Before(deadline) && sub.State() != uring.SubscriptionStopped {
-		_, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
-			t.Fatalf("Wait: %v", err)
-		}
-		b.Wait()
+	checkAcceptCancellation(t, ring, sub)
+	if err := sub.Cancel(); err != nil {
+		t.Fatalf("Cancel after stop: %v", err)
 	}
-	t.Logf("final state: %v, stopped: %d", sub.State(), handler.stoppedCount.Load())
 }
 
 // TestSubscriptionState tests the SubscriptionState constants.

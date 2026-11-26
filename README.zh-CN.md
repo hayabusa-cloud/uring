@@ -420,17 +420,22 @@ for {
 Multishot 操作产生 CQE 流，直到内核发送最终 CQE（不含 `IORING_CQE_F_MORE`）。调用方运行时代码先把每个 CQE 交给返回的订阅，再进入其余分发器。
 
 ```go
+accepting := true
 handler := uring.NewMultishotSubscriber().
 	OnStep(func(step uring.MultishotStep) uring.MultishotAction {
 		if step.Err != nil {
 			return uring.MultishotStop
 		}
 		connFD := iofd.FD(step.CQE.Res)
-		registerConnection(connFD)
+		if accepting {
+			registerConnection(connFD)
+		} else if err := connFD.Close(); err != nil {
+			log.Print(err)
+		}
 		return uring.MultishotContinue
 	}).
 	OnStop(func(err error, cancelled bool) {
-		if !cancelled {
+		if accepting && !cancelled {
 			queueAcceptRetry(err)
 		}
 	})
@@ -455,6 +460,8 @@ for i := range n {
 每一次 `OnStep` 回调观察一个 `MultishotStep`：返回 `MultishotContinue` 保持流活跃，或返回 `MultishotStop` 请求取消。如果回调一直保持启用直到终态观察，`OnStop` 至多以最终错误及 `cancelled` 标志触发一次；在步骤自身上，`step.Cancelled` 在边界处把内核的 `-ECANCELED` 判定与其他失败明确区分开。这两个回调分别对应 `MultishotHandler.OnMultishotStep` 和 `MultishotHandler.OnMultishotStop`；也可以直接实现该接口。`HandleCQE` 用于调用方串行化完成循环内的立即 dispatch；若调用方在该循环之后保留复制 CQE，则需维护自己的 route state，并拒绝已退役订阅的观察。在默认的单提交者 ring（`MultiIssuers=false`）上，应从固定于 OS 线程的 ring 所有者调用 `Cancel` / `Unsubscribe`，并将其与提交、`Wait`、`WaitDirect`、`WaitExtended`、`Stop` 以及 `ResizeRings` 串行化。`MultiIssuers=true` 的 ring 通过共享提交路径串行化取消 SQE。
 
 每个已入队的取消 CQE 都应交给同一订阅的 `HandleCQE` 或其扩展处理器，即使已到达 `SubscriptionStopped` 或触发 `OnStop`。提交失败或未执行新提交的调用不会产生新的取消 CQE 处理义务。订阅拥有两个上下文，只有在处理完原请求的终态 CQE、完成取消分派且取消提交过程结束后，才将原上下文归还池。不要手动归还这些上下文。[接收示例](./examples/multishot_test.go)展示了自然完成和由处理器请求的取消。
+
+要停止接收新连接，循环的所有者先设置 `accepting = false`，再调用 `sub.Cancel()`。步骤处理器会关闭随后接受的套接字。调用 `Unsubscribe` 后，若某次成功接受连接的回调受到抑制，相应的套接字由分派器接管。[已接受的套接字](agents/boundary/resources.md#accepted-sockets)
 
 ### 类型化上下文承载连接状态
 
@@ -530,12 +537,15 @@ func queueReceiveWithTimeout(ring *uring.Uring, fd iofd.FD, buf []byte, d time.D
 `ListenerManager` 提交最初的 SOCKET 请求。将配置阶段的每个 CQE 交给 `listenerOp.HandleCQE`，即可自动调用回调并提交 BIND 和 LISTEN。如果返回 `iox.ErrWouldBlock`，应先驱动 ring，再通过 `ring.SubmitExtended(uring.PackExtended(listenerOp.Ext()))` 重试已准备好的 SQE；不要重复处理该 CQE。收到 `OnListening` 的成功通知后再开始接受连接。
 
 ```go
-// OnListening has reported successful setup for listenerOp.
 acceptSub, err := listenerOp.AcceptMultishot(acceptHandler)
 if err != nil {
 	return err
 }
+```
 
+由监听器的分发循环保留 `acceptSub`。每次接受连接成功后，连接的所有者将 `iofd.FD(step.CQE.Res)` 保存为 `clientFD`。如果提交接收请求返回 `iox.ErrWouldBlock`，保留该 FD，只重试接收请求。若放弃该连接，则关闭该 FD。
+
+```go
 recvCtx := uring.ForFD(int32(clientFD)).WithBufGroup(readGroup)
 recvSub, err := ring.ReceiveMultishot(recvCtx, recvHandler)
 if err != nil {
@@ -543,7 +553,7 @@ if err != nil {
 }
 ```
 
-停止订阅时调用 `Cancel`，然后继续分发，直到处理完其终端 CQE，以及已提交的取消请求对应的 CQE。两个订阅都必须完成收尾，才能关闭其描述符或停止 ring。[监听器示例](./listener_example_test.go) 展示完整的创建与关闭流程；[multishot 示例](./examples/multishot_test.go) 和 [echo 示例](./examples/echo_test.go) 展示连接处理。
+停止订阅时调用 `Cancel`，然后继续分发，直到处理完其终端 CQE，以及已提交的取消请求对应的 CQE。每个已提交的订阅都必须完成收尾，才能关闭其描述符。停止 ring 前须完成所有订阅的收尾。[监听器示例](./listener_example_test.go) 展示完整的创建与关闭流程；[multishot 示例](./examples/multishot_test.go) 和 [echo 示例](./examples/echo_test.go) 展示连接处理。
 
 ### TCP 客户端
 

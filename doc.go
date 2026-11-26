@@ -158,40 +158,25 @@
 //
 // # Handler Patterns
 //
-// Handler helpers provide convenience step/action adapters. They do not change
-// the underlying CQE facts and are optional.
-//
-// Subscriber pattern (functional callbacks):
+// [NewMultishotSubscriber] adapts functions to [MultishotHandler]. In this
+// accept handler, registerConnection takes ownership of each socket and closes
+// it after its last use.
 //
 //	handler := uring.NewMultishotSubscriber().
 //	    OnStep(func(step uring.MultishotStep) uring.MultishotAction {
-//	        if step.Err == nil {
-//	            return uring.MultishotContinue
+//	        if step.Err != nil {
+//	            return uring.MultishotStop
 //	        }
-//	        return uring.MultishotStop
+//	        registerConnection(iofd.NewFD(int(step.CQE.Res)))
+//	        return uring.MultishotContinue
 //	    }).
 //	    OnStop(func(err error, cancelled bool) {
 //	        log.Println("stopped", err, cancelled)
 //	    })
 //
-// Noop embedding pattern (override only needed methods):
-//
-//	type myHandler struct {
-//	    uring.NoopMultishotHandler
-//	    connections int
-//	}
-//
-//	func (h *myHandler) OnMultishotStep(step uring.MultishotStep) uring.MultishotAction {
-//	    if step.Err == nil && step.CQE.Res >= 0 {
-//	        h.connections++
-//	        return uring.MultishotContinue
-//	    }
-//	    return h.NoopMultishotHandler.OnMultishotStep(step)
-//	}
-//
-// Handlers either return `MultishotContinue` to keep a live subscription, or
-// `MultishotStop` to request cancellation after the current step. The request
-// is local until the cancel SQE is successfully enqueued.
+// Custom handlers can embed [NoopMultishotHandler] and override the methods
+// they need. [MultishotContinue] keeps a live subscription running.
+// [MultishotStop] requests cancellation after a non-final step.
 //
 // # Multishot Subscription Lifecycle
 //

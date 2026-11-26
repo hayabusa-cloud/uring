@@ -420,17 +420,22 @@ Aunque `Wait` tenga éxito, el lote puede contener un CQE de una operación fall
 Una operación multishot genera un flujo de CQEs hasta que el kernel envía uno final (sin `IORING_CQE_F_MORE`). El código de ejecución del llamador encamina cada CQE por la suscripción devuelta antes de pasar al resto del despachador:
 
 ```go
+accepting := true
 handler := uring.NewMultishotSubscriber().
 	OnStep(func(step uring.MultishotStep) uring.MultishotAction {
 		if step.Err != nil {
 			return uring.MultishotStop
 		}
 		connFD := iofd.FD(step.CQE.Res)
-		registerConnection(connFD)
+		if accepting {
+			registerConnection(connFD)
+		} else if err := connFD.Close(); err != nil {
+			log.Print(err)
+		}
 		return uring.MultishotContinue
 	}).
 	OnStop(func(err error, cancelled bool) {
-		if !cancelled {
+		if accepting && !cancelled {
 			queueAcceptRetry(err)
 		}
 	})
@@ -455,6 +460,8 @@ for i := range n {
 Cada llamada a `OnStep` observa un `MultishotStep`: devuelva `MultishotContinue` para mantener el flujo activo o `MultishotStop` para solicitar la cancelación. Si las devoluciones de llamada permanecen habilitadas hasta la observación terminal, `OnStop` se ejecuta como máximo una vez con el error final y la bandera `cancelled`; en el propio paso, `step.Cancelled` distingue en el límite el veredicto específico `-ECANCELED` del kernel del resto de fallos. Estas funciones corresponden a `MultishotHandler.OnMultishotStep` y `MultishotHandler.OnMultishotStop`; también puede implementar esa interfaz directamente. `HandleCQE` sirve para el despacho inmediato en el bucle de finalización serializado del llamador; si el código llamador conserva CQE copiadas más allá de ese bucle, debe mantener su propio estado de ruta y rechazar observaciones de suscripciones ya retiradas. En los rings predeterminados de emisor único (`MultiIssuers=false`), llame a `Cancel` / `Unsubscribe` desde el propietario fijado a un hilo del sistema operativo y serialícelos con envío, `Wait`, `WaitDirect`, `WaitExtended`, `Stop` y `ResizeRings`. Los rings con `MultiIssuers=true` serializan los SQE de cancelación mediante la ruta de envío compartida.
 
 Dirija cada CQE de cancelación encolada al `HandleCQE` de la misma suscripción o a su manejador extendido, incluso después de `SubscriptionStopped` o `OnStop`. Un fallo de envío o una llamada sin efecto no crea una nueva obligación de CQE de cancelación. La suscripción posee ambos contextos y devuelve el original a su pool solo tras procesar la CQE terminal original, despachar la cancelación y finalizar su envío. No devuelva estos contextos manualmente. El [ejemplo de recepción](./examples/multishot_test.go) muestra la finalización natural y la cancelación solicitada por el manejador.
+
+Para dejar de admitir conexiones, el propietario del bucle establece `accepting = false` antes de llamar a `sub.Cancel()`. El manejador de pasos cierra los sockets que se acepten después. Tras `Unsubscribe`, el despachador se hace cargo de cada socket aceptado cuya devolución de llamada se haya suprimido. [Sockets aceptados](agents/boundary/resources.md#accepted-sockets)
 
 ### Estado por conexión con contextos tipados
 
@@ -530,12 +537,15 @@ Los siguientes son los flujos más cortos, pensados para leerse junto con las pr
 `ListenerManager` envía la solicitud SOCKET inicial. Pase cada CQE de configuración a `listenerOp.HandleCQE` para invocar los callbacks y enviar BIND y LISTEN automáticamente. Si devuelve `iox.ErrWouldBlock`, procese el anillo y reintente el SQE preparado con `ring.SubmitExtended(uring.PackExtended(listenerOp.Ext()))`; no vuelva a procesar el CQE. Empiece a aceptar conexiones cuando `OnListening` confirme el éxito.
 
 ```go
-// OnListening has reported successful setup for listenerOp.
 acceptSub, err := listenerOp.AcceptMultishot(acceptHandler)
 if err != nil {
 	return err
 }
+```
 
+Conserve `acceptSub` en el bucle que despacha las CQE del listener. Por cada conexión aceptada, su propietario guarda `iofd.FD(step.CQE.Res)` como `clientFD`. Si el envío de la solicitud de recepción devuelve `iox.ErrWouldBlock`, conserve ese FD y reintente solo la recepción. Ciérrelo si abandona la conexión.
+
+```go
 recvCtx := uring.ForFD(int32(clientFD)).WithBufGroup(readGroup)
 recvSub, err := ring.ReceiveMultishot(recvCtx, recvHandler)
 if err != nil {
@@ -543,7 +553,7 @@ if err != nil {
 }
 ```
 
-Para detener una suscripción, llame a `Cancel` y siga despachando hasta procesar su CQE terminal y la CQE de cancelación, si se envió. Drene ambas suscripciones antes de cerrar sus descriptores o detener el ring. [El ejemplo de escucha](./listener_example_test.go) muestra la configuración y el cierre completos; los [ejemplos multishot](./examples/multishot_test.go) y de [echo](./examples/echo_test.go) cubren el flujo de conexión.
+Para detener una suscripción, llame a `Cancel` y siga despachando hasta procesar su CQE terminal y la CQE de cancelación, si se envió. Drene cada suscripción admitida antes de cerrar su descriptor o detener el ring. [El ejemplo de escucha](./listener_example_test.go) muestra la configuración y el cierre completos; los [ejemplos multishot](./examples/multishot_test.go) y de [echo](./examples/echo_test.go) cubren el flujo de conexión.
 
 ### Cliente TCP
 

@@ -420,17 +420,22 @@ A successful `Wait` can include a CQE for a failed operation, so dispatch all `n
 A multishot operation produces a stream of CQEs until the kernel sends a final one (without `IORING_CQE_F_MORE`). Caller-side code routes each CQE through the returned subscription in the same serialized completion loop before falling back to the rest of the dispatcher:
 
 ```go
+accepting := true
 handler := uring.NewMultishotSubscriber().
 	OnStep(func(step uring.MultishotStep) uring.MultishotAction {
 		if step.Err != nil {
 			return uring.MultishotStop
 		}
 		connFD := iofd.FD(step.CQE.Res)
-		registerConnection(connFD)
+		if accepting {
+			registerConnection(connFD)
+		} else if err := connFD.Close(); err != nil {
+			log.Print(err)
+		}
 		return uring.MultishotContinue
 	}).
 	OnStop(func(err error, cancelled bool) {
-		if !cancelled {
+		if accepting && !cancelled {
 			queueAcceptRetry(err)
 		}
 	})
@@ -455,6 +460,8 @@ for i := range n {
 Each `OnStep` callback observes one `MultishotStep`: return `MultishotContinue` to keep the stream live, or `MultishotStop` to request cancellation. If callbacks remain enabled until the terminal observation, `OnStop` runs at most once with the final error and a `cancelled` flag; on the step itself, `step.Cancelled` distinguishes the specific `-ECANCELED` kernel verdict from other failures at the boundary. These callbacks correspond to `MultishotHandler.OnMultishotStep` and `MultishotHandler.OnMultishotStop`; you can also implement that interface directly. `HandleCQE` is for immediate dispatch in the caller's serialized completion loop; if caller code stores copied CQEs beyond that loop, it must keep its own route state and reject observations for retired subscriptions. On default single-issuer rings (`MultiIssuers=false`), call `Cancel` / `Unsubscribe` from the OS-thread-pinned ring owner and serialize them with submit, `Wait`, `WaitDirect`, `WaitExtended`, `Stop`, and `ResizeRings`. `MultiIssuers=true` rings serialize cancel SQEs through the shared-submit path.
 
 Route every queued cancellation CQE through the same subscription's `HandleCQE` or its extended handler, even after `SubscriptionStopped` or `OnStop`. Failed submission or a no-op creates no new cancellation CQE obligation. The subscription owns both contexts and returns the original to its pool only after original terminality, cancellation dispatch, and cancellation submission have finished. Do not return these contexts manually. The [receive example](./examples/multishot_test.go) demonstrates natural completion and handler-requested cancellation.
+
+To stop taking connections, the loop owner sets `accepting = false` before calling `sub.Cancel()`. The step handler then closes late sockets. After `Unsubscribe`, the dispatcher owns each successful accept whose callback was suppressed. [Accepted sockets](agents/boundary/resources.md#accepted-sockets)
 
 ### Per-connection state with typed contexts
 
@@ -530,12 +537,15 @@ These are the shortest flows, meant to be read alongside the tests:
 `ListenerManager` submits the initial SOCKET request. Route each setup CQE to `listenerOp.HandleCQE` to invoke callbacks and submit BIND and LISTEN automatically. If it returns `iox.ErrWouldBlock`, drive the ring and retry the prepared SQE with `ring.SubmitExtended(uring.PackExtended(listenerOp.Ext()))`; do not replay the CQE. Start accepting after `OnListening` reports success.
 
 ```go
-// OnListening has reported successful setup for listenerOp.
 acceptSub, err := listenerOp.AcceptMultishot(acceptHandler)
 if err != nil {
 	return err
 }
+```
 
+Keep `acceptSub` in the listener’s dispatcher. For each successful accept, the connection owner takes `iofd.FD(step.CQE.Res)` as `clientFD`. If receive admission returns `iox.ErrWouldBlock`, retain that FD and retry only the receive. Close it if you abandon the connection.
+
+```go
 recvCtx := uring.ForFD(int32(clientFD)).WithBufGroup(readGroup)
 recvSub, err := ring.ReceiveMultishot(recvCtx, recvHandler)
 if err != nil {
@@ -543,7 +553,7 @@ if err != nil {
 }
 ```
 
-Call `Cancel` when stopping a subscription, then keep dispatching until its terminal CQE and any submitted cancellation CQE have been consumed. Drain both subscriptions before closing their descriptors or stopping the ring. [The listener example](./listener_example_test.go) shows the complete setup and shutdown; [multishot examples](./examples/multishot_test.go) and [echo examples](./examples/echo_test.go) cover the connection flow.
+Call `Cancel` when stopping a subscription, then keep dispatching until its terminal CQE and any submitted cancellation CQE have been consumed. Drain each admitted subscription before closing its descriptor or stopping the ring. [The listener example](./listener_example_test.go) shows the complete setup and shutdown; [multishot examples](./examples/multishot_test.go) and [echo examples](./examples/echo_test.go) cover the connection flow.
 
 ### TCP client
 

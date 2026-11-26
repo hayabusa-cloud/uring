@@ -25,4 +25,10 @@ After an early `Close`, dispatch the pending setup CQE to retire it and close an
 
 For manual control, use `DecodeListenerCQE`, `SetFD`, the `PrepareListener*` helpers, and `SetListenerReady`. Consume each CQE exactly once through manual decoding or `HandleCQE`.
 
+## Accept Connections
+
+Start `ListenerOp.AcceptMultishot` after `OnListening`. The listener already has an fd after `SOCKET`, before `BIND` and `LISTEN` complete.
+
+Give each accepted process fd to its connection owner. If `ReceiveMultishot` returns `iox.ErrWouldBlock`, keep that fd and retry only the receive, or close it if the connection is abandoned. Continue dispatching the accept subscription. Drain operations using the listener fd before calling `ListenerOp.Close`. [TCP echo flow](../../README.md#tcp-echo-server) · [Accepted sockets](../boundary/files.md#accepted-sockets)
+
 [Listener example](../../listener_example_test.go) demonstrates setup through accept cancellation and drain. [Regression tests](../../listener_auto_test.go) cover IPv4/IPv6/Unix, wildcard inputs, callback stops, errors, routing, close, and full-SQ retry; [manual tests](../../listener_linux_test.go) cover the primitives. Review [resource lifetimes](../boundary/resources.md) and follow [verification](../verify.md).

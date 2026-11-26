@@ -44,13 +44,20 @@ On `iox.ErrWouldBlock`, keep the retry pending and still call `Wait` that turn. 
 
 ## Cancel and Retire
 
-Cancellation races with natural completion. A queued cancellation owns a separate completion and helper context. Dispatch original and cancellation CQEs even after the original route ends. Failed submission or documented no-op cancellation creates no new CQE obligation.
+Cancellation races with natural completion. A raw `AsyncCancel` uses the caller's control context. With `IOSQE_CQE_SKIP_SUCCESS` clear, an admitted cancellation yields its own CQE. A refused offer or a helper's documented no-op adds no control reply to await. After local route retirement, dispatch the original through its terminal CQE and reap any outstanding control replies. [Poll cancellation](lifecycle.md#request-and-observe) · [Subscription drain](../runtime/takt.md#drain-and-ownership)
 
-For `MultishotSubscription`, use `HandleCQE` or its extended handler. `SubscriptionStopped`/`OnMultishotStop` report original terminality and permit no manual pool return. `Unsubscribe` suppresses callbacks without eliminating queued cancellation dispatch. Follow [managed cancellation](../boundary/resources.md#managed-cancellation) and [lifecycle](lifecycle.md).
+For an ordinary `AcceptMultishot`, withdraw on the serialized completion owner between callbacks. Choose where to handle remaining [accepted sockets](../boundary/files.md#accepted-sockets).
+
+| Native delivery | Caller action |
+|-----------------|---------------|
+| Keep the step callback | Stop application admission, then call `Cancel`. The handler closes each subsequent success. If cancellation submission fails, continue dispatch and apply the caller's retry policy. |
+| Suppress callbacks with `Unsubscribe` | On the known ordinary-accept route, copy the opcode and result before `HandleCQE` can retire the context. Dispatch both requests. Close each matched original success whose callback was suppressed. An in-flight callback can already own its socket. |
+
+`HandleCQE` returns true for both the original and its cancellation. `Unsubscribe` makes one best-effort cancellation attempt, and an active original can still be cancelled with `Cancel`. Dispatch through original terminality and each admitted cancellation's CQE. The helper returns its own contexts. [Managed cancellation](../boundary/resources.md#managed-cancellation) · [Lifecycle](lifecycle.md)
 
 ## Validate
 
-[Multishot examples](../../examples/multishot_test.go) cover accept, selected-buffer receive, and callback-requested cancellation. See [cancellation](../../cancel_linux_test.go) and [helper](../../multishot_internal_linux_test.go) tests.
+[Multishot examples](../../examples/multishot_test.go) cover accept, selected-buffer receive, and callback-requested cancellation. The [accept withdrawal test](../../multishot_test.go) closes a reaped socket after callback suppression and checks EOF at its peer. See also [cancellation](../../cancel_linux_test.go) and [helper](../../multishot_internal_linux_test.go) tests.
 
 Check live success/error, terminal events, stale generations, both completion/cancellation orders, late dispatch, and bounded consumer capacity. Progress claims require kernel, peer, fairness, and service assumptions.
 

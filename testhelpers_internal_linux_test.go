@@ -9,8 +9,6 @@ package uring
 import (
 	"sync/atomic"
 	"testing"
-
-	"code.hybscloud.com/zcall"
 )
 
 const (
@@ -76,17 +74,4 @@ func lastSubmittedSQE(t *testing.T, ring *Uring) *ioUringSqe {
 	}
 	idx := (tail - 1) & *ring.ioUring.sq.kRingMask
 	return ring.ioUring.sq.sqeAt(idx)
-}
-
-func dispatchSimplifiedMultishotCQE(handler MultishotHandler, cqe CQEView) bool {
-	step := MultishotStep{CQE: cqe}
-	if cqe.Res < 0 {
-		step.Err = zcall.Errno(uintptr(-cqe.Res))
-		step.Cancelled = cqe.Res == -int32(ECANCELED)
-	}
-	keep := handler.OnMultishotStep(step) == MultishotContinue
-	if step.Final() {
-		handler.OnMultishotStop(step.Err, step.Cancelled)
-	}
-	return keep
 }

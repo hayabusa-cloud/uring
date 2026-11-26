@@ -29,6 +29,12 @@ Integer fields such as `RegionDesc.UserAddr` and `ZCRXAreaReg.Addr` do not retai
 
 `CloneBuffers` and `CloneBuffersFromRegistered` require Linux 6.18.3+ or a backport of the [buffer-cloning fix](https://github.com/torvalds/linux/commit/525916ce496615f531091855604eab9ca573b195) to preserve destination registrations after a replaced range. Unpatched kernels discard those registrations even when cloning succeeds.
 
+## File Lifetimes
+
+| Resource | Caller action |
+|----------|---------------|
+| <a id="accepted-sockets"></a>[Accepted socket](files.md#accepted-sockets) | Transfer or close every successful accept, including after callback withdrawal. Use the accept mode to identify the process fd or ring slot. |
+
 ### Fixed-File Lookup
 
 Keep each slot bound to the intended file until every request that needs it has acquired its file or finished. [Lookup and replacement](files.md#fixed-file-lookup)

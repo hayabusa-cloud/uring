@@ -156,16 +156,17 @@ func (s *MultishotSubscription) Cancel() error {
 	return s.submitCancel()
 }
 
-// Unsubscribe suppresses future callbacks and best-effort cancels the subscription.
-// It also suppresses callbacks that have not started yet, including `OnMultishotStop`.
-// Use it when you do not need a terminal callback.
+// Unsubscribe suppresses future step and stop callbacks and makes one
+// best-effort cancellation attempt. An in-flight callback may still finish.
 //
-// In-flight callbacks may still finish after `Unsubscribe` returns. If the cancel
-// submission fails, the kernel request can remain live until it terminates
-// naturally, but further callbacks stay suppressed.
-// Continue dispatching original and cancellation CQEs to release their contexts.
-// Unsubscribe follows the same cancel submission serialization contract as
-// [MultishotSubscription.Cancel].
+// After a failed submission, callbacks stay suppressed and the caller can retry
+// [MultishotSubscription.Cancel] while the original is active. Continue dispatching
+// original and cancellation CQEs. Unsubscribe follows the same serialization
+// contract as Cancel.
+//
+// The caller must account for resources from suppressed steps, such as sockets
+// returned by [Uring.AcceptMultishot]. Use Cancel directly to keep receiving
+// those resources in the step handler during shutdown.
 func (s *MultishotSubscription) Unsubscribe() {
 	s.unsubscribed.Store(true)
 	_ = s.Cancel()
@@ -187,9 +188,10 @@ func (s *MultishotSubscription) State() SubscriptionState {
 }
 
 // HandleCQE processes an original or cancellation CQE for this subscription.
-// It returns true when the CQE belongs to this route and was handled. It returns
-// false for non-extended CQEs, foreign routes, or observations whose current
-// pooled ExtSQE owner is no longer this subscription.
+// It returns true for either matched request, including when callbacks are
+// suppressed. Use the original operation and callback delivery to determine
+// who owns a returned resource. It returns false for non-extended CQEs,
+// foreign routes, or pooled ExtSQEs whose owner is no longer this subscription.
 //
 // HandleCQE is for immediate dispatch in the caller's serialized completion
 // loop. Caller code must call it before the observed ExtSQE can be retired and
@@ -287,7 +289,8 @@ func (ur *Uring) newMultishotSubscription(
 // AcceptMultishot starts a multishot accept subscription.
 // While callbacks stay enabled, the handler receives one MultishotStep per
 // original CQE and at most one terminal stop.
-// `step.CQE.Res` contains the accepted fd on success.
+// Each successful original CQE returns a process fd in Res, including fd zero.
+// The caller must transfer or close each fd, even on a final or suppressed step.
 // Options may add SQE control flags and accept-specific ioprio flags such as
 // `IORING_ACCEPT_POLL_FIRST`.
 func (ur *Uring) AcceptMultishot(sqeCtx SQEContext, handler MultishotHandler, options ...OpOptionFunc) (*MultishotSubscription, error) {
