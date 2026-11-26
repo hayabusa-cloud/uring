@@ -2,7 +2,7 @@
 
 ## Use When
 
-Local actions follow a protocol: send/receive, choice, recursion, and close. A caller adapter determines which kernel observations permit each action.
+Use an endpoint for local sends, receives, choices and close. Use `sess.Loop` or `sess.ExprLoop` for protocol recursion. The caller determines which kernel observations permit each action. [Protocol loops](https://github.com/hayabusa-cloud/sess/blob/v0.2.0/rec.go#L11-L30)
 
 ## Owns
 
@@ -12,26 +12,30 @@ Local actions follow a protocol: send/receive, choice, recursion, and close. A c
 
 ## Inputs and Preconditions
 
-Construct compatible peers with one owner per endpoint. Local channel capacity is four; preserve SPSC ownership across goroutines.
+Construct compatible peers with one goroutine owning each endpoint. In `sess v0.2.0` each direction has four data slots and a separate four-slot choice queue. [Queue capacity](https://github.com/hayabusa-cloud/sess/blob/v0.2.0/session.go#L14-L25) · [Endpoint pair](https://github.com/hayabusa-cloud/sess/blob/v0.2.0/session.go#L105-L119)
 
-`Step` exposes a suspension; `Advance` consumes it after successful dispatch. On full/empty transport, `iox.ErrWouldBlock` preserves the pending action. Drive the peer or wait under caller policy. `ErrMore` is outside this transport domain; classify kernel stream events before choosing endpoint actions.
+Classify kernel stream events before choosing an endpoint action. Session transport reports success or `iox.ErrWouldBlock`. [Transport outcomes](https://github.com/hayabusa-cloud/sess/blob/v0.2.0/session.go#L54-L69)
+
+## Choose a Driver
+
+| Driver | Who makes progress |
+|--------|--------------------|
+| `Step` and `Advance` | Use `sess.Step` for an `Expr` role or `kont.Step` for a `Cont` role. When either yields a suspension, the owner can try one action with `sess.Advance` and return to driving the CQ or the peer. [Stepping a role](https://github.com/hayabusa-cloud/sess/blob/v0.2.0/step.go#L11-L26) |
+| `Exec` / `ExecExpr` | Drive one endpoint and wait with backoff when blocked. The peer must be able to run independently. [Single-endpoint drivers](https://github.com/hayabusa-cloud/sess/blob/v0.2.0/exec.go#L11-L25) |
+| `Run` / `RunExpr` | Create a pair, drive both protocols on the calling goroutine and return the two results. [Paired drivers](https://github.com/hayabusa-cloud/sess/blob/v0.2.0/run.go#L12-L31) |
+| `RunError` / `RunErrorExpr` | Return two local `Either` values and a `*E` for the first uncaught `Throw`. Inspect that pointer first. If set, the peer's result may still be unresolved. [Paired error handling](https://github.com/hayabusa-cloud/sess/blob/v0.2.0/error.go#L65-L86) |
 
 ## Outputs and Ownership
 
-Retain the successor after `Advance`. Protocol `Close` leaves descriptor, request, buffer, and ring retirement independent.
+`Step` returns a nil suspension on completion. The endpoint owner serializes `Advance` and `Discard` on a live suspension. A successful send enqueues its value before resuming the continuation. The peer can receive it before `Advance` returns. Continue with the returned successor, if any. [Step and advance](https://github.com/hayabusa-cloud/sess/blob/v0.2.0/step.go#L11-L38)
 
-| Driver | Scope |
-|--------|-------|
-| `Exec`/`ExecExpr` | One endpoint |
-| `Run`/`RunExpr` | A pair; inspect the outer error before possibly unresolved peer results |
+On `iox.ErrWouldBlock`, `Advance` returns the same suspension. Keep it and its payload. Give the peer a turn or let it run independently. Its `Recv` frees a data slot for `Send`. Its `Offer` frees a choice slot for `SelectL` or `SelectR`. Recheck any publication grant before retrying. [Choice operations](https://github.com/hayabusa-cloud/sess/blob/v0.2.0/op.go#L89-L131) · [Write-receipt example](../recipes/protocol.md#deliver-a-write-receipt)
 
-Error-aware forms carry protocol errors. Recursive `sess.Loop` differs from `takt.Loop`.
-
-A [protocol adapter](../recipes/protocol.md) matches I/O, checks context, then advances the chosen action. Retain that action and its payload under backpressure; do not replay a consumed suspension or treat endpoint close as I/O drain.
+`sess.Close{}` signals protocol termination by incrementing the pair's shared close counter. The caller enforces the protocol after close and retires descriptors, requests, buffers and the ring through their own release conditions. [Close operation](https://github.com/hayabusa-cloud/sess/blob/v0.2.0/op.go#L53-L66) · [I/O release conditions](../recipes/lifecycle.md#release-each-owner)
 
 ## Cost Obligations
 
-Count queue storage, endpoint construction, pending values, frames/captures, and wait cadence. Compatible types remove neither capacity nor scheduling/peer-service obligations and establish no arbitrary global progress guarantee.
+Account for queue storage, endpoint construction, pending values, captured frames and retry frequency.
 
 ## Sources
 

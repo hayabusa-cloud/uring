@@ -8,7 +8,7 @@ Choose an operation shape and only the runtime roles it needs. Recipes describe 
 | [Listener](listener.md) | Advance socket, bind, and listen from CQEs |
 | [Stream](stream.md) | Dispatch events and retire a subscription |
 | [Buffers](buffers.md) | Retain storage and release correctly |
-| [Protocol](protocol.md) | Advance endpoint actions from I/O facts |
+| [Protocol](protocol.md) | Deliver framed messages or a [write receipt](protocol.md#deliver-a-write-receipt) under endpoint backpressure |
 | [Lifecycle](lifecycle.md) | [Track poll and cancellation replies](lifecycle.md#request-and-observe), [update or remove a timer](lifecycle.md#update-or-remove-a-timer) and release each resource after its final use |
 
 Read [core contracts](../core.md), then the recipe's retained state, pending and failure paths, release conditions, and validation cases. Finish with [verification](../verify.md). Linked examples are executable tests, not proofs of every variant; run relevant cases and report skips.

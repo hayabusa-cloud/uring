@@ -12,8 +12,8 @@ Use each package's own contracts and mechanisms. Make value and ownership transf
 | `spin` | Spin, yield, and lock primitives |
 | `lfq`, `atomix`, `dwcas` | Queue handoff and the atomic mechanisms used to implement it |
 | `framer` | Frame boundaries and codec operations |
-| `kont`, `cove`, `takt`, `sess` | Caller suspension, context, execution, and protocol mechanisms |
-| `tempo` | Pure temporal residuals and event observations; no clocks, scheduling or resource release |
+| `kont`, `cove`, `takt`, `sess` | Optional suspension, context, execution and endpoint mechanisms. [Runtime roles](../runtime/INDEX.md) |
+| `tempo` | Evaluates temporal contracts over caller-supplied events. The caller supplies any timing observations, drives the ring and releases resources. [Receipt policy](../runtime/tempo.md#track-a-write-receipt) · [Target and cancellation events](../recipes/lifecycle.md#request-and-observe) |
 
 ## Compose Through Public Contracts
 

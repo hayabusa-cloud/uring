@@ -12,9 +12,37 @@ Stop admission before teardown. Retain unaccepted suffixes and pending protocol 
 
 Request cancellation where permitted, then keep driving and dispatching. Cancellation races with its target and cannot replace the target's completion. [Cancellation contract](https://github.com/axboe/liburing/blob/liburing-2.13/man/io_uring_prep_cancel.3)
 
-Dispatch original terminal and successfully queued cancellation CQEs, including after route retirement. Helpers own cancellation contexts; never return them manually. No-op/failed submission creates no new CQE obligation.
+Dispatch every target and cancellation CQE, including those reaped after the application route retires. A managed helper owns its cancellation context through dispatch. A helper call that queues nothing adds no reply to await.
 
-For one target and one queued cancellation, a caller can pair two `tempo` contracts over the same CQE history. One records the target's terminal CQE and the other records the cancellation CQE. The caller matches and dispatches both. [`tempo.Both`](https://pkg.go.dev/code.hybscloud.com/tempo@v0.1.0#Both)
+The example tracks one terminal CQE for a multishot poll with a fixed Direct ID and one for its cancellation. If the poll ID changes, match each CQE to the ID it carries. [Poll ID changes](../boundary/sqe-cqe.md#change-a-poll-id)
+
+```go
+type terminalSeen struct {
+	request uring.SQEContext
+	seen    bool
+}
+
+func (s terminalSeen) Step(cqe uring.CQEView) terminalSeen {
+	if cqe.Context() == s.request && !cqe.HasMore() {
+		s.seen = true
+	}
+	return s
+}
+
+func (s terminalSeen) Observe() bool { return s.seen }
+```
+
+Cancellation matches the poll's submitted `user_data`. For a poll on `fd` with zero SQE flags, initialize both identities with their submitted opcodes before reaping.
+
+```go
+poll := uring.PackDirect(uring.IORING_OP_POLL_ADD, 0, 0, int32(fd))
+cancel := poll.WithOp(uring.IORING_OP_ASYNC_CANCEL)
+watch := tempo.Both(terminalSeen{request: poll}, terminalSeen{request: cancel})
+```
+
+Submit `ring.PollAddMultishot(poll, uring.EPOLLIN)`. Leave `IOSQE_CQE_SKIP_SUCCESS` clear on both requests. If `ring.AsyncCancel(cancel, poll.Raw())` is admitted, dispatch its reply and the poll's terminal CQE. Keep both identities reserved until those replies are routed. [Request identity](../boundary/sqe-cqe.md#request-identity)
+
+For each reaped CQE, assign `watch = watch.Step(cqe)` and dispatch its result. Readiness with `MORE` leaves the poll live. If the cancel reply arrives first, only `watch.Observe().Right` is true, whether cancellation succeeded or failed. Both fields together record that both terminal CQEs were observed. Release each resource at its own final use. [Temporal product](https://github.com/hayabusa-cloud/tempo/blob/v0.1.1/product.go#L21-L45)
 
 Keep results, failures, terminality, and releases distinct. Neither terminal callbacks nor empty CQ establish that all work ended. Continue required service/wakeup paths; caller no-progress waits use adaptive backoff.
 
