@@ -29,7 +29,7 @@ Create one `IncrementalReceiver` for the registration before its first receive. 
 
 ## Zero-Copy
 
-For SEND_ZC, consume the data result separately from notification history. Data `MORE` promises notification: retain the payload through its release evidence. Early notification alone cannot retire the request; terminal no-notification fallback is separate. Track each request even when sends share bytes. [SEND_ZC contract](https://github.com/axboe/liburing/blob/liburing-2.13/man/io_uring_prep_send_zc.3)
+For `ZCTracker`, record the submitted byte range on admission. Use `OnCompleted` to advance a stream by the bytes actually sent. A retry borrows its own suffix. Remove each send’s range at its `OnNotification`. If handing out independent slots within an array, use `buf[lo:hi:hi]` to limit each slot’s capacity and account for any wider aliases. [Send release](../boundary/resources.md#zero-copy-send-and-receive) · [Shared send buffers](../boundary/resources.md#shared-send-buffers)
 
 For ZCRX, publish refills only after kernel delivery. `ZCRXBuffer.Release` returning `iox.ErrWouldBlock` preserves the view. Nil consumes it and pools the wrapper: stop accessing bytes and never release that wrapper again. Zero-length EOF has no refill identity but requires wrapper release. Bound credits and check wrapper/CQE-format support; refill and SEND_ZC notification are distinct protocols.
 

@@ -8,6 +8,7 @@ Validate the operation's semantic domain and the destination field width before 
 |-------|--------------------------------|
 | Ring entries | `1..32768`, subject to the selected setup and package limits |
 | SEND, RECV, SEND_ZC length | Fits a nonnegative signed 32-bit kernel length; a particular wrapper may require positive length |
+| Tracked SEND_ZC source | Keep `IORING_SEND_VECTORIZED` clear for a contiguous byte range. Use `SendZC` for a slice with `IORING_RECVSEND_FIXED_BUF` clear. `SendZCFixed` sets the fixed bit and supplies the selected registered slot, including slot zero. [Tracker](../../zc_tracker.go) |
 | READV/WRITEV and fixed variants | `1..1024` iovecs; message operations permit `0..1024` |
 | Read/write offset | Nonnegative signed 64-bit offset, or `-1` for current position where the API permits it |
 | FileAdvise, Fallocate, SyncFileRange offset | Nonnegative; no current-position sentinel. Fallocate length is positive signed 64-bit |

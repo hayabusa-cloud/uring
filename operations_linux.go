@@ -126,10 +126,9 @@ const (
 	IORING_SEND_VECTORIZED                  // Vectorized send
 )
 
-// Notification CQE usage flags for zero-copy operations.
-const (
-	IORING_NOTIF_USAGE_ZC_COPIED = 1 << 31 // Data was copied instead of zero-copy
-)
+// IORING_NOTIF_USAGE_ZC_COPIED is set in a send usage report if any data was
+// copied or the send never used zero-copy.
+const IORING_NOTIF_USAGE_ZC_COPIED = 1 << 31
 
 // nop submits a no-op operation.
 func (ur *ioUring) nop(sqeCtx SQEContext) error {

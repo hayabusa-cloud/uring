@@ -45,7 +45,7 @@ Match the current request, submitted group, registration and selected ID before 
 
 ### Bundles
 
-For a matched ordinary bundle with `Res > 0`, check that `F_BUFFER` is set and `F_BUF_MORE` is clear. With uniform slots of `s > 0` bytes filled in order, integer division gives `1 + (Res - 1) / s` consumed slots, including an exactly full final slot. Pass the receive's registered group to `ring.BundleIterator`. Its `AllWithSlotID()` yields each ID and its valid bytes in publication order, starting at the CQE's first ID. IDs can be nonconsecutive. [Receive-bundle manual](https://github.com/axboe/liburing/blob/liburing-2.13/man/io_uring_prep_recv.3#L85-L104) · [Reordered buffers](../../operation_facts_linux_test.go#L26)
+For a matched ordinary bundle with `Res > 0`, check that `F_BUFFER` is set and `F_BUF_MORE` is clear. With uniform slots of `s > 0` bytes filled in order, integer division gives `1 + (Res - 1) / s` consumed slots, including an exactly full final slot. Pass the receive's registered group to `ring.BundleIterator`. Its `AllWithSlotID()` yields each ID and its valid bytes in publication order, starting at the CQE's first ID. IDs can be nonconsecutive. [Receive-bundle manual](https://github.com/axboe/liburing/blob/liburing-2.13/man/io_uring_prep_recv.3#L85-L104) · [Reordered buffers](../../operation_facts_linux_test.go#L27)
 
 `Collect()` allocates the outer slice and borrows the payload bytes. After every borrower finishes, call `it.Recycle(ring)` exactly once across all copies of the managed iterator. Use the originating ring and serialize recycling with its other buffer returns and publication. [Bundle handoff](../recipes/buffers.md#hand-off-a-receive-bundle)
 
@@ -69,11 +69,17 @@ Apply every relevant row. `IncrementalHandler.OnData` borrows until return; copy
 
 ## Zero-Copy Send and Receive
 
-SEND_ZC data reports the result; notification history governs reuse. An early notification alone cannot retire the request. Data without `MORE` supplies the no-notification fallback. Retain identity and buffers through all required evidence.
+A SEND_ZC data CQE reports bytes sent or a negative errno. Data without `MORE` ends this send’s borrow. With `MORE`, wait for both the data and its matching notification, in either order. Both `ZCHandler` callbacks carry the original data result.
 
 The [tracker proof](../../proofs/README.md) establishes signal-count and release-evidence properties of the four-state model. Actual dispatch additionally requires matched identities, typed roots, valid borrows and serialized callback/pool ownership.
 
 Managed ZC helpers retain success evidence regardless of `NotifySucceed` and reject explicit `IOSQE_CQE_SKIP_SUCCESS`. Raw SQEs require a caller-defined completion/lifetime contract.
+
+### Shared send buffers
+
+Each accepted send borrows its entire submitted range, including the unsent suffix of a short send. Before writing any byte, wait for every send borrowing that byte to release it. Before returning a slice to a pool, check the full range the next owner can write by reslicing up to its capacity. [SEND_ZC manual](https://github.com/axboe/liburing/blob/liburing-2.13/man/io_uring_prep_send_zc.3) · [Go slice expressions](https://go.dev/ref/spec#Slice_expressions)
+
+### ZCRX refills
 
 ZCRX starts with an empty refill ring; publish only kernel-delivered references. Release would-block preserves retry ownership; successful release consumes the view. EOF has no refill identity but still requires wrapper release. Check actual wrapper setup and CQE-format support, separately from kernel capability.
 
@@ -83,7 +89,9 @@ ZCRX starts with an empty refill ring; publish only kernel-delivered references.
 
 Both require Direct context and return `(accepted, err)`, stopping at the first submission error. An accepted prefix can precede would-block: resume at the first unaccepted target and retain every accepted operation's resources.
 
-Track the accepted target prefix and each send’s byte result separately. Retry only the unsent suffix of a short stream send. Preserve datagram boundaries. Direct context records the target FD. Overlapping sends with identical packed fields have the same `user_data`. If the caller needs to match each result to a specific send, serialize those sends or submit them individually with distinct live contexts.
+Track the accepted target prefix and each send’s byte result separately. Retry only the unsent suffix of a short stream send. Preserve datagram boundaries.
+
+Each Direct completion records the selected opcode and target FD. A registered send replaces the caller’s buffer-group field with the registered slot. Two ranges in that slot share `user_data` when the opcode, flags and FD also match. To identify each send, wait for its release before reusing that identity or submit individual operations with distinct live contexts.
 
 Keep shared bytes immutable until every accepted send releases them. An ordinary send releases on completion. A zero-copy send requires terminal data without `MORE`, or both data and its matching notification.
 
@@ -91,7 +99,7 @@ Keep shared bytes immutable until every accepted send releases them. An ordinary
 
 Cancellation and timeout race with the original operation. Observe their results and any remaining original CQEs before releasing the original request context.
 
-`Uring.Close` submits a close for one process fd, or one registered slot with `IOSQE_FIXED_FILE`. Submit it after the target's last use. Leave `IOSQE_CQE_SKIP_SUCCESS` clear to observe the result. On a full SQ, the caller still owns the close. Drive the ring and retry. A nil return admits the request. Stop using the target and reap the matched close CQE. Success reports zero. [Close encoding](../../operations_linux.go#L431-L450) · [File close example](../../examples/file_lifecycle_test.go#L150-L174)
+`Uring.Close` submits a close for one process fd, or one registered slot with `IOSQE_FIXED_FILE`. Submit it after the target's last use. Leave `IOSQE_CQE_SKIP_SUCCESS` clear to observe the result. On a full SQ, the caller still owns the close. Drive the ring and retry. A nil return admits the request. Stop using the target and reap the matched close CQE. Success reports zero. [Close encoding](../../operations_linux.go#L430-L449) · [File close example](../../examples/file_lifecycle_test.go#L150-L174)
 
 Call `Uring.Stop` on the serialized ring owner after draining accepted work, reaping outstanding CQEs and quiescing subscriptions. It tears down the ring without driving pending closes or invoking terminal callbacks. [Ring teardown](../../io_uring_linux.go#L602-L618)
 

@@ -25,7 +25,7 @@ Read the [core contracts](core.md). Identify the request, caller decision and re
 | Set a deadline or start, update or remove a timer | [Independent timers and linked deadlines](recipes/lifecycle.md#timers-and-linked-deadlines), [updates and removal](recipes/lifecycle.md#update-or-remove-a-timer) |
 | Use a fixed file, replace its slot or pass it to another ring | [Fixed-file lookup](boundary/files.md#fixed-file-lookup), [slot updates](boundary/files.md#updating-slots), [inter-ring transfers](boundary/files.md#inter-ring-file-transfers) |
 | Use buffers, registered files, or zero-copy | [Buffers](recipes/buffers.md), [receive-bundle handoff](recipes/buffers.md#hand-off-a-receive-bundle) |
-| Use incremental receive | [Incremental receive](recipes/buffers.md#incremental-receive) |
+| Reuse an incremental or zero-copy buffer | [Incremental receive](recipes/buffers.md#incremental-receive), [zero-copy](recipes/buffers.md#zero-copy), [shared send buffers](boundary/resources.md#shared-send-buffers) |
 | Retain completion data | [Retained completions](recipes/buffers.md#retained-completions) |
 | Submit to multiple targets | [Multiple targets](recipes/buffers.md#multiple-targets) |
 | Deliver a framed message or a write receipt | [Protocol recipe](recipes/protocol.md), [stream framing](boundary/protocols.md#stream-framing), [write receipt](recipes/protocol.md#deliver-a-write-receipt) |

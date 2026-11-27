@@ -7,9 +7,11 @@
 package uring_test
 
 import (
+	"bytes"
 	"errors"
+	"io"
 	"net"
-	"sync/atomic"
+	"runtime"
 	"testing"
 	"time"
 
@@ -21,132 +23,36 @@ import (
 // Integration tests for kernel 6.18+ runtime expectations.
 // These tests verify real kernel behavior against the Linux 6.18+ baseline.
 
-// TestIntegrationZeroCopySend tests zero-copy send on real connections.
 func TestIntegrationZeroCopySend(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
-		opt.NotifySucceed = true
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	mustStartRing(t, ring)
+	payload := []byte("Integration test: zero-copy send")
+	var pin runtime.Pinner
+	pin.Pin(&payload[0])
+	t.Cleanup(pin.Unpin)
 
-	pool := uring.NewContextPools(int(uring.EntriesSmall))
-	tracker := uring.NewZCTracker(ring, pool)
-
-	// Create TCP connection
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Listen: %v", err)
-	}
-	defer ln.Close()
-	addr := ln.Addr().(*net.TCPAddr)
-
-	clientConn, err := net.DialTimeout("tcp", addr.String(), 2*time.Second)
-	if err != nil {
-		t.Fatalf("Dial: %v", err)
-	}
-	defer clientConn.Close()
-
-	serverConn, err := ln.Accept()
-	if err != nil {
-		t.Fatalf("Accept: %v", err)
-	}
-	defer serverConn.Close()
-
-	serverFile, err := serverConn.(*net.TCPConn).File()
-	if err != nil {
-		t.Fatalf("File: %v", err)
-	}
-	defer serverFile.Close()
-
-	// Test zero-copy send
-	testData := []byte("Integration test: zero-copy send")
-	handler := &integrationZCHandler{}
-
-	err = tracker.SendZC(iofd.FD(serverFile.Fd()), testData, handler)
-	if err != nil {
-		// -EOPNOTSUPP on loopback is expected
-		t.Logf("SendZC: %v (may be unsupported on loopback)", err)
-		return
-	}
-
-	// Wait for completion
-	cqes := make([]uring.CQEView, 16)
-	deadline := time.Now().Add(5 * time.Second)
-	b := iox.Backoff{}
-
-	for time.Now().Before(deadline) {
-		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
-			t.Fatalf("Wait: %v", err)
+	ring := newTestRing(t)
+	fd, peer := newTestTCPPair(t)
+	tracker := uring.NewZCTracker(ring, uring.NewContextPools(1))
+	for sent := 0; sent < len(payload); {
+		var h testZCHandler
+		if err := tracker.SendZC(fd, payload[sent:], &h); err != nil {
+			t.Fatal(err)
 		}
-		for i := 0; i < n; i++ {
-			tracker.HandleCQE(cqes[i])
+		drainTrackedSends(t, ring, tracker, 1)
+		n := h.completedRes.Load()
+		if n <= 0 || int(n) > len(payload)-sent {
+			t.Fatalf("send result = %d for %d remaining bytes", n, len(payload)-sent)
 		}
-		if handler.completed.Load() && handler.notified.Load() {
-			break
-		}
-		b.Wait()
+		h.check(t, 1, n)
+		sent += int(n)
 	}
 
-	completed := handler.completed.Load()
-	notified := handler.notified.Load()
-	result := handler.result.Load()
-
-	if !completed && !notified {
-		t.Skip("no zero-copy callbacks observed on loopback in this environment")
+	if err := peer.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
 	}
-	if !completed {
-		t.Fatal("zero-copy send did not report completion")
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(peer, got); err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("received %q, want %q: %v", got, payload, err)
 	}
-	if result == -int32(uring.EOPNOTSUPP) {
-		t.Log("EOPNOTSUPP returned (expected on loopback)")
-		return
-	}
-	if result < 0 {
-		t.Fatalf("zero-copy send failed: %d", result)
-	}
-	if !notified {
-		t.Fatal("zero-copy send did not report notification")
-	}
-
-	recv := make([]byte, len(testData))
-	total := 0
-	readDeadline := time.Now().Add(2 * time.Second)
-	for total < len(testData) && time.Now().Before(readDeadline) {
-		clientConn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
-		n, err := clientConn.Read(recv[total:])
-		if ne, ok := err.(net.Error); ok && ne.Timeout() {
-			continue
-		}
-		if err != nil {
-			t.Fatalf("Read: %v", err)
-		}
-		total += n
-	}
-	if total != len(testData) {
-		t.Fatalf("read %d bytes, want %d", total, len(testData))
-	}
-	if string(recv[:total]) != string(testData) {
-		t.Fatalf("received %q, want %q", recv[:total], testData)
-	}
-}
-
-type integrationZCHandler struct {
-	completed atomic.Bool
-	notified  atomic.Bool
-	result    atomic.Int32
-}
-
-func (h *integrationZCHandler) OnCompleted(result int32) {
-	h.completed.Store(true)
-	h.result.Store(result)
-}
-
-func (h *integrationZCHandler) OnNotification(result int32) {
-	h.notified.Store(true)
 }
 
 func consumeAcceptCQEs(cqes []uring.CQEView) (accepted int, errRes int32) {

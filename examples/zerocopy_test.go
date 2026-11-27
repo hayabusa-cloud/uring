@@ -34,6 +34,11 @@ func TestZCTrackerBasic(t *testing.T) {
 	runtime.LockOSThread()
 	t.Cleanup(runtime.UnlockOSThread)
 
+	payload := []byte("retain this payload until release")
+	var pin runtime.Pinner
+	pin.Pin(&payload[0])
+	t.Cleanup(pin.Unpin)
+
 	ring, err := uring.New(func(opt *uring.Options) {
 		opt.Entries = uring.EntriesNano
 		opt.LockedBufferMem = uring.BufferSizeLarge
@@ -54,7 +59,6 @@ func TestZCTrackerBasic(t *testing.T) {
 	})
 	fd, client := tcpPair(t)
 	tracker := uring.NewZCTracker(ring, uring.NewContextPools(2))
-	payload := []byte("retain this payload until release")
 	completed, released := 0, 0
 	var sendResult int32
 	handler := uring.NewZCSubscriber().
@@ -102,7 +106,6 @@ func TestZCTrackerBasic(t *testing.T) {
 				t.Fatal("unhandled zero-copy completion")
 			}
 		}
-		runtime.KeepAlive(payload)
 		if completed != 1 || released != 1 || sendResult <= 0 || int(sendResult) > len(payload)-sent {
 			t.Fatalf("completed=%d released=%d result=%d", completed, released, sendResult)
 		}

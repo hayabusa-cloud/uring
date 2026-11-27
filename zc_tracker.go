@@ -121,35 +121,21 @@ func (d *zcTrackerData) result() int32 {
 	return zcMetaResult(d.meta.Load())
 }
 
-// ZCHandler handles zero-copy send completion events.
+// ZCHandler receives the send result and the release of that send's buffer range.
 type ZCHandler interface {
-	// OnCompleted is called when the send CQE arrives.
-	// The result is the number of bytes sent or a negative errno value.
-	// The buffer must not be modified until OnNotification runs.
+	// OnCompleted reports the byte count or negative errno from the data CQE.
 	OnCompleted(result int32)
 
-	// OnNotification is called when the buffer can be safely reused.
-	// In the notification path this callback runs after the data CQE is known,
-	// even if the notification CQE arrived first. If the data CQE is terminal
-	// without MORE, the tracker calls this from the terminal no-notification
-	// fallback. The result is the original send result.
+	// OnNotification ends this send's borrow and repeats its original result.
+	// Wait for every send borrowing overlapping bytes before rewriting them.
 	OnNotification(result int32)
 }
 
-// ZCTracker manages zero-copy send operations through the notification path and
-// the terminal no-notification fallback. The notification path pairs an
-// operation CQE with MORE and a notification CQE; the tracker tolerates either
-// CQE arrival order and releases only after the pair is complete. The fallback
-// produces a terminal operation CQE without MORE.
-//
-// A terminal operation CQE without IORING_CQE_F_MORE is release-ready for this
-// tracker. If no notification was observed, it is the no-notification fallback;
-// if a notification arrived early, it closes the already paired lifecycle.
-//
-// The tracker ensures:
-//   - Handlers are invoked in the correct order
-//   - Each handler is invoked exactly once
-//   - ExtSQE is returned to pool only after data plus notification, or terminal fallback
+// ZCTracker pairs each admitted zero-copy send with its release evidence.
+// Dispatch each CQE once in a serialized completion loop. The tracker calls
+// OnCompleted and then OnNotification once each. Data without MORE triggers
+// both callbacks. Data with MORE requires the matching notification for
+// release, in either arrival order. The tracker then returns the pooled context.
 type ZCTracker struct {
 	ring *Uring
 	pool *ContextPools
@@ -163,120 +149,55 @@ func NewZCTracker(ring *Uring, pool *ContextPools) *ZCTracker {
 	}
 }
 
-// SendZC submits a zero-copy send operation.
-// The handler receives OnCompleted for the send CQE and OnNotification when the
-// buffer can be safely reused.
-// Caller must keep buf valid and unmodified until OnNotification runs.
-// Completion notifications are required regardless of NotifySucceed;
-// explicit IOSQE_CQE_SKIP_SUCCESS is invalid.
-// Returns iox.ErrWouldBlock if the context pool is exhausted.
+// SendZC submits a zero-copy send from buf. [WithOffset] and [WithN] select
+// a nonempty range. Keep its backing reachable and address-stable, and its
+// bytes unchanged, until this send's OnNotification callback.
+// Keep IORING_SEND_VECTORIZED and IORING_RECVSEND_FIXED_BUF clear in
+// [WithIOPrio]. Use [ZCTracker.SendZCFixed] for a registered slot.
+// The tracker requires success CQEs regardless of NotifySucceed and rejects
+// explicit IOSQE_CQE_SKIP_SUCCESS. Pool or SQ exhaustion returns iox.ErrWouldBlock.
 func (t *ZCTracker) SendZC(fd iofd.FD, buf []byte, handler ZCHandler, options ...OpOptionFunc) error {
-	if len(buf) < 1 {
-		return ErrInvalidParam
-	}
-
-	var flags uint8 = uringOpFlagsNone
-	var ioprio uint16 = uringOpIOPrioNone
-	dataOffset := 0
-	n := len(buf)
-	if len(options) > 0 {
-		opt := defaultUringOpOption
-		opt.Apply(options...)
-		if opt.Offset < 0 || opt.Offset > int64(len(buf)) {
-			return ErrInvalidParam
-		}
-		dataOffset = int(opt.Offset)
-		remaining := len(buf) - dataOffset
-		if opt.N != nil {
-			if *opt.N < 1 || *opt.N > remaining {
-				return ErrInvalidParam
-			}
-			n = *opt.N
-		} else {
-			n = remaining
-			if n < 1 {
-				return ErrInvalidParam
-			}
-		}
-		flags = opt.Flags
-		ioprio = opt.IOPrio
-	}
-	if n > math.MaxInt32 || flags&IOSQE_CQE_SKIP_SUCCESS != 0 {
-		return ErrInvalidParam
-	}
-
-	ext := t.pool.Extended()
-	if ext == nil {
-		return iox.ErrWouldBlock
-	}
-
-	// Initialize tracker data in UserData
-	ctx := zcInitCtx(ext, t, handler)
-	ctx.Fn = zcTrackerCQEHandler
-
-	ext.SQE = ioUringSqe{}
-	ext.SQE.opcode = IORING_OP_SEND_ZC
-	ext.SQE.flags = flags
-	ext.SQE.ioprio = ioprio
-	ext.SQE.fd = int32(fd)
-	ext.SQE.addr = uint64(uintptr(unsafe.Pointer(unsafe.SliceData(buf)))) + uint64(dataOffset)
-	ext.SQE.len = uint32(n)
-	ext.SQE.off = 0
-	ext.SQE.uflags = 0
-
-	// Submit with Extended mode context (preserves pointer + mode bits)
-	sqeCtx := PackExtended(ext)
-	if err := t.ring.SubmitExtended(sqeCtx); err != nil {
-		t.pool.PutExtended(ext)
-		return err
-	}
-
-	return nil
+	return t.submitZC(fd, buf, 0, 0, handler, options)
 }
 
-// SendZCFixed submits a zero-copy send using a registered buffer.
-// Caller must keep the registered buffer range valid and unmodified until
-// OnNotification runs.
-// Completion notifications are required regardless of NotifySucceed;
-// explicit IOSQE_CQE_SKIP_SUCCESS is invalid.
-// Returns iox.ErrWouldBlock if the context pool is exhausted.
+// SendZCFixed submits a zero-copy send from a registered buffer. [WithOffset]
+// and [WithN] select bytes within the supplied offset/length range.
+// It sets IORING_RECVSEND_FIXED_BUF. Keep IORING_SEND_VECTORIZED clear in [WithIOPrio].
+// The lifetime, completion and admission rules are the same as [ZCTracker.SendZC].
 func (t *ZCTracker) SendZCFixed(fd iofd.FD, bufIndex int, offset int, length int, handler ZCHandler, options ...OpOptionFunc) error {
 	buf := t.ring.RegisteredBuffer(bufIndex)
-	if buf == nil {
+	if offset < 0 || length < 1 || offset > len(buf)-length {
 		return ErrInvalidParam
 	}
-	if offset < 0 || length < 1 || offset > len(buf) || length > len(buf)-offset {
-		return ErrInvalidParam
-	}
+	return t.submitZC(fd, buf[offset:offset+length], uint16(bufIndex), IORING_RECVSEND_FIXED_BUF, handler, options)
+}
 
-	var flags uint8 = uringOpFlagsNone
-	var ioprio uint16 = uringOpIOPrioNone
-	dataOffset := 0
-	n := length
+func (t *ZCTracker) submitZC(fd iofd.FD, buf []byte, bufIndex, ioprio uint16, handler ZCHandler, options []OpOptionFunc) error {
+	if len(buf) == 0 {
+		return ErrInvalidParam
+	}
+	var flags uint8
 	if len(options) > 0 {
 		opt := defaultUringOpOption
 		opt.Apply(options...)
-		if opt.Offset < 0 || opt.Offset > int64(length) {
+		flags = opt.Flags
+		ioprio |= opt.IOPrio
+		if flags&IOSQE_CQE_SKIP_SUCCESS != 0 {
 			return ErrInvalidParam
 		}
-		dataOffset = int(opt.Offset)
-		remaining := length - dataOffset
-		if opt.N != nil {
-			if *opt.N < 1 || *opt.N > remaining {
-				return ErrInvalidParam
-			}
-			n = *opt.N
-		} else {
-			n = remaining
-			if n < 1 {
-				return ErrInvalidParam
-			}
+		if opt.Offset < 0 || opt.Offset >= int64(len(buf)) {
+			return ErrInvalidParam
 		}
-		flags = opt.Flags
-		ioprio = opt.IOPrio
+		buf = buf[opt.Offset:]
+		if opt.N != nil {
+			n := *opt.N
+			if n < 1 || n > len(buf) {
+				return ErrInvalidParam
+			}
+			buf = buf[:n]
+		}
 	}
-	effectiveOffset := offset + dataOffset
-	if flags&IOSQE_CQE_SKIP_SUCCESS != 0 {
+	if len(buf) > math.MaxInt32 {
 		return ErrInvalidParam
 	}
 
@@ -284,30 +205,21 @@ func (t *ZCTracker) SendZCFixed(fd iofd.FD, bufIndex int, offset int, length int
 	if ext == nil {
 		return iox.ErrWouldBlock
 	}
-
-	// Initialize tracker data in UserData
 	ctx := zcInitCtx(ext, t, handler)
 	ctx.Fn = zcTrackerCQEHandler
-
-	ext.SQE = ioUringSqe{}
-	// IORING_RECVSEND_FIXED_BUF goes in ioprio, not IOSQE_FIXED_FILE in flags.
-	ext.SQE.opcode = IORING_OP_SEND_ZC
-	ext.SQE.flags = flags
-	ext.SQE.ioprio = ioprio | IORING_RECVSEND_FIXED_BUF
-	ext.SQE.fd = int32(fd)
-	ext.SQE.addr = uint64(uintptr(unsafe.Pointer(unsafe.SliceData(buf)))) + uint64(effectiveOffset)
-	ext.SQE.len = uint32(n)
-	ext.SQE.off = 0
-	ext.SQE.uflags = 0
-	ext.SQE.bufIndex = uint16(bufIndex)
-
-	// Submit with Extended mode context
-	sqeCtx := PackExtended(ext)
-	if err := t.ring.SubmitExtended(sqeCtx); err != nil {
+	ext.SQE = ioUringSqe{
+		opcode:   IORING_OP_SEND_ZC,
+		flags:    flags,
+		ioprio:   ioprio,
+		fd:       int32(fd),
+		addr:     uint64(uintptr(unsafe.Pointer(unsafe.SliceData(buf)))),
+		len:      uint32(len(buf)),
+		bufIndex: bufIndex,
+	}
+	if err := t.ring.SubmitExtended(PackExtended(ext)); err != nil {
 		t.pool.PutExtended(ext)
 		return err
 	}
-
 	return nil
 }
 

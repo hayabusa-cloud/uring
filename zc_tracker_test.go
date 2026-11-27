@@ -7,15 +7,13 @@
 package uring_test
 
 import (
-	"errors"
-	"net"
+	"slices"
 	"sync/atomic"
 	"testing"
-	"time"
 
-	"code.hybscloud.com/iofd"
 	"code.hybscloud.com/iox"
 	"code.hybscloud.com/uring"
+	"code.hybscloud.com/zcall"
 )
 
 // =============================================================================
@@ -40,378 +38,126 @@ func (h *testZCHandler) OnNotification(result int32) {
 	h.notifyCalls.Add(1)
 }
 
-// TestZCTrackerBasic verifies the ZCTracker handles the notification and
-// terminal no-notification fallback lifecycle.
-func TestZCTrackerBasic(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping zero-copy tracker test in short mode (requires reliable io_uring)")
-	}
-
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
-		opt.NotifySucceed = true
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	mustStartRing(t, ring)
-
-	// Create context pool and tracker
-	pool := uring.NewContextPools(int(uring.EntriesSmall))
-	tracker := uring.NewZCTracker(ring, pool)
-
-	// Create TCP socket pair
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Listen: %v", err)
-	}
-	defer ln.Close()
-	addr := ln.Addr().(*net.TCPAddr)
-
-	clientConn, err := net.DialTimeout("tcp", addr.String(), 2*time.Second)
-	if err != nil {
-		t.Fatalf("Dial: %v", err)
-	}
-	defer clientConn.Close()
-
-	serverConn, err := ln.Accept()
-	if err != nil {
-		t.Fatalf("Accept: %v", err)
-	}
-	defer serverConn.Close()
-
-	// Get raw FD
-	serverFile, err := serverConn.(*net.TCPConn).File()
-	if err != nil {
-		t.Fatalf("File: %v", err)
-	}
-	defer serverFile.Close()
-
-	// Prepare test data
-	testData := []byte("ZCTracker Test Data")
-	handler := &testZCHandler{}
-
-	// Submit zero-copy send via tracker
-	err = tracker.SendZC(iofd.FD(serverFile.Fd()), testData, handler)
-	if err != nil {
-		t.Fatalf("SendZC: %v", err)
-	}
-
-	// Collect CQEs and process through tracker
-	cqes := make([]uring.CQEView, 16)
-	deadline := time.Now().Add(5 * time.Second)
-	b := iox.Backoff{}
-
-	for time.Now().Before(deadline) {
-		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
-			t.Fatalf("Wait: %v", err)
+// Drain the data CQE for each admitted send and every notification it promises.
+// A notification may already have been dispatched when its data CQE arrives.
+func drainTrackedSends(t *testing.T, ring *uring.Uring, tracker *uring.ZCTracker, sends int) {
+	t.Helper()
+	var data, promised, notified int
+	for data < sends || notified < promised {
+		cqe := waitForCQEs(t, ring, 1)[0]
+		if cqe.IsNotification() {
+			notified++
+		} else {
+			data++
+			if cqe.HasMore() {
+				promised++
+			}
 		}
-
-		for i := 0; i < n; i++ {
-			tracker.HandleCQE(cqes[i])
+		if !tracker.HandleCQE(cqe) {
+			t.Fatalf("unhandled send CQE: result=%d flags=%#x", cqe.Res, cqe.Flags)
 		}
-
-		// Check if handler received both callbacks
-		if handler.completedCalls.Load() > 0 && handler.notifyCalls.Load() > 0 {
-			break
-		}
-		b.Wait()
-	}
-
-	completedCalls := handler.completedCalls.Load()
-	notifyCalls := handler.notifyCalls.Load()
-	completedRes := handler.completedRes.Load()
-
-	t.Logf("completed calls: %d, notify calls: %d, completed res: %d",
-		completedCalls, notifyCalls, completedRes)
-
-	if completedCalls == 0 && notifyCalls == 0 {
-		t.Skip("no zero-copy callbacks observed on loopback in this environment")
-	}
-
-	// Handle EOPNOTSUPP gracefully.
-	if completedRes == -int32(uring.EOPNOTSUPP) {
-		t.Log("EOPNOTSUPP returned (expected on loopback)")
-		if completedCalls != 1 {
-			t.Errorf("expected 1 completed call for EOPNOTSUPP, got %d", completedCalls)
-		}
-		return
-	}
-
-	// Normal zero-copy: should have both callbacks
-	if completedCalls != 1 {
-		t.Errorf("expected 1 completed call, got %d", completedCalls)
-	}
-	if notifyCalls != 1 {
-		t.Errorf("expected 1 notify call, got %d", notifyCalls)
 	}
 }
 
-// TestZCTrackerPoolExhaustion verifies pool exhaustion returns ErrWouldBlock.
-func TestZCTrackerPoolExhaustion(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
-		opt.NotifySucceed = true
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
+func (h *testZCHandler) check(t *testing.T, calls, result int32) {
+	t.Helper()
+	if got, released := h.completedCalls.Load(), h.notifyCalls.Load(); got != calls || released != calls {
+		t.Errorf("completion and release calls = (%d, %d), want (%d, %d)", got, released, calls, calls)
 	}
-	mustStartRing(t, ring)
+	if got, released := h.completedRes.Load(), h.notifyRes.Load(); got != result || released != result {
+		t.Errorf("completion and release results = (%d, %d), want (%d, %d)", got, released, result, result)
+	}
+}
 
-	// Create a small pool to exhaust
+func TestZCTrackerBasic(t *testing.T) {
+	ring := newTestRing(t)
+	fd, _ := newTestTCPPair(t)
+	pool := uring.NewContextPools(1)
+	tracker := uring.NewZCTracker(ring, pool)
+	var h testZCHandler
+	if err := tracker.SendZC(fd, ring.RegisteredBuffer(0)[:1], &h); err != nil {
+		t.Fatal(err)
+	}
+	drainTrackedSends(t, ring, tracker, 1)
+	h.check(t, 1, 1)
+	if got := pool.ExtendedAvailable(); got != 1 {
+		t.Fatalf("available after release = %d, want 1", got)
+	}
+}
+
+func TestZCTrackerPoolExhaustion(t *testing.T) {
+	ring := newTestRing(t)
+	fd, _ := newTestTCPPair(t)
 	pool := uring.NewContextPools(2)
 	tracker := uring.NewZCTracker(ring, pool)
-
-	// Create socket for testing
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Listen: %v", err)
-	}
-	defer ln.Close()
-	addr := ln.Addr().(*net.TCPAddr)
-
-	clientConn, err := net.DialTimeout("tcp", addr.String(), 2*time.Second)
-	if err != nil {
-		t.Fatalf("Dial: %v", err)
-	}
-	defer clientConn.Close()
-
-	serverConn, err := ln.Accept()
-	if err != nil {
-		t.Fatalf("Accept: %v", err)
-	}
-	defer serverConn.Close()
-
-	serverFile, err := serverConn.(*net.TCPConn).File()
-	if err != nil {
-		t.Fatalf("File: %v", err)
-	}
-	defer serverFile.Close()
-
-	testData := []byte("test")
-	handler := &testZCHandler{}
-
-	// Exhaust the pool (capacity rounded to power of 2 = 2)
-	for i := 0; i < 2; i++ {
-		err := tracker.SendZC(iofd.FD(serverFile.Fd()), testData, handler)
-		if err != nil {
-			t.Logf("SendZC[%d]: %v", i, err)
+	buf := ring.RegisteredBuffer(0)[:1]
+	var handlers [3]testZCHandler
+	for i := range 2 {
+		if err := tracker.SendZC(fd, buf, &handlers[i]); err != nil {
+			t.Fatalf("send %d: %v", i, err)
 		}
 	}
+	if err := tracker.SendZC(fd, buf, &handlers[2]); !iox.IsWouldBlock(err) {
+		t.Fatalf("send with exhausted pool = %v, want ErrWouldBlock", err)
+	}
+	drainTrackedSends(t, ring, tracker, 2)
+	handlers[0].check(t, 1, 1)
+	handlers[1].check(t, 1, 1)
+	handlers[2].check(t, 0, 0)
+	if got := pool.ExtendedAvailable(); got != 2 {
+		t.Fatalf("available after both releases = %d, want 2", got)
+	}
 
-	// Next send should return ErrWouldBlock
-	err = tracker.SendZC(iofd.FD(serverFile.Fd()), testData, handler)
-	if !errors.Is(err, iox.ErrWouldBlock) {
-		t.Errorf("expected ErrWouldBlock when pool exhausted, got: %v", err)
+	if err := tracker.SendZC(fd, buf, &handlers[2]); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	drainTrackedSends(t, ring, tracker, 1)
+	handlers[2].check(t, 1, 1)
+	if got := pool.ExtendedAvailable(); got != 2 {
+		t.Fatalf("available after retry = %d, want 2", got)
 	}
 }
 
-// TestZCTrackerHandlerOrder verifies OnCompleted is called before OnNotification.
 func TestZCTrackerHandlerOrder(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
-		opt.NotifySucceed = true
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	mustStartRing(t, ring)
-
-	pool := uring.NewContextPools(int(uring.EntriesSmall))
+	ring := newTestRing(t)
+	fd, _ := newTestTCPPair(t)
+	pool := uring.NewContextPools(1)
 	tracker := uring.NewZCTracker(ring, pool)
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Listen: %v", err)
+	var order []string
+	handler := uring.NewZCSubscriber().
+		OnCompleted(func(int32) { order = append(order, "completed") }).
+		OnNotification(func(int32) { order = append(order, "released") }).
+		Handler()
+	if err := tracker.SendZC(fd, ring.RegisteredBuffer(0)[:1], handler); err != nil {
+		t.Fatal(err)
 	}
-	defer ln.Close()
-	addr := ln.Addr().(*net.TCPAddr)
-
-	clientConn, err := net.DialTimeout("tcp", addr.String(), 2*time.Second)
-	if err != nil {
-		t.Fatalf("Dial: %v", err)
-	}
-	defer clientConn.Close()
-
-	serverConn, err := ln.Accept()
-	if err != nil {
-		t.Fatalf("Accept: %v", err)
-	}
-	defer serverConn.Close()
-
-	serverFile, err := serverConn.(*net.TCPConn).File()
-	if err != nil {
-		t.Fatalf("File: %v", err)
-	}
-	defer serverFile.Close()
-
-	// Track call order
-	var callOrder []string
-	var mu atomic.Int32 // Simple lock via atomic
-
-	orderHandler := &orderTrackingHandler{
-		onCompleted: func(res int32) {
-			for !mu.CompareAndSwap(0, 1) {
-			}
-			callOrder = append(callOrder, "completed")
-			mu.Store(0)
-		},
-		onNotification: func(res int32) {
-			for !mu.CompareAndSwap(0, 1) {
-			}
-			callOrder = append(callOrder, "notification")
-			mu.Store(0)
-		},
-	}
-
-	testData := []byte("order test")
-	err = tracker.SendZC(iofd.FD(serverFile.Fd()), testData, orderHandler)
-	if err != nil {
-		t.Fatalf("SendZC: %v", err)
-	}
-
-	cqes := make([]uring.CQEView, 16)
-	deadline := time.Now().Add(5 * time.Second)
-	b := iox.Backoff{}
-
-	for time.Now().Before(deadline) && len(callOrder) < 2 {
-		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
-			t.Fatalf("Wait: %v", err)
-		}
-		for i := 0; i < n; i++ {
-			tracker.HandleCQE(cqes[i])
-		}
-		b.Wait()
-	}
-
-	if len(callOrder) == 0 {
-		t.Skip("no zero-copy callbacks observed on loopback in this environment")
-	}
-	if len(callOrder) != 2 {
-		t.Fatalf("expected 2 callbacks, got %v", callOrder)
-	}
-	if callOrder[0] != "completed" {
-		t.Errorf("expected first call to be 'completed', got '%s'", callOrder[0])
-	}
-	if callOrder[1] != "notification" {
-		t.Errorf("expected second call to be 'notification', got '%s'", callOrder[1])
+	drainTrackedSends(t, ring, tracker, 1)
+	if !slices.Equal(order, []string{"completed", "released"}) {
+		t.Fatalf("callback order = %v", order)
 	}
 }
 
-// orderTrackingHandler tracks the order of handler calls.
-type orderTrackingHandler struct {
-	onCompleted    func(int32)
-	onNotification func(int32)
-}
-
-func (h *orderTrackingHandler) OnCompleted(result int32) {
-	if h.onCompleted != nil {
-		h.onCompleted(result)
-	}
-}
-
-func (h *orderTrackingHandler) OnNotification(result int32) {
-	if h.onNotification != nil {
-		h.onNotification(result)
-	}
-}
-
-// TestZCTrackerExactlyOnce verifies handlers are invoked exactly once.
+// Reuse the same pool slot for a successful send and a failed send. Each
+// lifetime has its own handler and receives its own data result twice.
 func TestZCTrackerExactlyOnce(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
-		opt.NotifySucceed = true
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	mustStartRing(t, ring)
-
-	pool := uring.NewContextPools(int(uring.EntriesSmall))
+	ring := newTestRing(t)
+	fd, _ := newTestTCPPair(t)
+	pool := uring.NewContextPools(1)
 	tracker := uring.NewZCTracker(ring, pool)
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Listen: %v", err)
+	buf := ring.RegisteredBuffer(0)[:1]
+	var first, second testZCHandler
+	if err := tracker.SendZC(fd, buf, &first); err != nil {
+		t.Fatal(err)
 	}
-	defer ln.Close()
-	addr := ln.Addr().(*net.TCPAddr)
-
-	clientConn, err := net.DialTimeout("tcp", addr.String(), 2*time.Second)
-	if err != nil {
-		t.Fatalf("Dial: %v", err)
+	drainTrackedSends(t, ring, tracker, 1)
+	first.check(t, 1, 1)
+	if err := tracker.SendZC(-1, buf, &second); err != nil {
+		t.Fatal(err)
 	}
-	defer clientConn.Close()
-
-	serverConn, err := ln.Accept()
-	if err != nil {
-		t.Fatalf("Accept: %v", err)
-	}
-	defer serverConn.Close()
-
-	serverFile, err := serverConn.(*net.TCPConn).File()
-	if err != nil {
-		t.Fatalf("File: %v", err)
-	}
-	defer serverFile.Close()
-
-	handler := &testZCHandler{}
-	testData := []byte("exactly-once test")
-
-	err = tracker.SendZC(iofd.FD(serverFile.Fd()), testData, handler)
-	if err != nil {
-		t.Fatalf("SendZC: %v", err)
-	}
-
-	cqes := make([]uring.CQEView, 16)
-	deadline := time.Now().Add(5 * time.Second)
-	b := iox.Backoff{}
-	processed := 0
-
-	for time.Now().Before(deadline) {
-		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
-			t.Fatalf("Wait: %v", err)
-		}
-
-		for i := 0; i < n; i++ {
-			// Process each CQE multiple times to test idempotency
-			for j := 0; j < 3; j++ {
-				tracker.HandleCQE(cqes[i])
-			}
-			processed++
-		}
-
-		if handler.completedCalls.Load() > 0 && handler.notifyCalls.Load() > 0 {
-			break
-		}
-		b.Wait()
-	}
-
-	t.Logf("processed %d CQEs", processed)
-	if processed == 0 {
-		t.Skip("no zero-copy CQEs observed on loopback in this environment")
-	}
-
-	// Despite multiple HandleCQE calls, handler should be called exactly once each
-	completedCalls := handler.completedCalls.Load()
-	notifyCalls := handler.notifyCalls.Load()
-
-	// EOPNOTSUPP case: both called together
-	if handler.completedRes.Load() == -int32(uring.EOPNOTSUPP) {
-		if completedCalls != 1 || notifyCalls != 1 {
-			t.Errorf("EOPNOTSUPP: expected 1/1 calls, got %d/%d", completedCalls, notifyCalls)
-		}
-		return
-	}
-
-	// Normal case
-	if completedCalls != 1 {
-		t.Errorf("expected exactly 1 OnCompleted call, got %d", completedCalls)
-	}
-	if notifyCalls != 1 {
-		t.Errorf("expected exactly 1 OnNotification call, got %d", notifyCalls)
+	drainTrackedSends(t, ring, tracker, 1)
+	first.check(t, 1, 1)
+	second.check(t, 1, -int32(zcall.EBADF))
+	if got := pool.ExtendedAvailable(); got != 1 {
+		t.Fatalf("available after slot reuse = %d, want 1", got)
 	}
 }

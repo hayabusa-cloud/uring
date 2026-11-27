@@ -30,7 +30,7 @@ Give every success an owner, including a final CQE and any accept reaped after a
 
 ## Installing a Process FD
 
-On success, `FixedFdInstall` reports a new process fd for the registered file in `Res`. The fd and the ring slot can be closed independently. To close the slot through `Uring.Close`, pass its index with `IOSQE_FIXED_FILE`. [Installation test](../../integration_linux_test.go#L1493) · [Close encoding](../../operations_linux.go#L431) · [Installation manual](https://github.com/axboe/liburing/blob/liburing-2.13/man/io_uring_prep_fixed_fd_install.3)
+On success, `FixedFdInstall` reports a new process fd for the registered file in `Res`. The fd and the ring slot can be closed independently. To close the slot through `Uring.Close`, pass its index with `IOSQE_FIXED_FILE`. [Installation test](../../integration_linux_test.go#L1493) · [Close encoding](../../operations_linux.go#L430) · [Installation manual](https://github.com/axboe/liburing/blob/liburing-2.13/man/io_uring_prep_fixed_fd_install.3)
 
 ## Inter-Ring File Transfers
 

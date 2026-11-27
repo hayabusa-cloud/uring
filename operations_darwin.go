@@ -122,7 +122,8 @@ const (
 	IORING_SEND_VECTORIZED      = 1 << 5 // Vectorized send
 )
 
-// Notification CQE usage flags for zero-copy operations.
+// IORING_NOTIF_USAGE_ZC_COPIED is set in a send usage report if any data was
+// copied or the send never used zero-copy.
 const IORING_NOTIF_USAGE_ZC_COPIED = 1 << 31
 
 // Internal flags
