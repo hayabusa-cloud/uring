@@ -117,7 +117,7 @@ func DecodeListenerCQE(cqe CQEView) (ListenerStep, bool) {
 		Handler: handler,
 	}
 	if cqe.Res < 0 {
-		step.Err = errFromErrno(uintptr(-cqe.Res))
+		step.Err = cqe.Err()
 		step.State = ListenerStateFailed
 	} else if step.Op == IORING_OP_SOCKET {
 		step.FD = iofd.FD(cqe.Res)
