@@ -1289,56 +1289,58 @@ func TestAcceptDirect(t *testing.T) {
 	t.Logf("AcceptDirect allocated slot %d", allocatedSlot)
 }
 
-// TestSocketDirect tests direct descriptor socket creation using registered file table.
 func TestSocketDirect(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
-		opt.NotifySucceed = true // Request a CQE for every successful operation.
-		opt.MultiIssuers = true  // Exercise the shared-submit configuration.
+	ring := newTestRing(t, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesPico
+		opt.NotifySucceed = true
 	})
+	// Leave only slot 1 free so the result identifies automatic allocation.
+	occupied, err := os.Open(os.DevNull)
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatal(err)
 	}
-	mustStartRing(t, ring)
-
-	// Register sparse file table for direct descriptors
-	err = ring.RegisterFilesSparse(16)
-	if err != nil {
-		t.Fatalf("RegisterFilesSparse: %v", err)
+	defer occupied.Close()
+	if err := ring.RegisterFiles([]int32{int32(occupied.Fd()), -1}); err != nil {
+		t.Fatalf("RegisterFiles: %v", err)
 	}
 
-	// Create socket directly into registered file table with auto-allocation
+	// Fill the SQ with distinguishable NOPs before attempting socket creation.
+	pending := make(map[uring.SQEContext]bool)
+	for i := range ring.SQAvailable() {
+		ctx := uring.ForFD(int32(i + 1))
+		if err := ring.Nop(ctx); err != nil {
+			t.Fatal(err)
+		}
+		pending[ctx] = true
+	}
 	socketCtx := uring.PackDirect(uring.IORING_OP_SOCKET, 0, 0xa503, 0)
-	err = ring.TCP4SocketDirect(socketCtx)
-	if err != nil {
-		t.Fatalf("TCP4SocketDirect: %v", err)
+	if err := ring.TCP4SocketDirect(socketCtx); !iox.IsWouldBlock(err) {
+		t.Fatalf("TCP4SocketDirect on full SQ: got %v, want ErrWouldBlock", err)
+	}
+	if free := ring.SQAvailable(); free != 0 {
+		t.Fatalf("full SQ after refusal: %d free entries, want 0 before Wait", free)
+	}
+	for _, cqe := range waitForCQEs(t, ring, len(pending)) {
+		ctx := cqe.Context()
+		if !pending[ctx] || cqe.Res != 0 {
+			t.Fatalf("unexpected completion while draining NOPs: %+v", cqe)
+		}
+		delete(pending, ctx)
 	}
 
-	ev, ok := waitForOp(t, ring, uring.IORING_OP_SOCKET, time.Second)
-	if !ok {
-		t.Fatal("SocketDirect did not complete")
+	if err := ring.TCP4SocketDirect(socketCtx); err != nil {
+		t.Fatalf("TCP4SocketDirect after drain: %v", err)
+	}
+	ev := waitForCQEs(t, ring, 1)[0]
+	if ev.Op() != uring.IORING_OP_SOCKET || ev.BufGroup() != socketCtx.BufGroup() || ev.Res != 1 {
+		t.Fatalf("socket retry: op=%d tag=%#x slot=%d, want SOCKET tag=%#x slot=1", ev.Op(), ev.BufGroup(), ev.Res, socketCtx.BufGroup())
 	}
 
-	// With IORING_FILE_INDEX_ALLOC, res contains the allocated slot index (0-based)
-	if ev.Res < 0 {
-		t.Fatalf("SocketDirect returned error: %d", ev.Res)
-	}
-	if got := ev.BufGroup(); got != socketCtx.BufGroup() {
-		t.Errorf("direct socket completion tag = %#x, want %#x", got, socketCtx.BufGroup())
-	}
-
-	allocatedSlot := ev.Res
-	if allocatedSlot >= 16 {
-		t.Errorf("allocated slot %d out of range [0,16)", allocatedSlot)
-	}
-
-	// The socket is in the registered file table at allocatedSlot
-	// Close it using IOSQE_FIXED_FILE flag (close the direct descriptor)
-	closeCtx := uring.PackDirect(uring.IORING_OP_CLOSE, uring.IOSQE_FIXED_FILE, 0, allocatedSlot)
+	closeCtx := uring.PackDirect(uring.IORING_OP_CLOSE, uring.IOSQE_FIXED_FILE, 0, ev.Res)
 	mustCloseAndWait(t, ring, closeCtx, time.Second, "direct socket")
-
-	ring.UnregisterFiles()
-	t.Logf("SocketDirect allocated slot %d", allocatedSlot)
+	if err := ring.UnregisterFiles(); err != nil {
+		t.Fatalf("UnregisterFiles: %v", err)
+	}
 }
 
 // TestConnectWithDirectSocket tests Connect using a socket created via SocketDirect.
