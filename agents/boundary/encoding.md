@@ -23,9 +23,17 @@ Optional option fields use pointers when absence differs from zero. A signed sen
 
 ### Direct Files
 
-An explicit direct slot `n` encodes as `n+1`. `IORING_FILE_INDEX_ALLOC` passes through unchanged; reject the adjacent value whose increment would collide with that sentinel. Direct multishot accept requires allocation. Direct sockets reject `SOCK_CLOEXEC`; fixed-file installation accepts only its documented installation flag. Distinguish an ordinary descriptor, registered slot and task-local registered-ring index.
+| Use | Encoding |
+|-----|----------|
+| Fixed read or poll | Set `IOSQE_FIXED_FILE` and put the zero-based source slot in `fd`. Slot zero encodes as zero. |
+| Direct socket, direct accept or `MsgRingFD` destination | An explicit slot `n` encodes as `file_index=n+1`. `IORING_FILE_INDEX_ALLOC` passes through unchanged. Reject the adjacent value whose increment would collide with it. Direct multishot accept requires allocation. |
+| `FixedFdInstall` | Supply the zero-based source slot. The wrapper sets `IOSQE_FIXED_FILE`. Installation flags are zero or `IORING_FIXED_FD_NO_CLOEXEC`. |
 
-`FILES_UPDATE` offsets are unsigned 32-bit, including the allocation sentinel. Retain its descriptor array through completion; allocation mode may write the selected indexes. This is separate from the synchronous registration update described below.
+On `SOCKET` and `ACCEPT`, the Direct context's `BufGroup` can carry a caller tag in `user_data`. Both operations require a zero SQE `buf_index`, including when they create a registered descriptor. [Linux accept](https://github.com/torvalds/linux/blob/v6.18/io_uring/net.c#L1610-L1632) · [Linux socket](https://github.com/torvalds/linux/blob/v6.18/io_uring/net.c#L1705-L1723)
+
+Direct sockets reject `SOCK_CLOEXEC`. A task-local registered-ring index selects a ring in the current Linux task. [File ownership and results](files.md) · [Operation encoding](../../operations_linux.go)
+
+`FILES_UPDATE` offsets fit unsigned 32 bits, including the allocation sentinel. The array is both input and, in allocation mode, output. [Registration array lifetimes](resources.md#registration)
 
 ### Receive Shape
 

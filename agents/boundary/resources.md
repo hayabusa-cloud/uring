@@ -91,7 +91,7 @@ Keep shared bytes immutable until every accepted send releases them. An ordinary
 
 Cancellation and timeout race with the original operation. Observe their results and any remaining original CQEs before releasing the original request context.
 
-`Uring.Close` submits a close for one process fd, or one registered slot with `IOSQE_FIXED_FILE`. Submit it after the target's last use. Leave `IOSQE_CQE_SKIP_SUCCESS` clear to observe the result. On a full SQ, the caller still owns the close. Drive the ring and retry. A nil return admits the request. Stop using the target and reap the matched close CQE. Success reports zero. [Close encoding](../../operations_linux.go#L437-L456) · [File close example](../../examples/file_lifecycle_test.go#L150-L174)
+`Uring.Close` submits a close for one process fd, or one registered slot with `IOSQE_FIXED_FILE`. Submit it after the target's last use. Leave `IOSQE_CQE_SKIP_SUCCESS` clear to observe the result. On a full SQ, the caller still owns the close. Drive the ring and retry. A nil return admits the request. Stop using the target and reap the matched close CQE. Success reports zero. [Close encoding](../../operations_linux.go#L431-L450) · [File close example](../../examples/file_lifecycle_test.go#L150-L174)
 
 Call `Uring.Stop` on the serialized ring owner after draining accepted work, reaping outstanding CQEs and quiescing subscriptions. It tears down the ring without driving pending closes or invoking terminal callbacks. [Ring teardown](../../io_uring_linux.go#L602-L618)
 

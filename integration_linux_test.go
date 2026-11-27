@@ -511,7 +511,7 @@ func TestUringTCPSocketCycle(t *testing.T) {
 	mustStartRing(t, ring)
 
 	// Create TCP4 socket via io_uring
-	ctx := uring.PackDirect(uring.IORING_OP_SOCKET, 0, 0, 0)
+	ctx := uring.PackDirect(uring.IORING_OP_SOCKET, 0, 0xa501, 0)
 	if err := ring.TCP4Socket(ctx); err != nil {
 		t.Fatalf("TCP4Socket: %v", err)
 	}
@@ -522,6 +522,9 @@ func TestUringTCPSocketCycle(t *testing.T) {
 	}
 	if ev.Res < 0 {
 		t.Fatalf("Socket creation failed: %d", ev.Res)
+	}
+	if got := ev.BufGroup(); got != ctx.BufGroup() {
+		t.Errorf("socket completion tag = %#x, want %#x", got, ctx.BufGroup())
 	}
 	socketFD := ev.Res
 
@@ -1229,7 +1232,7 @@ func TestAcceptDirect(t *testing.T) {
 	boundPort := int(boundAddr[2])<<8 | int(boundAddr[3])
 
 	// Submit AcceptDirect with auto-allocation
-	acceptCtx := uring.PackDirect(uring.IORING_OP_ACCEPT, 0, 0, serverFD)
+	acceptCtx := uring.PackDirect(uring.IORING_OP_ACCEPT, 0, 0xa502, serverFD)
 	err = ring.AcceptDirect(acceptCtx, uring.IORING_FILE_INDEX_ALLOC)
 	if err != nil {
 		t.Fatalf("AcceptDirect: %v", err)
@@ -1257,6 +1260,9 @@ func TestAcceptDirect(t *testing.T) {
 	// With IORING_FILE_INDEX_ALLOC, res contains the allocated slot index (0-based)
 	if ev.Res < 0 {
 		t.Fatalf("AcceptDirect returned error: %d", ev.Res)
+	}
+	if got := ev.BufGroup(); got != acceptCtx.BufGroup() {
+		t.Errorf("accept completion tag = %#x, want %#x", got, acceptCtx.BufGroup())
 	}
 
 	allocatedSlot := ev.Res
@@ -1300,7 +1306,7 @@ func TestSocketDirect(t *testing.T) {
 	}
 
 	// Create socket directly into registered file table with auto-allocation
-	socketCtx := uring.PackDirect(uring.IORING_OP_SOCKET, 0, 0, 0)
+	socketCtx := uring.PackDirect(uring.IORING_OP_SOCKET, 0, 0xa503, 0)
 	err = ring.TCP4SocketDirect(socketCtx)
 	if err != nil {
 		t.Fatalf("TCP4SocketDirect: %v", err)
@@ -1314,6 +1320,9 @@ func TestSocketDirect(t *testing.T) {
 	// With IORING_FILE_INDEX_ALLOC, res contains the allocated slot index (0-based)
 	if ev.Res < 0 {
 		t.Fatalf("SocketDirect returned error: %d", ev.Res)
+	}
+	if got := ev.BufGroup(); got != socketCtx.BufGroup() {
+		t.Errorf("direct socket completion tag = %#x, want %#x", got, socketCtx.BufGroup())
 	}
 
 	allocatedSlot := ev.Res

@@ -22,7 +22,8 @@ The baseline below pins Linux v6.18 and liburing 2.13; the v6.19 ZCRX source is 
 | Epoll fields | [epoll.c](https://github.com/torvalds/linux/blob/v6.18/io_uring/epoll.c) |
 | WAITID fields and domains | [waitid.c](https://github.com/torvalds/linux/blob/v6.18/io_uring/waitid.c), [exit.c](https://github.com/torvalds/linux/blob/v6.18/kernel/exit.c) |
 | FUTEX_WAITV fields and limits | [futex.c](https://github.com/torvalds/linux/blob/v6.18/io_uring/futex.c), [futex UAPI](https://github.com/torvalds/linux/blob/v6.18/include/uapi/linux/futex.h) |
-| Registered-file updates and fixed-iovec import | [rsrc.c](https://github.com/torvalds/linux/blob/v6.18/io_uring/rsrc.c) |
+| Registered-file lookup, updates, retirement tags and fixed-iovec import | [fixed-file lookup](https://github.com/torvalds/linux/blob/v6.18/io_uring/io_uring.c#L1998-L2015), [rsrc.c](https://github.com/torvalds/linux/blob/v6.18/io_uring/rsrc.c) |
+| File installation into a process or target ring | [installation manual](https://github.com/axboe/liburing/blob/liburing-2.13/man/io_uring_prep_fixed_fd_install.3), [msg_ring.c](https://github.com/torvalds/linux/blob/v6.18/io_uring/msg_ring.c#L176-L205) |
 | Registration descriptor copyback and memory-region lifetime | [register.c](https://github.com/torvalds/linux/blob/v6.18/io_uring/register.c), [memmap.c](https://github.com/torvalds/linux/blob/v6.18/io_uring/memmap.c) |
 | ZCRX setup, references, and refill | [documentation](https://github.com/torvalds/linux/blob/v6.18/Documentation/networking/iou-zcrx.rst), [v6.18 implementation](https://github.com/torvalds/linux/blob/v6.18/io_uring/zcrx.c), [v6.19 comparison](https://github.com/torvalds/linux/blob/v6.19/io_uring/zcrx.c), [liburing example](https://github.com/axboe/liburing/blob/liburing-2.13/examples/zcrx.c) |
 
