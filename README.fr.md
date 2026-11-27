@@ -521,7 +521,7 @@ func queueReceiveWithTimeout(ring *uring.Uring, pairID uint16, fd iofd.FD, buf [
 }
 ```
 
-Si `iox.ErrWouldBlock` est renvoyé sans aucune admission, faites progresser le ring avant de réessayer la paire. Si seule la réception est en file, transmettez-la au noyau avant toute autre soumission et conservez `buf` jusqu’à sa complétion. Si les deux requêtes sont en file, relevez les deux CQE. À l’échéance, le noyau tente d’annuler la réception. Sa propre CQE en donne le résultat. [Exemple de délai lié](./examples/timeout_linux_test.go#L259)
+Si `iox.ErrWouldBlock` est renvoyé sans aucune admission, faites progresser le ring avant de réessayer la paire. Si seule la réception est en file, transmettez-la au noyau avant toute autre soumission et conservez `buf` jusqu’à sa complétion. Si les deux requêtes sont en file, relevez les deux CQE. À l’échéance, le noyau tente d’annuler la réception. Sa propre CQE en donne le résultat. [Deux réceptions avec des échéances distinctes](./examples/receive_deadline_linux_test.go)
 
 ## Parcours TCP courants
 

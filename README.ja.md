@@ -521,7 +521,7 @@ func queueReceiveWithTimeout(ring *uring.Uring, pairID uint16, fd iofd.FD, buf [
 }
 ```
 
-投入数が 0 で `iox.ErrWouldBlock` が返ったら、リングを駆動してから 2 件とも再試行します。受信だけがキューに入った場合は、他の要求を追加する前にその受信をカーネルに渡し、完了まで `buf` を保持します。2 件とも入った場合は両方の CQE を回収します。期限切れはキャンセルを試みるためのもので、受信の結果は受信自身の CQE で確認します。[リンクタイムアウトの例](./examples/timeout_linux_test.go#L259)
+投入数が 0 で `iox.ErrWouldBlock` が返ったら、リングを駆動してから 2 件とも再試行します。受信だけがキューに入った場合は、他の要求を追加する前にその受信をカーネルに渡し、完了まで `buf` を保持します。2 件とも入った場合は両方の CQE を回収します。期限切れはキャンセルを試みるためのもので、受信の結果は受信自身の CQE で確認します。[同じソケットでの2つの受信期限](./examples/receive_deadline_linux_test.go)
 
 ## TCP の使用パターン
 

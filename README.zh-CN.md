@@ -521,7 +521,7 @@ func queueReceiveWithTimeout(ring *uring.Uring, pairID uint16, fd iofd.FD, buf [
 }
 ```
 
-若返回 `iox.ErrWouldBlock` 且没有请求入队，先驱动 ring，再重试这一对请求。若仅接收入队，先驱动 ring 将其提交给内核，再提交其他请求，并保留 `buf` 直到接收完成。若两者均已入队，则回收两条 CQE。期限届满时内核会尝试取消接收，实际接收结果以接收 CQE 为准。[关联超时示例](./examples/timeout_linux_test.go#L259)
+若返回 `iox.ErrWouldBlock` 且没有请求入队，先驱动 ring，再重试这一对请求。若仅接收入队，先驱动 ring 将其提交给内核，再提交其他请求，并保留 `buf` 直到接收完成。若两者均已入队，则回收两条 CQE。期限届满时内核会尝试取消接收，实际接收结果以接收 CQE 为准。[同一套接字上的两个接收期限](./examples/receive_deadline_linux_test.go)
 
 ## TCP 使用模式
 
