@@ -23,9 +23,9 @@ At stream EOF or on error, recycle any slot returned by `ring.BundleIterator`. F
 
 ## Incremental Receive
 
-Create one `IncrementalReceiver` for the registration before its first receive. Dispatch every consuming CQE once, serially in CQ order. Track offsets per ID; interleaving does not reset another ID.
-
-`F_BUF_MORE` retains the buffer. Without it, locate the final fragment before resetting that ID. `OnData` borrows until return; copy retained bytes. Zero/negative results can return buffers: inspect `F_BUFFER` and `F_BUF_MORE`. Zero bytes alone grant no recycle authority. Finish borrows before republishing.
+1. Register the incremental group, add each backing slice with its matching ID and publish the entries. Create one `IncrementalReceiver` before the first receive on that group.
+2. Submit with `Recv`. Dispatch each consuming CQE once, serially in CQ order. Copy needed context fields before calling `HandleCQE`, which returns the context to its pool.
+3. Copy any `OnData` bytes needed after the callback. Account for returned buffers even on zero or failure, using `F_BUFFER` and `F_BUF_MORE`. The receiver tracks each ID's offset across interleaved CQEs. [Incremental buffer contract](../boundary/resources.md#incremental-receive) · [Receiver](../../incremental_linux.go)
 
 ## Zero-Copy
 

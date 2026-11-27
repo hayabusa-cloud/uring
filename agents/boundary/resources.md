@@ -66,7 +66,7 @@ Create one `IncrementalReceiver` before the registration's first receive; use it
 | Zero or negative result | Still inspect both flags; zero bytes alone grant no recycle authority |
 | `OnComplete` | Ends one successful receive, even if its buffer remains retained |
 
-Apply every relevant row. `IncrementalHandler.OnData` borrows until return; copy retained bytes. Copy needed context facts before dispatch returns the pooled request context. Finish borrows before republishing. Byte layout, request `F_MORE`, and whole-buffer reuse remain separate.
+Apply every relevant row. `IncrementalHandler.OnData` borrows a fragment whose length and capacity equal the delivered byte count. Copy retained bytes before the callback returns and needed context facts before dispatch returns the pooled request context. Finish borrows before republishing. Byte layout, request `F_MORE`, and whole-buffer reuse remain separate.
 
 ## Zero-Copy Send and Receive
 
