@@ -2067,208 +2067,85 @@ func TestSQE128NopCycle(t *testing.T) {
 // TestAsyncCancel: IORING_OP_ASYNC_CANCEL operation
 // =============================================================================
 
-// TestAsyncCancel validates async cancellation of pending operations.
-//
-// Architecture:
-//   - Submit a timeout that will wait 60 seconds (effectively forever for this test)
-//   - Flush that timeout into the kernel before issuing AsyncCancel
-//   - Submit AsyncCancel targeting the timeout's userData
-//   - Verify: timeout receives -ECANCELED, cancel receives 0 or -EALREADY
-//
-// Cancel CQE results:
-//   - 0: Successfully cancelled
-//   - -EALREADY: Request already running (past cancellation point)
 func TestAsyncCancel(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	mustStartRing(t, ring)
+	ring := newTestRing(t)
+	timer := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, 1, 0)
+	nop := uring.PackDirect(uring.IORING_OP_NOP, 0, 2, 0)
+	cancel := uring.PackDirect(uring.IORING_OP_ASYNC_CANCEL, 0, 3, 0)
 
-	// Submit a long timeout that we'll cancel
-	const targetUserData = uint16(42)
-	targetCtx := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, targetUserData, 0)
-	if err := ring.Timeout(targetCtx, 60*time.Second); err != nil {
-		t.Fatalf("Timeout: %v", err)
+	// The timer must stay pending across unrelated completions.
+	if err := ring.Timeout(timer, time.Hour, uring.WithCount(0)); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := ring.Wait(nil); err != nil {
-		t.Fatalf("Wait(nil): %v", err)
+	if err := ring.Nop(nop); err != nil {
+		t.Fatal(err)
 	}
-	t.Log("Submitted and flushed 60s timeout with userData=42")
+	requireTerminalResults(t, ring, map[uring.SQEContext]int32{nop: 0})
 
-	// Cancel the timeout using AsyncCancel with target userData
-	cancelCtx := uring.PackDirect(uring.IORING_OP_ASYNC_CANCEL, 0, 1, 0)
-	if err := ring.AsyncCancel(cancelCtx, targetCtx.Raw()); err != nil {
-		t.Fatalf("AsyncCancel: %v", err)
+	if err := ring.AsyncCancel(cancel, timer.Raw()); err != nil {
+		t.Fatal(err)
 	}
-	t.Log("Submitted AsyncCancel targeting userData=42")
+	requireTerminalResults(t, ring, map[uring.SQEContext]int32{timer: -int32(zcall.ECANCELED), cancel: 0})
 
-	// Wait for both CQEs
-	// Note: longer deadline covers race/coverage overhead and the documented
-	// -EALREADY path where the target CQE may arrive slightly later.
-	cqes := make([]uring.CQEView, 8)
-	deadline := time.Now().Add(10 * time.Second)
-	b := iox.Backoff{}
-	var gotTimeout, gotCancel bool
-	var timeoutRes, cancelRes int32
-
-	for (!gotTimeout || !gotCancel) && time.Now().Before(deadline) {
-		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
-			t.Fatalf("Wait: %v", err)
-		}
-		for i := range n {
-			op := cqes[i].Op()
-			res := cqes[i].Res
-			t.Logf("CQE: op=%d, res=%d", op, res)
-
-			switch op {
-			case uring.IORING_OP_TIMEOUT:
-				gotTimeout = true
-				timeoutRes = res
-			case uring.IORING_OP_ASYNC_CANCEL:
-				gotCancel = true
-				cancelRes = res
-			}
-		}
-		if !gotTimeout || !gotCancel {
-			b.Wait()
-		}
+	if err := ring.AsyncCancel(cancel, timer.Raw()); err != nil {
+		t.Fatal(err)
 	}
-
-	// Validate results
-	if !gotTimeout {
-		t.Fatal("Timeout CQE not received")
-	}
-	if !gotCancel {
-		t.Fatal("AsyncCancel CQE not received")
-	}
-
-	const (
-		wantTimeoutCanceled = -int32(zcall.ECANCELED)
-		wantCancelBusy      = -int32(zcall.EALREADY)
-	)
-
-	if timeoutRes != wantTimeoutCanceled {
-		t.Errorf("Timeout result: got %d, want %d (-ECANCELED)", timeoutRes, wantTimeoutCanceled)
-	} else {
-		t.Log("Timeout correctly cancelled with -ECANCELED")
-	}
-
-	if cancelRes != 0 && cancelRes != wantCancelBusy {
-		t.Errorf("AsyncCancel result: got %d, want 0 or %d (-EALREADY)", cancelRes, wantCancelBusy)
-	} else {
-		t.Logf("AsyncCancel result: %d (success)", cancelRes)
-	}
+	requireTerminalResults(t, ring, map[uring.SQEContext]int32{cancel: -int32(zcall.ENOENT)})
 }
 
-// TestAsyncCancelExtended validates extended async cancellation modes.
-// Tests the CANCEL_FD, CANCEL_OP, CANCEL_ANY, and CANCEL_ALL flags.
 func TestAsyncCancelExtended(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
+	const canceled = -int32(zcall.ECANCELED)
+	for _, name := range []string{"CancelFD", "CancelOpcode", "CancelAny", "CancelAll"} {
+		t.Run(name, func(t *testing.T) {
+			fd, errno := zcall.Eventfd2(0, zcall.EFD_NONBLOCK|zcall.EFD_CLOEXEC)
+			if errno != 0 {
+				t.Fatal(zcall.Errno(errno))
+			}
+			t.Cleanup(func() { zcall.Close(fd) })
+			ring := newTestRing(t)
+			poll := uring.PackDirect(uring.IORING_OP_POLL_ADD, 0, 1, int32(fd))
+			timer := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, 2, 0)
+			cancel := uring.PackDirect(uring.IORING_OP_ASYNC_CANCEL, 0, 3, int32(fd))
+			if err := ring.PollAdd(poll, uring.EPOLLIN); err != nil {
+				t.Fatal(err)
+			}
+			if err := ring.Timeout(timer, time.Hour, uring.WithCount(0)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ring.Wait(nil); err != nil {
+				t.Fatal(err)
+			}
+
+			var target, remaining uring.SQEContext
+			var err error
+			switch name {
+			case "CancelFD":
+				err = ring.AsyncCancelFD(cancel, false)
+				target, remaining = poll, timer
+			case "CancelOpcode":
+				err = ring.AsyncCancelOpcode(cancel, uring.IORING_OP_TIMEOUT, false)
+				target, remaining = timer, poll
+			case "CancelAny":
+				err = ring.AsyncCancelAny(cancel)
+			case "CancelAll":
+				err = ring.AsyncCancelAll(cancel)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if target == 0 {
+				requireTerminalResults(t, ring, map[uring.SQEContext]int32{poll: canceled, timer: canceled, cancel: 2})
+				return
+			}
+			requireTerminalResults(t, ring, map[uring.SQEContext]int32{target: canceled, cancel: 0})
+			// The unselected request is still pending and cancellable by identity.
+			if err := ring.AsyncCancel(cancel, remaining.Raw()); err != nil {
+				t.Fatal(err)
+			}
+			requireTerminalResults(t, ring, map[uring.SQEContext]int32{remaining: canceled, cancel: 0})
+		})
 	}
-	mustStartRing(t, ring)
-
-	// Create pipe for poll operations
-	var fds [2]int32
-	errno := zcall.Pipe2(&fds, zcall.O_NONBLOCK|zcall.O_CLOEXEC)
-	if errno != 0 {
-		t.Fatalf("Pipe2: %v", zcall.Errno(errno))
-	}
-	readFD := uintptr(fds[0])
-	defer zcall.Close(readFD)
-	defer zcall.Close(uintptr(fds[1]))
-
-	cqes := make([]uring.CQEView, 16)
-
-	// Test AsyncCancelAny API exists
-	t.Run("CancelAny", func(t *testing.T) {
-		// Submit a long timeout to have something to cancel
-		timeoutCtx := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, 1, 0)
-		ring.Timeout(timeoutCtx, 60*time.Second)
-
-		// Try to cancel any pending operation
-		cancelCtx := uring.PackDirect(uring.IORING_OP_ASYNC_CANCEL, 0, 2, 0)
-		if err := ring.AsyncCancelAny(cancelCtx); err != nil {
-			t.Fatalf("AsyncCancelAny: %v", err)
-		}
-		t.Log("Submitted AsyncCancelAny")
-
-		// Collect CQEs
-		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
-			t.Fatalf("Wait: %v", err)
-		}
-		t.Logf("Got %d CQEs", n)
-		for i := 0; i < n; i++ {
-			t.Logf("CQE %d: op=%d res=%d", i, cqes[i].Op(), cqes[i].Res)
-		}
-	})
-
-	// Test AsyncCancelFD API exists
-	t.Run("CancelFD", func(t *testing.T) {
-		// Submit a poll on the pipe
-		pollCtx := uring.PackDirect(uring.IORING_OP_POLL_ADD, 0, 10, int32(readFD))
-		ring.PollAdd(pollCtx, uring.EPOLLIN)
-
-		// Try to cancel by FD
-		cancelCtx := uring.PackDirect(uring.IORING_OP_ASYNC_CANCEL, 0, 11, int32(readFD))
-		if err := ring.AsyncCancelFD(cancelCtx, false); err != nil {
-			t.Fatalf("AsyncCancelFD: %v", err)
-		}
-		t.Log("Submitted AsyncCancelFD")
-
-		// Collect CQEs
-		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
-			t.Fatalf("Wait: %v", err)
-		}
-		t.Logf("Got %d CQEs", n)
-		for i := 0; i < n; i++ {
-			t.Logf("CQE %d: op=%d res=%d", i, cqes[i].Op(), cqes[i].Res)
-		}
-	})
-
-	// Test AsyncCancelOpcode API exists
-	t.Run("CancelOpcode", func(t *testing.T) {
-		// Submit a timeout to cancel
-		timeoutCtx := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, 20, 0)
-		ring.Timeout(timeoutCtx, 60*time.Second)
-
-		// Try to cancel by opcode
-		cancelCtx := uring.PackDirect(uring.IORING_OP_ASYNC_CANCEL, 0, 21, 0)
-		if err := ring.AsyncCancelOpcode(cancelCtx, uring.IORING_OP_TIMEOUT, false); err != nil {
-			t.Fatalf("AsyncCancelOpcode: %v", err)
-		}
-		t.Log("Submitted AsyncCancelOpcode")
-
-		// Collect CQEs
-		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
-			t.Fatalf("Wait: %v", err)
-		}
-		t.Logf("Got %d CQEs", n)
-		for i := 0; i < n; i++ {
-			t.Logf("CQE %d: op=%d res=%d", i, cqes[i].Op(), cqes[i].Res)
-		}
-	})
-
-	// Verify cancel flag constants exist
-	t.Run("Constants", func(t *testing.T) {
-		_ = uring.IORING_ASYNC_CANCEL_ALL
-		_ = uring.IORING_ASYNC_CANCEL_FD
-		_ = uring.IORING_ASYNC_CANCEL_ANY
-		_ = uring.IORING_ASYNC_CANCEL_FD_FIXED
-		_ = uring.IORING_ASYNC_CANCEL_USERDATA
-		_ = uring.IORING_ASYNC_CANCEL_OP
-		t.Log("Cancel constants verified")
-	})
 }
 
 // =============================================================================

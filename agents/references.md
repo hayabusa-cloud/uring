@@ -9,8 +9,9 @@ The baseline below pins Linux v6.18 and liburing 2.13; the v6.19 ZCRX source is 
 | Claim | Primary source |
 |-------|----------------|
 | SQE/CQE layout and flags | [Linux UAPI](https://github.com/torvalds/linux/blob/v6.18/include/uapi/linux/io_uring.h) |
-| Opaque request/completion identity | [user-data manual](https://github.com/axboe/liburing/blob/liburing-2.13/man/io_uring_sqe_set_data64.3) |
+| Request identity and poll ID changes | [user-data manual](https://github.com/axboe/liburing/blob/liburing-2.13/man/io_uring_sqe_set_data.3), [poll update and rearm](https://github.com/torvalds/linux/blob/v6.18/io_uring/poll.c#L925-L955) |
 | Cancellation matching and drain deferral | [cancel.c](https://github.com/torvalds/linux/blob/v6.18/io_uring/cancel.c), [io_uring.c](https://github.com/torvalds/linux/blob/v6.18/io_uring/io_uring.c), [cancellation manual](https://github.com/axboe/liburing/blob/liburing-2.13/man/io_uring_prep_cancel.3) |
+| Timer counts, updates, expiry and linked submission boundaries | [timeout.c](https://github.com/torvalds/linux/blob/v6.18/io_uring/timeout.c), [control CQE results](https://github.com/axboe/liburing/blob/liburing-2.13/man/io_uring_prep_timeout_update.3#L61-L78), [link flags in io_uring_enter(2)](https://github.com/axboe/liburing/blob/liburing-2.13/man/io_uring_enter.2) |
 | Setup, normalization, and issuer checks | [io_uring.c](https://github.com/torvalds/linux/blob/v6.18/io_uring/io_uring.c), [internal limits](https://github.com/torvalds/linux/blob/v6.18/io_uring/io_uring.h) |
 | Network operation validation and completion | [net.c](https://github.com/torvalds/linux/blob/v6.18/io_uring/net.c) |
 | Provided buffers and descriptor consumption order | [kbuf.c](https://github.com/torvalds/linux/blob/v6.18/io_uring/kbuf.c), [receive manual](https://github.com/axboe/liburing/blob/liburing-2.13/man/io_uring_prep_recv.3) |

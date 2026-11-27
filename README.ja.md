@@ -500,18 +500,20 @@ ring.PutExtSQE(ext)
 
 ### デッドライン合成
 
-`LinkTimeout` は、直前の `IOSQE_IO_LINK` 付き SQE に期限を設定します。起動済みのリングを単一の所有者が操作し、空き数の確認から 2 つの SQE の投入までの間に、他の投入や `Wait` を挟まないようにします。次の例の戻り値は、完了を回収する必要のある要求の数です。空でない受信バッファを渡し、受信 CQE を回収するまでそのアドレスを固定してください。
+独立したタイマーで時間の経過だけを待つには、`ring.Timeout(ctx, d, uring.WithCount(0))` を使います。既定のカウントは 1 なので、別のリクエストが完了すると、満了を待たずに結果 0 でタイマーが完了することがあります。満了時の結果は `-ETIME` です。 [タイマーとリンクされた期限](./agents/recipes/lifecycle.md#timers-and-linked-deadlines)
+
+`LinkTimeout` は、直前の `IOSQE_IO_LINK` 付き SQE に期限を設定します。起動済みのリングを単一の所有者が操作し、空き数の確認から 2 つの SQE の投入までの間に、他の投入や `Wait` を挟まないようにします。次の例の戻り値は、完了を回収する必要のある要求の数です。空でない受信バッファを渡し、受信 CQE を回収するまでそのアドレスを固定してください。処理中のペアごとに異なる `pairID` を割り当てます。そのペアの両方の CQE と、ペアを参照する制御要求の CQE をすべて処理した後で ID を再利用できます。
 
 ```go
-func queueReceiveWithTimeout(ring *uring.Uring, fd iofd.FD, buf []byte, d time.Duration) (int, error) {
+func queueReceiveWithTimeout(ring *uring.Uring, pairID uint16, fd iofd.FD, buf []byte, d time.Duration) (int, error) {
 	if ring.SQAvailable() < 2 {
 		return 0, iox.ErrWouldBlock
 	}
-	recvCtx := uring.PackDirect(uring.IORING_OP_RECV, uring.IOSQE_IO_LINK, 0, int32(fd))
+	recvCtx := uring.PackDirect(uring.IORING_OP_RECV, uring.IOSQE_IO_LINK, pairID, int32(fd))
 	if err := ring.ReceiveFD(recvCtx, fd, buf); err != nil {
 		return 0, err
 	}
-	timeoutCtx := uring.PackDirect(uring.IORING_OP_LINK_TIMEOUT, 0, 0, 0)
+	timeoutCtx := uring.PackDirect(uring.IORING_OP_LINK_TIMEOUT, 0, pairID, 0)
 	if err := ring.LinkTimeout(timeoutCtx, d); err != nil {
 		return 1, err
 	}

@@ -644,7 +644,7 @@ func (ur *Uring) SendFD(sqeCtx SQEContext, fd iofd.FD, p []byte, options ...OpOp
 	return ur.send(ctx, ioprio, p, uint64(offset), n)
 }
 
-// Timeout submits a timeout request.
+// Timeout submits a timer. The Darwin simulator completes an admitted request with -ENOSYS.
 func (ur *Uring) Timeout(sqeCtx SQEContext, d time.Duration, options ...OpOptionFunc) error {
 	flags, cnt, timeoutFlags := ur.timeoutOptions(options)
 	ctx := sqeCtx.OrFlags(flags)
@@ -854,7 +854,7 @@ func (ur *Uring) PollUpdate(sqeCtx SQEContext, oldUserData, newUserData uint64, 
 	return ErrNotSupported
 }
 
-// TimeoutRemove removes a timeout request.
+// TimeoutRemove submits timeout removal. The Darwin simulator completes an admitted request with -ENOSYS.
 func (ur *Uring) TimeoutRemove(sqeCtx SQEContext, userData uint64, options ...OpOptionFunc) error {
 	flags := ur.operationOptions(options)
 	ctx := sqeCtx.OrFlags(flags)
@@ -921,7 +921,7 @@ func (ur *Uring) SyncFileRange(sqeCtx SQEContext, offset int64, length int, sync
 	return ur.syncFileRange(ctx, uint64(offset), length, syncFlags)
 }
 
-// LinkTimeout creates a linked timeout operation.
+// LinkTimeout submits a linked timeout. The Darwin simulator completes an admitted request with -ENOSYS.
 func (ur *Uring) LinkTimeout(sqeCtx SQEContext, d time.Duration, options ...OpOptionFunc) error {
 	flags := ur.operationOptions(options)
 	ctx := sqeCtx.OrFlags(flags)

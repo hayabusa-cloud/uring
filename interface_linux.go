@@ -772,7 +772,8 @@ func (ur *Uring) SendFD(sqeCtx SQEContext, fd iofd.FD, p []byte, options ...OpOp
 	return ur.send(ctx, ioprio, p, uint64(offset), n)
 }
 
-// Timeout submits a timeout request with the specified duration.
+// Timeout submits a timer. The default one-shot timer reports zero after one
+// qualifying completion, or -ETIME on expiry. Use WithCount(0) to wait for time alone.
 func (ur *Uring) Timeout(sqeCtx SQEContext, d time.Duration, options ...OpOptionFunc) error {
 	flags, cnt, timeoutFlags := ur.timeoutOptions(options)
 	ctx := sqeCtx.OrFlags(flags)

@@ -500,18 +500,20 @@ Keep live Go pointer roots reachable outside `UserData`. The GC does not trace t
 
 ### Deadline composition
 
-`LinkTimeout` applies to the preceding SQE marked `IOSQE_IO_LINK`. On a started ring with a single owner, check capacity and queue the two SQEs together before any other submission or `Wait`. The return count below records how many requests the caller must still reap. Use a nonempty receive buffer and keep its address stable until the receive CQE.
+For a standalone timer that waits for time alone, use `ring.Timeout(ctx, d, uring.WithCount(0))`. The default count is one, so another completion can finish the timer with result zero before it expires. Clock expiry reports `-ETIME`. [Timers and linked deadlines](./agents/recipes/lifecycle.md#timers-and-linked-deadlines)
+
+`LinkTimeout` applies to the preceding SQE marked `IOSQE_IO_LINK`. On a started ring with a single owner, check capacity and queue the two SQEs together before any other submission or `Wait`. The return count below records how many requests the caller must still reap. Use a nonempty receive buffer and keep its address stable until the receive CQE. Assign a distinct `pairID` to each live pair. Reuse it after handling both completions and any control replies that refer to the pair.
 
 ```go
-func queueReceiveWithTimeout(ring *uring.Uring, fd iofd.FD, buf []byte, d time.Duration) (int, error) {
+func queueReceiveWithTimeout(ring *uring.Uring, pairID uint16, fd iofd.FD, buf []byte, d time.Duration) (int, error) {
 	if ring.SQAvailable() < 2 {
 		return 0, iox.ErrWouldBlock
 	}
-	recvCtx := uring.PackDirect(uring.IORING_OP_RECV, uring.IOSQE_IO_LINK, 0, int32(fd))
+	recvCtx := uring.PackDirect(uring.IORING_OP_RECV, uring.IOSQE_IO_LINK, pairID, int32(fd))
 	if err := ring.ReceiveFD(recvCtx, fd, buf); err != nil {
 		return 0, err
 	}
-	timeoutCtx := uring.PackDirect(uring.IORING_OP_LINK_TIMEOUT, 0, 0, 0)
+	timeoutCtx := uring.PackDirect(uring.IORING_OP_LINK_TIMEOUT, 0, pairID, 0)
 	if err := ring.LinkTimeout(timeoutCtx, d); err != nil {
 		return 1, err
 	}

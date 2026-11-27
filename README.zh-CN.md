@@ -500,18 +500,20 @@ ring.PutExtSQE(ext)
 
 ### 截止时间组合
 
-`LinkTimeout` 为前一个带 `IOSQE_IO_LINK` 的 SQE 设置期限。在已启动且只有一个所有者的 ring 上，先检查容量，再连续提交两个 SQE，其间不插入其他提交或 `Wait`。下面的返回值记录调用方还需回收多少个请求的完成事件。传入非空的接收缓冲区，并在回收接收 CQE 前保持其地址稳定。
+独立定时器若只需等待时间届满，使用 `ring.Timeout(ctx, d, uring.WithCount(0))`。默认计数为一，因此其他请求的完成可能使定时器提前结束，结果为零。定时器到期时，结果为 `-ETIME`。 [定时器与关联超时](./agents/recipes/lifecycle.md#timers-and-linked-deadlines)
+
+`LinkTimeout` 为前一个带 `IOSQE_IO_LINK` 的 SQE 设置期限。在已启动且只有一个所有者的 ring 上，先检查容量，再连续提交两个 SQE，其间不插入其他提交或 `Wait`。下面的返回值记录调用方还需回收多少个请求的完成事件。传入非空的接收缓冲区，并在回收接收 CQE 前保持其地址稳定。为每组尚未完成的接收和定时器分配不同的 `pairID`。处理完两者的 CQE 以及引用该组的所有控制请求的 CQE 后，才能复用这个 ID。
 
 ```go
-func queueReceiveWithTimeout(ring *uring.Uring, fd iofd.FD, buf []byte, d time.Duration) (int, error) {
+func queueReceiveWithTimeout(ring *uring.Uring, pairID uint16, fd iofd.FD, buf []byte, d time.Duration) (int, error) {
 	if ring.SQAvailable() < 2 {
 		return 0, iox.ErrWouldBlock
 	}
-	recvCtx := uring.PackDirect(uring.IORING_OP_RECV, uring.IOSQE_IO_LINK, 0, int32(fd))
+	recvCtx := uring.PackDirect(uring.IORING_OP_RECV, uring.IOSQE_IO_LINK, pairID, int32(fd))
 	if err := ring.ReceiveFD(recvCtx, fd, buf); err != nil {
 		return 0, err
 	}
-	timeoutCtx := uring.PackDirect(uring.IORING_OP_LINK_TIMEOUT, 0, 0, 0)
+	timeoutCtx := uring.PackDirect(uring.IORING_OP_LINK_TIMEOUT, 0, pairID, 0)
 	if err := ring.LinkTimeout(timeoutCtx, d); err != nil {
 		return 1, err
 	}

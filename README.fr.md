@@ -500,18 +500,20 @@ On maintient les racines de pointeurs Go actives accessibles en dehors de `UserD
 
 ### Composition de délais
 
-`LinkTimeout` fixe une échéance pour la SQE précédente marquée `IOSQE_IO_LINK`. Sur un ring démarré et géré par un seul propriétaire, vérifiez la capacité puis soumettez les deux SQE à la suite, avant toute autre soumission ou tout appel à `Wait`. Le nombre renvoyé ci-dessous indique combien de requêtes restent à traiter en complétion. Utilisez un tampon de réception non vide et gardez son adresse stable jusqu’à la CQE de réception.
+Pour attendre uniquement l’expiration d’un temporisateur indépendant, utilisez `ring.Timeout(ctx, d, uring.WithCount(0))`. Par défaut, le compteur vaut un. L’achèvement d’une autre opération peut donc terminer le temporisateur avec un résultat nul avant l’échéance. À l’expiration, le résultat vaut `-ETIME`. [Temporisateurs et échéances liées](./agents/recipes/lifecycle.md#timers-and-linked-deadlines)
+
+`LinkTimeout` fixe une échéance pour la SQE précédente marquée `IOSQE_IO_LINK`. Sur un ring démarré et géré par un seul propriétaire, vérifiez la capacité puis soumettez les deux SQE à la suite, avant toute autre soumission ou tout appel à `Wait`. Le nombre renvoyé ci-dessous indique combien de requêtes restent à traiter en complétion. Utilisez un tampon de réception non vide et gardez son adresse stable jusqu’à la CQE de réception. Attribuez un `pairID` distinct à chaque paire en cours. Réutilisez-le après avoir traité les deux CQE et les réponses aux opérations de contrôle qui désignent cette paire.
 
 ```go
-func queueReceiveWithTimeout(ring *uring.Uring, fd iofd.FD, buf []byte, d time.Duration) (int, error) {
+func queueReceiveWithTimeout(ring *uring.Uring, pairID uint16, fd iofd.FD, buf []byte, d time.Duration) (int, error) {
 	if ring.SQAvailable() < 2 {
 		return 0, iox.ErrWouldBlock
 	}
-	recvCtx := uring.PackDirect(uring.IORING_OP_RECV, uring.IOSQE_IO_LINK, 0, int32(fd))
+	recvCtx := uring.PackDirect(uring.IORING_OP_RECV, uring.IOSQE_IO_LINK, pairID, int32(fd))
 	if err := ring.ReceiveFD(recvCtx, fd, buf); err != nil {
 		return 0, err
 	}
-	timeoutCtx := uring.PackDirect(uring.IORING_OP_LINK_TIMEOUT, 0, 0, 0)
+	timeoutCtx := uring.PackDirect(uring.IORING_OP_LINK_TIMEOUT, 0, pairID, 0)
 	if err := ring.LinkTimeout(timeoutCtx, d); err != nil {
 		return 1, err
 	}

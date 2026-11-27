@@ -12,7 +12,7 @@ Stop accepting new application work. Keep driving accepted prefixes and submit t
 
 Request cancellation where permitted, then keep driving and dispatching. Cancellation races with its target and cannot replace the target's completion. [Cancellation contract](https://github.com/axboe/liburing/blob/liburing-2.13/man/io_uring_prep_cancel.3)
 
-Dispatch every target and cancellation CQE, including those reaped after the application route retires. A managed helper owns its cancellation context through dispatch. A helper call that queues nothing adds no reply to await.
+A successful bulk cancellation reports how many requests it matched. Dispatch the cancel reply and each target’s CQEs by their own identities, even after the application route retires. A managed helper owns its cancellation context through dispatch. A helper call that queues nothing adds no reply to await. [Cancellation tests](../../integration_linux_test.go#L2096)
 
 The example tracks one terminal CQE for a multishot poll with a fixed Direct ID and one for its cancellation. If the poll ID changes, match each CQE to the ID it carries. [Poll ID changes](../boundary/sqe-cqe.md#change-a-poll-id)
 
@@ -50,9 +50,11 @@ Keep results, failures, terminality, and releases distinct. Neither terminal cal
 
 For an independent one-shot timer, call `ring.Timeout(ctx, d, uring.WithCount(0))` to wait for time alone. The default count is one. An unrelated completion, such as a NOP, can satisfy that count and produce a timer CQE with `Res == 0`. Clock expiry reports `-ETIME`. If another request is still pending when the timer fires, keep driving it or cancel it and account for its terminal CQE. [Timeout defaults](../../interface_internal.go#L135) · [Poll with an independent timer](../../examples/timeout_linux_test.go#L139)
 
-For a periodic timer, pass `WithTimeoutMultishot()` and a relative interval. An unmodified timer fires once by default, at most `n` times with a positive `WithCount(n)`, or repeatedly with `WithCount(0)`. Each expiry reports `-ETIME`. `IORING_CQE_F_MORE` means the timer remains active. Reap its terminal CQE before reusing its identity. [Linux timer completion](https://github.com/torvalds/linux/blob/v6.18/io_uring/timeout.c#L57-L90)
+For a periodic timer, pass `WithTimeoutMultishot()` and a relative interval. The default is one expiry. A positive `WithCount(n)` sets a limit of `n` expiries. Use `WithCount(0)` for no expiry limit. Each expiry reports `-ETIME`. `IORING_CQE_F_MORE` means the timer remains active. Reap its terminal CQE before reusing its identity. [Linux timer completion](https://github.com/torvalds/linux/blob/v6.18/io_uring/timeout.c#L57-L90)
 
-To give a request a deadline, check that two SQ slots are available on an exclusively driven ring. Queue the target with `IOSQE_IO_LINK`, immediately followed by `LinkTimeout`, in the same kernel submission. Once Linux consumes the target, a later standalone `LinkTimeout` completes with `-EINVAL`. Enable success reporting and leave `IOSQE_CQE_SKIP_SUCCESS` clear on both. Reap both replies. Target completion can disarm the timer with `-ECANCELED`. Expiry attempts cancellation, and the target's own CQE reports its outcome. [Linked example](../../examples/timeout_linux_test.go#L259) · [Linux link and timer handling](https://github.com/torvalds/linux/blob/v6.18/io_uring/timeout.c)
+To give a request a deadline, check that two SQ slots are available on an exclusively driven ring. Queue the target with `IOSQE_IO_LINK`, immediately followed by `LinkTimeout`, in the same kernel submission. Once Linux consumes the target, a later standalone `LinkTimeout` completes with `-EINVAL`. Leave `IOSQE_CQE_SKIP_SUCCESS` clear on both SQEs. For a target such as `SendFD` that suppresses success by default, enable `NotifySucceed` when creating the ring. Reap both replies. Target completion can disarm the timer with `-ECANCELED`. Expiry attempts cancellation, and the target's own CQE reports its outcome. [Linked example](../../examples/timeout_linux_test.go#L259) · [Linux link and timer handling](https://github.com/torvalds/linux/blob/v6.18/io_uring/timeout.c)
+
+Give each overlapping pair a distinct live `pairID`. The README's `queueReceiveWithTimeout` packs that `uint16` into both Direct contexts. The opcodes distinguish the receive from its timer, even when several pairs share a socket. Reuse the ID after handling both terminal CQEs and all outstanding control replies that reference the pair. [README helper](../../README.md#deadline-composition) · [Direct fields](../../ctx_unix.go#L79-L88) · [Context encoding model](../../proofs/README.md#context-representation)
 
 Link direction also matters. If an ordinary `Timeout` itself carries `IOSQE_IO_LINK`, expiry normally cancels the following request. `WithTimeoutEtimeSuccess()` lets that successor run on expiry. The timer's own CQE still reports `-ETIME`. [Linux timer expiry](https://github.com/torvalds/linux/blob/v6.18/io_uring/timeout.c#L254-L276)
 
@@ -87,3 +89,5 @@ When closing a file through `Uring.Close`, leave `IOSQE_CQE_SKIP_SUCCESS` clear.
 ## Validate
 
 Use [managed receive](../../examples/multishot_test.go), [poll cancellation](../../examples/poll_test.go), and [zero-copy](../../examples/zerocopy_test.go) cases. Check completion-before-cancel, late cancellation, delayed release, partial admission, failed startup, and repeated finalization only where idempotence is promised. Record feature skips under [verification](../verify.md).
+
+To check overlapping deadlines, arm two receives on the same socket with different `pairID` values. Update the second timer and reap both CQEs for its pair. Then send one byte from the peer. Match the update, both receives and both deadlines by `user_data`.

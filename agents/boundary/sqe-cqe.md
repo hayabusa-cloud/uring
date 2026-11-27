@@ -59,7 +59,7 @@ For deferred dispatch, bind the event to its originating request when reaping or
 
 For a multishot poll using Direct contexts, bind a fresh `next` to the poll before calling `ring.PollUpdate(update, old.Raw(), next.Raw(), 0, uring.IORING_POLL_UPDATE_USER_DATA)`. Give `update` its own `IORING_OP_POLL_REMOVE` context. Its zero result acknowledges the change. The rearmed poll uses `next`. CQEs already generated under `old` keep that ID through deferred dispatch. To remove the live poll, target `next.Raw()`. Removal by `old.Raw()` can report `-ENOENT` while the poll is still active. [Go encoding](../../operations_linux.go#L222) · [Linux poll update and rearm](https://github.com/gregkh/linux/blob/v6.18.15/io_uring/poll.c#L925-L960)
 
-To change only the readiness mask, pass zero for `newUserData` and select `IORING_POLL_UPDATE_EVENTS`. The rearmed poll keeps its ID and multishot mode. A later ID-only update preserves that mask. [Poll update regression](../../integration_linux_test.go#L2414)
+To change only the readiness mask, pass zero for `newUserData` and select `IORING_POLL_UPDATE_EVENTS`. The rearmed poll keeps its ID and multishot mode. A later ID-only update preserves that mask. [Poll update regression](../../integration_linux_test.go#L2291)
 
 ## Completion Retention
 
