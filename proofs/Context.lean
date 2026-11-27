@@ -3,7 +3,7 @@
 
 import Std
 
-/-! Arithmetic model of the disjoint fields in ctx.go. Powers-of-two division,
+/-! Arithmetic model of the disjoint fields in ctx_unix.go. Powers-of-two division,
 remainder and addition represent the reviewed masks, shifts and disjoint ORs.
 Pointer validity and lifetime are outside this representation model. -/
 namespace Uring.Context

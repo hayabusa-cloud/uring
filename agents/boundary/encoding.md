@@ -29,7 +29,7 @@ An explicit direct slot `n` encodes as `n+1`. `IORING_FILE_INDEX_ALLOC` passes t
 
 ### Receive Shape
 
-`Receive` and `ReceiveFD` with a nonempty caller buffer use `MSG_WAITALL`. `WithOffset(off)` sets the start within the slice. The requested length defaults to `len(buf)-off`. Use `WithN(n)` for an explicit length, including zero. A nil buffer selects a provided-buffer group with zero message flags. [ReceiveFD](../../interface_linux.go#L715) · [Socket options](../../interface_internal.go#L225)
+`Receive` and `ReceiveFD` with a nonempty caller buffer use `MSG_WAITALL`. `WithOffset(off)` sets the start within the slice. The requested length defaults to `len(buf)-off`. Use `WithN(n)` for an explicit length, including zero. A nil buffer selects a provided-buffer group with zero message flags. [ReceiveFD](../../interface_linux.go#L678) · [Socket options](../../interface_internal.go#L225)
 
 Multishot RECV uses buffer selection, zero address, zero message flags and a nonnegative signed 32-bit cap. `SubmitReceiveMultishot` and its FD variant take a nil buffer and derive the group from the fd and size. `WithReadBufferSize(0)` selects the default size class with no per-completion byte cap. Managed `ReceiveMultishot` takes the group from its context and submits a zero cap.
 
@@ -61,7 +61,7 @@ Version strings alone establish no usable capability. ZCRX control/query records
 
 For live resize, leave `MultiIssuers` and `HybridPolling` at their default `false` values. This enables `IORING_SETUP_DEFER_TASKRUN`, which `ResizeRings` requires. [Ring setup](../../interface_linux.go#L162-L183) · [Resize requirements](https://github.com/axboe/liburing/blob/liburing-2.13/man/io_uring_resize_rings.3#L50-L55)
 
-Call `ResizeRings(sq, cq)` from the OS thread that called `Start`. Serialize resize with submission, waits and `Stop`. Resolve any CQ overflow first. Zero `sq` keeps the current SQ size. Zero `cq` requests twice the resulting SQ size. On success, read the effective sizes from `Features.SQEntries` and `Features.CQEntries`. Context pools keep their original capacities. [ResizeRings](../../interface_linux.go#L1603)
+Call `ResizeRings(sq, cq)` from the OS thread that called `Start`. Serialize resize with submission, waits and `Stop`. Resolve any CQ overflow first. Zero `sq` keeps the current SQ size. Zero `cq` requests twice the resulting SQ size. On success, read the effective sizes from `Features.SQEntries` and `Features.CQEntries`. Context pools keep their original capacities. [ResizeRings](../../interface_linux.go#L1566)
 
 A successful resize preserves pending submissions and completions, their entry widths and request identities in both SQ layouts. A shrink rejected because pending entries would no longer fit leaves those entries on the original ring. Continue driving them there. [Pending submissions](../../resize_linux_test.go#L55) · [Pending completions](../../resize_completion_linux_test.go#L14) · [Rejected shrink](../../resize_linux_test.go#L178)
 

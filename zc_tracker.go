@@ -371,11 +371,7 @@ func (t *ZCTracker) dispatchCQE(cqe CQEView, ext *ExtSQE, ctx *zcCtx, handler ZC
 
 // zcTrackerCQEHandler is the static CQE dispatcher for zero-copy tracking.
 func zcTrackerCQEHandler(_ *Uring, _ *ioUringSqe, cqe *ioUringCqe) {
-	view := CQEView{
-		Res:   cqe.res,
-		Flags: cqe.flags,
-		ctx:   SQEContextFromRaw(cqe.userData),
-	}
+	view := cqe.view()
 	if !view.Extended() {
 		return
 	}

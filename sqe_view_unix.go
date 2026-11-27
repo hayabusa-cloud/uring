@@ -2,7 +2,7 @@
 // Use of this source code is governed by a MIT-style
 // license that can be found in the LICENSE file.
 
-//go:build darwin
+//go:build unix
 
 package uring
 
@@ -12,6 +12,37 @@ import "code.hybscloud.com/iofd"
 // Copying the view does not copy the fields or transfer ownership. Copy needed
 // fields before target mutation, reuse, or release; never access released
 // storage. SQE128 extensions are outside this view. The zero value is invalid.
+//
+// # Usage
+//
+//	cqe := cqes[i]
+//	if cqe.FullSQE() {
+//	    sqe := cqe.SQE()
+//	    op := sqe.Opcode()
+//	    fd := sqe.FD()
+//	    addr := sqe.Addr()
+//	    // ...
+//	}
+//
+// # Field Layout (64 bytes)
+//
+//	┌────────────┬────────────┬────────────┬────────────┐
+//	│ opcode (1) │ flags (1)  │ ioprio (2) │   fd (4)   │  bytes 0-7
+//	├────────────┴────────────┴────────────┴────────────┤
+//	│                    off (8)                        │  bytes 8-15
+//	├───────────────────────────────────────────────────┤
+//	│                   addr (8)                        │  bytes 16-23
+//	├────────────────────────┬──────────────────────────┤
+//	│       len (4)          │      uflags (4)          │  bytes 24-31
+//	├────────────────────────┴──────────────────────────┤
+//	│                  userData (8)                     │  bytes 32-39
+//	├────────────┬───────────┬──────────────────────────┤
+//	│bufIndex(2) │person.(2) │     spliceFdIn (4)       │  bytes 40-47
+//	├────────────┴───────────┴──────────────────────────┤
+//	│                   pad[0] (8)                      │  bytes 48-55
+//	├───────────────────────────────────────────────────┤
+//	│                   pad[1] (8)                      │  bytes 56-63
+//	└───────────────────────────────────────────────────┘
 type SQEView struct {
 	sqe *ioUringSqe
 }
@@ -59,14 +90,14 @@ func (v SQEView) IoPrio() uint16 {
 	return v.sqe.ioprio
 }
 
-// FD returns the file descriptor for the operation.
+// FD returns the SQE's fd field, which can hold a registered-file index.
 //
 //go:nosplit
 func (v SQEView) FD() iofd.FD {
 	return iofd.FD(v.sqe.fd)
 }
 
-// RawFD returns the raw file descriptor as int32.
+// RawFD returns the same SQE field as [SQEView.FD], as an int32.
 //
 //go:nosplit
 func (v SQEView) RawFD() int32 {
@@ -74,6 +105,11 @@ func (v SQEView) RawFD() int32 {
 }
 
 // Off returns the offset field.
+// Interpretation depends on the operation:
+//   - For read/write: file offset
+//   - For accept: sockaddr length pointer
+//   - For timeout: completion count, or repeat count for multishot
+//   - For socket: socket type
 //
 //go:nosplit
 func (v SQEView) Off() uint64 {
@@ -81,6 +117,10 @@ func (v SQEView) Off() uint64 {
 }
 
 // Addr returns the address/pointer field.
+// Interpretation depends on the operation:
+//   - For read/write: buffer address
+//   - For accept: sockaddr pointer
+//   - For timeout: timespec pointer
 //
 //go:nosplit
 func (v SQEView) Addr() uint64 {
@@ -88,20 +128,32 @@ func (v SQEView) Addr() uint64 {
 }
 
 // Len returns the length field.
+// Interpretation depends on the operation:
+//   - For read/write: buffer length
+//   - For accept: zero
+//   - For socket: protocol
 //
 //go:nosplit
 func (v SQEView) Len() uint32 {
 	return v.sqe.len
 }
 
-// UFlags returns the operation-specific union flags field.
+// UFlags returns the union flags field.
+// Interpretation depends on the operation:
+//   - For read/write: RW flags
+//   - For poll: poll events
+//   - For timeout: timeout flags
+//   - For accept: accept flags
+//   - For open: open flags
+//   - For send/recv: msg flags
+//   - For uring commands: IORING_URING_CMD_* flags
 //
 //go:nosplit
 func (v SQEView) UFlags() uint32 {
 	return v.sqe.uflags
 }
 
-// UserData returns the user data field.
+// UserData returns the user data field (the packed SQEContext).
 //
 //go:nosplit
 func (v SQEView) UserData() uint64 {
@@ -116,10 +168,11 @@ func (v SQEView) BufIndex() uint16 {
 }
 
 // BufGroup returns the buffer group ID.
+// Only valid when IOSQE_BUFFER_SELECT flag is set.
 //
 //go:nosplit
 func (v SQEView) BufGroup() uint16 {
-	return v.sqe.bufIndex
+	return v.sqe.bufIndex // Same field, different interpretation
 }
 
 // Personality returns the personality ID for credentials.
@@ -137,6 +190,7 @@ func (v SQEView) SpliceFDIn() int32 {
 }
 
 // FileIndex returns the file index for direct file operations.
+// This is a union with spliceFdIn.
 //
 //go:nosplit
 func (v SQEView) FileIndex() uint32 {

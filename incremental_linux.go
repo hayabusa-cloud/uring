@@ -150,11 +150,7 @@ func (r *IncrementalReceiver) HandleCQE(cqe CQEView) bool {
 // incrementalCQEHandler is the static CQE dispatcher for incremental receive.
 // The live receiver and handler anchors stay in the pooled ExtSQE sidecar.
 var incrementalCQEHandler Handler = func(_ *Uring, _ *ioUringSqe, cqe *ioUringCqe) {
-	view := CQEView{
-		Res:   cqe.res,
-		Flags: cqe.flags,
-		ctx:   SQEContextFromRaw(cqe.userData),
-	}
+	view := cqe.view()
 	if !view.Extended() {
 		return
 	}

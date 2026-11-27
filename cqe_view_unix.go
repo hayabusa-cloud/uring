@@ -2,7 +2,7 @@
 // Use of this source code is governed by a MIT-style
 // license that can be found in the LICENSE file.
 
-//go:build linux
+//go:build unix
 
 package uring
 
@@ -57,6 +57,11 @@ type CQEView struct {
 	Res   int32  // Completion result (directly accessible)
 	Flags uint32 // CQE flags (directly accessible)
 	ctx   SQEContext
+}
+
+// view copies the base CQE and leaves user_data opaque until the caller matches it.
+func (e *ioUringCqe) view() CQEView {
+	return CQEView{Res: e.res, Flags: e.flags, ctx: e.Context()}
 }
 
 // FullSQE reports whether the context retains a 64-byte base SQE.
@@ -193,10 +198,7 @@ func (c *CQEView) SocketNonEmpty() bool {
 	return c.Flags&IORING_CQE_F_SOCK_NONEMPTY != 0
 }
 
-// IsNotification reports whether this is a zero-copy notification CQE.
-// Notification CQEs mark the buffer-reuse frontier. A terminal data CQE without
-// MORE closes the data side; if no notification was observed, it is the
-// no-notification fallback.
+// IsNotification reports whether IORING_CQE_F_NOTIF is set.
 //
 //go:nosplit
 func (c *CQEView) IsNotification() bool {
@@ -218,7 +220,7 @@ func (c *CQEView) HasBufferMore() bool {
 //
 //go:nosplit
 func (c *CQEView) BundleStartID() uint16 {
-	return uint16(c.Flags >> IORING_CQE_BUFFER_SHIFT)
+	return c.BufID()
 }
 
 // BundleCount counts buffers containing payload bytes from Res, rounding up.
@@ -249,4 +251,39 @@ func (c *CQEView) BundleBuffers(bufferSize int) (startID uint16, count int) {
 	default:
 		return startID, c.BundleCount(bufferSize)
 	}
+}
+
+// Wait flushes pending submissions and copies the result, flags and raw user_data
+// of each observed CQE. Match incoming message IDs and Linux resource tags before
+// using request accessors. Serialize waits, submission, resize and teardown on a single-issuer ring.
+// On Linux, Wait also drives deferred task work. After a successful enter, a
+// zero-length destination returns (0, nil) and consumes no CQEs.
+// With a nonempty destination, Wait polls an empty Linux IOPOLL ring as needed.
+// If no CQEs are available, Wait returns iox.ErrWouldBlock or, on Linux,
+// ErrCQOverflow if overflow is observed. Inspect every CQE in the returned count.
+//
+// Here messageID is reserved for incoming messages. Every other CQE belongs to
+// a one-shot read with a context borrowed from ring.ExtSQE and a sequence in Val1.
+//
+//	var cqes [64]CQEView
+//	n, err := ring.Wait(cqes[:])
+//	for i := range n {
+//	    cqe := &cqes[i]
+//	    if cqe.Context().Raw() == messageID {
+//	        handleMessage(cqe.Res)
+//	        continue
+//	    }
+//	    ext := cqe.ExtSQE()
+//	    seq := ViewCtx(ext).Vals1().Val1
+//	    handleRead(seq, cqe.Res, cqe.Err())
+//	    ring.PutExtSQE(ext)
+//	}
+//	if err != nil {
+//	    return err
+//	}
+func (ur *Uring) Wait(cqes []CQEView) (n int, err error) {
+	if err := ur.ioUring.enter(); err != nil {
+		return 0, err
+	}
+	return ur.ioUring.waitBatch(cqes)
 }

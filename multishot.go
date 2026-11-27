@@ -335,7 +335,7 @@ func (ur *Uring) ReceiveMultishot(sqeCtx SQEContext, handler MultishotHandler, o
 // ========================================
 
 func multishotCQEHandler(ring *Uring, _ *ioUringSqe, cqe *ioUringCqe) {
-	ctx := SQEContextFromRaw(cqe.userData)
+	ctx := cqe.Context()
 	if !ctx.IsExtended() {
 		return
 	}
@@ -348,12 +348,7 @@ func multishotCQEHandler(ring *Uring, _ *ioUringSqe, cqe *ioUringCqe) {
 }
 
 func (s *MultishotSubscription) handleCQE(cqe *ioUringCqe) {
-	ctx := SQEContextFromRaw(cqe.userData)
-	s.handleCQEView(CQEView{
-		Res:   cqe.res,
-		Flags: cqe.flags,
-		ctx:   ctx,
-	})
+	s.handleCQEView(cqe.view())
 }
 
 func (s *MultishotSubscription) handleCQEView(cqe CQEView) {

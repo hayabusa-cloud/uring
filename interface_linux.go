@@ -340,43 +340,6 @@ func (ur *Uring) releaseRegisteredBufRings() error {
 	return err
 }
 
-// Wait flushes pending submissions and copies the result, flags and raw user_data
-// of each observed CQE. Match incoming message IDs and Linux resource tags before
-// using request accessors. Serialize waits, submission, resize and teardown on a single-issuer ring.
-// On Linux, Wait also drives deferred task work. After a successful enter, a
-// zero-length destination returns (0, nil) and consumes no CQEs.
-// With a nonempty destination, Wait polls an empty Linux IOPOLL ring as needed.
-// If no CQEs are available, Wait returns iox.ErrWouldBlock or, on Linux,
-// ErrCQOverflow if overflow is observed. Inspect every CQE in the returned count.
-//
-// Here messageID is reserved for incoming messages. Every other CQE belongs to
-// a one-shot read with a context borrowed from ring.ExtSQE and a sequence in Val1.
-//
-//	var cqes [64]CQEView
-//	n, err := ring.Wait(cqes[:])
-//	for i := range n {
-//	    cqe := &cqes[i]
-//	    if cqe.Context().Raw() == messageID {
-//	        handleMessage(cqe.Res)
-//	        continue
-//	    }
-//	    ext := cqe.ExtSQE()
-//	    seq := ViewCtx(ext).Vals1().Val1
-//	    handleRead(seq, cqe.Res, cqe.Err())
-//	    ring.PutExtSQE(ext)
-//	}
-//	if err != nil {
-//	    return err
-//	}
-func (ur *Uring) Wait(cqes []CQEView) (n int, err error) {
-	err = ur.ioUring.enter()
-	if err != nil {
-		return 0, err
-	}
-
-	return ur.ioUring.waitBatch(cqes)
-}
-
 // ========================================
 // Context Pool Accessors
 // ========================================

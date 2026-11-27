@@ -954,11 +954,7 @@ func (ur *ioUring) waitBatch(cqes []CQEView) (int, error) {
 	n := int(available)
 	for i := range n {
 		e := ur.cq.cqeAt((h + uint32(i)) & mask)
-		cqes[i] = CQEView{
-			Res:   e.res,
-			Flags: e.flags,
-			ctx:   SQEContextFromRaw(e.userData),
-		}
+		cqes[i] = e.view()
 	}
 	ur.publishCQ(claim, available)
 	return n, nil
@@ -1124,23 +1120,6 @@ func (sq *ioUringSq) sqe128At(index uint32) *ioUringSqe128 {
 	return (*ioUringSqe128)(unsafe.Add(sq.sqesPtr, uintptr(index)*sq.sqeStride))
 }
 
-type ioUringSqe struct {
-	opcode   uint8
-	flags    uint8
-	ioprio   uint16
-	fd       int32
-	off      uint64
-	addr     uint64
-	len      uint32
-	uflags   uint32
-	userData uint64
-
-	bufIndex    uint16
-	personality uint16
-	spliceFdIn  int32
-	pad         [2]uint64
-}
-
 type ioUringSqe128 struct {
 	ioUringSqe
 	extra [64]byte
@@ -1172,12 +1151,6 @@ func (cq *ioUringCq) cqeAt(index uint32) *ioUringCqe {
 		stride = 1
 	}
 	return &cq.cqes[int(index)*stride]
-}
-
-type ioUringCqe struct {
-	userData uint64
-	res      int32
-	flags    uint32
 }
 
 type ioSqRingOffsets struct {

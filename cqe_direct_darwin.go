@@ -11,45 +11,6 @@ import (
 	"code.hybscloud.com/iox"
 )
 
-// DirectCQE is a compact copied CQE for Direct mode operations.
-type DirectCQE struct {
-	Res      int32 // Raw CQE result
-	Flags    uint32
-	Op       uint8
-	SQEFlags uint8
-	BufGroup uint16
-	FD       iofd.FD
-}
-
-// IsSuccess reports whether Res is nonnegative. Use it on a matched operation result.
-func (c *DirectCQE) IsSuccess() bool { return cqeIsSuccess(c.Res) }
-
-// HasMore reports IORING_CQE_F_MORE: the request has further completions,
-// including multishot results or a zero-copy notification.
-func (c *DirectCQE) HasMore() bool { return cqeHasMore(c.Flags) }
-
-// HasBuffer reports whether a buffer ID is available.
-func (c *DirectCQE) HasBuffer() bool { return cqeHasBuffer(c.Flags) }
-
-// BufID returns the buffer ID from CQE flags.
-// Only valid when HasBuffer() returns true.
-func (c *DirectCQE) BufID() uint16 { return cqeBufID(c.Flags) }
-
-// IsNotification reports whether this is a zero-copy notification CQE.
-func (c *DirectCQE) IsNotification() bool { return cqeIsNotification(c.Flags) }
-
-// WaitDirect copies completion events into DirectCQE values (Darwin stub).
-// On single-issuer rings it is not safe for concurrent use with submit, Wait,
-// WaitDirect, WaitExtended, or Stop; caller must serialize those operations.
-// A zero-length destination returns (0, nil) and consumes no CQEs.
-// With a nonempty destination, an empty CQ returns iox.ErrWouldBlock.
-func (ur *Uring) WaitDirect(cqes []DirectCQE) (int, error) {
-	if err := ur.ioUring.enter(); err != nil {
-		return 0, err
-	}
-	return ur.ioUring.waitBatchDirect(cqes)
-}
-
 func (ur *ioUring) waitBatchDirect(cqes []DirectCQE) (int, error) {
 	if len(cqes) == 0 {
 		return 0, nil
@@ -60,7 +21,7 @@ func (ur *ioUring) waitBatchDirect(cqes []DirectCQE) (int, error) {
 		select {
 		case cqe := <-ur.cqChan:
 			if cqe != nil {
-				ctx := SQEContextFromRaw(cqe.userData)
+				ctx := cqe.Context()
 				cqes[n] = DirectCQE{
 					Res:      cqe.res,
 					Flags:    cqe.flags,

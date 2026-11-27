@@ -35,7 +35,7 @@ func (c *cancelRequest) complete() bool {
 }
 
 func cancelCQEHandler(_ *Uring, _ *ioUringSqe, cqe *ioUringCqe) {
-	ext := SQEContextFromRaw(cqe.userData).ExtSQE()
+	ext := cqe.Context().ExtSQE()
 	owner, _ := extAnchors(ext).owner.(cancelOwner)
 	if owner != nil {
 		owner.finishCancellation()

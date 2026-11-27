@@ -390,11 +390,7 @@ var _ [unsafe.Sizeof(zcrxCtx{}) - 64]byte
 
 // zcrxCQEHandler is the static CQE dispatcher for ZCRX multishot receives.
 func zcrxCQEHandler(_ *Uring, _ *ioUringSqe, cqe *ioUringCqe) {
-	view := CQEView{
-		Res:   cqe.res,
-		Flags: cqe.flags,
-		ctx:   SQEContextFromRaw(cqe.userData),
-	}
+	view := cqe.view()
 	if !view.Extended() {
 		return
 	}

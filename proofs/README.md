@@ -7,9 +7,9 @@ These Lean proofs check models of `uring` mechanisms. They use only Lean’s sta
 | [ZeroCopy](ZeroCopy.lean) | [zc_tracker.go](../zc_tracker.go) | Completion and release signals occur at most once and require the right evidence |
 | [Cancellation](Cancellation.lean) | [multishot.go](../multishot.go), [cancel_linux.go](../cancel_linux.go) | Publication and pending cancellation retain the original context; pool return occurs at most once |
 | [Incremental](Incremental.lean) | [incremental_linux.go](../incremental_linux.go) | Per-ID offsets, fragment bounds, retention and buffer return |
-| [Bundle](Bundle.lean) | [CQE counts](../cqe_view.go), [iterator and recycling](../bundle_iter.go) | Exact publication prefix for positive receives and slot conservation across receives and returns |
+| [Bundle](Bundle.lean) | [CQE counts](../cqe_view_unix.go), [iterator and recycling](../bundle_iter.go) | Exact publication prefix for positive receives and slot conservation across receives and returns |
 | [CompletionQueue](CompletionQueue.lean) | [io_uring_linux.go](../io_uring_linux.go) | Exclusive copying yields a contiguous prefix before head publication; bounded counter wrap is sound |
-| [Context](Context.lean) | [ctx.go](../ctx.go) | Direct-field recovery, signed FD bounds, flags replacement and pointer-tag separation |
+| [Context](Context.lean) | [ctx_unix.go](../ctx_unix.go) | Direct-field recovery, signed FD bounds, flags replacement and pointer-tag separation |
 
 ## Check
 

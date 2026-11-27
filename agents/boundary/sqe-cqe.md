@@ -14,9 +14,9 @@ Choose the wait by the contexts that can arrive on the ring. All three waits dri
 
 | Wait | Incoming CQEs | What the caller receives |
 |------|---------------|--------------------------|
-| [Wait](../../interface_linux.go) | Local contexts, message IDs or Linux resource tags | Raw result, flags and all 64 bits of `user_data`. A local pointer-mode context borrows its target. |
-| [WaitDirect](../../cqe_direct_linux.go) | Direct contexts only | Result, CQE flags, opcode, SQE flags, buffer group and signed descriptor, all copied by value. |
-| [WaitExtended](../../cqe_extended_linux.go) | Extended contexts only | Result, CQE flags and a borrowed `ExtSQE`. Return a pooled context to its originating pool after final use. |
+| [Wait](../../cqe_view_unix.go) | Local contexts, message IDs or Linux resource tags | Raw result, flags and all 64 bits of `user_data`. A local pointer-mode context borrows its target. |
+| [WaitDirect](../../cqe_direct_unix.go) | Direct contexts only | Result, CQE flags, opcode, SQE flags, buffer group and signed descriptor, all copied by value. |
+| [WaitExtended](../../cqe_extended_unix.go) | Extended contexts only | Result, CQE flags and a borrowed `ExtSQE`. Return a pooled context to its originating pool after final use. |
 
 ### Completion Origin
 
@@ -83,7 +83,7 @@ Keep a live request's target address, identity, and submitted base-SQE fields st
 
 For example, save a READ's `Off()` before preparing a NOP on the same target. Retaining `cqe.SQE()` preserves neither that offset nor an independent snapshot, for pooled or caller-allocated targets.
 
-Sources: [publication](../../submit_state.go), [context setters](../../ctx.go), [CQE views](../../cqe_view.go), [SQE views](../../sqe_view.go). [Resource lifetimes](resources.md) govern retention.
+[Base entries](../../entries_unix.go) · [Publication](../../submit_state.go) · [Context setters](../../ctx_unix.go) · [CQE views](../../cqe_view_unix.go) · [SQE views](../../sqe_view_unix.go). [Resource lifetimes](resources.md) govern retention.
 
 ## Batch and Hot-Path Obligations
 

@@ -260,21 +260,6 @@ func (ur *Uring) Stop() error {
 	return err
 }
 
-// Wait copies completions from the Darwin worker queue into cqes.
-// On single-issuer rings it is not safe for concurrent use with submit, Wait,
-// WaitDirect, WaitExtended, or Stop; caller must serialize those operations.
-// A zero-length destination returns (0, nil) and consumes no CQEs.
-// With a nonempty destination, an empty CQ returns iox.ErrWouldBlock.
-func (ur *Uring) Wait(cqes []CQEView) (n int, err error) {
-	err = ur.ioUring.enter()
-	if err != nil {
-		return 0, err
-	}
-
-	// Use batch retrieval for consistency with Linux implementation
-	return ur.ioUring.waitBatch(cqes)
-}
-
 // ExtSQE borrows a cleared ExtSQE for Extended mode submissions.
 // It returns nil if the context pool is exhausted, independently of SQ capacity.
 // Keep the context until all request completions and borrowed access finish,
