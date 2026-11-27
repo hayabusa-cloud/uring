@@ -59,7 +59,7 @@ func (h *zcrxBlockingStoppedHandler) OnStopped() {
 }
 
 func TestZCRXReceiverHandleCQETerminalErrorPreservesErrorAndClearsIdentity(t *testing.T) {
-	pool := NewContextPools(4)
+	pool := NewContextPools(1)
 	ext := pool.Extended()
 	if ext == nil {
 		t.Fatal("pool exhausted")
@@ -69,6 +69,7 @@ func TestZCRXReceiverHandleCQETerminalErrorPreservesErrorAndClearsIdentity(t *te
 	r := &ZCRXReceiver{pool: pool, handler: h, ext: ext}
 	r.state.Store(zcrxStateActive)
 	view := CQEView{Res: -int32(EINVAL), ctx: PackExtended(ext)}
+	r.userData.Store(view.ctx.Raw())
 
 	r.handleCQE(view, &ioUringCqe{})
 
@@ -87,8 +88,8 @@ func TestZCRXReceiverHandleCQETerminalErrorPreservesErrorAndClearsIdentity(t *te
 	if r.ext != nil {
 		t.Fatal("ext: got non-nil, want nil")
 	}
-	if got := pool.Extended(); got == nil {
-		t.Fatal("expected terminal CQE to return ExtSQE to pool")
+	if got := pool.ExtendedAvailable(); got != 1 {
+		t.Fatalf("available contexts after terminal CQE: got %d, want 1", got)
 	}
 }
 
@@ -1053,15 +1054,6 @@ func TestZCRXReceiverCloseRequiresStoppedAndClosedRing(t *testing.T) {
 	}
 }
 
-func TestZCRXErrFromResultNonNegativeIsNil(t *testing.T) {
-	if err := errFromResult(0); err != nil {
-		t.Fatalf("errFromResult(0): got %v, want nil", err)
-	}
-	if err := errFromResult(5); err != nil {
-		t.Fatalf("errFromResult(5): got %v, want nil", err)
-	}
-}
-
 func TestZCRXMmapHelpersAllocateWritableMemory(t *testing.T) {
 	size := int(iobuf.PageSize)
 
@@ -1092,12 +1084,14 @@ func TestZCRXReceiverRetainsIdentityUntilCancelCompletion(t *testing.T) {
 			h := &zcrxRecordingHandler{}
 			r := &ZCRXReceiver{pool: pool, handler: h, ext: ext}
 			r.state.Store(zcrxStateStopping)
+			extAnchors(ext).owner = r
+			receiveCQE := ioUringCqe{userData: PackExtended(ext).Raw(), res: -int32(ECANCELED)}
 			cancelCtx := r.cancel.prepare(r)
 			completeCancel := func() {
 				cancelCQEHandler(nil, nil, &ioUringCqe{userData: cancelCtx.Raw()})
 			}
 			if originalFirst {
-				r.finish(ext)
+				zcrxCQEHandler(nil, nil, &receiveCQE)
 			} else {
 				completeCancel()
 			}
@@ -1107,7 +1101,10 @@ func TestZCRXReceiverRetainsIdentityUntilCancelCompletion(t *testing.T) {
 			if originalFirst {
 				completeCancel()
 			} else {
-				r.finish(ext)
+				zcrxCQEHandler(nil, nil, &receiveCQE)
+			}
+			if len(h.errors) != 1 || !errors.Is(h.errors[0], ErrCanceled) {
+				t.Fatalf("OnError calls: got %v, want [%v]", h.errors, ErrCanceled)
 			}
 			if !r.Stopped() || r.ext != nil || pool.ExtendedAvailable() != 1 || h.stopped != 1 {
 				t.Fatal("receiver did not retire exactly once after both completions")

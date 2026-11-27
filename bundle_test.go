@@ -7,64 +7,61 @@
 package uring_test
 
 import (
+	"runtime"
 	"testing"
 
 	"code.hybscloud.com/iofd"
 	"code.hybscloud.com/uring"
+	"code.hybscloud.com/zcall"
 )
 
 // =============================================================================
 // Receive Bundle Tests
 // =============================================================================
 
-// TestReceiveBundle verifies basic bundle receive with buffer groups.
-// Bundle receive grabs multiple contiguous buffers in a single operation.
-// Note: This test verifies the API exists on the Linux 6.18+ baseline.
-// Full integration requires proper buffer group setup via UringBufferGroupsConfig.
+// Both receives return one byte. Only the selected buffer can be recycled.
 func TestReceiveBundle(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
-		opt.NotifySucceed = true
-		opt.MultiSizeBuffer = 1 // Enable multi-size buffers for buffer groups
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	mustStartRing(t, ring)
-
-	// Test API availability - full integration requires buffer group setup
-	// which is complex and tested in integration scenarios with actual network traffic.
-	// Here we verify the API is callable and returns proper errors.
-
-	// Create socket pair
+	ring := newTestRing(t, func(opt *uring.Options) { opt.MultiSizeBuffer = 1 })
 	fds, err := newUnixSocketPairForTest()
 	if err != nil {
-		t.Fatalf("socketpair: %v", err)
+		t.Fatal(err)
 	}
 	defer closeTestFds(fds)
+	if n, errno := writeTestFD(fds[1], []byte("ab")); n != 2 || errno != 0 {
+		t.Fatalf("write: n=%d errno=%d", n, errno)
+	}
 
-	// Test with mock PollFd - this will likely fail or panic due to buffer setup
-	// but it verifies the API path works
-	pollFd := testPollFd{fd: fds[0]}
+	ctx := uring.ForFD(int32(fds[0]))
+	var dst [1]byte
+	var pin runtime.Pinner
+	pin.Pin(&dst[0])
+	defer pin.Unpin()
+	if err := ring.ReceiveFD(ctx, fds[0], dst[:]); err != nil {
+		t.Fatal(err)
+	}
+	ordinary := waitForCQEs(t, ring, 1)[0]
+	if ordinary.Res != 1 || ordinary.HasBuffer() || dst[0] != 'a' {
+		t.Fatalf("caller buffer: result=%d flags=%#x byte=%q", ordinary.Res, ordinary.Flags, dst[0])
+	}
 
-	// The ReceiveBundle call may fail if buffer groups aren't properly configured
-	// This is expected - we're testing the API path, not full integration
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				t.Logf("ReceiveBundle panicked (expected without buffer setup): %v", r)
-			}
-		}()
-		ctx := uring.PackDirect(uring.IORING_OP_RECV, 0, 0, int32(fds[0]))
-		err = ring.ReceiveBundle(ctx, pollFd)
-		if err != nil {
-			t.Logf("ReceiveBundle returned error (expected without buffer setup): %v", err)
-		} else {
-			t.Log("ReceiveBundle submitted successfully")
-		}
-	}()
-
-	t.Log("bundle receive API verified")
+	if err := ring.ReceiveBundle(ctx, &fds[0]); err != nil {
+		t.Fatal(err)
+	}
+	selected := waitForCQEs(t, ring, 1)[0]
+	if selected.Res != 1 || !selected.HasBuffer() || selected.BufID() != 0 {
+		t.Fatalf("first selected buffer: result=%d flags=%#x", selected.Res, selected.Flags)
+	}
+	group := selected.BufGroup()
+	it, ok := ring.BundleIterator(selected, group)
+	if !ok || it.Count() != 1 || string(it.Buffer(0)) != "b" {
+		t.Fatal("missing data from selected slot zero")
+	}
+	if err := it.Recycle(ring); err != nil {
+		t.Fatal(err)
+	}
+	if it, ok := ring.BundleIterator(ordinary, group); ok || it.Count() != 0 {
+		t.Fatal("caller-buffer receive returned a managed iterator")
+	}
 }
 
 // testPollFd implements PollFd interface for testing
@@ -186,45 +183,42 @@ func TestBundleStartID(t *testing.T) {
 	}
 }
 
-// TestSubmitReceiveBundleMultishot tests raw multishot bundle receive submission.
-// Combines continuous reception with bundle efficiency.
-// Note: Full integration requires proper buffer group setup.
+// Each data CQE returns a buffer while MORE keeps the multishot receive live.
 func TestSubmitReceiveBundleMultishot(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
-		opt.NotifySucceed = true
-		opt.MultiSizeBuffer = 1
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	mustStartRing(t, ring)
-
-	// Create socket pair
+	ring := newTestRing(t, func(opt *uring.Options) { opt.MultiSizeBuffer = 1 })
 	fds, err := newUnixSocketPairForTest()
 	if err != nil {
-		t.Fatalf("socketpair: %v", err)
+		t.Fatal(err)
 	}
 	defer closeTestFds(fds)
-
-	// Test API availability - may panic without buffer setup
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				t.Logf("SubmitReceiveBundleMultishot panicked (expected without buffer setup): %v", r)
-			}
-		}()
-		ctx := uring.PackDirect(uring.IORING_OP_RECV, 0, 0, int32(fds[0]))
-		pollFd := testPollFd{fd: fds[0]}
-		err = ring.SubmitReceiveBundleMultishot(ctx, pollFd)
-		if err != nil {
-			t.Logf("SubmitReceiveBundleMultishot returned error (expected without buffer setup): %v", err)
-		} else {
-			t.Log("SubmitReceiveBundleMultishot submitted successfully")
+	ctx := uring.ForFD(int32(fds[0]))
+	if err := ring.SubmitReceiveBundleMultishot(ctx, &fds[0], uring.WithReadBufferSize(0)); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []byte("ab") {
+		if n, errno := writeTestFD(fds[1], []byte{want}); n != 1 || errno != 0 {
+			t.Fatalf("write: n=%d errno=%d", n, errno)
 		}
-	}()
+		cqe := waitForCQEs(t, ring, 1)[0]
+		if cqe.Res != 1 || !cqe.HasMore() || !cqe.HasBuffer() {
+			t.Fatalf("data: result=%d flags=%#x", cqe.Res, cqe.Flags)
+		}
+		it, ok := ring.BundleIterator(cqe, cqe.BufGroup())
+		if !ok || it.Count() != 1 || it.Buffer(0)[0] != want {
+			t.Fatalf("missing selected byte %q", want)
+		}
+		if err := it.Recycle(ring); err != nil {
+			t.Fatal(err)
+		}
+	}
 
-	t.Log("multishot bundle receive API verified")
+	if errno := zcall.Shutdown(uintptr(fds[1]), zcall.SHUT_WR); errno != 0 {
+		t.Fatal(zcall.Errno(errno))
+	}
+	eof := waitForCQEs(t, ring, 1)[0]
+	if eof.Res != 0 || eof.HasMore() {
+		t.Fatalf("EOF: result=%d flags=%#x", eof.Res, eof.Flags)
+	}
 }
 
 // TestBundleFeatureDetection verifies that bundle APIs are present on the Linux 6.18+ baseline.
@@ -448,6 +442,10 @@ func TestBundleBuffersComplex(t *testing.T) {
 			wantStartID: 10,
 			wantCount:   0,
 		},
+		{"selected EOF", 7<<uring.IORING_CQE_BUFFER_SHIFT | uring.IORING_CQE_F_BUFFER, 0, 1024, 7, 1},
+		{"selected error", uring.IORING_CQE_F_BUFFER, -int32(zcall.ENOTCONN), 1024, 0, 1},
+		{"retained slot", uring.IORING_CQE_F_BUFFER | uring.IORING_CQE_F_BUF_MORE, 1, 1024, 0, 0},
+		{"invalid size", uring.IORING_CQE_F_BUFFER, 0, 0, 0, 0},
 	}
 
 	for _, tc := range testCases {
@@ -538,4 +536,55 @@ func TestRegisteredBufferContent(t *testing.T) {
 		t.Errorf("buffer length %d seems too small", len(buf))
 	}
 	t.Logf("registered buffer 0 length: %d", len(buf))
+}
+
+func TestBundleRecycleWithoutPayload(t *testing.T) {
+	const entries = 2
+	ring := newTestRing(t, func(o *uring.Options) { o.ReadBufferNum = entries })
+	pair, err := newUnixSocketPairForTest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeTestFds(pair)
+	if errno := zcall.Shutdown(uintptr(pair[1]), zcall.SHUT_WR); errno != 0 {
+		t.Fatal(errno)
+	}
+	unconnected, errno := zcall.Socket(zcall.AF_INET, zcall.SOCK_STREAM|zcall.SOCK_CLOEXEC, 0)
+	if errno != 0 {
+		t.Fatal(errno)
+	}
+	defer closeTestFD(iofd.FD(unconnected))
+
+	for _, tc := range []struct {
+		name string
+		fd   iofd.FD
+		want int32
+	}{
+		{"EOF", pair[0], 0},
+		{"unconnected", iofd.FD(unconnected), -int32(zcall.ENOTCONN)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := uring.ForFD(int32(tc.fd)).WithFlags(uring.IOSQE_ASYNC)
+			// Receiving past the group's capacity requires republishing returned slots.
+			for range entries + 1 {
+				if err := ring.ReceiveBundle(ctx, &tc.fd); err != nil {
+					t.Fatal(err)
+				}
+				cqe := waitForCQEs(t, ring, 1)[0]
+				it, ok := ring.BundleIterator(cqe, cqe.BufGroup())
+				if cqe.Res != tc.want || cqe.HasBufferMore() || ok != cqe.HasBuffer() {
+					t.Fatalf("res=%d flags=%#x iterator=%v", cqe.Res, cqe.Flags, ok)
+				}
+				if !ok {
+					continue
+				}
+				if it.Count() != 1 || it.SlotID(0) != cqe.BufID() || it.TotalBytes() != 0 || len(it.Buffer(0)) != 0 {
+					t.Fatalf("id=%d count=%d bytes=%d", cqe.BufID(), it.Count(), it.TotalBytes())
+				}
+				if err := it.Recycle(ring); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
 }

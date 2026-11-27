@@ -42,7 +42,7 @@ type OpOption struct {
 	Offset int64
 	// Optional byte limit; nil uses the operation's default. See [WithN].
 	N *int
-	// Completion count for timeout operations. Values must fit uint32.
+	// Timeout count. See [WithCount].
 	Count int
 	// Timeout clock and behavior flags (IORING_TIMEOUT_ABS, _BOOTTIME, _REALTIME, etc.)
 	TimeoutFlags uint32
@@ -185,8 +185,10 @@ func WithFadvise(advice int) OpOptionFunc {
 	}
 }
 
-// WithCount sets the completion count for timeout operations.
-// Values must be in the inclusive uint32 domain.
+// WithCount sets the timeout count. The default is one.
+// For a one-shot timer, zero waits for time alone. For a multishot timer,
+// a positive value limits expirations and zero allows it to repeat until stopped.
+// The count must fit uint32.
 func WithCount(cnt int) OpOptionFunc {
 	return func(opt *OpOption) {
 		opt.Count = cnt
@@ -210,9 +212,9 @@ func WithWriteBufferSize(n int) OpOptionFunc {
 	}
 }
 
-// WithTimeoutFlags sets timeout clock and behavior flags.
-// Combine IORING_TIMEOUT_ABS, IORING_TIMEOUT_BOOTTIME, IORING_TIMEOUT_REALTIME,
-// IORING_TIMEOUT_ETIME_SUCCESS, or IORING_TIMEOUT_MULTISHOT.
+// WithTimeoutFlags replaces the timeout flags. A timer accepts at most one
+// clock selector (IORING_TIMEOUT_BOOTTIME or IORING_TIMEOUT_REALTIME).
+// IORING_TIMEOUT_MULTISHOT requires a relative interval.
 func WithTimeoutFlags(flags uint32) OpOptionFunc {
 	return func(opt *OpOption) {
 		opt.TimeoutFlags = flags
@@ -240,14 +242,16 @@ func WithTimeoutRealTime() OpOptionFunc {
 	}
 }
 
-// WithTimeoutEtimeSuccess converts -ETIME into successful completion.
+// WithTimeoutEtimeSuccess lets the next soft-linked request run when an ordinary
+// Timeout expires. The timer CQE still reports -ETIME.
 func WithTimeoutEtimeSuccess() OpOptionFunc {
 	return func(opt *OpOption) {
 		opt.TimeoutFlags |= IORING_TIMEOUT_ETIME_SUCCESS
 	}
 }
 
-// WithTimeoutMultishot makes the timeout fire repeatedly.
+// WithTimeoutMultishot selects a repeating relative timer. [WithCount] sets the
+// expiration limit. A CQE with IORING_CQE_F_MORE leaves the timer active.
 func WithTimeoutMultishot() OpOptionFunc {
 	return func(opt *OpOption) {
 		opt.TimeoutFlags |= IORING_TIMEOUT_MULTISHOT

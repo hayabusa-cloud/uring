@@ -1330,102 +1330,20 @@ func TestVectorSubmitAcceptsMaxIovecs(t *testing.T) {
 	}
 }
 
-func TestRegisterFilesRejectsInvalidCountDomains(t *testing.T) {
-	t.Run("register oversized", func(t *testing.T) {
-		ur := &ioUring{ringFd: -1}
-		if err := ur.registerFiles(mappedTestSlice[int32](t, oversizedLen32(t))); !errors.Is(err, ErrInvalidParam) {
-			t.Fatalf("registerFiles oversized error = %v, want %v", err, ErrInvalidParam)
-		}
-		if len(ur.files) != 0 {
-			t.Fatalf("registered file table len = %d, want 0", len(ur.files))
-		}
-	})
+func TestRegisterFilesRejectsOversizedCount(t *testing.T) {
+	ring := &Uring{ioUring: &ioUring{ringFd: -1}}
+	fds := mappedTestSlice[int32](t, oversizedLen32(t))
+	if err := ring.RegisterFiles(fds); !errors.Is(err, ErrInvalidParam) {
+		t.Fatalf("RegisterFiles error = %v, want %v", err, ErrInvalidParam)
+	}
+	if got := ring.RegisteredFileCount(); got != 0 {
+		t.Fatalf("RegisteredFileCount = %d, want 0", got)
+	}
 
-	t.Run("update oversized", func(t *testing.T) {
-		ur := &ioUring{ringFd: -1, files: []int32{10, 11}}
-		before := append([]int32(nil), ur.files...)
-		if _, err := ur.registerFilesUpdate(1, mappedTestSlice[int32](t, oversizedLen32(t))); !errors.Is(err, ErrInvalidParam) {
-			t.Fatalf("registerFilesUpdate oversized error = %v, want %v", err, ErrInvalidParam)
-		}
-		if len(ur.files) != len(before) {
-			t.Fatalf("registered file table len = %d, want %d", len(ur.files), len(before))
-		}
-		for i := range before {
-			if ur.files[i] != before[i] {
-				t.Fatalf("registered file table[%d] = %d, want %d", i, ur.files[i], before[i])
-			}
-		}
-	})
-
-	t.Run("update beyond remaining table", func(t *testing.T) {
-		ur := &ioUring{ringFd: -1, files: []int32{10, 11}}
-		before := append([]int32(nil), ur.files...)
-		if _, err := ur.registerFilesUpdate(1, []int32{20, 21}); !errors.Is(err, ErrInvalidParam) {
-			t.Fatalf("registerFilesUpdate overrun error = %v, want %v", err, ErrInvalidParam)
-		}
-		for i := range before {
-			if ur.files[i] != before[i] {
-				t.Fatalf("registered file table[%d] = %d, want %d", i, ur.files[i], before[i])
-			}
-		}
-	})
-
-	t.Run("update rejects skip sentinel", func(t *testing.T) {
-		ur := &ioUring{ringFd: -1, files: []int32{10, 11}}
-		if updated, err := ur.registerFilesUpdate(0, []int32{-2}); updated != 0 || !errors.Is(err, ErrInvalidParam) {
-			t.Fatalf("registerFilesUpdate(-2) = (%d, %v), want (0, %v)", updated, err, ErrInvalidParam)
-		}
-		if ur.files[0] != 10 || ur.files[1] != 11 {
-			t.Fatalf("registered file table = %v, want [10 11]", ur.files)
-		}
-	})
-}
-
-func TestRegisterFilesUpdatePreservesPartialProgress(t *testing.T) {
-	ur := newTestIoUring(t)
-	f, err := os.Open("/dev/null")
-	if err != nil {
-		t.Fatalf("open /dev/null: %v", err)
+	ring.fileSlots = 2
+	if n, err := ring.RegisterFilesUpdate(1, fds); n != 0 || !errors.Is(err, ErrInvalidParam) {
+		t.Fatalf("RegisterFilesUpdate = (%d, %v), want (0, %v)", n, err, ErrInvalidParam)
 	}
-	defer f.Close()
-
-	fd := int32(f.Fd())
-	if err := ur.registerFiles([]int32{fd, fd}); err != nil {
-		t.Fatalf("registerFiles: %v", err)
-	}
-	updated, err := ur.registerFilesUpdate(0, []int32{fd, math.MaxInt32})
-	if err != nil {
-		t.Fatalf("registerFilesUpdate: %v", err)
-	}
-	if updated != 1 {
-		t.Fatalf("updated = %d, want 1", updated)
-	}
-	if ur.files[0] != fd || ur.files[1] != -1 {
-		t.Fatalf("registered file table = %v, want [%d -1]", ur.files, fd)
-	}
-	runtime.KeepAlive(f)
-}
-
-func TestRegisterFilesUpdatePreservesFirstFailureClear(t *testing.T) {
-	ur := newTestIoUring(t)
-	f, err := os.Open("/dev/null")
-	if err != nil {
-		t.Fatalf("open /dev/null: %v", err)
-	}
-	defer f.Close()
-
-	fd := int32(f.Fd())
-	if err := ur.registerFiles([]int32{fd}); err != nil {
-		t.Fatalf("registerFiles: %v", err)
-	}
-	updated, err := ur.registerFilesUpdate(0, []int32{math.MaxInt32})
-	if updated != 0 || !errors.Is(err, zcall.Errno(zcall.EBADF)) {
-		t.Fatalf("registerFilesUpdate = (%d, %v), want (0, EBADF)", updated, err)
-	}
-	if ur.files[0] != -1 {
-		t.Fatalf("registered file table = %v, want [-1]", ur.files)
-	}
-	runtime.KeepAlive(f)
 }
 
 func TestCloneBuffersPublishesExactViews(t *testing.T) {

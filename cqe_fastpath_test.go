@@ -144,30 +144,14 @@ func TestWaitDirectNOP(t *testing.T) {
 		t.Fatalf("Nop: %v", err)
 	}
 
-	// Wait using fast-path
-	cqes := make([]uring.DirectCQE, 16)
-	deadline := time.Now().Add(2 * time.Second)
-	b := iox.Backoff{}
-
-	for time.Now().Before(deadline) {
-		n, err := ring.WaitDirect(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
-			t.Fatalf("WaitDirect: %v", err)
-		}
-		if n > 0 {
-			cqe := cqes[0]
-			if !cqe.IsSuccess() {
-				t.Errorf("expected success, got res=%d", cqe.Res)
-			}
-			if cqe.Op != uring.IORING_OP_NOP {
-				t.Errorf("expected NOP, got op=%d", cqe.Op)
-			}
-			t.Logf("DirectCQE: Op=%d, Res=%d, FD=%d", cqe.Op, cqe.Res, cqe.FD)
-			return
-		}
-		b.Wait()
+	checkWaitWithoutReaping(t, ring, ring.WaitDirect, 1)
+	var dst [1]uring.DirectCQE
+	if n, err := ring.WaitDirect(dst[:]); n != 1 || err != nil {
+		t.Fatalf("WaitDirect = (%d, %v), want (1, nil)", n, err)
 	}
-	t.Fatal("timeout waiting for CQE")
+	if cqe := dst[0]; cqe.Op != uring.IORING_OP_NOP || cqe.FD != -1 || cqe.Res != 0 || cqe.Flags != 0 {
+		t.Fatalf("WaitDirect returned %+v, want submitted NOP with FD -1", cqe)
+	}
 }
 
 // TestWaitExtendedNOP tests the Extended mode fast-path with NOP operations.
@@ -193,38 +177,19 @@ func TestWaitExtendedNOP(t *testing.T) {
 		t.Fatalf("Nop: %v", err)
 	}
 
-	// Wait using fast-path
-	cqes := make([]uring.ExtCQE, 16)
-	deadline := time.Now().Add(2 * time.Second)
-	b := iox.Backoff{}
-
-	for time.Now().Before(deadline) {
-		n, err := ring.WaitExtended(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
-			t.Fatalf("WaitExtended: %v", err)
-		}
-		if n > 0 {
-			cqe := cqes[0]
-			if !cqe.IsSuccess() {
-				t.Errorf("expected success, got res=%d", cqe.Res)
-			}
-			if cqe.Ext == nil {
-				t.Error("expected ExtSQE pointer")
-			} else {
-				if got := cqe.Op(); got != uring.IORING_OP_NOP {
-					t.Errorf("Op: got %d, want %d", got, uring.IORING_OP_NOP)
-				}
-				if got := cqe.FD(); got != iofd.FD(77) {
-					t.Errorf("FD: got %d, want 77", got)
-				}
-				t.Logf("ExtCQE: Res=%d, Ext=%p", cqe.Res, cqe.Ext)
-				ring.PutExtSQE(cqe.Ext)
-			}
-			return
-		}
-		b.Wait()
+	checkWaitWithoutReaping(t, ring, ring.WaitExtended, 1)
+	var dst [1]uring.ExtCQE
+	if n, err := ring.WaitExtended(dst[:]); n != 1 || err != nil {
+		t.Fatalf("WaitExtended = (%d, %v), want (1, nil)", n, err)
 	}
-	t.Fatal("timeout waiting for CQE")
+	cqe := dst[0]
+	if cqe.Ext != ext {
+		t.Fatalf("WaitExtended returned context %p, want %p", cqe.Ext, ext)
+	}
+	if cqe.Op() != uring.IORING_OP_NOP || cqe.FD() != 77 || cqe.Res != 0 || cqe.Flags != 0 {
+		t.Errorf("WaitExtended returned op=%d fd=%d res=%d flags=%#x", cqe.Op(), cqe.FD(), cqe.Res, cqe.Flags)
+	}
+	ring.PutExtSQE(ext)
 }
 
 // TestDirectCQEFlags tests DirectCQE flag helper methods.

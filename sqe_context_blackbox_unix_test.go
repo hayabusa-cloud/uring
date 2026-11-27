@@ -2,7 +2,7 @@
 // Use of this source code is governed by a MIT-style
 // license that can be found in the LICENSE file.
 
-//go:build linux
+//go:build unix
 
 package uring_test
 
@@ -27,6 +27,7 @@ func TestPackDirectBlackBox(t *testing.T) {
 		{"send with cqe skip", uring.IORING_OP_SEND, uring.IOSQE_CQE_SKIP_SUCCESS, 0, 100},
 		{"max values", 255, 255, 65535, 536870911},
 		{"negative fd", uring.IORING_OP_CLOSE, 0, 0, -1},
+		{"lowest direct fd", 0, 0, 0, -1 << 29},
 		{"all flags", uring.IORING_OP_NOP, uring.IOSQE_FIXED_FILE | uring.IOSQE_IO_DRAIN | uring.IOSQE_IO_LINK, 100, 42},
 	}
 

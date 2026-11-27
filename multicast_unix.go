@@ -24,10 +24,10 @@ type SendTargets interface {
 // 2 KiB for 512-4095, and 1.5 KiB for 4096 or more. These are workload heuristics;
 // MulticastZeroCopy uses lower thresholds to favor zero-copy.
 //
-// sqeCtx must use Direct mode. Each send carries its target FD in user_data.
-// Overlapping sends with identical packed fields have the same user_data.
-// To match their results individually, serialize them or submit separate sends
-// with distinct live contexts.
+// sqeCtx must use Direct mode. Each send records its selected opcode and target FD.
+// Registered sends replace the buffer group with bufIndex. Ranges with the same
+// opcode, flags, FD and slot share user_data. To distinguish their results,
+// serialize those sends or submit individual operations with distinct live contexts.
 //
 // The return count is the accepted target prefix, not completed sends or bytes.
 // Submission stops at the first error, including ErrWouldBlock. Resume with the

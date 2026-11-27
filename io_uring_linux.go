@@ -177,12 +177,12 @@ type ioUring struct {
 	closed        atomic.Bool
 	params        *ioUringParams
 
-	sq     ioUringSq
-	cq     ioUringCq
-	ringFd int
-	bufs   [][]byte
-	files  []int32 // registered file descriptors
-	ops    []ioUringProbeOp
+	sq        ioUringSq
+	cq        ioUringCq
+	ringFd    int
+	fileSlots int // capacity of the kernel's registered file table
+	bufs      [][]byte
+	ops       []ioUringProbeOp
 
 	pollerFd int
 }
@@ -422,79 +422,36 @@ func (ur *ioUring) unregisterBuffers() error {
 	return nil
 }
 
-// registerFiles registers file descriptors for use with IOSQE_FIXED_FILE.
-// Using registered files reduces per-operation overhead by avoiding
-// file reference management on each I/O operation.
-func (ur *ioUring) registerFiles(fds []int32) error {
-	if len(ur.files) > 0 {
+func (ur *ioUring) registerFileTable(count int, fds []int32, flags uint32) error {
+	if ur.fileSlots != 0 {
 		return ErrExists
 	}
-	if len(fds) < 1 || uint(len(fds)) > math.MaxUint32 {
-		return ErrInvalidParam
-	}
-
-	// Use IORING_REGISTER_FILES2 with rsrc_register struct for consistency
-	reg := ioUringRSrcRegister{
-		nr:   uint32(len(fds)),
-		data: unsafe.Pointer(unsafe.SliceData(fds)),
-	}
-	regSize := uintptr(unsafe.Sizeof(reg))
-	_, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_REGISTER_FILES2, unsafe.Pointer(&reg), regSize)
-	if errno != 0 {
-		return errFromErrno(errno)
-	}
-
-	// Store a copy of the file descriptors
-	ur.files = make([]int32, len(fds))
-	copy(ur.files, fds)
-
-	return nil
-}
-
-// registerFilesSparse allocates a sparse file table of the given size.
-// Entries are initially empty (-1) and can be populated with registerFilesUpdate.
-// Sparse registration allows dynamic file management without pre-populating all entries.
-func (ur *ioUring) registerFilesSparse(count uint32) error {
-	if len(ur.files) > 0 {
-		return ErrExists
-	}
-	if count < 1 {
+	if count < 1 || uint(count) > math.MaxUint32 {
 		return ErrInvalidParam
 	}
 
 	reg := ioUringRSrcRegister{
-		nr:    count,
-		flags: IORING_RSRC_REGISTER_SPARSE,
+		nr:    uint32(count),
+		flags: flags,
+		data:  unsafe.Pointer(unsafe.SliceData(fds)),
 	}
 	regSize := uintptr(unsafe.Sizeof(reg))
 	_, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_REGISTER_FILES2, unsafe.Pointer(&reg), regSize)
+	runtime.KeepAlive(fds)
 	if errno != 0 {
 		return errFromErrno(errno)
 	}
-
-	// Initialize sparse table with -1 (empty slots)
-	ur.files = make([]int32, count)
-	for i := range ur.files {
-		ur.files[i] = -1
-	}
-
+	ur.fileSlots = count
 	return nil
 }
 
 // registerFilesUpdate updates registered files at the specified offset.
 // Use -1 to clear a slot, or a valid fd to set it.
 func (ur *ioUring) registerFilesUpdate(offset uint32, fds []int32) (int, error) {
-	if len(ur.files) < 1 {
+	if ur.fileSlots == 0 {
 		return 0, ErrNotFound
 	}
-	if len(fds) < 1 || uint(len(fds)) > math.MaxUint32 {
-		return 0, ErrInvalidParam
-	}
-	if uint64(offset) > uint64(len(ur.files)) {
-		return 0, ErrInvalidParam
-	}
-	start := int(offset)
-	if len(fds) > len(ur.files)-start {
+	if len(fds) == 0 || uint64(offset)+uint64(len(fds)) > uint64(ur.fileSlots) {
 		return 0, ErrInvalidParam
 	}
 	for _, fd := range fds {
@@ -514,33 +471,23 @@ func (ur *ioUring) registerFilesUpdate(offset uint32, fds []int32) (int, error) 
 		fds:    unsafe.SliceData(fds),
 	}
 	result, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_REGISTER_FILES_UPDATE, unsafe.Pointer(&up), uintptr(len(fds)))
+	runtime.KeepAlive(fds)
 	if errno != 0 {
-		// Linux clears the destination before acquiring the replacement file.
-		if errno == uintptr(zcall.EBADF) || errno == ENOMEM {
-			ur.files[start] = -1
-		}
 		return 0, errFromErrno(errno)
 	}
-
-	updated := int(result)
-	copy(ur.files[start:start+updated], fds[:updated])
-	if updated < len(fds) {
-		ur.files[start+updated] = -1
-	}
-
-	return updated, nil
+	return int(result), nil
 }
 
 // unregisterFiles removes all registered file descriptors.
 func (ur *ioUring) unregisterFiles() error {
-	if len(ur.files) < 1 {
+	if ur.fileSlots == 0 {
 		return ErrNotFound
 	}
 	_, errno := zcall.IoUringRegister(uintptr(ur.ringFd), IORING_UNREGISTER_FILES, nil, 0)
 	if errno != 0 {
 		return errFromErrno(errno)
 	}
-	ur.files = nil
+	ur.fileSlots = 0
 
 	return nil
 }
@@ -688,7 +635,7 @@ func (ur *ioUring) cleanupCoreRingResources() error {
 	}
 
 	ur.bufs = nil
-	ur.files = nil
+	ur.fileSlots = 0
 	ur.ops = nil
 
 	ur.unmapRings()
@@ -1007,11 +954,7 @@ func (ur *ioUring) waitBatch(cqes []CQEView) (int, error) {
 	n := int(available)
 	for i := range n {
 		e := ur.cq.cqeAt((h + uint32(i)) & mask)
-		cqes[i] = CQEView{
-			Res:   e.res,
-			Flags: e.flags,
-			ctx:   SQEContextFromRaw(e.userData),
-		}
+		cqes[i] = e.view()
 	}
 	ur.publishCQ(claim, available)
 	return n, nil
@@ -1177,23 +1120,6 @@ func (sq *ioUringSq) sqe128At(index uint32) *ioUringSqe128 {
 	return (*ioUringSqe128)(unsafe.Add(sq.sqesPtr, uintptr(index)*sq.sqeStride))
 }
 
-type ioUringSqe struct {
-	opcode   uint8
-	flags    uint8
-	ioprio   uint16
-	fd       int32
-	off      uint64
-	addr     uint64
-	len      uint32
-	uflags   uint32
-	userData uint64
-
-	bufIndex    uint16
-	personality uint16
-	spliceFdIn  int32
-	pad         [2]uint64
-}
-
 type ioUringSqe128 struct {
 	ioUringSqe
 	extra [64]byte
@@ -1225,12 +1151,6 @@ func (cq *ioUringCq) cqeAt(index uint32) *ioUringCqe {
 		stride = 1
 	}
 	return &cq.cqes[int(index)*stride]
-}
-
-type ioUringCqe struct {
-	userData uint64
-	res      int32
-	flags    uint32
 }
 
 type ioSqRingOffsets struct {
@@ -1795,6 +1715,30 @@ func (ur *ioUring) cloneBuffers(clone *CloneBuffers) error {
 // Resize Rings Methods
 // ========================================
 
+func (ur *ioUring) remapResizedRings(params *ioUringParams) error {
+	// Some kernels omit sq_off.array on resize. The array follows the CQ
+	// with kernel-specific alignment. SETUP reports its offset for that CQ
+	// geometry even with a single SQ entry.
+	if params.flags&IORING_SETUP_NO_SQARRAY == 0 && params.sqOff.array == 0 {
+		if params.cqEntries == ur.params.cqEntries {
+			params.sqOff.array = ur.params.sqOff.array
+		} else {
+			const cqLayoutFlags = IORING_SETUP_CQE32 | IORING_SETUP_CQE_MIXED
+			layout := ioUringParams{
+				cqEntries: params.cqEntries,
+				flags:     IORING_SETUP_R_DISABLED | IORING_SETUP_CQSIZE | (params.flags & cqLayoutFlags),
+			}
+			fd, err := ioUringSetup(1, &layout)
+			if err != nil {
+				return fmt.Errorf("get resized SQ array offset: %w", err)
+			}
+			zcall.Close(uintptr(fd))
+			params.sqOff.array = layout.sqOff.array
+		}
+	}
+	return ur.remapRings(params)
+}
+
 // resizeRings replaces the SQ/CQ mappings while preserving pending entries
 // and their submission storage.
 //
@@ -1847,7 +1791,7 @@ func (ur *ioUring) resizeRings(newSQSize, newCQSize uint32) error {
 	defer zcall.Munmap(oldSqesPtr, oldSqeMapSz)
 	defer zcall.Munmap(oldRingPtr, oldRingMapSz)
 	ur.clearRingViews()
-	if err := ur.remapRings(&params); err != nil {
+	if err := ur.remapResizedRings(&params); err != nil {
 		return ur.closeAfterFatalResize(fmt.Errorf("remap resized rings: %w", err))
 	}
 	// Registration freezes the old CQ. Preserve complete entries, including

@@ -70,6 +70,7 @@ func TestCompletionError(t *testing.T) {
 		{"zero", 0, nil},
 		{"would block", -int32(EAGAIN), iox.ErrWouldBlock},
 		{"canceled", -int32(ECANCELED), ErrCanceled},
+		{"minimum signed input", -1 << 31, zcall.Errno(1 << 31)},
 	}
 
 	for _, tt := range tests {
@@ -83,8 +84,8 @@ func TestCompletionError(t *testing.T) {
 }
 
 func TestCompletionErrMethods(t *testing.T) {
-	if err := (&CQEView{Res: 1}).Err(); err != nil {
-		t.Fatalf("CQEView.Err positive = %v", err)
+	if err := (&CQEView{Res: 1, Flags: IORING_CQE_F_MORE}).Err(); err != nil {
+		t.Fatalf("CQEView.Err for a positive multishot result = %v", err)
 	}
 	if err := (&DirectCQE{Res: -int32(EAGAIN)}).Err(); !errors.Is(err, iox.ErrWouldBlock) {
 		t.Fatalf("DirectCQE.Err = %v, want %v", err, iox.ErrWouldBlock)

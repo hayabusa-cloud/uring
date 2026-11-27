@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"runtime"
 	"slices"
 	"testing"
 	"time"
@@ -126,23 +127,47 @@ func newTestTCPPair(t *testing.T) (iofd.FD, net.Conn) {
 }
 
 func TestZCTrackerDefaultNotifications(t *testing.T) {
-	for _, fixed := range []bool{false, true} {
-		name := "user"
-		if fixed {
-			name = "registered"
-		}
-		t.Run(name, func(t *testing.T) {
-			ring := newTestRing(t) // NotifySucceed remains false.
-			fd, client := newTestTCPPair(t)
+	const pollAndReport = uring.IORING_RECVSEND_POLL_FIRST | uring.IORING_SEND_ZC_REPORT_USAGE
+	for _, tc := range []struct {
+		name     string
+		slot     int // -1 selects the caller's slice
+		subrange bool
+		ioprio   uint16
+	}{
+		{"user", -1, false, 0},
+		{"registered", 0, false, 0},
+		{"user-range", -1, true, pollAndReport},
+		{"registered-range", 1, true, pollAndReport},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			payload := []byte("zero-copy completion is required")
+			var pin runtime.Pinner
+			pin.Pin(&payload[0])
+			t.Cleanup(pin.Unpin)
+
+			// Two registered slots, with the default NotifySucceed=false.
+			ring := newTestRing(t, func(o *uring.Options) { o.LockedBufferMem = 2 * uring.BufferSizeLarge })
+			fd, client := newTestTCPPair(t)
 			tracker := uring.NewZCTracker(ring, uring.NewContextPools(2))
 			handler := &testZCHandler{}
+			offset, length := 0, len(payload)
+			want := payload
+			var opts []uring.OpOptionFunc
+			var wantIndex uint16
+			wantPrio := tc.ioprio
+			if tc.subrange {
+				offset, length = 3, 12
+				opts = []uring.OpOptionFunc{uring.WithOffset(2), uring.WithN(7), uring.WithIOPrio(tc.ioprio)}
+				want = payload[offset+2 : offset+2+7]
+			}
 			var err error
-			if fixed {
-				copy(ring.RegisteredBuffer(0), payload)
-				err = tracker.SendZCFixed(fd, 0, 0, len(payload), handler)
+			if tc.slot >= 0 {
+				wantIndex = uint16(tc.slot)
+				wantPrio |= uring.IORING_RECVSEND_FIXED_BUF
+				copy(ring.RegisteredBuffer(tc.slot), payload)
+				err = tracker.SendZCFixed(fd, tc.slot, offset, length, handler, opts...)
 			} else {
-				err = tracker.SendZC(fd, payload, handler)
+				err = tracker.SendZC(fd, payload[offset:offset+length], handler, opts...)
 			}
 			if err != nil {
 				t.Fatal(err)
@@ -156,6 +181,10 @@ func TestZCTrackerDefaultNotifications(t *testing.T) {
 					t.Fatal(err)
 				}
 				for _, cqe := range cqes[:n] {
+					sqe := cqe.SQE()
+					if sqe.IoPrio() != wantPrio || sqe.BufIndex() != wantIndex || sqe.Len() != uint32(len(want)) {
+						t.Fatalf("send SQE: ioprio=%#x index=%d length=%d", sqe.IoPrio(), sqe.BufIndex(), sqe.Len())
+					}
 					if !tracker.HandleCQE(cqe) {
 						t.Fatalf("unhandled completion: %+v", cqe)
 					}
@@ -169,17 +198,44 @@ func TestZCTrackerDefaultNotifications(t *testing.T) {
 			if handler.completedCalls.Load() != 1 || handler.notifyCalls.Load() != 1 {
 				t.Fatalf("callbacks: completed=%d released=%d", handler.completedCalls.Load(), handler.notifyCalls.Load())
 			}
-			if got := handler.completedRes.Load(); got != int32(len(payload)) {
-				t.Fatalf("send result=%d, want %d", got, len(payload))
+			if got := handler.completedRes.Load(); got != int32(len(want)) || handler.notifyRes.Load() != got {
+				t.Fatalf("send=%d release=%d, want %d", got, handler.notifyRes.Load(), len(want))
 			}
 			if err := client.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
 				t.Fatal(err)
 			}
-			received := make([]byte, len(payload))
-			if _, err := io.ReadFull(client, received); err != nil || !bytes.Equal(received, payload) {
+			received := make([]byte, len(want))
+			if _, err := io.ReadFull(client, received); err != nil || !bytes.Equal(received, want) {
 				t.Fatalf("receive: data=%q error=%v", received, err)
 			}
 		})
+	}
+}
+
+func TestZCTrackerFullSQReturnsContext(t *testing.T) {
+	ring := newTestRing(t, func(o *uring.Options) {
+		o.Entries = uring.EntriesPico
+		o.NotifySucceed = true
+	})
+	for range uring.EntriesPico {
+		if err := ring.Nop(uring.ForFD(0)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	pool := uring.NewContextPools(1)
+	tracker := uring.NewZCTracker(ring, pool)
+	buf := ring.RegisteredBuffer(0)
+	if err := tracker.SendZC(-1, buf[:1], nil); !iox.IsWouldBlock(err) || pool.ExtendedAvailable() != 1 {
+		t.Fatalf("SendZC on full SQ: err=%v available=%d", err, pool.ExtendedAvailable())
+	}
+	if err := tracker.SendZCFixed(-1, 0, 0, 1, nil); !iox.IsWouldBlock(err) || pool.ExtendedAvailable() != 1 {
+		t.Fatalf("SendZCFixed on full SQ: err=%v available=%d", err, pool.ExtendedAvailable())
+	}
+	for _, cqe := range waitForCQEs(t, ring, uring.EntriesPico) {
+		if cqe.Op() != uring.IORING_OP_NOP || cqe.Res != 0 {
+			t.Fatalf("unexpected completion: %+v", cqe)
+		}
 	}
 }
 

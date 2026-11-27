@@ -32,74 +32,48 @@ func (h *incrementalErrorHandler) OnError(err error) {
 	h.lastErr.Store(err)
 }
 
-func newIncrementalBoundsTestState(t *testing.T) (*IncrementalReceiver, *ExtSQE, *incrementalErrorHandler) {
-	t.Helper()
-
-	pool := NewContextPools(1)
-	receiver := &IncrementalReceiver{
-		pool:          pool,
-		bufSize:       4,
-		bufBacking:    make([]byte, 8),
-		bufferOffsets: make([]uint32, 2),
-	}
-	ext := pool.Extended()
-	if ext == nil {
-		t.Fatal("Extended returned nil")
-	}
-	ext.SQE.opcode = IORING_OP_RECV
-
-	handler := &incrementalErrorHandler{}
-	_ = incInitCtx(ext, receiver, handler)
-	return receiver, ext, handler
-}
-
 func TestIncrementalHandleCQERejectsOutOfRangeBufferID(t *testing.T) {
-	receiver, ext, handler := newIncrementalBoundsTestState(t)
-	cqe := CQEView{
-		Res:   4,
-		Flags: IORING_CQE_F_BUFFER | (3 << IORING_CQE_BUFFER_SHIFT),
-		ctx:   PackExtended(ext),
-	}
-
-	if !receiver.HandleCQE(cqe) {
-		t.Fatal("HandleCQE did not claim incremental CQE")
-	}
-	if handler.dataCalls.Load() != 0 || handler.completeCalls.Load() != 0 {
-		t.Fatal("invalid buffer CQE should not deliver data or completion")
-	}
-	if handler.errorCalls.Load() != 1 {
-		t.Fatalf("errorCalls = %d, want 1", handler.errorCalls.Load())
-	}
-	lastErr, _ := handler.lastErr.Load().(error)
-	if !errors.Is(lastErr, ErrInvalidParam) {
-		t.Fatalf("OnError got %v, want %v", lastErr, ErrInvalidParam)
-	}
-	if got := receiver.pool.Extended(); got == nil {
-		t.Fatal("invalid single-shot CQE did not return ExtSQE")
-	}
-}
-
-func TestIncrementalHandleCQEWithHandlerRejectsOutOfRangeBufferID(t *testing.T) {
-	receiver, ext, handler := newIncrementalBoundsTestState(t)
-	cqe := CQEView{
-		Res:   4,
-		Flags: IORING_CQE_F_BUFFER | (3 << IORING_CQE_BUFFER_SHIFT),
-		ctx:   PackExtended(ext),
-	}
-
-	receiver.handleCQEWithHandler(cqe, handler)
-	if handler.dataCalls.Load() != 0 || handler.completeCalls.Load() != 0 {
-		t.Fatal("invalid buffer CQE should not deliver data or completion")
-	}
-	if handler.errorCalls.Load() != 1 {
-		t.Fatalf("errorCalls = %d, want 1", handler.errorCalls.Load())
-	}
-	lastErr, _ := handler.lastErr.Load().(error)
-	if !errors.Is(lastErr, ErrInvalidParam) {
-		t.Fatalf("OnError got %v, want %v", lastErr, ErrInvalidParam)
-	}
-	if got := receiver.pool.Extended(); got == nil {
-		t.Fatal("invalid single-shot CQE did not return ExtSQE")
+	for _, route := range []string{"receiver", "stored_handler"} {
+		t.Run(route, func(t *testing.T) {
+			ring := newWrapperSyntheticSubmitRing(t, 2)
+			pool := NewContextPools(1)
+			receiver := NewIncrementalReceiver(ring, pool, 7, 4, make([]byte, 8), 2)
+			handler := &incrementalErrorHandler{}
+			if err := receiver.Recv(11, handler); err != nil {
+				t.Fatal(err)
+			}
+			cqe := ioUringCqe{
+				userData: lastSubmittedSQE(t, ring).userData,
+				res:      4,
+				flags:    IORING_CQE_F_BUFFER | (3 << IORING_CQE_BUFFER_SHIFT),
+			}
+			switch route {
+			case "receiver":
+				other := NewIncrementalReceiver(ring, pool, 8, 4, make([]byte, 4), 1)
+				if other.HandleCQE(cqe.view()) {
+					t.Fatal("another receiver claimed the completion")
+				}
+				if !receiver.HandleCQE(cqe.view()) {
+					t.Fatal("receiver did not claim its completion")
+				}
+			case "stored_handler":
+				ext := cqe.Context().ExtSQE()
+				fn := CastUserData[Ctx0](ext).Fn
+				if fn == nil {
+					t.Fatal("Recv did not install the completion handler")
+				}
+				fn(ring, &ext.SQE, &cqe)
+			}
+			if handler.dataCalls.Load() != 0 || handler.completeCalls.Load() != 0 || handler.errorCalls.Load() != 1 {
+				t.Fatalf("data=%d complete=%d errors=%d", handler.dataCalls.Load(), handler.completeCalls.Load(), handler.errorCalls.Load())
+			}
+			if err, _ := handler.lastErr.Load().(error); !errors.Is(err, ErrInvalidParam) {
+				t.Fatalf("OnError = %v, want ErrInvalidParam", err)
+			}
+			if got := pool.ExtendedAvailable(); got != 1 {
+				t.Fatalf("available after dispatch = %d, want 1", got)
+			}
+		})
 	}
 }
 
@@ -125,7 +99,7 @@ func (h *incrementalFragmentHandler) OnError(error) {
 	h.errors.Add(1)
 }
 
-func TestIncrementalHandleResolvedCQEPersistsBufferOffsetAcrossRequests(t *testing.T) {
+func TestIncrementalHandleCQEPersistsBufferOffsetAcrossRequests(t *testing.T) {
 	pool := NewContextPools(1)
 	receiver := &IncrementalReceiver{
 		pool:          pool,
@@ -151,9 +125,9 @@ func TestIncrementalHandleResolvedCQEPersistsBufferOffsetAcrossRequests(t *testi
 			t.Fatalf("step %d: ExtSQE was not returned by the previous request", i)
 		}
 		ext.SQE.opcode = IORING_OP_RECV
-		_ = incInitCtx(ext, receiver, handler)
+		incInitCtx(ext, receiver, handler)
 		cqe := CQEView{Res: 2, Flags: step.flags, ctx: PackExtended(ext)}
-		if !receiver.handleResolvedCQE(cqe, ext, handler) {
+		if !receiver.HandleCQE(cqe) {
 			t.Fatalf("step %d: CQE was not handled", i)
 		}
 		if got := string(handler.fragments[i]); got != step.want {
@@ -175,7 +149,7 @@ func TestIncrementalHandleResolvedCQEPersistsBufferOffsetAcrossRequests(t *testi
 	}
 }
 
-func TestIncrementalHandleResolvedCQENonpositiveBufferReturn(t *testing.T) {
+func TestIncrementalHandleCQENonpositiveBufferReturn(t *testing.T) {
 	tests := []struct {
 		name       string
 		res        int32
@@ -206,9 +180,10 @@ func TestIncrementalHandleResolvedCQENonpositiveBufferReturn(t *testing.T) {
 				if ext == nil {
 					t.Fatal("ExtSQE was not returned by the previous request")
 				}
-				_ = incInitCtx(ext, receiver, handler)
+				ext.SQE.opcode = IORING_OP_RECV
+				incInitCtx(ext, receiver, handler)
 				cqe := CQEView{Res: res, Flags: flags, ctx: PackExtended(ext)}
-				if !receiver.handleResolvedCQE(cqe, ext, handler) {
+				if !receiver.HandleCQE(cqe) {
 					t.Fatal("CQE was not handled")
 				}
 			}
@@ -236,7 +211,7 @@ func TestIncrementalHandleResolvedCQENonpositiveBufferReturn(t *testing.T) {
 	}
 }
 
-func TestIncrementalHandleResolvedCQEErrorReturnsExtSQE(t *testing.T) {
+func TestIncrementalHandleCQEErrorReturnsExtSQE(t *testing.T) {
 	pool := NewContextPools(1)
 	receiver := &IncrementalReceiver{pool: pool}
 	ext := pool.Extended()
@@ -244,10 +219,11 @@ func TestIncrementalHandleResolvedCQEErrorReturnsExtSQE(t *testing.T) {
 		t.Fatal("pool exhausted")
 	}
 	handler := &incrementalErrorHandler{}
-	_ = incInitCtx(ext, receiver, handler)
+	ext.SQE.opcode = IORING_OP_RECV
+	incInitCtx(ext, receiver, handler)
 	cqe := CQEView{Res: -int32(ECANCELED), ctx: PackExtended(ext)}
 
-	if !receiver.handleResolvedCQE(cqe, ext, handler) {
+	if !receiver.HandleCQE(cqe) {
 		t.Fatal("error CQE was not handled")
 	}
 	if handler.errorCalls.Load() != 1 {
@@ -270,7 +246,7 @@ func TestIncrementalHandleCQEReturnsExtSQEOnNilHandler(t *testing.T) {
 		t.Fatal("pool exhausted")
 	}
 	ext.SQE.opcode = IORING_OP_RECV
-	_ = incInitCtx(ext, receiver, nil)
+	incInitCtx(ext, receiver, nil)
 
 	cqe := CQEView{
 		Res:   0,
@@ -286,22 +262,25 @@ func TestIncrementalHandleCQEReturnsExtSQEOnNilHandler(t *testing.T) {
 }
 
 func TestIncrementalStaticHandlerReturnsExtSQEOnNilHandler(t *testing.T) {
+	ring := newWrapperSyntheticSubmitRing(t, 2)
 	pool := NewContextPools(1)
-	receiver := &IncrementalReceiver{pool: pool}
-	ext := pool.Extended()
-	if ext == nil {
-		t.Fatal("pool exhausted")
+	receiver := NewIncrementalReceiver(ring, pool, 7, 4, make([]byte, 4), 1)
+	if err := receiver.Recv(11, nil); err != nil {
+		t.Fatal(err)
 	}
-	ext.SQE.opcode = IORING_OP_RECV
-	_ = incInitCtx(ext, receiver, nil)
 
-	incrementalCQEHandler(nil, nil, &ioUringCqe{
-		res:      0,
+	cqe := ioUringCqe{
+		userData: lastSubmittedSQE(t, ring).userData,
 		flags:    IORING_CQE_F_BUFFER,
-		userData: uint64(PackExtended(ext)),
-	})
-	if got := pool.Extended(); got == nil {
-		t.Fatal("expected static nil-handler path to return ExtSQE to pool")
+	}
+	ext := cqe.Context().ExtSQE()
+	fn := CastUserData[Ctx0](ext).Fn
+	if fn == nil {
+		t.Fatal("Recv did not install the completion handler")
+	}
+	fn(ring, &ext.SQE, &cqe)
+	if got := pool.ExtendedAvailable(); got != 1 {
+		t.Fatalf("available after nil-handler dispatch = %d, want 1", got)
 	}
 }
 
@@ -348,17 +327,21 @@ func TestIncrementalRecvAllocations(t *testing.T) {
 		}
 		tail := atomic.LoadUint32(ring.ioUring.sq.kTail)
 		sqe := ring.ioUring.sq.sqeAt((tail - 1) & *ring.ioUring.sq.kRingMask)
-		ext := SQEContextFromRaw(sqe.userData).ExtSQE()
+		cqe := CQEView{ctx: SQEContextFromRaw(sqe.userData)}
 		atomic.StoreUint32(ring.ioUring.sq.kHead, tail)
-		pool.PutExtended(ext)
+		if !receiver.HandleCQE(cqe) {
+			panic("incremental completion was not handled")
+		}
 	})
 	if allocs != 0 {
-		t.Fatalf("Recv allocations = %v, want 0", allocs)
+		t.Fatalf("Recv and HandleCQE allocations = %v, want 0", allocs)
 	}
 }
 
 func TestIncrementalRecvRejectsOutOfRangeKernelLength(t *testing.T) {
-	receiver := &IncrementalReceiver{bufSize: oversizedSignedInt32(t)}
+	ring := newWrapperSyntheticSubmitRing(t, 8)
+	size := oversizedSignedInt32(t)
+	receiver := NewIncrementalReceiver(ring, NewContextPools(1), 1, size, mappedTestSlice[byte](t, size), 1)
 	if err := receiver.Recv(0, nil); !errors.Is(err, ErrInvalidParam) {
 		t.Fatalf("Recv error = %v, want %v", err, ErrInvalidParam)
 	}

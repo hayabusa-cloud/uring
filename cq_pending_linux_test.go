@@ -7,6 +7,7 @@
 package uring_test
 
 import (
+	"errors"
 	"runtime"
 	"testing"
 	"time"
@@ -38,21 +39,7 @@ func TestCQPendingTracksPartialDrain(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			var backoff iox.Backoff
-			deadline := time.Now().Add(3 * time.Second)
-			for {
-				// Flush submissions and deferred task work without consuming CQEs.
-				if n, err := ring.Wait(nil); err != nil || n != 0 {
-					t.Fatalf("Wait(nil) = (%d, %v), want (0, nil)", n, err)
-				}
-				if ring.CQPending() == count {
-					break
-				}
-				if time.Now().After(deadline) {
-					t.Fatalf("CQPending = %d, want %d", ring.CQPending(), count)
-				}
-				backoff.Wait()
-			}
+			checkWaitWithoutReaping(t, ring, ring.Wait, count)
 
 			var cqes [1]uring.CQEView
 			for remaining := count - 1; remaining >= 0; remaining-- {
@@ -67,5 +54,51 @@ func TestCQPendingTracksPartialDrain(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestEmptyWaitAfterStop(t *testing.T) {
+	ring := newTestRing(t)
+	if err := ring.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := ring.Wait(nil); n != 0 || !errors.Is(err, uring.ErrClosed) {
+		t.Errorf("Wait(nil) = (%d, %v), want (0, ErrClosed)", n, err)
+	}
+	if n, err := ring.WaitDirect(nil); n != 0 || !errors.Is(err, uring.ErrClosed) {
+		t.Errorf("WaitDirect(nil) = (%d, %v), want (0, ErrClosed)", n, err)
+	}
+	if n, err := ring.WaitExtended(nil); n != 0 || !errors.Is(err, uring.ErrClosed) {
+		t.Errorf("WaitExtended(nil) = (%d, %v), want (0, ErrClosed)", n, err)
+	}
+}
+
+// Drive the submitted requests using only the wait method under test.
+func checkWaitWithoutReaping[T any](t *testing.T, ring *uring.Uring, wait func([]T) (int, error), want int) {
+	t.Helper()
+	var backoff iox.Backoff
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if n, err := wait(nil); n != 0 || err != nil {
+			t.Fatalf("wait(nil) = (%d, %v), want (0, nil)", n, err)
+		}
+		got := ring.CQPending()
+		if got == want {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("CQPending = %d, want %d after empty waits", got, want)
+		}
+		backoff.Wait()
+	}
+
+	var slot [1]T
+	for _, dst := range [][]T{nil, slot[:0]} {
+		if n, err := wait(dst); n != 0 || err != nil {
+			t.Fatalf("empty wait with cap %d = (%d, %v), want (0, nil)", cap(dst), n, err)
+		}
+		if got := ring.CQPending(); got != want {
+			t.Fatalf("CQPending after empty wait with cap %d = %d, want %d", cap(dst), got, want)
+		}
 	}
 }

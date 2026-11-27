@@ -199,32 +199,79 @@ func TestListenerAutomaticStop(t *testing.T) {
 }
 
 func TestListenerAutomaticClosePending(t *testing.T) {
-	ring := newTestRing(t)
-	h := &automaticListenerHandler{}
-	op, err := uring.NewListenerManager(ring, uring.NewContextPools(1)).ListenTCP4(&net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)}, 16, h)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(op.Close)
-	op.Close()
-	if op.Ext() == nil {
-		t.Fatal("pending context released")
-	}
-	cqe := nextListenerCQE(t, ring)
-	if cqe.Res < 0 {
-		t.Fatalf("SOCKET: %d", cqe.Res)
-	}
-	fd := iofd.FD(cqe.Res)
-	if ok, err := op.HandleCQE(cqe); !ok || err != nil {
-		t.Fatalf("HandleCQE: handled=%v err=%v", ok, err)
-	}
-	assertListenerFDClosed(t, fd)
-	if h.calls != [3]int{} || h.err != nil || ring.SQAvailable() != int(ring.Features.SQEntries) {
-		t.Fatalf("callback or successor after Close: calls=%v err=%v", h.calls, h.err)
-	}
-	op.Close()
-	if op.Ext() != nil {
-		t.Fatal("context retained after drain")
+	testListenerClosePending(t, (*uring.ListenerOp).HandleCQE)
+}
+
+func TestListenerManualClosePending(t *testing.T) {
+	testListenerClosePending(t, func(op *uring.ListenerOp, cqe uring.CQEView) (bool, error) {
+		step, ok := uring.DecodeListenerCQE(cqe)
+		if ok && step.Op == uring.IORING_OP_SOCKET && step.Err == nil {
+			op.SetFD(step.FD)
+		}
+		return ok, step.Err
+	})
+}
+
+func testListenerClosePending(t *testing.T, consume func(*uring.ListenerOp, uring.CQEView) (bool, error)) {
+	t.Helper()
+	for completed, tc := range []struct {
+		name string
+		op   uint8
+	}{
+		{"socket", uring.IORING_OP_SOCKET},
+		{"bind", uring.IORING_OP_BIND},
+		{"listen", uring.IORING_OP_LISTEN},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ring := newTestRing(t)
+			h := &automaticListenerHandler{}
+			pool := uring.NewContextPools(1)
+			addr := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)}
+			op, err := uring.NewListenerManager(ring, pool).ListenTCP4(addr, 16, h)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(op.Close)
+			for range completed {
+				if ok, err := op.HandleCQE(nextListenerCQE(t, ring)); !ok || err != nil || h.err != nil {
+					t.Fatalf("advance setup: handled=%v err=%v callback error=%v", ok, err, h.err)
+				}
+			}
+			fd, ext, calls := op.FD(), op.Ext(), h.calls
+			op.Close()
+			if op.FD() != -1 || ext == nil || op.Ext() != ext {
+				t.Fatal("early Close must hide the fd and retain the pending context")
+			}
+			cqe := nextListenerCQE(t, ring)
+			if cqe.Op() != tc.op || cqe.Res < 0 {
+				t.Fatalf("pending setup: opcode=%d result=%d, want opcode=%d and success", cqe.Op(), cqe.Res, tc.op)
+			}
+			if tc.op == uring.IORING_OP_SOCKET {
+				fd = iofd.FD(cqe.Res)
+			}
+			if _, errno := zcall.Syscall4(iofd.SYS_FCNTL, uintptr(fd), iofd.F_GETFD, 0, 0); errno != 0 {
+				t.Fatalf("fd %d before dispatch: %v", fd, zcall.Errno(errno))
+			}
+			if ok, err := consume(op, cqe); !ok || err != nil {
+				t.Fatalf("consume setup CQE: handled=%v err=%v", ok, err)
+			}
+			assertListenerFDClosed(t, fd)
+			if op.Ext() != ext || pool.Extended() != nil {
+				t.Fatal("context released before final Close")
+			}
+			if h.calls != calls || h.err != nil || ring.SQAvailable() != int(ring.Features.SQEntries) {
+				t.Fatalf("callback or successor after Close: calls=%v err=%v", h.calls, h.err)
+			}
+			op.Close()
+			if op.Ext() != nil {
+				t.Fatal("context retained after drain")
+			}
+			returned := pool.Extended()
+			if returned != ext {
+				t.Fatalf("pool returned %p after final Close, want %p", returned, ext)
+			}
+			pool.PutExtended(returned)
+		})
 	}
 }
 

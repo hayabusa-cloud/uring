@@ -153,19 +153,20 @@ func (s *MultishotSubscription) Cancel() error {
 	if s.State() != SubscriptionActive {
 		return nil
 	}
-	return s.submitCancel()
+	return s.submitCancelUsing(s.ring.asyncCancel)
 }
 
-// Unsubscribe suppresses future callbacks and best-effort cancels the subscription.
-// It also suppresses callbacks that have not started yet, including `OnMultishotStop`.
-// Use it when you do not need a terminal callback.
+// Unsubscribe suppresses future step and stop callbacks and makes one
+// best-effort cancellation attempt. An in-flight callback may still finish.
 //
-// In-flight callbacks may still finish after `Unsubscribe` returns. If the cancel
-// submission fails, the kernel request can remain live until it terminates
-// naturally, but further callbacks stay suppressed.
-// Continue dispatching original and cancellation CQEs to release their contexts.
-// Unsubscribe follows the same cancel submission serialization contract as
-// [MultishotSubscription.Cancel].
+// After a failed submission, callbacks stay suppressed and the caller can retry
+// [MultishotSubscription.Cancel] while the original is active. Continue dispatching
+// original and cancellation CQEs. Unsubscribe follows the same serialization
+// contract as Cancel.
+//
+// The caller must account for resources from suppressed steps, such as sockets
+// returned by [Uring.AcceptMultishot]. Use Cancel directly to keep receiving
+// those resources in the step handler during shutdown.
 func (s *MultishotSubscription) Unsubscribe() {
 	s.unsubscribed.Store(true)
 	_ = s.Cancel()
@@ -187,9 +188,10 @@ func (s *MultishotSubscription) State() SubscriptionState {
 }
 
 // HandleCQE processes an original or cancellation CQE for this subscription.
-// It returns true when the CQE belongs to this route and was handled. It returns
-// false for non-extended CQEs, foreign routes, or observations whose current
-// pooled ExtSQE owner is no longer this subscription.
+// It returns true for either matched request, including when callbacks are
+// suppressed. Use the original operation and callback delivery to determine
+// who owns a returned resource. It returns false for non-extended CQEs,
+// foreign routes, or pooled ExtSQEs whose owner is no longer this subscription.
 //
 // HandleCQE is for immediate dispatch in the caller's serialized completion
 // loop. Caller code must call it before the observed ExtSQE can be retired and
@@ -287,7 +289,8 @@ func (ur *Uring) newMultishotSubscription(
 // AcceptMultishot starts a multishot accept subscription.
 // While callbacks stay enabled, the handler receives one MultishotStep per
 // original CQE and at most one terminal stop.
-// `step.CQE.Res` contains the accepted fd on success.
+// Each successful original CQE returns a process fd in Res, including fd zero.
+// The caller must transfer or close each fd, even on a final or suppressed step.
 // Options may add SQE control flags and accept-specific ioprio flags such as
 // `IORING_ACCEPT_POLL_FIRST`.
 func (ur *Uring) AcceptMultishot(sqeCtx SQEContext, handler MultishotHandler, options ...OpOptionFunc) (*MultishotSubscription, error) {
@@ -332,7 +335,7 @@ func (ur *Uring) ReceiveMultishot(sqeCtx SQEContext, handler MultishotHandler, o
 // ========================================
 
 func multishotCQEHandler(ring *Uring, _ *ioUringSqe, cqe *ioUringCqe) {
-	ctx := SQEContextFromRaw(cqe.userData)
+	ctx := cqe.Context()
 	if !ctx.IsExtended() {
 		return
 	}
@@ -345,41 +348,24 @@ func multishotCQEHandler(ring *Uring, _ *ioUringSqe, cqe *ioUringCqe) {
 }
 
 func (s *MultishotSubscription) handleCQE(cqe *ioUringCqe) {
-	ctx := SQEContextFromRaw(cqe.userData)
-	s.handleCQEView(CQEView{
-		Res:   cqe.res,
-		Flags: cqe.flags,
-		ctx:   ctx,
-	})
+	s.handleCQEView(cqe.view())
 }
 
 func (s *MultishotSubscription) handleCQEView(cqe CQEView) {
-	if s.unsubscribed.Load() {
-		s.retireIfTerminal(cqe)
-		return
-	}
-
 	step := MultishotStep{CQE: cqe}
-	if cqe.Res < 0 {
-		step.Err = errFromErrno(uintptr(-cqe.Res))
+	action := MultishotContinue
+	if !s.unsubscribed.Load() {
+		step.Err = cqe.Err()
 		step.Cancelled = cqe.Res == -int32(ECANCELED)
+		action = s.handler.OnMultishotStep(step)
 	}
-	action := s.handler.OnMultishotStep(step)
 	if step.Final() {
 		s.finish(step.Err, step.Cancelled)
 		return
 	}
-	if action == MultishotStop && s.Active() {
-		s.trySubmitCancel()
+	if action == MultishotStop {
+		_ = s.Cancel()
 	}
-}
-
-func (s *MultishotSubscription) trySubmitCancel() {
-	_ = s.submitCancel()
-}
-
-func (s *MultishotSubscription) submitCancel() error {
-	return s.submitCancelUsing(s.ring.asyncCancel)
 }
 
 func (s *MultishotSubscription) submitCancelUsing(submit func(SQEContext, uint64) error) error {
@@ -426,18 +412,5 @@ func (s *MultishotSubscription) finish(err error, cancelled bool) {
 	}
 	if !s.cancelSubmit.Load() && !s.cancel.pending.Load() {
 		s.retireExt()
-	}
-}
-
-// retireIfTerminal records original terminality with callbacks suppressed.
-// The pooled identity stays retained while cancellation is pending or publishing.
-func (s *MultishotSubscription) retireIfTerminal(cqe CQEView) {
-	if !cqe.HasMore() {
-		if SubscriptionState(s.state.Swap(uint32(SubscriptionStopped))) == SubscriptionStopped {
-			return
-		}
-		if !s.cancelSubmit.Load() && !s.cancel.pending.Load() {
-			s.retireExt()
-		}
 	}
 }

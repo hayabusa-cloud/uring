@@ -390,11 +390,7 @@ var _ [unsafe.Sizeof(zcrxCtx{}) - 64]byte
 
 // zcrxCQEHandler is the static CQE dispatcher for ZCRX multishot receives.
 func zcrxCQEHandler(_ *Uring, _ *ioUringSqe, cqe *ioUringCqe) {
-	view := CQEView{
-		Res:   cqe.res,
-		Flags: cqe.flags,
-		ctx:   SQEContextFromRaw(cqe.userData),
-	}
+	view := cqe.view()
 	if !view.Extended() {
 		return
 	}
@@ -411,7 +407,7 @@ func (r *ZCRXReceiver) handleCQE(view CQEView, rawCqe *ioUringCqe) {
 	if view.Res < 0 {
 		continueOnError := true
 		if r.handler != nil {
-			continueOnError = r.handler.OnError(errFromResult(view.Res))
+			continueOnError = r.handler.OnError(view.Err())
 		}
 		if view.Flags&IORING_CQE_F_MORE != 0 {
 			if r.handler != nil && !continueOnError {
@@ -577,14 +573,6 @@ func (r *ZCRXReceiver) deliverError(err error) {
 	if !r.handler.OnError(err) {
 		_ = r.Stop()
 	}
-}
-
-// errFromResult converts a negative CQE result to an error.
-func errFromResult(res int32) error {
-	if res >= 0 {
-		return nil
-	}
-	return errFromErrno(uintptr(-res))
 }
 
 // mmapArea allocates the shared receive area via mmap.

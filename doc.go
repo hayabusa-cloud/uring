@@ -6,10 +6,8 @@
 // `uring` assumes the 6.18+ baseline and carries no fallback branches for older
 // kernels. Its core Linux `io_uring` implementation was refactored from
 // `code.hybscloud.com/sox` into this dedicated package. It prepares SQEs,
-// decodes CQEs, transports submission context through `user_data`, and exposes
-// kernel-boundary facts. Dispatch, retry, completion routing, route retirement,
-// and connection/session orchestration stay in caller-side runtime code outside
-// this boundary.
+// copies CQEs, and carries submission context through `user_data`. The caller
+// drives the ring and routes each completion to its owner.
 //
 // A typical caller starts the ring, submits an operation, and then treats the
 // completion queue as the source of truth for kernel results. This example has
@@ -158,40 +156,25 @@
 //
 // # Handler Patterns
 //
-// Handler helpers provide convenience step/action adapters. They do not change
-// the underlying CQE facts and are optional.
-//
-// Subscriber pattern (functional callbacks):
+// [NewMultishotSubscriber] adapts functions to [MultishotHandler]. In this
+// accept handler, registerConnection takes ownership of each socket and closes
+// it after its last use.
 //
 //	handler := uring.NewMultishotSubscriber().
 //	    OnStep(func(step uring.MultishotStep) uring.MultishotAction {
-//	        if step.Err == nil {
-//	            return uring.MultishotContinue
+//	        if step.Err != nil {
+//	            return uring.MultishotStop
 //	        }
-//	        return uring.MultishotStop
+//	        registerConnection(iofd.NewFD(int(step.CQE.Res)))
+//	        return uring.MultishotContinue
 //	    }).
 //	    OnStop(func(err error, cancelled bool) {
 //	        log.Println("stopped", err, cancelled)
 //	    })
 //
-// Noop embedding pattern (override only needed methods):
-//
-//	type myHandler struct {
-//	    uring.NoopMultishotHandler
-//	    connections int
-//	}
-//
-//	func (h *myHandler) OnMultishotStep(step uring.MultishotStep) uring.MultishotAction {
-//	    if step.Err == nil && step.CQE.Res >= 0 {
-//	        h.connections++
-//	        return uring.MultishotContinue
-//	    }
-//	    return h.NoopMultishotHandler.OnMultishotStep(step)
-//	}
-//
-// Handlers either return `MultishotContinue` to keep a live subscription, or
-// `MultishotStop` to request cancellation after the current step. The request
-// is local until the cancel SQE is successfully enqueued.
+// Custom handlers can embed [NoopMultishotHandler] and override the methods
+// they need. [MultishotContinue] keeps a live subscription running.
+// [MultishotStop] requests cancellation after a non-final step.
 //
 // # Multishot Subscription Lifecycle
 //
@@ -230,11 +213,12 @@
 // The Multicast zero-copy path and both MulticastZeroCopy paths retain success
 // CQEs regardless of NotifySucceed and reject explicit success suppression.
 //
-// uring is a kernel boundary, not a scheduler. It owns SQE encoding, CQE
-// observation, `user_data` identity, capability exposure, and kernel-facing
-// lifetimes. Runtime policy, completion routing, route retirement, batching,
-// retries, parking, protocol parsing, safety checks, and terminal resource
-// release belong outside this package.
+// Publishing an SQE admits the request. The caller matches each CQE to its
+// source and interprets the result and flags for that operation. The caller
+// decides when to poll, retry, cancel or advance a protocol. For managed
+// operations, dispatching a CQE lets the helper advance its own state.
+// [MultishotSubscription], for example, retains its pooled context through
+// dispatch of the original terminal CQE and any queued cancellation CQE.
 //
 // # Buffer Groups
 //
@@ -302,17 +286,19 @@
 //	}
 //
 // Bundle receives may consume more than one provided buffer in one CQE.
-// Process the iterator and then recycle the consumed slots. Call Recycle
-// exactly once across all copies of an iterator; after it returns, do not read
-// the yielded buffers.
+// A selected slot can accompany EOF or an error and yields one empty slice.
+// Finish all borrowed reads, then call Recycle exactly once across all copies
+// of the iterator to return the slots to the kernel.
 //
 //	if err := ring.ReceiveBundle(recvCtx, &socketFD, uring.WithReadBufferSize(uring.BufferSizeSmall)); err != nil {
 //	    return err
 //	}
 //
 //	if it, ok := ring.BundleIterator(cqe, cqe.BufGroup()); ok {
-//	    for buf := range it.All() {
-//	        handle(buf)
+//	    if it.TotalBytes() > 0 {
+//	        for buf := range it.All() {
+//	            handle(buf)
+//	        }
 //	    }
 //	    if err := it.Recycle(ring); err != nil {
 //	        return err

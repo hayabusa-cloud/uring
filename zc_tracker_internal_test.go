@@ -6,7 +6,10 @@
 
 package uring
 
-import "testing"
+import (
+	"slices"
+	"testing"
+)
 
 type zcContractHandler struct {
 	completed []int32
@@ -21,16 +24,6 @@ func (h *zcContractHandler) OnNotification(result int32) {
 	h.notified = append(h.notified, result)
 }
 
-func assertNoPanic(t *testing.T, f func()) {
-	t.Helper()
-	defer func() {
-		if r := recover(); r != nil {
-			t.Fatalf("unexpected panic: %v", r)
-		}
-	}()
-	f()
-}
-
 func TestZCTrackerNotificationUsesStoredCompletionResult(t *testing.T) {
 	pool := NewContextPools(4)
 	ext := pool.Extended()
@@ -43,7 +36,8 @@ func TestZCTrackerNotificationUsesStoredCompletionResult(t *testing.T) {
 	ctx := asZCCtx(ext)
 
 	completed := CQEView{Res: 23, Flags: IORING_CQE_F_MORE}
-	notified := CQEView{Res: -7, Flags: IORING_CQE_F_NOTIF}
+	usage := uint32(IORING_NOTIF_USAGE_ZC_COPIED)
+	notified := CQEView{Res: int32(usage), Flags: IORING_CQE_F_NOTIF}
 
 	if !tracker.dispatchCQE(completed, ext, ctx, h) {
 		t.Fatal("completed CQE was not handled")
@@ -58,8 +52,8 @@ func TestZCTrackerNotificationUsesStoredCompletionResult(t *testing.T) {
 	if len(h.notified) != 1 || h.notified[0] != 23 {
 		t.Fatalf("OnNotification results: got %v, want [23]", h.notified)
 	}
-	if got := pool.Extended(); got == nil {
-		t.Fatal("expected notification CQE to return ExtSQE to pool")
+	if got := pool.ExtendedAvailable(); got != pool.Capacity() {
+		t.Fatalf("available after release = %d, want %d", got, pool.Capacity())
 	}
 }
 
@@ -193,8 +187,8 @@ func TestZCTrackerHandleCQEUsesNoopHandlerWhenNil(t *testing.T) {
 	if !tracker.HandleCQE(notified) {
 		t.Fatal("notification CQE was not handled")
 	}
-	if got := pool.Extended(); got == nil {
-		t.Fatal("expected notification CQE to return ExtSQE to pool")
+	if got := pool.ExtendedAvailable(); got != pool.Capacity() {
+		t.Fatalf("available after release = %d, want %d", got, pool.Capacity())
 	}
 }
 
@@ -254,41 +248,30 @@ func TestZCTrackerDataAfterEarlyNotificationCompletesAndReleases(t *testing.T) {
 	}
 }
 
-func TestZCTrackerLateNotificationAfterTerminalFallbackDoesNotReleaseAgain(t *testing.T) {
+func TestZCTrackerTerminalDataReturnsContextAfterCallbacks(t *testing.T) {
 	pool := NewContextPools(1)
 	ext := pool.Extended()
 	if ext == nil {
 		t.Fatal("pool exhausted")
 	}
-	h := &zcContractHandler{}
 	tracker := &ZCTracker{pool: pool}
-	ctx := zcInitCtx(ext, tracker, h)
-
-	terminal := CQEView{Res: 23}
-	if !tracker.dispatchCQE(terminal, ext, ctx, h) {
-		t.Fatal("terminal CQE was not handled")
-	}
-	if len(h.completed) != 1 || h.completed[0] != 23 {
-		t.Fatalf("terminal completed callbacks: got %v, want [23]", h.completed)
-	}
-	if len(h.notified) != 1 || h.notified[0] != 23 {
-		t.Fatalf("terminal notification callbacks: got %v, want [23]", h.notified)
-	}
-	if got := pool.ExtendedAvailable(); got != 1 {
-		t.Fatalf("available ExtSQE after terminal fallback: got %d, want 1", got)
-	}
-
-	notified := CQEView{Res: 0, Flags: IORING_CQE_F_NOTIF, ctx: PackExtended(ext)}
-	assertNoPanic(t, func() {
-		if tracker.HandleCQE(notified) {
-			t.Fatal("late notification CQE was handled after ExtSQE release")
+	var calls []string
+	check := func(callback string, result int32) {
+		calls = append(calls, callback)
+		if result != 23 || pool.ExtendedAvailable() != 0 {
+			t.Errorf("%s: result=%d available=%d, want 23 and 0", callback, result, pool.ExtendedAvailable())
 		}
-	})
-	if len(h.completed) != 1 || len(h.notified) != 1 {
-		t.Fatalf("late notification callbacks: got completed=%v notified=%v, want one each", h.completed, h.notified)
 	}
-	if got := pool.ExtendedAvailable(); got != 1 {
-		t.Fatalf("available ExtSQE after late notification: got %d, want 1", got)
+	handler := NewZCSubscriber().
+		OnCompleted(func(result int32) { check("completed", result) }).
+		OnNotification(func(result int32) { check("released", result) }).
+		Handler()
+	zcInitCtx(ext, tracker, handler)
+	if !tracker.HandleCQE(CQEView{Res: 23, ctx: PackExtended(ext)}) {
+		t.Fatal("terminal data CQE was not handled")
+	}
+	if !slices.Equal(calls, []string{"completed", "released"}) || pool.ExtendedAvailable() != 1 {
+		t.Fatalf("callbacks=%v available=%d, want both callbacks and one free context", calls, pool.ExtendedAvailable())
 	}
 }
 
@@ -320,8 +303,8 @@ func TestZCTrackerCQEHandlerDispatchesAnchoredTracker(t *testing.T) {
 	if len(h.notified) != 1 || h.notified[0] != 44 {
 		t.Fatalf("OnNotification results: got %v, want [44]", h.notified)
 	}
-	if got := pool.Extended(); got == nil {
-		t.Fatal("expected notification CQE to return ExtSQE to pool")
+	if got := pool.ExtendedAvailable(); got != pool.Capacity() {
+		t.Fatalf("available after release = %d, want %d", got, pool.Capacity())
 	}
 }
 
@@ -333,6 +316,7 @@ func TestZCTrackerCQEHandlerIgnoresNonExtendedAndUnownedContexts(t *testing.T) {
 	if ext == nil {
 		t.Fatal("pool exhausted")
 	}
+	defer pool.PutExtended(ext)
 	zcTrackerCQEHandler(nil, nil, &ioUringCqe{
 		userData: PackExtended(ext).Raw(),
 		flags:    IORING_CQE_F_MORE,

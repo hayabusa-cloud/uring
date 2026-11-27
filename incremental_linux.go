@@ -8,7 +8,6 @@ package uring
 
 import (
 	"math"
-	"unsafe"
 
 	"code.hybscloud.com/iofd"
 	"code.hybscloud.com/iox"
@@ -16,7 +15,8 @@ import (
 
 // IncrementalHandler handles incremental receive completion events.
 type IncrementalHandler interface {
-	// OnData is called with the newly received fragment.
+	// OnData receives a borrowed fragment whose length and capacity both equal
+	// the byte count reported by this completion.
 	// bufferMore reports IORING_CQE_F_BUF_MORE: the selected buffer remains
 	// incrementally consumable. It does not report parent-request liveness.
 	// The buffer is valid until this callback returns.
@@ -62,7 +62,8 @@ func NewIncrementalReceiver(ring *Uring, pool *ContextPools, groupID uint16, buf
 		bufSize:    bufSize,
 		bufBacking: bufBacking,
 	}
-	if entries > 0 && entries <= 1<<15 {
+	if ring != nil && pool != nil && entries > 0 && entries <= 1<<15 &&
+		bufSize > 0 && bufSize <= math.MaxInt32 && entries <= len(bufBacking)/bufSize {
 		r.bufferOffsets = make([]uint32, entries)
 	}
 	return r
@@ -74,24 +75,18 @@ func NewIncrementalReceiver(ring *Uring, pool *ContextPools, groupID uint16, buf
 // OnComplete runs after the request's successful CQE, including when
 // bufferMore is true.
 //
-// A nil return means the request was queued. Recv returns iox.ErrWouldBlock if
-// the context pool or submission queue is full.
+// A nil return means the request was queued. Recv returns [ErrInvalidParam] for
+// an invalid receiver configuration, or iox.ErrWouldBlock if the pool or SQ is full.
 func (r *IncrementalReceiver) Recv(fd iofd.FD, handler IncrementalHandler) error {
-	if !r.valid() {
+	if r == nil || len(r.bufferOffsets) == 0 {
 		return ErrInvalidParam
 	}
-	if handler == nil {
-		handler = NoopIncrementalHandler{}
-	}
-
 	ext := r.pool.Extended()
 	if ext == nil {
 		return iox.ErrWouldBlock
 	}
 
-	// Initialize context
-	ctx := incInitCtx(ext, r, handler)
-	ctx.Fn = incrementalCQEHandler
+	incInitCtx(ext, r, handler)
 
 	ext.SQE = ioUringSqe{}
 	ext.SQE.opcode = IORING_OP_RECV
@@ -110,13 +105,6 @@ func (r *IncrementalReceiver) Recv(fd iofd.FD, handler IncrementalHandler) error
 	return nil
 }
 
-func (r *IncrementalReceiver) valid() bool {
-	return r != nil && r.ring != nil && r.pool != nil &&
-		r.bufSize > 0 && r.bufSize <= math.MaxInt32 &&
-		len(r.bufferOffsets) > 0 &&
-		len(r.bufBacking)/r.bufSize >= len(r.bufferOffsets)
-}
-
 // HandleCQE dispatches a receive CQE owned by this receiver and returns true.
 // It returns false for a CQE owned by another receiver or operation.
 // Caller must serialize dispatch in CQ order and dispatch each CQE once.
@@ -127,34 +115,22 @@ func (r *IncrementalReceiver) HandleCQE(cqe CQEView) bool {
 		return false
 	}
 
-	if cqe.Op() != IORING_OP_RECV {
-		return false
-	}
-
 	ext := cqe.ExtSQE()
-	if ext == nil {
+	if ext == nil || ext.SQE.opcode != IORING_OP_RECV {
 		return false
 	}
-	owner, _ := extAnchors(ext).owner.(*IncrementalReceiver)
-	if owner != r {
+	if extAnchors(ext).owner != r {
 		return false
 	}
 
-	handler := incGetHandler(ext)
-	if handler == nil {
-		handler = NoopIncrementalHandler{}
-	}
-	return r.handleResolvedCQE(cqe, ext, handler)
+	r.handleResolvedCQE(cqe, ext)
+	return true
 }
 
 // incrementalCQEHandler is the static CQE dispatcher for incremental receive.
 // The live receiver and handler anchors stay in the pooled ExtSQE sidecar.
-var incrementalCQEHandler Handler = func(_ *Uring, _ *ioUringSqe, cqe *ioUringCqe) {
-	view := CQEView{
-		Res:   cqe.res,
-		Flags: cqe.flags,
-		ctx:   SQEContextFromRaw(cqe.userData),
-	}
+func incrementalCQEHandler(_ *Uring, _ *ioUringSqe, cqe *ioUringCqe) {
+	view := cqe.view()
 	if !view.Extended() {
 		return
 	}
@@ -166,44 +142,25 @@ var incrementalCQEHandler Handler = func(_ *Uring, _ *ioUringSqe, cqe *ioUringCq
 	if receiver == nil {
 		return
 	}
-	handler := incGetHandler(ext)
-	if handler == nil {
-		handler = NoopIncrementalHandler{}
-	}
-	receiver.handleResolvedCQE(view, ext, handler)
+	receiver.handleResolvedCQE(view, ext)
 }
 
-// handleCQEWithHandler processes a CQE with the supplied handler.
-// It resolves the anchored extended state before delegating to the shared CQE path.
-func (r *IncrementalReceiver) handleCQEWithHandler(cqe CQEView, handler IncrementalHandler) bool {
-	if !cqe.Extended() {
-		return false
-	}
-	ext := cqe.ExtSQE()
-	if ext == nil {
-		return false
-	}
-	if handler == nil {
-		handler = NoopIncrementalHandler{}
-	}
-	return r.handleResolvedCQE(cqe, ext, handler)
-}
-
-// handleResolvedCQE processes one incremental receive CQE after ownership,
-// rooting, and handler selection have already been resolved.
-func (r *IncrementalReceiver) handleResolvedCQE(cqe CQEView, ext *ExtSQE, handler IncrementalHandler) bool {
+// handleResolvedCQE dispatches an owned single-shot receive and returns its
+// context to the pool after the callbacks finish.
+func (r *IncrementalReceiver) handleResolvedCQE(cqe CQEView, ext *ExtSQE) {
+	handler := extAnchors(ext).handler.(IncrementalHandler)
 	if cqe.Res <= 0 {
 		// A worker can consume the selected buffer before receiving any data.
 		if bufID := cqeBufID(cqe.Flags); cqeHasBuffer(cqe.Flags) && !cqeHasBufferMore(cqe.Flags) && int(bufID) < len(r.bufferOffsets) {
 			r.bufferOffsets[bufID] = 0
 		}
 		if cqe.Res < 0 {
-			handler.OnError(errFromErrno(uintptr(-cqe.Res)))
+			handler.OnError(cqe.Err())
 		} else {
 			handler.OnComplete()
 		}
 		r.pool.PutExtended(ext)
-		return true
+		return
 	}
 
 	bufferMore := cqeHasBufferMore(cqe.Flags)
@@ -211,7 +168,7 @@ func (r *IncrementalReceiver) handleResolvedCQE(cqe CQEView, ext *ExtSQE, handle
 	if err != nil {
 		handler.OnError(err)
 		r.pool.PutExtended(ext)
-		return true
+		return
 	}
 
 	if bufferMore {
@@ -223,8 +180,6 @@ func (r *IncrementalReceiver) handleResolvedCQE(cqe CQEView, ext *ExtSQE, handle
 	handler.OnData(buf, bufferMore)
 	handler.OnComplete()
 	r.pool.PutExtended(ext)
-
-	return true
 }
 
 func (r *IncrementalReceiver) bufferFromCQE(cqe CQEView) ([]byte, uint16, int, error) {
@@ -246,28 +201,15 @@ func (r *IncrementalReceiver) bufferFromCQE(cqe CQEView) ([]byte, uint16, int, e
 	if off < 0 || end < off || end > slotEnd || end > len(r.bufBacking) {
 		return nil, bufID, 0, ErrInvalidParam
 	}
-	return r.bufBacking[off:end], bufID, nextOffset, nil
+	return r.bufBacking[off:end:end], bufID, nextOffset, nil
 }
 
-// incCtx is the raw scalar dispatch context for incremental receive.
-type incCtx struct {
-	Fn Handler  // 8 bytes - static dispatch function
-	_  [56]byte // reserved for future scalar state
-}
-
-var _ [64 - unsafe.Sizeof(incCtx{})]struct{}
-
-// incInitCtx initializes an incCtx in the ExtSQE UserData.
-func incInitCtx(ext *ExtSQE, receiver *IncrementalReceiver, handler IncrementalHandler) *incCtx {
-	ctx := (*incCtx)(unsafe.Pointer(&ext.UserData[0]))
+func incInitCtx(ext *ExtSQE, receiver *IncrementalReceiver, handler IncrementalHandler) {
+	if handler == nil {
+		handler = NoopIncrementalHandler{}
+	}
 	anchors := extAnchors(ext)
 	anchors.owner = receiver
 	anchors.handler = handler
-	return ctx
-}
-
-// incGetHandler returns the anchored IncrementalHandler.
-func incGetHandler(ext *ExtSQE) IncrementalHandler {
-	handler, _ := extAnchors(ext).handler.(IncrementalHandler)
-	return handler
+	CastUserData[Ctx0](ext).Fn = incrementalCQEHandler
 }

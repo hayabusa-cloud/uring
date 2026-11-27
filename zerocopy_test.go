@@ -8,165 +8,22 @@ package uring_test
 
 import (
 	"bytes"
-	"errors"
-	"net"
+	"io"
 	"testing"
 	"time"
 
 	"code.hybscloud.com/iofd"
-	"code.hybscloud.com/iox"
+	"code.hybscloud.com/sock"
 	"code.hybscloud.com/uring"
+	"code.hybscloud.com/zcall"
 )
 
-// =============================================================================
-// Fixed Buffer Zero-Copy Send Tests
-// =============================================================================
-
-// TestSendZeroCopyFixed verifies basic zero-copy send with registered buffers.
-// Uses a single target socket and validates data is received correctly.
-// Note: zero-copy send may return EOPNOTSUPP on Unix sockets or loopback.
 func TestSendZeroCopyFixed(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipping zero-copy send test in short mode (requires reliable io_uring)")
+		t.Skip("skipping TCP integration test in short mode")
 	}
-
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
-		opt.NotifySucceed = true
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	mustStartRing(t, ring)
-
-	// Check registered buffers are available
-	bufCount := ring.RegisteredBufferCount()
-	if bufCount < 1 {
-		t.Skip("no registered buffers available")
-	}
-	t.Logf("registered buffers: %d", bufCount)
-
-	// Note: Zero-copy send may not be supported on all socket types.
-	// Unix sockets and loopback typically don't support SEND_ZC.
-	// This test verifies the API works and handles EOPNOTSUPP gracefully.
-
-	// Create TCP socket pair using standard library
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Listen: %v", err)
-	}
-	defer ln.Close()
-	addr := ln.Addr().(*net.TCPAddr)
-
-	// Connect client
-	clientConn, err := net.DialTimeout("tcp", addr.String(), 2*time.Second)
-	if err != nil {
-		t.Fatalf("Dial: %v", err)
-	}
-	defer clientConn.Close()
-
-	// Accept on server
-	serverConn, err := ln.Accept()
-	if err != nil {
-		t.Fatalf("Accept: %v", err)
-	}
-	defer serverConn.Close()
-
-	// Prepare test data in registered buffer
-	// The payload exceeds the single-target zero-copy threshold.
-	testData := make([]byte, 2048)
-	for i := range testData {
-		testData[i] = byte('A' + i%26)
-	}
-	regBuf := ring.RegisteredBuffer(0)
-	if regBuf == nil {
-		t.Fatal("RegisteredBuffer(0) returned nil")
-	}
-	copy(regBuf, testData)
-
-	// Get raw FD for client connection (we need to use io_uring for sending)
-	// Since we're using stdlib net.Conn, we'll use Multicast with single target
-	serverFile, err := serverConn.(*net.TCPConn).File()
-	if err != nil {
-		t.Fatalf("File: %v", err)
-	}
-	defer serverFile.Close()
-
-	// Use MulticastZeroCopy with single target
-	targets := &singleTarget{fd: iofd.FD(serverFile.Fd())}
-
-	ctx := uring.PackDirect(uring.IORING_OP_SEND_ZC, 0, 0, int32(targets.fd))
-	_, err = ring.MulticastZeroCopy(ctx, targets, 0, 0, len(testData))
-	if err != nil {
-		t.Fatalf("MulticastZeroCopy: %v", err)
-	}
-
-	// Wait for the operation CQE and, when the kernel reports MORE, its
-	// notification CQE.
-	cqes := make([]uring.CQEView, 16)
-	deadline := time.Now().Add(3 * time.Second)
-	b := iox.Backoff{}
-	opCompleted := false
-	notifReceived := false
-
-	eopnotsupp := false
-	for time.Now().Before(deadline) && (!opCompleted || !notifReceived) {
-		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
-			t.Fatalf("Wait: %v", err)
-		}
-		for i := 0; i < n; i++ {
-			cqe := &cqes[i]
-			if cqe.Op() == uring.IORING_OP_SEND_ZC {
-				if cqe.IsNotification() {
-					notifReceived = true
-					t.Logf("notification CQE received, res=%d flags=0x%x", cqe.Res, cqe.Flags)
-				} else {
-					opCompleted = true
-					if cqe.Res == -int32(uring.EOPNOTSUPP) {
-						eopnotsupp = true
-						t.Logf("SEND_ZC returned EOPNOTSUPP (expected on loopback/Unix sockets)")
-					} else if cqe.Res < 0 {
-						t.Errorf("SEND_ZC failed: res=%d", cqe.Res)
-					} else {
-						t.Logf("operation CQE received, res=%d flags=0x%x hasMore=%v",
-							cqe.Res, cqe.Flags, cqe.HasMore())
-					}
-				}
-			}
-		}
-		b.Wait()
-	}
-
-	if !opCompleted {
-		if !notifReceived {
-			t.Skip("no zero-copy CQEs observed on loopback in this environment")
-		}
-		t.Fatal("notification CQE arrived without operation CQE")
-	}
-	// Note: notification may not always be received depending on kernel and socket state
-
-	// Skip data verification if EOPNOTSUPP (zero-copy not supported on this socket)
-	if eopnotsupp {
-		t.Log("skipping data verification (SEND_ZC not supported on loopback)")
-		return
-	}
-
-	// Verify data received on client side
-	clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	recvBuf := make([]byte, len(testData)+10)
-	totalRead := 0
-	for totalRead < len(testData) {
-		n, err := clientConn.Read(recvBuf[totalRead:])
-		if err != nil {
-			t.Fatalf("client Read: %v", err)
-		}
-		totalRead += n
-	}
-	if !bytes.Equal(recvBuf[:totalRead], testData) {
-		t.Errorf("data mismatch: got %d bytes, want %d bytes", totalRead, len(testData))
-	}
-	t.Logf("received %d bytes correctly", totalRead)
+	ring := newTestRing(t)
+	checkRegisteredStream(t, ring, bytes.Repeat([]byte("registered send "), 128))
 }
 
 // singleTarget implements SendTargets for a single FD
@@ -177,215 +34,63 @@ type singleTarget struct {
 func (t *singleTarget) Count() int       { return 1 }
 func (t *singleTarget) FD(i int) iofd.FD { return iofd.FD(t.fd) }
 
-// TestZeroCopyNotificationFlags verifies the zero-copy notification path.
-// The notification path emits an operation CQE with MORE and a notification CQE
-// with NOTIF; terminal operation CQEs without MORE use the fallback path.
 func TestZeroCopyNotificationFlags(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
-		opt.NotifySucceed = true
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
+	ring := newTestRing(t)
+	fd, peer := newTestUDPPair(t)
+	ctx := uring.ForFD(int32(fd))
+	id := ctx.WithOp(uring.IORING_OP_SEND_ZC)
+
+	// An oversized IPv4 datagram fails at execution. MORE still promises a notification.
+	accepted, err := ring.MulticastZeroCopy(ctx, &singleTarget{fd: fd}, 0, 0, 1<<16)
+	if accepted != 1 || err != nil {
+		t.Fatalf("accepted %d targets, error %v", accepted, err)
 	}
-	mustStartRing(t, ring)
-
-	if ring.RegisteredBufferCount() < 1 {
-		t.Skip("no registered buffers available")
-	}
-
-	// Create socket pair
-	fds, err := newUnixSocketPairForTest()
-	if err != nil {
-		t.Fatalf("socketpair: %v", err)
-	}
-	defer closeTestFds(fds)
-
-	// Write test data to registered buffer
-	regBuf := ring.RegisteredBuffer(0)
-	testData := bytes.Repeat([]byte("X"), 4096) // 4KB to ensure zero-copy path
-	copy(regBuf, testData)
-
-	// Submit zero-copy send (using the write FD)
-	targets := &singleTarget{fd: fds[1]}
-	ctx := uring.PackDirect(uring.IORING_OP_SEND_ZC, 0, 0, int32(fds[1]))
-	_, err = ring.MulticastZeroCopy(ctx, targets, 0, 0, len(testData))
-	if err != nil {
-		t.Fatalf("MulticastZeroCopy: %v", err)
+	if res := waitRegisteredSends(t, ring, id)[id]; res != -int32(uring.EMSGSIZE) {
+		t.Fatalf("data result %d, want -EMSGSIZE", res)
 	}
 
-	// Collect CQEs and verify flags
-	cqes := make([]uring.CQEView, 16)
-	deadline := time.Now().Add(3 * time.Second)
-	b := iox.Backoff{}
-
-	var opCQE, notifCQE *uring.CQEView
-
-	for time.Now().Before(deadline) {
-		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
-			t.Fatalf("Wait: %v", err)
-		}
-		for i := 0; i < n; i++ {
-			cqe := &cqes[i]
-			if cqe.Op() == uring.IORING_OP_SEND_ZC {
-				if cqe.IsNotification() {
-					notifCQE = cqe
-					t.Logf("NOTIF CQE: res=%d flags=0x%x", cqe.Res, cqe.Flags)
-				} else {
-					opCQE = cqe
-					t.Logf("OP CQE: res=%d flags=0x%x hasMore=%v", cqe.Res, cqe.Flags, cqe.HasMore())
-				}
-			}
-		}
-		if opCQE != nil && notifCQE != nil {
-			break
-		}
-		b.Wait()
-	}
-
-	// Verify operation CQE
-	if opCQE == nil {
-		t.Fatal("operation CQE not received")
-	}
-	if opCQE.Res == -int32(uring.EOPNOTSUPP) {
-		t.Log("SEND_ZC returned EOPNOTSUPP (expected on Unix sockets)")
-	} else if opCQE.Res < 0 {
-		t.Errorf("SEND_ZC failed: res=%d", opCQE.Res)
-	}
-
-	// HasMore reports whether a notification CQE follows the operation CQE.
-	t.Logf("operation HasMore: %v", opCQE.HasMore())
-
-	if notifCQE == nil {
-		if opCQE.HasMore() {
-			t.Log("notification CQE not received before deadline")
-		} else {
-			t.Log("terminal operation CQE used no-notification fallback")
-		}
-	} else {
-		if !notifCQE.IsNotification() {
-			t.Error("notification CQE missing IORING_CQE_F_NOTIF flag")
-		}
-		t.Log("zero-copy notification lifecycle verified")
-	}
+	// The failed send has released the slot. Send a valid datagram with the same identity.
+	checkRegisteredDatagrams(t, ring, fd, peer, uring.IORING_OP_SEND_ZC,
+		bytes.Repeat([]byte("Z"), 2048))
 }
 
-// TestSendZeroCopyFixedMultiTarget tests zero-copy send to multiple sockets.
-// The same registered buffer is sent to all targets efficiently.
 func TestSendZeroCopyFixedMultiTarget(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
-		opt.NotifySucceed = true
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	mustStartRing(t, ring)
-
-	if ring.RegisteredBufferCount() < 1 {
-		t.Skip("no registered buffers available")
-	}
-
-	// Create multiple socket pairs (3 targets)
-	const numTargets = 3
-	var pairs [][2]iofd.FD
-	var readers []iofd.FD
-	var writers []iofd.FD
-
-	for i := 0; i < numTargets; i++ {
-		fds, err := newUnixSocketPairForTest()
-		if err != nil {
-			for _, p := range pairs {
-				closeTestFds(p)
-			}
-			t.Fatalf("socketpair[%d]: %v", i, err)
+	ring := newTestRing(t)
+	var fds [4]iofd.FD
+	var peers [len(fds)]*sock.UDPConn
+	for i := range fds {
+		if i == 1 {
+			fds[i] = -1
+			continue
 		}
-		pairs = append(pairs, fds)
-		readers = append(readers, fds[0])
-		writers = append(writers, fds[1])
+		fds[i], peers[i] = newTestUDPPair(t)
 	}
-	defer func() {
-		for _, p := range pairs {
-			closeTestFds(p)
-		}
-	}()
-
-	// Prepare test data in registered buffer
-	// Each target uses the zero-copy completion protocol.
-	regBuf := ring.RegisteredBuffer(0)
-	testData := make([]byte, 2048)
-	for i := range testData {
-		testData[i] = byte('A' + i%26)
+	payload := bytes.Repeat([]byte("multicast payload "), 128)
+	copy(ring.RegisteredBuffer(0), payload)
+	accepted, err := ring.MulticastZeroCopy(uring.ForFD(0), &multiTargets{fds: fds[:]}, 0, 0, len(payload))
+	if accepted != len(fds) || err != nil {
+		t.Fatalf("accepted %d of %d targets, error %v", accepted, len(fds), err)
 	}
-	copy(regBuf, testData)
-
-	// Create multi-target adapter
-	targets := &multiTargets{fds: writers}
-
-	// Submit multicast zero-copy
-	ctx := uring.PackDirect(uring.IORING_OP_SEND_ZC, 0, 0, 0)
-	_, err = ring.MulticastZeroCopy(ctx, targets, 0, 0, len(testData))
-	if err != nil {
-		t.Fatalf("MulticastZeroCopy: %v", err)
+	if _, err := ring.Wait(nil); err != nil {
+		t.Fatal(err)
 	}
-
-	// Wait for all completions
-	cqes := make([]uring.CQEView, 32)
-	deadline := time.Now().Add(3 * time.Second)
-	b := iox.Backoff{}
-	opCount := 0
-	eopnotsupp := false
-
-	for time.Now().Before(deadline) && opCount < numTargets {
-		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
-			t.Fatalf("Wait: %v", err)
-		}
-		for i := 0; i < n; i++ {
-			cqe := &cqes[i]
-			if cqe.Op() == uring.IORING_OP_SEND_ZC && !cqe.IsNotification() {
-				opCount++
-				if cqe.Res == -int32(uring.EOPNOTSUPP) {
-					eopnotsupp = true
-					t.Logf("SEND_ZC[%d] returned EOPNOTSUPP (expected on Unix sockets)", opCount-1)
-				} else if cqe.Res < 0 {
-					t.Errorf("SEND_ZC[%d] failed: res=%d", opCount-1, cqe.Res)
-				}
-			}
-		}
-		b.Wait()
-	}
-
-	if opCount < numTargets {
-		t.Errorf("only %d/%d operations completed", opCount, numTargets)
-	}
-
-	// Skip data verification if EOPNOTSUPP
-	if eopnotsupp {
-		t.Log("skipping data verification (SEND_ZC not supported on Unix sockets)")
-		return
-	}
-
-	// Verify all readers received the data
-	recvBuf := make([]byte, len(testData)+10)
-	for i, rfd := range readers {
-		// Read all data (may come in multiple chunks)
-		totalRead := 0
-		deadline := time.Now().Add(time.Second)
-		for totalRead < len(testData) && time.Now().Before(deadline) {
-			n, errno := readWithTimeout(rfd, recvBuf[totalRead:], 100*time.Millisecond)
-			if errno != 0 && errno != 11 { // 11 = EAGAIN
-				t.Errorf("reader[%d] read failed: errno=%d", i, errno)
-				break
-			}
-			totalRead += n
-		}
-		if totalRead != len(testData) {
-			t.Errorf("reader[%d] got %d bytes, want %d", i, totalRead, len(testData))
+	var ids [len(fds)]uring.SQEContext
+	for i, fd := range fds {
+		ids[i] = uring.PackDirect(uring.IORING_OP_SEND_ZC, 0, 0, int32(fd))
+		if peers[i] != nil {
+			requireDatagram(t, peers[i], payload)
 		}
 	}
-	t.Logf("all %d targets received data correctly", numTargets)
+	results := waitRegisteredSends(t, ring, ids[:]...)
+	for i, id := range ids {
+		want := int32(len(payload))
+		if peers[i] == nil {
+			want = -int32(zcall.EBADF)
+		}
+		if res := results[id]; res != want {
+			t.Fatalf("target %d: data result %d, want %d", i, res, want)
+		}
+	}
 }
 
 type multiTargets struct {
@@ -403,542 +108,216 @@ func (t *multiTargets) FD(i int) iofd.FD {
 	return t.fds[i]
 }
 
-// TestZeroCopyBufferSafety verifies buffer is safe to reuse after notification.
-// Modifying the buffer before notification arrives is unsafe; after is safe.
 func TestZeroCopyBufferSafety(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
-		opt.NotifySucceed = true
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	mustStartRing(t, ring)
-
-	if ring.RegisteredBufferCount() < 1 {
-		t.Skip("no registered buffers available")
-	}
-
-	// Create socket pair
-	fds, err := newUnixSocketPairForTest()
-	if err != nil {
-		t.Fatalf("socketpair: %v", err)
-	}
-	defer closeTestFds(fds)
-
-	regBuf := ring.RegisteredBuffer(0)
-
-	// Test 1: Send first message
-	// Keep this registered payload unchanged until release evidence arrives.
-	msg1 := make([]byte, 2048)
-	for i := range msg1 {
-		msg1[i] = byte('1')
-	}
-	copy(regBuf, msg1)
-
-	targets := &singleTarget{fd: fds[1]}
-	ctx := uring.PackDirect(uring.IORING_OP_SEND_ZC, 0, 0, int32(fds[1]))
-	_, err = ring.MulticastZeroCopy(ctx, targets, 0, 0, len(msg1))
-	if err != nil {
-		t.Fatalf("first MulticastZeroCopy: %v", err)
-	}
-
-	// Wait for notification before modifying buffer
-	cqes := make([]uring.CQEView, 16)
-	deadline := time.Now().Add(3 * time.Second)
-	b := iox.Backoff{}
-	notifReceived := false
-	opCompleted := false
-	releaseReady := false
-	eopnotsupp := false
-
-	for time.Now().Before(deadline) && !releaseReady {
-		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
-			t.Fatalf("Wait: %v", err)
-		}
-		for i := 0; i < n; i++ {
-			cqe := &cqes[i]
-			if cqe.Op() == uring.IORING_OP_SEND_ZC {
-				if cqe.IsNotification() {
-					notifReceived = true
-					if opCompleted {
-						releaseReady = true
-					}
-				} else {
-					opCompleted = true
-					if cqe.Res == -int32(uring.EOPNOTSUPP) {
-						eopnotsupp = true
-					} else if cqe.Res < 0 {
-						t.Errorf("SEND_ZC failed: res=%d", cqe.Res)
-					}
-					if !cqe.HasMore() {
-						releaseReady = true
-					} else if notifReceived {
-						releaseReady = true
-					}
-				}
-			}
-		}
-		b.Wait()
-	}
-
-	if !opCompleted {
-		if !notifReceived {
-			t.Skip("no zero-copy CQEs observed on Unix socket pair in this environment")
-		}
-		t.Fatal("operation CQE not received")
-	}
-
-	// Skip buffer safety test if SEND_ZC not supported
-	if eopnotsupp {
-		t.Log("SEND_ZC returned EOPNOTSUPP, buffer safety test verified (no data sent)")
-		return
-	}
-	if !releaseReady {
-		t.Skip("SEND_ZC release frontier not observed before deadline")
-	}
-
-	// Read first message
-	recvBuf := make([]byte, len(msg1)+10)
-	totalRead := 0
-	readDeadline := time.Now().Add(time.Second)
-	for totalRead < len(msg1) && time.Now().Before(readDeadline) {
-		n, errno := readWithTimeout(fds[0], recvBuf[totalRead:], 100*time.Millisecond)
-		if errno != 0 && errno != 11 { // 11 = EAGAIN
-			t.Fatalf("first read failed: errno=%d", errno)
-		}
-		totalRead += n
-	}
-	if !bytes.Equal(recvBuf[:totalRead], msg1) {
-		t.Errorf("first message mismatch: got %d bytes, want %d", totalRead, len(msg1))
-	}
-
-	// Now it's safe to modify the buffer (notification received or timed out)
-	// Test 2: Send second message using the same buffer
-	msg2 := make([]byte, 2048)
-	for i := range msg2 {
-		msg2[i] = byte('2')
-	}
-	copy(regBuf, msg2)
-
-	ctx2 := uring.PackDirect(uring.IORING_OP_SEND_ZC, 0, 1, int32(fds[1]))
-	_, err = ring.MulticastZeroCopy(ctx2, targets, 0, 0, len(msg2))
-	if err != nil {
-		t.Fatalf("second MulticastZeroCopy: %v", err)
-	}
-
-	// Wait for second operation
-	deadline = time.Now().Add(3 * time.Second)
-	b = iox.Backoff{}
-	op2Completed := false
-	op2Unsupported := false
-
-	for time.Now().Before(deadline) && !op2Completed {
-		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
-			t.Fatalf("Wait: %v", err)
-		}
-		for i := 0; i < n; i++ {
-			cqe := &cqes[i]
-			if cqe.Op() == uring.IORING_OP_SEND_ZC && !cqe.IsNotification() {
-				op2Completed = true
-				if cqe.Res == -int32(uring.EOPNOTSUPP) {
-					op2Unsupported = true
-				} else if cqe.Res < 0 {
-					t.Errorf("second SEND_ZC failed: res=%d", cqe.Res)
-				}
-			}
-		}
-		b.Wait()
-	}
-	if !op2Completed {
-		t.Skip("second SEND_ZC operation CQE not observed before deadline")
-	}
-	if op2Unsupported {
-		t.Skip("second SEND_ZC returned EOPNOTSUPP in this environment")
-	}
-
-	// Read second message
-	totalRead = 0
-	readDeadline = time.Now().Add(time.Second)
-	for totalRead < len(msg2) && time.Now().Before(readDeadline) {
-		n, errno := readWithTimeout(fds[0], recvBuf[totalRead:], 100*time.Millisecond)
-		if errno != 0 && errno != 11 { // 11 = EAGAIN
-			t.Fatalf("second read failed: errno=%d", errno)
-		}
-		totalRead += n
-	}
-	if !bytes.Equal(recvBuf[:totalRead], msg2) {
-		t.Errorf("second message mismatch: got %d bytes, want %d", totalRead, len(msg2))
-	}
-
-	t.Logf("buffer safely reused after notification")
+	ring := newTestRing(t)
+	checkRegisteredStream(t, ring, bytes.Repeat([]byte("A"), 2048), bytes.Repeat([]byte("B"), 2048))
 }
 
-// =============================================================================
-// Zero-Copy Edge Case Tests
-// =============================================================================
-
-// TestZeroCopyLargeBuffer tests zero-copy send with maximum buffer size.
 func TestZeroCopyLargeBuffer(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
-		opt.NotifySucceed = true
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
+	ring := newTestRing(t)
+	payload := make([]byte, len(ring.RegisteredBuffer(0)))
+	if len(payload) == 0 {
+		t.Fatal("missing registered buffer")
 	}
-	mustStartRing(t, ring)
-
-	if ring.RegisteredBufferCount() < 1 {
-		t.Skip("no registered buffers available")
+	for i := range payload {
+		payload[i] = byte(i % 251)
 	}
-
-	regBuf := ring.RegisteredBuffer(0)
-	if regBuf == nil {
-		t.Fatal("RegisteredBuffer(0) returned nil")
-	}
-
-	// Fill entire buffer with pattern
-	for i := range regBuf {
-		regBuf[i] = byte(i % 256)
-	}
-	bufLen := len(regBuf)
-	t.Logf("testing with buffer size: %d bytes", bufLen)
-
-	// Create socket pair
-	fds, err := newUnixSocketPairForTest()
-	if err != nil {
-		t.Fatalf("socketpair: %v", err)
-	}
-	defer closeTestFds(fds)
-
-	// Submit zero-copy send with full buffer
-	targets := &singleTarget{fd: fds[1]}
-	ctx := uring.PackDirect(uring.IORING_OP_SEND_ZC, 0, 0, int32(fds[1]))
-
-	// Use smaller size to avoid socket buffer issues
-	sendSize := min(bufLen, 65536)
-	_, err = ring.MulticastZeroCopy(ctx, targets, 0, 0, sendSize)
-	if err != nil {
-		t.Fatalf("MulticastZeroCopy: %v", err)
-	}
-
-	// Wait for completion
-	cqes := make([]uring.CQEView, 16)
-	deadline := time.Now().Add(3 * time.Second)
-	b := iox.Backoff{}
-	opCompleted := false
-
-	for time.Now().Before(deadline) && !opCompleted {
-		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
-			t.Fatalf("Wait: %v", err)
-		}
-		for i := 0; i < n; i++ {
-			cqe := &cqes[i]
-			if cqe.Op() == uring.IORING_OP_SEND_ZC && !cqe.IsNotification() {
-				opCompleted = true
-				if cqe.Res == -int32(uring.EOPNOTSUPP) {
-					t.Log("SEND_ZC returned EOPNOTSUPP (expected on Unix sockets)")
-				} else if cqe.Res < 0 {
-					t.Errorf("SEND_ZC failed: res=%d", cqe.Res)
-				} else {
-					t.Logf("large buffer send completed: %d bytes", cqe.Res)
-				}
-			}
-		}
-		b.Wait()
-	}
-
-	if !opCompleted {
-		t.Error("operation CQE not received")
-	}
+	checkRegisteredStream(t, ring, payload)
 }
 
-// TestZeroCopyMultipleBuffers tests using different registered buffers.
+// For two outstanding sends to the same FD, only the slot differs in user_data.
 func TestZeroCopyMultipleBuffers(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, testTwoRegisteredBuffersOptions, func(opt *uring.Options) {
-		opt.NotifySucceed = true
+	t.Run("SEND", func(t *testing.T) {
+		ring := newTestRing(t, testTwoRegisteredBuffersOptions)
+		fd, peer := newTestUDPPair(t)
+		checkRegisteredDatagrams(t, ring, fd, peer, uring.IORING_OP_SEND,
+			[]byte("first slot"), []byte("second slot"))
 	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	mustStartRing(t, ring)
-
-	bufCount := ring.RegisteredBufferCount()
-	if bufCount < 2 {
-		t.Skipf("need at least 2 registered buffers, have %d", bufCount)
-	}
-	t.Logf("testing with %d registered buffers", bufCount)
-
-	// Create socket pairs for each buffer
-	numTests := min(bufCount, 4)
-	var pairs [][2]iofd.FD
-
-	for i := 0; i < numTests; i++ {
-		fds, err := newUnixSocketPairForTest()
-		if err != nil {
-			for _, p := range pairs {
-				closeTestFds(p)
-			}
-			t.Fatalf("socketpair[%d]: %v", i, err)
-		}
-		pairs = append(pairs, fds)
-	}
-	defer func() {
-		for _, p := range pairs {
-			closeTestFds(p)
-		}
-	}()
-
-	// Write unique data to each buffer
-	messages := make([][]byte, numTests)
-	for i := 0; i < numTests; i++ {
-		buf := ring.RegisteredBuffer(i)
-		if buf == nil {
-			t.Fatalf("RegisteredBuffer(%d) returned nil", i)
-		}
-		msg := []byte("Buffer " + string(rune('A'+i)) + " content")
-		copy(buf, msg)
-		messages[i] = msg
-	}
-
-	// Submit sends from different buffers
-	for i := 0; i < numTests; i++ {
-		targets := &singleTarget{fd: pairs[i][1]}
-		ctx := uring.PackDirect(uring.IORING_OP_SEND_ZC, 0, uint16(i), int32(pairs[i][1]))
-		_, err := ring.MulticastZeroCopy(ctx, targets, i, 0, len(messages[i]))
-		if err != nil {
-			t.Fatalf("MulticastZeroCopy[%d]: %v", i, err)
-		}
-	}
-
-	// Wait for all completions
-	cqes := make([]uring.CQEView, 32)
-	deadline := time.Now().Add(3 * time.Second)
-	b := iox.Backoff{}
-	completions := 0
-
-	for time.Now().Before(deadline) && completions < numTests {
-		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
-			t.Fatalf("Wait: %v", err)
-		}
-		for i := 0; i < n; i++ {
-			cqe := &cqes[i]
-			if cqe.Op() == uring.IORING_OP_SEND_ZC && !cqe.IsNotification() {
-				completions++
-				if cqe.Res == -int32(uring.EOPNOTSUPP) {
-					t.Logf("buffer %d: EOPNOTSUPP", completions-1)
-				} else if cqe.Res < 0 {
-					t.Errorf("buffer %d failed: res=%d", completions-1, cqe.Res)
-				}
-			}
-		}
-		b.Wait()
-	}
-
-	t.Logf("completed %d/%d buffer sends", completions, numTests)
+	t.Run("SEND_ZC", func(t *testing.T) {
+		ring := newTestRing(t, testTwoRegisteredBuffersOptions)
+		fd, peer := newTestUDPPair(t)
+		checkRegisteredDatagrams(t, ring, fd, peer, uring.IORING_OP_SEND_ZC,
+			bytes.Repeat([]byte("A"), 2048), bytes.Repeat([]byte("B"), 2049))
+	})
 }
 
-// TestZeroCopyErrorHandling tests error handling in zero-copy operations.
 func TestZeroCopyErrorHandling(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
-		opt.NotifySucceed = true
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	mustStartRing(t, ring)
-
-	if ring.RegisteredBufferCount() < 1 {
-		t.Skip("no registered buffers available")
-	}
-
-	// Test 1: Invalid FD (-1)
-	t.Run("invalid_fd", func(t *testing.T) {
-		targets := &singleTarget{fd: -1}
-		ctx := uring.PackDirect(uring.IORING_OP_SEND_ZC, 0, 0, -1)
-		_, err := ring.MulticastZeroCopy(ctx, targets, 0, 0, 2048)
-		if err != nil {
-			t.Logf("expected error for invalid FD: %v", err)
-		}
-
-		// Wait for error CQE
-		cqes := make([]uring.CQEView, 8)
-		deadline := time.Now().Add(time.Second)
-		b := iox.Backoff{}
-		for time.Now().Before(deadline) {
-			n, err := ring.Wait(cqes)
-			if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
-				t.Fatalf("Wait: %v", err)
-			}
-			for i := 0; i < n; i++ {
-				cqe := &cqes[i]
-				if cqe.Op() == uring.IORING_OP_SEND_ZC && !cqe.IsNotification() {
-					if cqe.Res >= 0 {
-						t.Errorf("expected error, got res=%d", cqe.Res)
-					} else {
-						t.Logf("got expected error: res=%d", cqe.Res)
-					}
-					return
+	for _, name := range []string{"invalid_fd", "closed_socket"} {
+		t.Run(name, func(t *testing.T) {
+			ring := newTestRing(t)
+			fd := iofd.FD(-1)
+			if name == "closed_socket" {
+				fds, err := newUnixSocketPairForTest()
+				if err != nil {
+					t.Fatal(err)
 				}
+				fd = fds[1]
+				closeTestFds(fds)
 			}
-			b.Wait()
-		}
-	})
-
-	// Test 2: Closed socket
-	t.Run("closed_socket", func(t *testing.T) {
-		fds, err := newUnixSocketPairForTest()
-		if err != nil {
-			t.Fatalf("socketpair: %v", err)
-		}
-		// Close immediately
-		closeTestFds(fds)
-
-		targets := &singleTarget{fd: fds[1]}
-		ctx := uring.PackDirect(uring.IORING_OP_SEND_ZC, 0, 0, int32(fds[1]))
-		_, err = ring.MulticastZeroCopy(ctx, targets, 0, 0, 2048)
-		if err != nil {
-			t.Logf("submit error (may be expected): %v", err)
-		}
-
-		// Wait for error CQE
-		cqes := make([]uring.CQEView, 8)
-		deadline := time.Now().Add(time.Second)
-		b := iox.Backoff{}
-		for time.Now().Before(deadline) {
-			n, err := ring.Wait(cqes)
-			if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
-				t.Fatalf("Wait: %v", err)
+			ctx := uring.ForFD(int32(fd))
+			accepted, err := ring.MulticastZeroCopy(ctx, &singleTarget{fd: fd}, 0, 0, 2048)
+			if accepted != 1 || err != nil {
+				t.Fatalf("accepted %d targets, error %v", accepted, err)
 			}
-			for i := 0; i < n; i++ {
-				cqe := &cqes[i]
-				if cqe.Op() == uring.IORING_OP_SEND_ZC && !cqe.IsNotification() {
-					if cqe.Res >= 0 {
-						t.Logf("unexpected success: res=%d", cqe.Res)
-					} else {
-						t.Logf("got expected error: res=%d (EBADF=-9, ENOTSOCK=-88)", cqe.Res)
-					}
-					return
-				}
+			id := ctx.WithOp(uring.IORING_OP_SEND_ZC)
+			if res := waitRegisteredSends(t, ring, id)[id]; res != -int32(zcall.EBADF) {
+				t.Fatalf("data result %d, want -EBADF", res)
 			}
-			b.Wait()
-		}
-	})
+		})
+	}
 }
 
-// TestZeroCopySequentialSends tests multiple sequential sends on same buffer.
 func TestZeroCopySequentialSends(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
-		opt.NotifySucceed = true
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
+	ring := newTestRing(t)
+	fd, peer := newTestUDPPair(t)
+	for seq := range 5 {
+		payload := bytes.Repeat([]byte{byte('0' + seq)}, 2048)
+		// Each call drains this send before the next overwrite of slot 0.
+		checkRegisteredDatagrams(t, ring, fd, peer, uring.IORING_OP_SEND_ZC, payload)
 	}
-	mustStartRing(t, ring)
-
-	if ring.RegisteredBufferCount() < 1 {
-		t.Skip("no registered buffers available")
-	}
-
-	fds, err := newUnixSocketPairForTest()
-	if err != nil {
-		t.Fatalf("socketpair: %v", err)
-	}
-	defer closeTestFds(fds)
-
-	regBuf := ring.RegisteredBuffer(0)
-	const numSends = 5
-
-	for seq := 0; seq < numSends; seq++ {
-		// Each payload exceeds the single-target zero-copy threshold.
-		msg := bytes.Repeat([]byte{byte('0' + seq)}, 2048)
-		copy(regBuf, msg)
-
-		targets := &singleTarget{fd: fds[1]}
-		ctx := uring.PackDirect(uring.IORING_OP_SEND_ZC, 0, uint16(seq), int32(fds[1]))
-		_, err := ring.MulticastZeroCopy(ctx, targets, 0, 0, len(msg))
-		if err != nil {
-			t.Fatalf("send[%d]: %v", seq, err)
-		}
-
-		// Wait for this send to complete before next
-		cqes := make([]uring.CQEView, 8)
-		deadline := time.Now().Add(3 * time.Second)
-		b := iox.Backoff{}
-		opDone := false
-		notifDone := false
-		unsupported := false
-
-		for time.Now().Before(deadline) && (!opDone || !notifDone) {
-			n, err := ring.Wait(cqes)
-			if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
-				t.Fatalf("Wait: %v", err)
-			}
-			for i := 0; i < n; i++ {
-				cqe := &cqes[i]
-				if cqe.Op() == uring.IORING_OP_SEND_ZC {
-					if cqe.IsNotification() {
-						notifDone = true
-					} else {
-						opDone = true
-						if cqe.Res == -int32(uring.EOPNOTSUPP) {
-							t.Logf("send[%d]: EOPNOTSUPP", seq)
-							unsupported = true
-							notifDone = true // Skip waiting for notification
-						} else if cqe.Res < 0 {
-							t.Errorf("send[%d] failed: res=%d", seq, cqe.Res)
-						} else if !cqe.HasMore() {
-							notifDone = true
-						}
-					}
-				}
-			}
-			if n > 0 {
-				b.Reset()
-			}
-			b.Wait()
-		}
-		if !opDone {
-			t.Skipf("send[%d]: SEND_ZC operation CQE not observed before deadline on Unix socket pair in this environment", seq)
-		}
-		if !notifDone {
-			t.Skipf("send[%d]: SEND_ZC release frontier not observed before deadline", seq)
-		}
-		if unsupported {
-			t.Skip("SEND_ZC is not supported for Unix socket pairs in this environment")
-		}
-	}
-
-	t.Logf("completed %d sequential sends", numSends)
 }
 
 // =============================================================================
 // Helper Functions
 // =============================================================================
 
-// readWithTimeout performs a blocking read with timeout using retry.
-// Returns (n, errno). errno=0 on success.
-func readWithTimeout(fd iofd.FD, buf []byte, timeout time.Duration) (int, uintptr) {
-	deadline := time.Now().Add(timeout)
-	b := iox.Backoff{}
-	for time.Now().Before(deadline) {
-		n, errno := readTestFD(fd, buf)
-		if errno == 0 {
-			return n, 0
-		}
-		// EAGAIN/EWOULDBLOCK means try again
-		if errno == 11 || errno == 35 { // EAGAIN on Linux, EWOULDBLOCK on Darwin
-			b.Wait()
-			continue
-		}
-		return 0, errno
+func newTestUDPPair(t *testing.T) (iofd.FD, *sock.UDPConn) {
+	t.Helper()
+	peer, err := sock.ListenUDP4(&sock.UDPAddr{IP: sock.IPv4LoopBack})
+	if err != nil {
+		t.Fatal(err)
 	}
-	return 0, 11 // EAGAIN - timeout
+	t.Cleanup(func() { peer.Close() })
+	sender, err := sock.DialUDP4(nil, peer.LocalAddr().(*sock.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { sender.Close() })
+	return iofd.FD(sender.FD().Raw()), peer
+}
+
+func checkRegisteredDatagrams(t *testing.T, ring *uring.Uring, fd iofd.FD, peer *sock.UDPConn, op uint8, payloads ...[]byte) {
+	t.Helper()
+	var ids []uring.SQEContext
+	for slot, payload := range payloads {
+		offset := slot + 1
+		copy(ring.RegisteredBuffer(slot)[offset:], payload)
+		// Both paths replace the caller's group with the selected slot.
+		ctx := uring.PackDirect(0, 0, 99, 0)
+		accepted, err := ring.MulticastZeroCopy(ctx, &singleTarget{fd: fd}, slot, int64(offset), len(payload))
+		if accepted != 1 || err != nil {
+			t.Fatalf("slot %d: accepted %d targets, error %v", slot, accepted, err)
+		}
+		ids = append(ids, uring.PackDirect(op, 0, uint16(slot), int32(fd)))
+
+		// Read before sending the next datagram. Keep every CQE queued for dispatch.
+		if _, err := ring.Wait(nil); err != nil {
+			t.Fatal(err)
+		}
+		requireDatagram(t, peer, payload)
+	}
+	results := waitRegisteredSends(t, ring, ids...)
+	for slot, id := range ids {
+		if res := results[id]; res != int32(len(payloads[slot])) {
+			t.Fatalf("slot %d: data result %d, want %d", slot, res, len(payloads[slot]))
+		}
+	}
+}
+
+func requireDatagram(t *testing.T, peer *sock.UDPConn, want []byte) {
+	t.Helper()
+	if err := peer.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, len(want)+1)
+	n, err := peer.Read(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buf[:n], want) {
+		t.Fatalf("unexpected datagram: %d bytes, prefix %x", n, buf[:min(n, 8)])
+	}
+}
+
+func checkRegisteredStream(t *testing.T, ring *uring.Uring, messages ...[]byte) {
+	t.Helper()
+	fd, peer := newTestTCPPair(t)
+	want := bytes.Join(messages, nil)
+	got := make([]byte, len(want))
+	if err := peer.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	read := make(chan error, 1)
+	go func() {
+		_, err := io.ReadFull(peer, got)
+		read <- err
+	}()
+
+	ctx := uring.ForFD(int32(fd))
+	for _, payload := range messages {
+		// The previous use of this slot has released every byte before this copy.
+		if n := copy(ring.RegisteredBuffer(0), payload); n != len(payload) {
+			t.Fatalf("copied %d of %d bytes into the registered slot", n, len(payload))
+		}
+		for sent := 0; sent < len(payload); {
+			left := len(payload) - sent
+			accepted, err := ring.MulticastZeroCopy(ctx, &singleTarget{fd: fd}, 0, int64(sent), left)
+			if accepted != 1 || err != nil {
+				t.Fatalf("offset %d: accepted %d targets, error %v", sent, accepted, err)
+			}
+			id := ctx.WithOp(uring.IORING_OP_SEND_ZC)
+			if left < 1536 { // A short suffix can select ordinary SEND for a single target.
+				id = ctx.WithOp(uring.IORING_OP_SEND)
+			}
+			res := waitRegisteredSends(t, ring, id)[id]
+			if res <= 0 || int(res) > left {
+				t.Fatalf("offset %d: data result %d for %d remaining bytes", sent, res, left)
+			}
+			sent += int(res)
+		}
+	}
+	if err := <-read; err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("TCP peer received different bytes for %d-byte stream", len(want))
+	}
+}
+
+// Return the signed data results after every send has released its range.
+func waitRegisteredSends(t *testing.T, ring *uring.Uring, ids ...uring.SQEContext) map[uring.SQEContext]int32 {
+	t.Helper()
+	pending := make(map[uring.SQEContext]bool, len(ids)) // value records an early notification
+	results := make(map[uring.SQEContext]int32, len(ids))
+	for _, id := range ids {
+		pending[id] = false
+	}
+	for len(pending) > 0 {
+		cqe := waitForCQEs(t, ring, 1)[0]
+		id := cqe.Context()
+		notified, live := pending[id]
+		_, haveData := results[id]
+		switch {
+		case !live:
+			t.Fatalf("unexpected send completion: context %#x, result %d", id, cqe.Res)
+		case cqe.IsNotification():
+			if id.Op() != uring.IORING_OP_SEND_ZC || notified {
+				t.Fatalf("context %#x: unexpected notification", id)
+			}
+			if haveData {
+				delete(pending, id)
+			} else {
+				pending[id] = true
+			}
+		default:
+			if haveData || id.Op() == uring.IORING_OP_SEND && cqe.HasMore() {
+				t.Fatalf("context %#x: unexpected data completion %+v", id, cqe)
+			}
+			results[id] = cqe.Res
+			if !cqe.HasMore() || notified {
+				delete(pending, id)
+			}
+		}
+	}
+	return results
 }

@@ -6,6 +6,7 @@ import Cancellation
 import Incremental
 import CompletionQueue
 import Context
+import Bundle
 
 #print axioms Uring.ZeroCopy.at_most_once
 #print axioms Uring.ZeroCopy.release_requires_completion
@@ -43,3 +44,10 @@ import Context
 #print axioms Uring.Context.signed_fd_roundtrip
 #print axioms Uring.Context.pointer_roundtrip
 #print axioms Uring.Context.modes_disjoint
+
+#print axioms Uring.Bundle.empty_slots
+#print axioms Uring.Bundle.bytes_alone_insufficient
+#print axioms Uring.Bundle.positive_slots
+#print axioms Uring.Bundle.positive_prefix
+#print axioms Uring.Bundle.step_inventory
+#print axioms Uring.Bundle.inventory_preserved

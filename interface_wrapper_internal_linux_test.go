@@ -187,7 +187,7 @@ func TestSubmitAcceptDirectMultishotEncodesExpectedSQE(t *testing.T) {
 
 	flags := uint8(IOSQE_IO_LINK)
 	ioprio := uint16(IORING_ACCEPT_POLL_FIRST)
-	if err := ring.SubmitAcceptDirectMultishot(ForFD(23), IORING_FILE_INDEX_ALLOC, WithFlags(flags), WithIOPrio(ioprio)); err != nil {
+	if err := ring.SubmitAcceptDirectMultishot(ForFD(23).WithBufGroup(7), IORING_FILE_INDEX_ALLOC, WithFlags(flags), WithIOPrio(ioprio)); err != nil {
 		t.Fatalf("SubmitAcceptDirectMultishot: %v", err)
 	}
 
@@ -1099,7 +1099,7 @@ func TestBundleIteratorWrapperUsesRegisteredGroup(t *testing.T) {
 
 	cqe := CQEView{
 		Res:   96,
-		Flags: 1 << IORING_CQE_BUFFER_SHIFT,
+		Flags: 1<<IORING_CQE_BUFFER_SHIFT | IORING_CQE_F_BUFFER,
 	}
 
 	iter, ok := ring.BundleIterator(cqe, groupID)
@@ -1397,6 +1397,9 @@ func TestControlWrappersEncodeExpectedSQEs(t *testing.T) {
 
 	t.Run("FutexWaitV", func(t *testing.T) {
 		waitWords := [2]uint64{11, 22}
+		var pinner runtime.Pinner
+		pinner.Pin(&waitWords[0])
+		defer pinner.Unpin()
 		waitv := unsafe.Pointer(&waitWords[0])
 		if err := ring.FutexWaitV(PackDirect(0, 0, 0, 0), waitv, 2, 0, WithFlags(IOSQE_ASYNC)); err != nil {
 			t.Fatalf("FutexWaitV: %v", err)
@@ -2542,12 +2545,10 @@ func TestSocketRawFileIndexOptionEncodesDirectTarget(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ring := newWrapperSyntheticSubmitRing(t, 8)
-			if err := ring.SocketRaw(ForFD(0), AF_INET, SOCK_STREAM|SOCK_NONBLOCK, IPPROTO_TCP, tt.options...); err != nil {
+			if err := ring.SocketRaw(ForFD(0).WithBufGroup(7), AF_INET, SOCK_STREAM|SOCK_NONBLOCK, IPPROTO_TCP, tt.options...); err != nil {
 				t.Fatalf("SocketRaw: %v", err)
 			}
-			if got := lastSubmittedSQE(t, ring).spliceFdIn; got != tt.want {
-				t.Fatalf("spliceFdIn = %d, want %d", got, tt.want)
-			}
+			assertSocketSQE(t, lastSubmittedSQE(t, ring), AF_INET, SOCK_STREAM|SOCK_NONBLOCK, IPPROTO_TCP, tt.want)
 		})
 	}
 }

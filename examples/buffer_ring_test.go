@@ -165,6 +165,9 @@ func TestIncrementalBufferConsumption(t *testing.T) {
 	received, submitted, completed := 0, 0, 0
 	handler := uring.NewIncrementalSubscriber().
 		OnData(func(buf []byte, bufferMore bool) {
+			if cap(buf) != len(buf) {
+				t.Errorf("fragment capacity = %d, want %d", cap(buf), len(buf))
+			}
 			received += copy(got[received:], buf)
 			if bufferMore != (received < size) {
 				t.Error("incorrect buffer continuation")

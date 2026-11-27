@@ -277,155 +277,117 @@ func TestUringIntrospection(t *testing.T) {
 	t.Logf("Completed %d operations", completed)
 }
 
+func requireTerminalResults(t *testing.T, ring *uring.Uring, want map[uring.SQEContext]int32) []uring.CQEView {
+	t.Helper()
+	cqes := waitForCQEs(t, ring, len(want))
+	for _, cqe := range cqes {
+		ctx := cqe.Context()
+		res, ok := want[ctx]
+		if !ok || cqe.Res != res || cqe.HasMore() {
+			t.Fatalf("CQE context=%#x result=%d flags=%#x, pending=%v", ctx.Raw(), cqe.Res, cqe.Flags, want)
+		}
+		delete(want, ctx)
+	}
+	return cqes
+}
+
 func TestUringTimeoutCycle(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.NotifySucceed = true // Request a CQE for every successful operation.
-		opt.MultiIssuers = true  // Exercise the shared-submit configuration.
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	mustStartRing(t, ring)
-
-	ctx := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, 0, 0)
-	if err := ring.Timeout(ctx, 20*time.Millisecond, uring.WithCount(0)); err != nil {
-		t.Fatalf("Timeout: %v", err)
-	}
-
-	ev, ok := waitForOp(t, ring, uring.IORING_OP_TIMEOUT, time.Second)
-	if !ok {
-		t.Fatal("Timeout operation did not complete")
-	}
-	if ev.Res != -int32(zcall.ETIME) {
-		t.Fatalf("timeout result = %d, want -ETIME", ev.Res)
+	nop := uring.PackDirect(uring.IORING_OP_NOP, 0, 1, 0)
+	timer := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, 2, 0)
+	linkedTimer := timer.OrFlags(uring.IOSQE_IO_LINK)
+	for _, tc := range []struct {
+		name    string
+		ctx     uring.SQEContext
+		delay   time.Duration
+		opts    []uring.OpOptionFunc
+		wantRes int32
+		wantNOP int32
+	}{
+		{name: "count reached", ctx: timer, delay: time.Hour},
+		{
+			name: "time only", ctx: timer, delay: time.Millisecond,
+			opts: []uring.OpOptionFunc{uring.WithCount(0)}, wantRes: -int32(zcall.ETIME),
+		},
+		{
+			name: "expiry cancels successor", ctx: linkedTimer, delay: time.Millisecond,
+			opts: []uring.OpOptionFunc{uring.WithCount(0)}, wantRes: -int32(zcall.ETIME), wantNOP: -int32(zcall.ECANCELED),
+		},
+		{
+			name: "successor runs", ctx: linkedTimer, delay: time.Millisecond,
+			opts: []uring.OpOptionFunc{uring.WithCount(0), uring.WithTimeoutEtimeSuccess()}, wantRes: -int32(zcall.ETIME),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ring := newTestRing(t, func(o *uring.Options) { o.NotifySucceed = true })
+			if err := ring.Timeout(tc.ctx, tc.delay, tc.opts...); err != nil {
+				t.Fatal(err)
+			}
+			if err := ring.Nop(nop); err != nil {
+				t.Fatal(err)
+			}
+			requireTerminalResults(t, ring, map[uring.SQEContext]int32{tc.ctx: tc.wantRes, nop: tc.wantNOP})
+		})
 	}
 }
 
-// TestTimeoutUpdate validates the IORING_TIMEOUT_UPDATE flag.
-// Timeout update allows modifying an existing timeout's expiration in-place.
-func TestTimeoutUpdate(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	mustStartRing(t, ring)
-
-	const targetUserData = uint16(42)
-
-	// Submit a long timeout (60s) that we'll update to be shorter
-	timeoutCtx := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, targetUserData, 0)
-	if err := ring.Timeout(timeoutCtx, 60*time.Second); err != nil {
-		t.Fatalf("Timeout: %v", err)
-	}
-	t.Log("Submitted 60s timeout with userData=42")
-
-	// Update the timeout to 10ms
-	updateCtx := uring.PackDirect(uring.IORING_OP_TIMEOUT_REMOVE, 0, 1, 0)
-	if err := ring.TimeoutUpdate(updateCtx, timeoutCtx.Raw(), 10*time.Millisecond, false); err != nil {
-		t.Fatalf("TimeoutUpdate: %v", err)
-	}
-	t.Log("Submitted TimeoutUpdate to change to 10ms")
-
-	// Collect CQEs - should get update result and eventually the timeout
-	cqes := make([]uring.CQEView, 8)
-	start := time.Now()
-
-	updateFound := false
-	for i := 0; i < 10; i++ {
-		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
-			t.Fatalf("Wait: %v", err)
-		}
-		for j := 0; j < n; j++ {
-			op := cqes[j].Op()
-			res := cqes[j].Res
-			t.Logf("CQE: op=%d res=%d", op, res)
-
-			if op == uring.IORING_OP_TIMEOUT_REMOVE {
-				if res == 0 {
-					updateFound = true
-					t.Log("TimeoutUpdate succeeded")
-				} else if res < 0 {
-					const ENOENT = 2
-					if -res == ENOENT {
-						t.Log("Timeout already expired or not found")
-					} else {
-						t.Logf("TimeoutUpdate error: %d", res)
-					}
+func TestTimeoutMultishot(t *testing.T) {
+	ring := newTestRing(t)
+	timer := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, 1, 0)
+	for _, tc := range []struct {
+		name string
+		want int
+		opts []uring.OpOptionFunc
+	}{
+		{"default", 1, []uring.OpOptionFunc{uring.WithTimeoutMultishot()}},
+		{"three expirations", 3, []uring.OpOptionFunc{uring.WithTimeoutMultishot(), uring.WithCount(3)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := ring.Timeout(timer, time.Millisecond, tc.opts...); err != nil {
+				t.Fatal(err)
+			}
+			for i, cqe := range waitForCQEs(t, ring, tc.want) {
+				wantMore := i+1 < tc.want
+				if cqe.Context() != timer || cqe.Res != -int32(zcall.ETIME) || cqe.HasMore() != wantMore {
+					t.Fatalf("expiry %d: context=%#x result=%d more=%t, want context=%#x result=-ETIME more=%t",
+						i+1, cqe.Context().Raw(), cqe.Res, cqe.HasMore(), timer.Raw(), wantMore)
 				}
 			}
-		}
-		if updateFound {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
+		})
 	}
+}
 
-	elapsed := time.Since(start)
-	t.Logf("Elapsed: %v", elapsed)
-
-	// Verify the API signature works
-	t.Run("APISignature", func(t *testing.T) {
-		ctx := uring.PackDirect(uring.IORING_OP_TIMEOUT_REMOVE, 0, 1, 0)
-		// Test both relative and absolute modes
-		_ = ring.TimeoutUpdate(ctx, 0, time.Second, false) // relative
-		_ = ring.TimeoutUpdate(ctx, 0, time.Second, true)  // absolute
-		t.Log("API signature verified")
-	})
+func TestTimeoutUpdate(t *testing.T) {
+	ring := newTestRing(t, func(o *uring.Options) { o.NotifySucceed = true })
+	timer := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, 42, 0)
+	update := uring.PackDirect(uring.IORING_OP_TIMEOUT_REMOVE, 0, 1, 0)
+	for _, absolute := range []bool{false, true} {
+		t.Run(fmt.Sprintf("absolute=%t", absolute), func(t *testing.T) {
+			if err := ring.Timeout(timer, time.Hour, uring.WithCount(0), uring.WithTimeoutRealTime()); err != nil {
+				t.Fatal(err)
+			}
+			deadline := time.Millisecond
+			if absolute {
+				deadline = time.Duration(time.Now().UnixNano())
+			}
+			if err := ring.TimeoutUpdate(update, timer.Raw(), deadline, absolute); err != nil {
+				t.Fatal(err)
+			}
+			requireTerminalResults(t, ring, map[uring.SQEContext]int32{update: 0, timer: -int32(zcall.ETIME)})
+		})
+	}
 }
 
 func TestTimeoutRemove(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.NotifySucceed = true
-		opt.MultiIssuers = true
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
+	ring := newTestRing(t, func(o *uring.Options) { o.NotifySucceed = true })
+	timer := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, 0, 0)
+	remove := uring.PackDirect(uring.IORING_OP_TIMEOUT_REMOVE, 0, 1, 0)
+	if err := ring.Timeout(timer, time.Minute, uring.WithCount(0)); err != nil {
+		t.Fatal(err)
 	}
-	mustStartRing(t, ring)
-
-	timeoutCtx := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, 0, 0)
-	if err := ring.Timeout(timeoutCtx, time.Minute); err != nil {
-		t.Fatalf("Timeout: %v", err)
+	if err := ring.TimeoutRemove(remove, timer.Raw()); err != nil {
+		t.Fatal(err)
 	}
-
-	removeCtx := uring.PackDirect(uring.IORING_OP_TIMEOUT_REMOVE, 0, 0, 0)
-	if err := ring.TimeoutRemove(removeCtx, timeoutCtx.Raw()); err != nil {
-		t.Fatalf("TimeoutRemove: %v", err)
-	}
-
-	cqes := make([]uring.CQEView, 8)
-	deadline := time.Now().Add(time.Second)
-	timeoutRemoved := false
-	timeoutCanceled := false
-	b := iox.Backoff{}
-
-	for time.Now().Before(deadline) && (!timeoutRemoved || !timeoutCanceled) {
-		n, err := ring.Wait(cqes)
-		if err != nil &&
-			!errors.Is(err, iox.ErrWouldBlock) {
-			t.Fatalf("Wait: %v", err)
-		}
-		for i := 0; i < n; i++ {
-			switch cqes[i].Op() {
-			case uring.IORING_OP_TIMEOUT_REMOVE:
-				if cqes[i].Res != 0 {
-					t.Fatalf("TimeoutRemove CQE res = %d, want 0", cqes[i].Res)
-				}
-				timeoutRemoved = true
-			case uring.IORING_OP_TIMEOUT:
-				if cqes[i].Res != -int32(zcall.ECANCELED) {
-					t.Fatalf("Timeout CQE res = %d, want %d", cqes[i].Res, -int32(zcall.ECANCELED))
-				}
-				timeoutCanceled = true
-			}
-		}
-		b.Wait()
-	}
-
-	if !timeoutRemoved || !timeoutCanceled {
-		t.Fatalf("timeout removal incomplete: remove=%t timeout=%t", timeoutRemoved, timeoutCanceled)
-	}
+	requireTerminalResults(t, ring, map[uring.SQEContext]int32{remove: 0, timer: -int32(zcall.ECANCELED)})
 }
 
 func TestUringLinkTimeoutCycle(t *testing.T) {
@@ -551,7 +513,7 @@ func TestUringTCPSocketCycle(t *testing.T) {
 	mustStartRing(t, ring)
 
 	// Create TCP4 socket via io_uring
-	ctx := uring.PackDirect(uring.IORING_OP_SOCKET, 0, 0, 0)
+	ctx := uring.PackDirect(uring.IORING_OP_SOCKET, 0, 0xa501, 0)
 	if err := ring.TCP4Socket(ctx); err != nil {
 		t.Fatalf("TCP4Socket: %v", err)
 	}
@@ -562,6 +524,9 @@ func TestUringTCPSocketCycle(t *testing.T) {
 	}
 	if ev.Res < 0 {
 		t.Fatalf("Socket creation failed: %d", ev.Res)
+	}
+	if got := ev.BufGroup(); got != ctx.BufGroup() {
+		t.Errorf("socket completion tag = %#x, want %#x", got, ctx.BufGroup())
 	}
 	socketFD := ev.Res
 
@@ -1269,7 +1234,7 @@ func TestAcceptDirect(t *testing.T) {
 	boundPort := int(boundAddr[2])<<8 | int(boundAddr[3])
 
 	// Submit AcceptDirect with auto-allocation
-	acceptCtx := uring.PackDirect(uring.IORING_OP_ACCEPT, 0, 0, serverFD)
+	acceptCtx := uring.PackDirect(uring.IORING_OP_ACCEPT, 0, 0xa502, serverFD)
 	err = ring.AcceptDirect(acceptCtx, uring.IORING_FILE_INDEX_ALLOC)
 	if err != nil {
 		t.Fatalf("AcceptDirect: %v", err)
@@ -1298,6 +1263,9 @@ func TestAcceptDirect(t *testing.T) {
 	if ev.Res < 0 {
 		t.Fatalf("AcceptDirect returned error: %d", ev.Res)
 	}
+	if got := ev.BufGroup(); got != acceptCtx.BufGroup() {
+		t.Errorf("accept completion tag = %#x, want %#x", got, acceptCtx.BufGroup())
+	}
 
 	allocatedSlot := ev.Res
 	if allocatedSlot >= 16 {
@@ -1321,53 +1289,58 @@ func TestAcceptDirect(t *testing.T) {
 	t.Logf("AcceptDirect allocated slot %d", allocatedSlot)
 }
 
-// TestSocketDirect tests direct descriptor socket creation using registered file table.
 func TestSocketDirect(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
-		opt.NotifySucceed = true // Request a CQE for every successful operation.
-		opt.MultiIssuers = true  // Exercise the shared-submit configuration.
+	ring := newTestRing(t, func(opt *uring.Options) {
+		opt.Entries = uring.EntriesPico
+		opt.NotifySucceed = true
 	})
+	// Leave only slot 1 free so the result identifies automatic allocation.
+	occupied, err := os.Open(os.DevNull)
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatal(err)
 	}
-	mustStartRing(t, ring)
-
-	// Register sparse file table for direct descriptors
-	err = ring.RegisterFilesSparse(16)
-	if err != nil {
-		t.Fatalf("RegisterFilesSparse: %v", err)
+	defer occupied.Close()
+	if err := ring.RegisterFiles([]int32{int32(occupied.Fd()), -1}); err != nil {
+		t.Fatalf("RegisterFiles: %v", err)
 	}
 
-	// Create socket directly into registered file table with auto-allocation
-	socketCtx := uring.PackDirect(uring.IORING_OP_SOCKET, 0, 0, 0)
-	err = ring.TCP4SocketDirect(socketCtx)
-	if err != nil {
-		t.Fatalf("TCP4SocketDirect: %v", err)
+	// Fill the SQ with distinguishable NOPs before attempting socket creation.
+	pending := make(map[uring.SQEContext]bool)
+	for i := range ring.SQAvailable() {
+		ctx := uring.ForFD(int32(i + 1))
+		if err := ring.Nop(ctx); err != nil {
+			t.Fatal(err)
+		}
+		pending[ctx] = true
+	}
+	socketCtx := uring.PackDirect(uring.IORING_OP_SOCKET, 0, 0xa503, 0)
+	if err := ring.TCP4SocketDirect(socketCtx); !iox.IsWouldBlock(err) {
+		t.Fatalf("TCP4SocketDirect on full SQ: got %v, want ErrWouldBlock", err)
+	}
+	if free := ring.SQAvailable(); free != 0 {
+		t.Fatalf("full SQ after refusal: %d free entries, want 0 before Wait", free)
+	}
+	for _, cqe := range waitForCQEs(t, ring, len(pending)) {
+		ctx := cqe.Context()
+		if !pending[ctx] || cqe.Res != 0 {
+			t.Fatalf("unexpected completion while draining NOPs: %+v", cqe)
+		}
+		delete(pending, ctx)
 	}
 
-	ev, ok := waitForOp(t, ring, uring.IORING_OP_SOCKET, time.Second)
-	if !ok {
-		t.Fatal("SocketDirect did not complete")
+	if err := ring.TCP4SocketDirect(socketCtx); err != nil {
+		t.Fatalf("TCP4SocketDirect after drain: %v", err)
+	}
+	ev := waitForCQEs(t, ring, 1)[0]
+	if ev.Op() != uring.IORING_OP_SOCKET || ev.BufGroup() != socketCtx.BufGroup() || ev.Res != 1 {
+		t.Fatalf("socket retry: op=%d tag=%#x slot=%d, want SOCKET tag=%#x slot=1", ev.Op(), ev.BufGroup(), ev.Res, socketCtx.BufGroup())
 	}
 
-	// With IORING_FILE_INDEX_ALLOC, res contains the allocated slot index (0-based)
-	if ev.Res < 0 {
-		t.Fatalf("SocketDirect returned error: %d", ev.Res)
-	}
-
-	allocatedSlot := ev.Res
-	if allocatedSlot >= 16 {
-		t.Errorf("allocated slot %d out of range [0,16)", allocatedSlot)
-	}
-
-	// The socket is in the registered file table at allocatedSlot
-	// Close it using IOSQE_FIXED_FILE flag (close the direct descriptor)
-	closeCtx := uring.PackDirect(uring.IORING_OP_CLOSE, uring.IOSQE_FIXED_FILE, 0, allocatedSlot)
+	closeCtx := uring.PackDirect(uring.IORING_OP_CLOSE, uring.IOSQE_FIXED_FILE, 0, ev.Res)
 	mustCloseAndWait(t, ring, closeCtx, time.Second, "direct socket")
-
-	ring.UnregisterFiles()
-	t.Logf("SocketDirect allocated slot %d", allocatedSlot)
+	if err := ring.UnregisterFiles(); err != nil {
+		t.Fatalf("UnregisterFiles: %v", err)
+	}
 }
 
 // TestConnectWithDirectSocket tests Connect using a socket created via SocketDirect.
@@ -1590,73 +1563,68 @@ func TestFixedFdInstall(t *testing.T) {
 	t.Log("FixedFdInstall test passed - both descriptors worked independently")
 }
 
-// TestFutexWakeWait tests the futex wait/wake operations.
 func TestFutexWakeWait(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
-		opt.NotifySucceed = true
-		opt.MultiIssuers = true
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	mustStartRing(t, ring)
+	for _, tc := range []struct {
+		name      string
+		waitOp    uint8
+		wakeIndex int32
+	}{
+		{"scalar", uring.IORING_OP_FUTEX_WAIT, 0},
+		{"vector_first", uring.IORING_OP_FUTEX_WAITV, 0},
+		{"vector_second", uring.IORING_OP_FUTEX_WAITV, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			words := [2]uint32{11, 22}
+			var pin runtime.Pinner
+			pin.Pin(&words[0])
+			t.Cleanup(pin.Unpin)
+			ring := newTestRing(t, func(o *uring.Options) { o.NotifySucceed = true })
+			word := &words[tc.wakeIndex]
 
-	// Create a futex variable
-	var futex uint32 = 0
-
-	// Submit FutexWait - will wait since futex == 0 (expected value)
-	waitCtx := uring.PackDirect(uring.IORING_OP_FUTEX_WAIT, 0, 0, 0)
-	err = ring.FutexWait(waitCtx, &futex, 0, uring.FUTEX_BITSET_MATCH_ANY, uring.FUTEX2_SIZE_U32)
-	if err != nil {
-		t.Fatalf("FutexWait: %v", err)
-	}
-
-	// Submit FutexWake to wake 1 waiter
-	wakeCtx := uring.PackDirect(uring.IORING_OP_FUTEX_WAKE, 0, 0, 0)
-	err = ring.FutexWake(wakeCtx, &futex, 1, uring.FUTEX_BITSET_MATCH_ANY, uring.FUTEX2_SIZE_U32)
-	if err != nil {
-		t.Fatalf("FutexWake: %v", err)
-	}
-
-	// Wait for completions
-	cqes := make([]uring.CQEView, 16)
-	deadline := time.Now().Add(5 * time.Second)
-	waitCompleted := false
-	wakeCompleted := false
-	b := iox.Backoff{}
-
-	for time.Now().Before(deadline) && (!waitCompleted || !wakeCompleted) {
-		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
-			t.Fatalf("Wait: %v", err)
-		}
-		for i := 0; i < n; i++ {
-			op := cqes[i].Op()
-			res := cqes[i].Res
-
-			switch op {
+			var err error
+			switch tc.waitOp {
 			case uring.IORING_OP_FUTEX_WAIT:
-				if res < 0 {
-					t.Fatalf("FutexWait result: %d", res)
+				err = ring.FutexWait(uring.ForFD(0), word, uint64(*word), uring.FUTEX_BITSET_MATCH_ANY, uring.FUTEX2_SIZE_U32)
+			case uring.IORING_OP_FUTEX_WAITV:
+				// Linux struct futex_waitv, one entry per word.
+				var waiters [len(words)]struct {
+					val   uint64
+					uaddr uint64
+					flags uint32
+					_     uint32
 				}
-				waitCompleted = true
-			case uring.IORING_OP_FUTEX_WAKE:
-				if res < 0 {
-					t.Fatalf("FutexWake result: %d", res)
-				} else {
-					t.Logf("FutexWake woke %d waiters", res)
+				pin.Pin(&waiters[0])
+				for i := range waiters {
+					waiters[i].val = uint64(words[i])
+					waiters[i].uaddr = uint64(uintptr(unsafe.Pointer(&words[i])))
+					waiters[i].flags = uring.FUTEX2_SIZE_U32
 				}
-				wakeCompleted = true
+				err = ring.FutexWaitV(uring.ForFD(0), unsafe.Pointer(&waiters[0]), uint32(len(waiters)), 0)
 			}
-		}
-		b.Wait()
-	}
+			if err != nil {
+				t.Fatalf("submit wait: %v", err)
+			}
+			var early [1]uring.CQEView
+			if n, err := ring.Wait(early[:]); n != 0 || !iox.IsWouldBlock(err) {
+				t.Fatalf("wait before wake: n=%d result=%d err=%v", n, early[0].Res, err)
+			}
+			if err := ring.FutexWake(uring.ForFD(0), word, 1, uring.FUTEX_BITSET_MATCH_ANY, uring.FUTEX2_SIZE_U32); err != nil {
+				t.Fatalf("submit wake: %v", err)
+			}
 
-	if !waitCompleted || !wakeCompleted {
-		t.Fatal("Futex operations did not complete")
+			cqes := waitForCQEs(t, ring, 2)
+			wait, wake := cqes[0], cqes[1]
+			if wait.Op() == uring.IORING_OP_FUTEX_WAKE {
+				wait, wake = wake, wait
+			}
+			if wait.Op() != tc.waitOp || wait.Res != tc.wakeIndex {
+				t.Fatalf("wait CQE: op=%d result=%d, want op=%d result=%d", wait.Op(), wait.Res, tc.waitOp, tc.wakeIndex)
+			}
+			if wake.Op() != uring.IORING_OP_FUTEX_WAKE || wake.Res != 1 {
+				t.Fatalf("wake CQE: op=%d result=%d, want FUTEX_WAKE with one waiter", wake.Op(), wake.Res)
+			}
+		})
 	}
-	t.Log("Futex wait/wake test passed")
 }
 
 // TestMsgRingSelf tests MSG_RING to the same ring (self-messaging).
@@ -1674,11 +1642,11 @@ func TestMsgRingSelf(t *testing.T) {
 	}
 	t.Logf("Self ring FD: %d", ringFD)
 
-	// Send message to self
-	const testUserData int64 = 0xDEADBEEF
-	const testResult int32 = 99
+	// Wait must preserve the opaque target ID even when it carries the Extended tag.
+	testUserData := uint64(uring.CtxModeExtended) | 0xDEADBEEF
+	const testResult int32 = -99 // Signed message payload on the target CQE.
 	ctx := uring.PackDirect(uring.IORING_OP_MSG_RING, 0, 0, ringFD.Raw())
-	err = ring.MsgRing(ctx, testUserData, testResult)
+	err = ring.MsgRing(ctx, int64(testUserData), testResult)
 	if err != nil {
 		t.Fatalf("MsgRing: %v", err)
 	}
@@ -1703,13 +1671,13 @@ func TestMsgRingSelf(t *testing.T) {
 		b.Reset()
 		for i := 0; i < n; i++ {
 			cqe := cqes[i]
-			switch cqe.Context() {
-			case ctx:
+			switch cqe.Context().Raw() {
+			case ctx.Raw():
 				if sendCompleted || cqe.Res != 0 {
 					t.Fatalf("unexpected source CQE: res=%d, duplicate=%t", cqe.Res, sendCompleted)
 				}
 				sendCompleted = true
-			case uring.SQEContext(testUserData):
+			case testUserData:
 				if recvCompleted || cqe.Res != testResult {
 					t.Fatalf("unexpected target CQE: res=%d, duplicate=%t; want res=%d", cqe.Res, recvCompleted, testResult)
 				}
@@ -2098,208 +2066,85 @@ func TestSQE128NopCycle(t *testing.T) {
 // TestAsyncCancel: IORING_OP_ASYNC_CANCEL operation
 // =============================================================================
 
-// TestAsyncCancel validates async cancellation of pending operations.
-//
-// Architecture:
-//   - Submit a timeout that will wait 60 seconds (effectively forever for this test)
-//   - Flush that timeout into the kernel before issuing AsyncCancel
-//   - Submit AsyncCancel targeting the timeout's userData
-//   - Verify: timeout receives -ECANCELED, cancel receives 0 or -EALREADY
-//
-// Cancel CQE results:
-//   - 0: Successfully cancelled
-//   - -EALREADY: Request already running (past cancellation point)
 func TestAsyncCancel(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	mustStartRing(t, ring)
+	ring := newTestRing(t)
+	timer := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, 1, 0)
+	nop := uring.PackDirect(uring.IORING_OP_NOP, 0, 2, 0)
+	cancel := uring.PackDirect(uring.IORING_OP_ASYNC_CANCEL, 0, 3, 0)
 
-	// Submit a long timeout that we'll cancel
-	const targetUserData = uint16(42)
-	targetCtx := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, targetUserData, 0)
-	if err := ring.Timeout(targetCtx, 60*time.Second); err != nil {
-		t.Fatalf("Timeout: %v", err)
+	// The timer must stay pending across unrelated completions.
+	if err := ring.Timeout(timer, time.Hour, uring.WithCount(0)); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := ring.Wait(nil); err != nil {
-		t.Fatalf("Wait(nil): %v", err)
+	if err := ring.Nop(nop); err != nil {
+		t.Fatal(err)
 	}
-	t.Log("Submitted and flushed 60s timeout with userData=42")
+	requireTerminalResults(t, ring, map[uring.SQEContext]int32{nop: 0})
 
-	// Cancel the timeout using AsyncCancel with target userData
-	cancelCtx := uring.PackDirect(uring.IORING_OP_ASYNC_CANCEL, 0, 1, 0)
-	if err := ring.AsyncCancel(cancelCtx, targetCtx.Raw()); err != nil {
-		t.Fatalf("AsyncCancel: %v", err)
+	if err := ring.AsyncCancel(cancel, timer.Raw()); err != nil {
+		t.Fatal(err)
 	}
-	t.Log("Submitted AsyncCancel targeting userData=42")
+	requireTerminalResults(t, ring, map[uring.SQEContext]int32{timer: -int32(zcall.ECANCELED), cancel: 0})
 
-	// Wait for both CQEs
-	// Note: longer deadline covers race/coverage overhead and the documented
-	// -EALREADY path where the target CQE may arrive slightly later.
-	cqes := make([]uring.CQEView, 8)
-	deadline := time.Now().Add(10 * time.Second)
-	b := iox.Backoff{}
-	var gotTimeout, gotCancel bool
-	var timeoutRes, cancelRes int32
-
-	for (!gotTimeout || !gotCancel) && time.Now().Before(deadline) {
-		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
-			t.Fatalf("Wait: %v", err)
-		}
-		for i := range n {
-			op := cqes[i].Op()
-			res := cqes[i].Res
-			t.Logf("CQE: op=%d, res=%d", op, res)
-
-			switch op {
-			case uring.IORING_OP_TIMEOUT:
-				gotTimeout = true
-				timeoutRes = res
-			case uring.IORING_OP_ASYNC_CANCEL:
-				gotCancel = true
-				cancelRes = res
-			}
-		}
-		if !gotTimeout || !gotCancel {
-			b.Wait()
-		}
+	if err := ring.AsyncCancel(cancel, timer.Raw()); err != nil {
+		t.Fatal(err)
 	}
-
-	// Validate results
-	if !gotTimeout {
-		t.Fatal("Timeout CQE not received")
-	}
-	if !gotCancel {
-		t.Fatal("AsyncCancel CQE not received")
-	}
-
-	const (
-		wantTimeoutCanceled = -int32(zcall.ECANCELED)
-		wantCancelBusy      = -int32(zcall.EALREADY)
-	)
-
-	if timeoutRes != wantTimeoutCanceled {
-		t.Errorf("Timeout result: got %d, want %d (-ECANCELED)", timeoutRes, wantTimeoutCanceled)
-	} else {
-		t.Log("Timeout correctly cancelled with -ECANCELED")
-	}
-
-	if cancelRes != 0 && cancelRes != wantCancelBusy {
-		t.Errorf("AsyncCancel result: got %d, want 0 or %d (-EALREADY)", cancelRes, wantCancelBusy)
-	} else {
-		t.Logf("AsyncCancel result: %d (success)", cancelRes)
-	}
+	requireTerminalResults(t, ring, map[uring.SQEContext]int32{cancel: -int32(zcall.ENOENT)})
 }
 
-// TestAsyncCancelExtended validates extended async cancellation modes.
-// Tests the CANCEL_FD, CANCEL_OP, CANCEL_ANY, and CANCEL_ALL flags.
 func TestAsyncCancelExtended(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
+	const canceled = -int32(zcall.ECANCELED)
+	for _, name := range []string{"CancelFD", "CancelOpcode", "CancelAny", "CancelAll"} {
+		t.Run(name, func(t *testing.T) {
+			fd, errno := zcall.Eventfd2(0, zcall.EFD_NONBLOCK|zcall.EFD_CLOEXEC)
+			if errno != 0 {
+				t.Fatal(zcall.Errno(errno))
+			}
+			t.Cleanup(func() { zcall.Close(fd) })
+			ring := newTestRing(t)
+			poll := uring.PackDirect(uring.IORING_OP_POLL_ADD, 0, 1, int32(fd))
+			timer := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, 2, 0)
+			cancel := uring.PackDirect(uring.IORING_OP_ASYNC_CANCEL, 0, 3, int32(fd))
+			if err := ring.PollAdd(poll, uring.EPOLLIN); err != nil {
+				t.Fatal(err)
+			}
+			if err := ring.Timeout(timer, time.Hour, uring.WithCount(0)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ring.Wait(nil); err != nil {
+				t.Fatal(err)
+			}
+
+			var target, remaining uring.SQEContext
+			var err error
+			switch name {
+			case "CancelFD":
+				err = ring.AsyncCancelFD(cancel, false)
+				target, remaining = poll, timer
+			case "CancelOpcode":
+				err = ring.AsyncCancelOpcode(cancel, uring.IORING_OP_TIMEOUT, false)
+				target, remaining = timer, poll
+			case "CancelAny":
+				err = ring.AsyncCancelAny(cancel)
+			case "CancelAll":
+				err = ring.AsyncCancelAll(cancel)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if target == 0 {
+				requireTerminalResults(t, ring, map[uring.SQEContext]int32{poll: canceled, timer: canceled, cancel: 2})
+				return
+			}
+			requireTerminalResults(t, ring, map[uring.SQEContext]int32{target: canceled, cancel: 0})
+			// The unselected request is still pending and cancellable by identity.
+			if err := ring.AsyncCancel(cancel, remaining.Raw()); err != nil {
+				t.Fatal(err)
+			}
+			requireTerminalResults(t, ring, map[uring.SQEContext]int32{remaining: canceled, cancel: 0})
+		})
 	}
-	mustStartRing(t, ring)
-
-	// Create pipe for poll operations
-	var fds [2]int32
-	errno := zcall.Pipe2(&fds, zcall.O_NONBLOCK|zcall.O_CLOEXEC)
-	if errno != 0 {
-		t.Fatalf("Pipe2: %v", zcall.Errno(errno))
-	}
-	readFD := uintptr(fds[0])
-	defer zcall.Close(readFD)
-	defer zcall.Close(uintptr(fds[1]))
-
-	cqes := make([]uring.CQEView, 16)
-
-	// Test AsyncCancelAny API exists
-	t.Run("CancelAny", func(t *testing.T) {
-		// Submit a long timeout to have something to cancel
-		timeoutCtx := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, 1, 0)
-		ring.Timeout(timeoutCtx, 60*time.Second)
-
-		// Try to cancel any pending operation
-		cancelCtx := uring.PackDirect(uring.IORING_OP_ASYNC_CANCEL, 0, 2, 0)
-		if err := ring.AsyncCancelAny(cancelCtx); err != nil {
-			t.Fatalf("AsyncCancelAny: %v", err)
-		}
-		t.Log("Submitted AsyncCancelAny")
-
-		// Collect CQEs
-		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
-			t.Fatalf("Wait: %v", err)
-		}
-		t.Logf("Got %d CQEs", n)
-		for i := 0; i < n; i++ {
-			t.Logf("CQE %d: op=%d res=%d", i, cqes[i].Op(), cqes[i].Res)
-		}
-	})
-
-	// Test AsyncCancelFD API exists
-	t.Run("CancelFD", func(t *testing.T) {
-		// Submit a poll on the pipe
-		pollCtx := uring.PackDirect(uring.IORING_OP_POLL_ADD, 0, 10, int32(readFD))
-		ring.PollAdd(pollCtx, uring.EPOLLIN)
-
-		// Try to cancel by FD
-		cancelCtx := uring.PackDirect(uring.IORING_OP_ASYNC_CANCEL, 0, 11, int32(readFD))
-		if err := ring.AsyncCancelFD(cancelCtx, false); err != nil {
-			t.Fatalf("AsyncCancelFD: %v", err)
-		}
-		t.Log("Submitted AsyncCancelFD")
-
-		// Collect CQEs
-		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
-			t.Fatalf("Wait: %v", err)
-		}
-		t.Logf("Got %d CQEs", n)
-		for i := 0; i < n; i++ {
-			t.Logf("CQE %d: op=%d res=%d", i, cqes[i].Op(), cqes[i].Res)
-		}
-	})
-
-	// Test AsyncCancelOpcode API exists
-	t.Run("CancelOpcode", func(t *testing.T) {
-		// Submit a timeout to cancel
-		timeoutCtx := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, 20, 0)
-		ring.Timeout(timeoutCtx, 60*time.Second)
-
-		// Try to cancel by opcode
-		cancelCtx := uring.PackDirect(uring.IORING_OP_ASYNC_CANCEL, 0, 21, 0)
-		if err := ring.AsyncCancelOpcode(cancelCtx, uring.IORING_OP_TIMEOUT, false); err != nil {
-			t.Fatalf("AsyncCancelOpcode: %v", err)
-		}
-		t.Log("Submitted AsyncCancelOpcode")
-
-		// Collect CQEs
-		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
-			t.Fatalf("Wait: %v", err)
-		}
-		t.Logf("Got %d CQEs", n)
-		for i := 0; i < n; i++ {
-			t.Logf("CQE %d: op=%d res=%d", i, cqes[i].Op(), cqes[i].Res)
-		}
-	})
-
-	// Verify cancel flag constants exist
-	t.Run("Constants", func(t *testing.T) {
-		_ = uring.IORING_ASYNC_CANCEL_ALL
-		_ = uring.IORING_ASYNC_CANCEL_FD
-		_ = uring.IORING_ASYNC_CANCEL_ANY
-		_ = uring.IORING_ASYNC_CANCEL_FD_FIXED
-		_ = uring.IORING_ASYNC_CANCEL_USERDATA
-		_ = uring.IORING_ASYNC_CANCEL_OP
-		t.Log("Cancel constants verified")
-	})
 }
 
 // =============================================================================
@@ -2442,106 +2287,62 @@ func TestPollModes(t *testing.T) {
 	})
 }
 
-// TestPollUpdate validates the IORING_OP_POLL_REMOVE with update flags.
-// Poll update allows modifying an existing poll's events or userData in-place.
 func TestPollUpdate(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
-	})
+	ring := newTestRing(t)
+	fds, err := newUnixSocketPairForTest()
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatal(err)
 	}
-	mustStartRing(t, ring)
+	defer closeTestFds(fds)
 
-	// Create pipe using zcall
-	var fds [2]int32
-	errno := zcall.Pipe2(&fds, zcall.O_NONBLOCK|zcall.O_CLOEXEC)
-	if errno != 0 {
-		t.Fatalf("Pipe2: %v", zcall.Errno(errno))
-	}
-	readFD, writeFD := uintptr(fds[0]), uintptr(fds[1])
-	defer zcall.Close(readFD)
-	defer zcall.Close(writeFD)
+	old := uring.PackDirect(uring.IORING_OP_POLL_ADD, 0, 1, int32(fds[0]))
+	next := old.WithBufGroup(2)
+	changeMask := uring.PackDirect(uring.IORING_OP_POLL_REMOVE, 0, 3, 0)
+	changeID := changeMask.WithBufGroup(4)
+	removeOld := changeMask.WithBufGroup(5)
+	removeNext := changeMask.WithBufGroup(6)
 
-	const originalUserData = uint16(100)
-	const updatedUserData = uint64(200)
-
-	// Submit initial poll on read end
-	pollCtx := uring.PackDirect(uring.IORING_OP_POLL_ADD, 0, originalUserData, int32(readFD))
-	if err := ring.PollAddMultishot(pollCtx, uring.EPOLLIN); err != nil {
-		t.Fatalf("PollAddMultishot: %v", err)
-	}
-	if _, err := ring.Wait(nil); err != nil {
-		t.Fatalf("Wait(nil): %v", err)
-	}
-
-	// Submit PollUpdate to change userData
-	updateCtx := uring.PackDirect(uring.IORING_OP_POLL_REMOVE, 0, 1, int32(readFD))
-	oldUserData := pollCtx.Raw() // The packed userData of the original poll
-	updateFlags := uring.IORING_POLL_UPDATE_USER_DATA
-	if err := ring.PollUpdate(updateCtx, oldUserData, updatedUserData, 0, updateFlags); err != nil {
-		t.Fatalf("PollUpdate: %v", err)
-	}
-
-	// Collect CQEs
-	cqes := make([]uring.CQEView, 8)
-	deadline := time.Now().Add(2 * time.Second)
-	b := iox.Backoff{}
-	n := 0
-	for time.Now().Before(deadline) {
-		n, err = ring.Wait(cqes)
-		if err != nil {
-			if errors.Is(err, iox.ErrWouldBlock) {
-				b.Wait()
-				continue
-			}
-			t.Fatalf("Wait: %v", err)
-		}
-		break
-	}
-	if n == 0 {
-		t.Fatal("PollUpdate did not complete")
-	}
-
-	// Analyze results
-	t.Logf("Got %d CQEs", n)
-	updateFound := false
-	for i := 0; i < n; i++ {
-		res := cqes[i].Res
-		t.Logf("CQE %d: res=%d", i, res)
-		// Check if this is the update CQE
-		if res == 0 {
-			updateFound = true
-		} else if res < 0 {
-			// ENOENT (-2) means poll not found
-			// EINVAL (-22) indicates that the current host rejected the operation
-			const ENOENT = 2
-			const EINVAL = 22
-			absRes := -res
-			if absRes == ENOENT {
-				t.Log("Poll not found (ENOENT) - may have already completed")
-			} else if absRes == EINVAL {
-				t.Fatalf("PollUpdate returned EINVAL on Linux 6.18+ baseline")
-			} else {
-				t.Logf("Error result: %d", res)
-			}
+	requireReady := func(want uring.SQEContext, events int32) {
+		t.Helper()
+		cqe := waitForCQEs(t, ring, 1)[0]
+		if cqe.Context() != want || cqe.Res != events || !cqe.HasMore() {
+			t.Fatalf("poll CQE context=%#x result=%#x flags=%#x, want context=%#x events=%#x with F_MORE",
+				cqe.Context().Raw(), cqe.Res, cqe.Flags, want.Raw(), events)
 		}
 	}
 
-	if updateFound {
-		t.Log("PollUpdate succeeded")
+	if err := ring.PollAddMultishot(old, uring.EPOLLOUT); err != nil {
+		t.Fatal(err)
+	}
+	requireReady(old, uring.EPOLLOUT)
+
+	// The socket is writable but has no data to read until the peer writes.
+	if err := ring.PollUpdate(changeMask, old.Raw(), 0, uring.EPOLLIN, uring.IORING_POLL_UPDATE_EVENTS); err != nil {
+		t.Fatal(err)
+	}
+	requireTerminalResults(t, ring, map[uring.SQEContext]int32{changeMask: 0})
+	if err := ring.PollUpdate(changeID, old.Raw(), next.Raw(), 0, uring.IORING_POLL_UPDATE_USER_DATA); err != nil {
+		t.Fatal(err)
+	}
+	requireTerminalResults(t, ring, map[uring.SQEContext]int32{changeID: 0})
+
+	if n, errno := writeTestFD(fds[1], []byte{1}); n != 1 || errno != 0 {
+		t.Fatalf("peer write: n=%d errno=%v", n, zcall.Errno(errno))
+	}
+	requireReady(next, uring.EPOLLIN)
+	var buf [1]byte
+	if n, errno := readTestFD(fds[0], buf[:]); n != 1 || errno != 0 {
+		t.Fatalf("read: n=%d errno=%v", n, zcall.Errno(errno))
 	}
 
-	// Verify the API signature is correct - this is a compile-time check
-	t.Run("APISignature", func(t *testing.T) {
-		ctx := uring.PackDirect(uring.IORING_OP_POLL_REMOVE, 0, 1, 0)
-		// Test all parameter combinations compile
-		_ = ring.PollUpdate(ctx, 0, 0, 0, 0)
-		_ = ring.PollUpdate(ctx, 0, 0, 0, uring.IORING_POLL_UPDATE_EVENTS)
-		_ = ring.PollUpdate(ctx, 0, 0, 0, uring.IORING_POLL_UPDATE_USER_DATA)
-		_ = ring.PollUpdate(ctx, 0, 0, 0, uring.IORING_POLL_UPDATE_EVENTS|uring.IORING_POLL_UPDATE_USER_DATA)
-		t.Log("API signature verified")
-	})
+	if err := ring.PollRemove(removeOld, old.Raw()); err != nil {
+		t.Fatal(err)
+	}
+	requireTerminalResults(t, ring, map[uring.SQEContext]int32{removeOld: -int32(zcall.ENOENT)})
+	if err := ring.PollRemove(removeNext, next.Raw()); err != nil {
+		t.Fatal(err)
+	}
+	requireTerminalResults(t, ring, map[uring.SQEContext]int32{removeNext: 0, next: -int32(zcall.ECANCELED)})
 }
 
 // =============================================================================

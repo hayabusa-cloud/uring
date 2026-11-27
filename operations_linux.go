@@ -126,10 +126,9 @@ const (
 	IORING_SEND_VECTORIZED                  // Vectorized send
 )
 
-// Notification CQE usage flags for zero-copy operations.
-const (
-	IORING_NOTIF_USAGE_ZC_COPIED = 1 << 31 // Data was copied instead of zero-copy
-)
+// IORING_NOTIF_USAGE_ZC_COPIED is set in a send usage report if any data was
+// copied or the send never used zero-copy.
+const IORING_NOTIF_USAGE_ZC_COPIED = 1 << 31
 
 // nop submits a no-op operation.
 func (ur *ioUring) nop(sqeCtx SQEContext) error {
@@ -353,13 +352,7 @@ func (ur *ioUring) acceptDirect(sqeCtx SQEContext, ioprio uint16, fileIndex uint
 		ioprio&IORING_ACCEPT_MULTISHOT != 0 && fileIndex != IORING_FILE_INDEX_ALLOC {
 		return ErrInvalidParam
 	}
-	// The kernel uses 0 for "not direct" and N+1 for slot N.
-	kernelIndex := fileIndex
-	if fileIndex != IORING_FILE_INDEX_ALLOC {
-		kernelIndex = fileIndex + 1
-	}
-	// Direct accept allows SOCK_NONBLOCK but rejects SOCK_CLOEXEC.
-	return ur.submitPacked9(sqeCtx.WithOp(IORING_OP_ACCEPT), ioprio, 0, 0, 0, SOCK_NONBLOCK, 0, int32(kernelIndex))
+	return ur.submitDirectFile(sqeCtx.WithOp(IORING_OP_ACCEPT), ioprio, 0, 0, SOCK_NONBLOCK, fileIndex)
 }
 
 // asyncCancel cancels a pending async operation matched by original SQE user_data.
@@ -797,7 +790,7 @@ func (ur *ioUring) socket(sqeCtx SQEContext, domain, typ, proto int) error {
 		return ErrInvalidParam
 	}
 	ctx := sqeCtx.WithOp(IORING_OP_SOCKET).withFD(int32(domain))
-	return ur.submitPacked9(ctx, 0, uint64(typ), 0, proto, 0, 0, 0)
+	return ur.submitPacked6(ctx, 0, uint64(typ), 0, proto, 0)
 }
 
 // socketDirect submits SOCKET into a registered file slot. fileIndex is a
@@ -807,13 +800,24 @@ func (ur *ioUring) socketDirect(sqeCtx SQEContext, domain, typ, proto int, fileI
 		fileIndex == IORING_FILE_INDEX_ALLOC-1 || typ&SOCK_CLOEXEC != 0 {
 		return ErrInvalidParam
 	}
-	// The kernel uses 0 for "not direct" and N+1 for slot N.
-	kernelIndex := fileIndex
-	if fileIndex != IORING_FILE_INDEX_ALLOC {
-		kernelIndex = fileIndex + 1
-	}
 	ctx := sqeCtx.WithOp(IORING_OP_SOCKET).withFD(int32(domain))
-	return ur.submitPacked9(ctx, 0, uint64(typ), 0, proto, 0, 0, int32(kernelIndex))
+	return ur.submitDirectFile(ctx, 0, uint64(typ), proto, 0, fileIndex)
+}
+
+// submitDirectFile prepares SOCKET or ACCEPT with a zero buf_index.
+func (ur *ioUring) submitDirectFile(ctx SQEContext, ioprio uint16, off uint64, n int, uflags uint32, fileIndex uint32) error {
+	slot, err := ur.reserveSubmitSlot()
+	if err != nil {
+		return err
+	}
+	slot.fill6(ctx, ioprio, off, 0, n, uflags)
+	// The kernel encodes an explicit slot as N+1 and accepts the allocation sentinel verbatim.
+	if fileIndex != IORING_FILE_INDEX_ALLOC {
+		fileIndex++
+	}
+	slot.sqe.spliceFdIn = int32(fileIndex)
+	ur.publishSubmitSlot(slot, ctx)
+	return nil
 }
 
 // sendZeroCopy submits SEND_ZC.

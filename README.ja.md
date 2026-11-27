@@ -11,9 +11,11 @@ Go で Linux 6.18+ の `io_uring` カーネル境界を扱うパッケージ。
 
 ## 概要
 
-`uring` は Linux `io_uring` へのカーネル境界を提供する Go パッケージです。リングの生成・開始、SQE の組み立て、CQE の解釈、`user_data` による発行元識別の伝達を担い、バッファ登録・マルチショット操作・リスナー構築の基本操作をスケジューラにしないまま公開します。
+`uring` は Linux の `io_uring` リングを作成して開始し、送信キューのエントリ（SQE）を準備して完了キューのエントリ（CQE）をコピーします。`user_data` で要求の識別情報を伝え、バッファ登録、マルチショット操作、リスナーの設定を提供します。
 
-パッケージは境界を明示に保ちます：カーネル側の機構と完了結果の観測はこの API にとどまり、方針や組み立ては呼び出し側レイヤーが担うという役割分担です。呼び出し側のランタイムコードが、完了ルーティング、ルートの終了処理、再試行とバックオフ、ハンドラとセッションのルーティング、安全性チェック、コネクションライフサイクル、終端時のリソース解放を担当します。
+`uring` は Proactor モデルを採用しています。読み取りでは、呼び出し側が SQE を公開し、Linux が I/O を実行し、呼び出し側が `Wait` で CQE を取得します。`user_data` で元の要求を特定してから、再試行するか、キャンセルするか、セッションを進めるかを決めます。マルチショットのサブスクリプションは、元の要求の終端 CQE とキューに入ったキャンセル CQE の処理が済むまで、プールから取得したコンテキストを保持します。
+
+`code.hybscloud.com/iox` はノンブロッキング操作の結果を表します。返された件数やバイト数は、すでに処理した量を示します。`iox.ErrWouldBlock` は、処理を続けるにはリソースの準備が整うか、空き容量が生じるのを待つ必要があることを示します。アプリケーション側の論理操作が続くときは `iox.ErrMore` を使えます。[結果の読み方](./AGENTS.md#outcome-discipline)
 
 主な API は以下のとおりです。
 
@@ -211,7 +213,9 @@ ring.PutExtSQE(ext)
 
 ### `CQEView` による完了ディスパッチ
 
-独立した完了コンテキスト型はありません。`cqe.Context()` で元の発行トークン、`cqe.Err()` でリクエストの結果を取得し、フラグでバッファとライフタイムの情報を確認します。`Wait` のエラーは回収処理の結果であり、個々のリクエストの結果ではありません。失敗したリクエストも含め、返されたバッチの全 CQE をディスパッチしてください。途中で戻ると、リングから回収済みの完了記録が失われます。
+`Wait` が `iox.ErrWouldBlock` を返したら、回収できる CQE はありません。成功したら、失敗したリクエストの分も含め、`n` 件の CQE をすべて処理してください。ローカルのリクエストでは、`cqe.Context()` で発行時のトークンを取得できます。操作結果の判定には `cqe.Err()` を使います。ゼロコピー送信の通知では、`Res` にゼロコピーの使用状況を示すフラグが入ることがあります。CQE のフラグでリクエストとバッファのライフタイムを判断します。
+
+送信側と受信側は `messageID` を `MsgRing` 専用に予約します。この例のリングでは、それ以外の ID はすべてローカルのリクエストを表します。まず `messageID` を照合し、一致したら送信側が指定した符号付きの `Res` を、負の値も含めてそのままメッセージハンドラに渡します。
 
 ```go
 var cqes [64]uring.CQEView
@@ -219,15 +223,15 @@ n, err := ring.Wait(cqes[:])
 if err != nil {
 	return err
 }
-if n == 0 {
-	return iox.ErrWouldBlock
-}
 
 for i := range n {
 	cqe := cqes[i]
-	// Res < 0 encodes -errno; flags describe buffers and request lifetime.
-	if err := cqe.Err(); err != nil {
-		fmt.Printf("completion failed: op=%d fd=%d: %v\n", cqe.Op(), cqe.FD(), err)
+	if cqe.Context().Raw() == uint64(messageID) {
+		handleMessage(cqe.Res)
+		continue
+	}
+	if !cqe.IsNotification() && cqe.Res < 0 {
+		fmt.Printf("completion failed: op=%d fd=%d: %v\n", cqe.Op(), cqe.FD(), cqe.Err())
 	}
 	if cqe.HasBuffer() {
 		fmt.Printf("buffer id=%d\n", cqe.BufID())
@@ -330,7 +334,7 @@ if cqe.HasBuffer() {
 }
 ```
 
-バンドル受信は同じ提供バッファストレージを使いますが、1 つの CQE で複数のバッファを消費することがあります。イテレータを処理したら、消費したスロットを回収してください。`Recycle` はイテレータのすべてのコピーを通じて正確に 1 回だけ呼び出し、返った後は生成されたバッファを読み取らないでください。
+バンドル受信では、1 件の CQE で複数の提供バッファを消費することがあります。この例のようなストリームソケットでは、EOF や受信エラーでも、選択済みのスロットがデータ長 0 で返る場合があります。データを読み終えたら、イテレータのコピー全体で `Recycle` を 1 回だけ呼び、消費したスロットをすべて返します。
 
 ```go
 if err := ring.ReceiveBundle(recvCtx, &socketFD, uring.WithReadBufferSize(uring.BufferSizeSmall)); err != nil {
@@ -338,8 +342,10 @@ if err := ring.ReceiveBundle(recvCtx, &socketFD, uring.WithReadBufferSize(uring.
 }
 
 if it, ok := ring.BundleIterator(cqe, cqe.BufGroup()); ok {
-	for buf := range it.All() {
-		handle(buf)
+	if it.TotalBytes() > 0 {
+		for buf := range it.All() {
+			handle(buf)
+		}
 	}
 	if err := it.Recycle(ring); err != nil {
 		return err
@@ -361,19 +367,15 @@ CQE のルーティングは呼び出し側が担当します。`ListenerOp.Hand
 
 1. `New`: 無効状態のカーネルリングを構築し、コンテキストプールを確保し、バッファ戦略を決定する。
 2. `Start`: バッファを登録し、Linux 6.18+ ベースライン向けにリングを有効化する。
-3. 操作メソッド: SQE を書き込んで操作の意図を発行する。
-4. `Wait`: 未送信分をフラッシュし、コピー済み CQE 記述子を返す。
-5. 呼び出し側ランタイムコード: スケジューリング、リトライ、待機、コネクションとセッションのルーティング、ルートの終了処理、安全性チェック、終端時のリソース方針を担う。
+3. キュー経由の操作では SQ のスロットを確保し、SQE に値を書き込んで公開します。
+4. `Wait` は保留中の送信を進め、CQ のスロットを解放する前に CQE をコピーします。
+5. 呼び出し側はこれらの CQE をディスパッチし、再試行を処理して、`Stop` の前に実行中の操作をすべて回収します。
 
-この構造により、`code.hybscloud.com/uring` はカーネル境界の機構に専念しつつ、境界を越えた完了結果の意味を保持します。
+同期の登録 API では、戻り値で結果を確認します。たとえば `RegisterFilesUpdate` では、エラーが `nil` でも処理件数が要求件数を下回ることがあります。
 
 ## ランタイム境界
 
-`code.hybscloud.com/uring` の上位にあるランタイム層は、これをスケジューラではなくカーネルバックエンドとして扱うべきです。境界は一方向で、`code.hybscloud.com/uring` は SQE の準備、CQE の回収、`user_data` の保持、CQE `res` とフラグの公開、所有権事実の報告を担い、呼び出し側ランタイムコードはそれらの観測を自身のトークンと相関付け、再試行とバックオフを適用し、ハンドラとセッションをルーティングし、発行をバッチ化し、ルートを終了処理し、終端リソースを解放します。
-
-抽象実行が完了事実を必要とする場合、ランタイムブリッジは Extended モード CQE を消費できます。コネクション単位のランタイムは、CQE の結果、フラグ、バッファ ID、エンコード済みトークンを必要とする場合、イベントをハンドラコールバックに還元する前に生の Extended CQE を直接ポーリングできます。
-
-この境界の上にあるコンテキスト層と抽象実行層は、`code.hybscloud.com/uring` のカーネル境界としての役割を変更しません。
+複数の発生元から CQE が届くキューでは、`Wait` を使い、`Res` の解釈やローカル要求のコンテキストの参照に先立って `cqe.Context().Raw()` で発生元を識別します。`MsgRing` の宛先リングに届く CQE には、アプリケーションが指定した負の値が入ることがあります。Extended モード専用のキューでは、`WaitExtended` が結果、フラグ、借用した `ExtSQE` を返します。後で必要になるフィールドは、コンテキストを再利用する前にコピーします。[完了処理の契約](agents/boundary/sqe-cqe.md#observation)
 
 ## アプリケーション層の設計パターン
 
@@ -381,60 +383,58 @@ CQE のルーティングは呼び出し側が担当します。`ListenerOp.Hand
 
 ### リング所有イベントループ
 
-デフォルトのリングのイベントループは、`Start` の前に OS スレッドへ固定した goroutine で実行し、`Stop` まで固定を保ちます。ループはリング操作を直列化して保留中の処理を発行し、`Wait` が観測可能な進展を返さないときは呼び出し側の `iox.Backoff` を適用して、完了を振り分けます。
+デフォルトのリングを所有する goroutine は、`Start` の前に OS スレッドに固定し、`Stop` が終わるまで固定を維持します。要求を送信した後、所有者は `Wait` を呼んで完了を回収します。
 
 ```go
-func runLoop(ring *uring.Uring, stop <-chan struct{}) error {
-	cqes := make([]uring.CQEView, 64)
-	var backoff iox.Backoff
-	for {
-		select {
-		case <-stop:
-			// The caller must still cancel and drain live requests before ring.Stop.
-			return nil
-		default:
-		}
+cqes := make([]uring.CQEView, 64)
+var backoff iox.Backoff
+for {
+	select {
+	case <-stop:
+		// 呼び出し側はリングを停止する前に、実行中の要求をキャンセルし、残りの完了を回収する。
+		return nil
+	default:
+	}
 
-		n, err := ring.Wait(cqes)
-		switch iox.Classify(err) {
-		case iox.OutcomeWouldBlock:
-			backoff.Wait()
-			continue
-		case iox.OutcomeFailure:
-			return err
-		}
-		if n == 0 {
-			backoff.Wait()
-			continue
-		}
-
+	n, err := ring.Wait(cqes)
+	switch iox.Classify(err) {
+	case iox.OutcomeOK:
 		backoff.Reset()
 		for i := range n {
 			dispatch(ring, cqes[i])
 		}
+	case iox.OutcomeWouldBlock:
+		backoff.Wait()
+	case iox.OutcomeFailure:
+		return err
 	}
 }
 ```
 
-`Send`、`Receive`、`AcceptMultishot`、`Wait` などのリングメソッドはすべてこの goroutine 上で実行します。他の goroutine からの作業は、`code.hybscloud.com/lfq` のように呼び出し側が所有する作業メールボックスを経由してループに渡します。リングメソッドを直接呼び出してはなりません。`iox.Backoff` は呼び出し側が所有します。`Wait` が `iox.OutcomeWouldBlock` に分類された場合、または CQE を 1 件も回収できなかった場合は `backoff.Wait()` を呼び、`n > 0` のバッチを回収できたら `backoff.Reset()` を呼びます。
+`Wait` が成功しても、バッチには失敗した操作の CQE が含まれることがあります。`n` 件すべてをディスパッチしてください。再試行する要求がある場合は、CQ が空でもポーリングの合間に確認します。[管理された accept の再試行](agents/recipes/stream.md#rearm-a-managed-accept)
 
 ### マルチショットサブスクリプションのライフサイクル
 
 マルチショット操作は、カーネルが最終 CQE（`IORING_CQE_F_MORE` なし）を送るまで CQE のストリームを生成します。呼び出し側ランタイムコードは各 CQE を返されたサブスクリプションへ先にルーティングしてから残りのディスパッチャへ渡します。
 
 ```go
+accepting := true
 handler := uring.NewMultishotSubscriber().
 	OnStep(func(step uring.MultishotStep) uring.MultishotAction {
 		if step.Err != nil {
 			return uring.MultishotStop
 		}
 		connFD := iofd.FD(step.CQE.Res)
-		registerConnection(connFD)
+		if accepting {
+			registerConnection(connFD)
+		} else if err := connFD.Close(); err != nil {
+			log.Print(err)
+		}
 		return uring.MultishotContinue
 	}).
 	OnStop(func(err error, cancelled bool) {
-		if !cancelled {
-			resubscribeAccept()
+		if accepting && !cancelled {
+			queueAcceptRetry(err)
 		}
 	})
 
@@ -453,9 +453,13 @@ for i := range n {
 }
 ```
 
+`queueAcceptRetry` はリング所有者のために終了結果を記録します。`OnStop` の実行中は、終了したサブスクリプションが最後の Extended コンテキストをまだ保持していることがあります。CQE のディスパッチ後、所有者は終了結果とリスナーの状態から accept を再発行するか判断します。`AcceptMultishot` が `iox.ErrWouldBlock` を返した場合は、再試行を保留します。[管理された accept の再発行](agents/recipes/stream.md#rearm-a-managed-accept)
+
 `OnStep` コールバックは 1 件の `MultishotStep` を観察します。ストリームを維持するなら `MultishotContinue` を、キャンセルを要求するなら `MultishotStop` を返します。コールバックが終端観察まで有効なままなら、`OnStop` は最終エラーと `cancelled` フラグを伴って高々一度だけ実行されます。ステップ自身の `step.Cancelled` は、境界上でカーネルが `-ECANCELED` を返した判定をその他の失敗と明示的に区別します。これらのコールバックはそれぞれ `MultishotHandler.OnMultishotStep` と `MultishotHandler.OnMultishotStop` に対応します。インタフェースを直接実装することもできます。`HandleCQE` は呼び出し側の直列化された完了ループ内で即時 dispatch するための補助です。コピー済み CQE をそのループの後も保持する場合、呼び出し側が独自の route state を保持し、すでに解放されたサブスクリプションの観察を拒否してください。デフォルトの単一発行者リング（`MultiIssuers=false`）では、OS スレッドに固定したリング所有者から `Cancel` / `Unsubscribe` を呼び、発行、`Wait`、`WaitDirect`、`WaitExtended`、`Stop`、`ResizeRings` と直列化してください。`MultiIssuers=true` のリングでは、共有発行パスがキャンセル SQE を直列化します。
 
 投入済みのキャンセル CQE は、`SubscriptionStopped` または `OnStop` の後も、同じサブスクリプションの `HandleCQE` またはその拡張ハンドラへ渡してください。投入の失敗や何もしない呼び出しでは、新たなキャンセル CQE の処理義務は生じません。サブスクリプションは両コンテキストを所有し、元の終端 CQE の処理、キャンセルの dispatch、キャンセル投入処理がすべて終わってから、元のコンテキストをプールへ返します。これらのコンテキストを手動で返さないでください。[受信の例](./examples/multishot_test.go)は、自然な完了とハンドラからのキャンセルを示します。
+
+接続の受け入れを終了するには、ループの所有者が `accepting = false` に設定してから `sub.Cancel()` を呼びます。その後に受理したソケットはステップハンドラが閉じます。`Unsubscribe` でコールバックが抑止された場合、そのコールバックが受け取るはずだった各ソケットはディスパッチャが引き受けます。[受理済みソケット](agents/boundary/resources.md#accepted-sockets)
 
 ### 型付きコンテキストによるコネクション状態
 
@@ -496,18 +500,20 @@ ring.PutExtSQE(ext)
 
 ### デッドライン合成
 
-`LinkTimeout` は、直前の `IOSQE_IO_LINK` 付き SQE に期限を設定します。起動済みのリングを単一の所有者が操作し、空き数の確認から 2 つの SQE の投入までの間に、他の投入や `Wait` を挟まないようにします。次の例の戻り値は、完了を回収する必要のある要求の数です。空でない受信バッファを渡し、受信 CQE を回収するまでそのアドレスを固定してください。
+独立したタイマーで時間の経過だけを待つには、`ring.Timeout(ctx, d, uring.WithCount(0))` を使います。既定のカウントは 1 なので、別のリクエストが完了すると、満了を待たずに結果 0 でタイマーが完了することがあります。満了時の結果は `-ETIME` です。 [タイマーとリンクされた期限](./agents/recipes/lifecycle.md#timers-and-linked-deadlines)
+
+`LinkTimeout` は、直前の `IOSQE_IO_LINK` 付き SQE に期限を設定します。起動済みのリングを単一の所有者が操作し、空き数の確認から 2 つの SQE の投入までの間に、他の投入や `Wait` を挟まないようにします。次の例の戻り値は、完了を回収する必要のある要求の数です。空でない受信バッファを渡し、受信 CQE を回収するまでそのアドレスを固定してください。処理中のペアごとに異なる `pairID` を割り当てます。そのペアの両方の CQE と、ペアを参照する制御要求の CQE をすべて処理した後で ID を再利用できます。
 
 ```go
-func queueReceiveWithTimeout(ring *uring.Uring, fd iofd.FD, buf []byte, d time.Duration) (int, error) {
+func queueReceiveWithTimeout(ring *uring.Uring, pairID uint16, fd iofd.FD, buf []byte, d time.Duration) (int, error) {
 	if ring.SQAvailable() < 2 {
 		return 0, iox.ErrWouldBlock
 	}
-	recvCtx := uring.PackDirect(uring.IORING_OP_RECV, uring.IOSQE_IO_LINK, 0, int32(fd))
+	recvCtx := uring.PackDirect(uring.IORING_OP_RECV, uring.IOSQE_IO_LINK, pairID, int32(fd))
 	if err := ring.ReceiveFD(recvCtx, fd, buf); err != nil {
 		return 0, err
 	}
-	timeoutCtx := uring.PackDirect(uring.IORING_OP_LINK_TIMEOUT, 0, 0, 0)
+	timeoutCtx := uring.PackDirect(uring.IORING_OP_LINK_TIMEOUT, 0, pairID, 0)
 	if err := ring.LinkTimeout(timeoutCtx, d); err != nil {
 		return 1, err
 	}
@@ -531,12 +537,15 @@ func queueReceiveWithTimeout(ring *uring.Uring, fd iofd.FD, buf []byte, d time.D
 `ListenerManager` は最初の SOCKET リクエストを投入します。構築中の各 CQE を `listenerOp.HandleCQE` に渡すと、コールバックの呼び出しと BIND、LISTEN の投入が自動的に行われます。`iox.ErrWouldBlock` が返った場合はリングを駆動し、`ring.SubmitExtended(uring.PackExtended(listenerOp.Ext()))` で準備済み SQE の投入を再試行してください。同じ CQE を再処理してはいけません。`OnListening` が成功を通知した後に接続の受け付けを開始します。
 
 ```go
-// OnListening has reported successful setup for listenerOp.
 acceptSub, err := listenerOp.AcceptMultishot(acceptHandler)
 if err != nil {
 	return err
 }
+```
 
+リスナーのディスパッチループで `acceptSub` を保持します。接続の受け付けに成功したら、その接続の所有者が `iofd.FD(step.CQE.Res)` を `clientFD` として保持します。受信の投入が `iox.ErrWouldBlock` を返した場合は、その FD を保持したまま受信の投入だけを再試行します。接続を破棄する場合は FD を閉じます。
+
+```go
 recvCtx := uring.ForFD(int32(clientFD)).WithBufGroup(readGroup)
 recvSub, err := ring.ReceiveMultishot(recvCtx, recvHandler)
 if err != nil {
@@ -544,7 +553,7 @@ if err != nil {
 }
 ```
 
-サブスクリプションを停止するときは `Cancel` を呼び、終端 CQE と、キャンセルを投入した場合はその CQE を処理するまでディスパッチを続けてください。両方のサブスクリプションをドレインしてから FD を閉じ、リングを停止します。[リスナーの例](./listener_example_test.go) はセットアップから終了処理までを示し、[multishot の例](./examples/multishot_test.go) と [echo の例](./examples/echo_test.go) は接続処理を示します。
+サブスクリプションを停止するときは `Cancel` を呼び、終端 CQE と、キャンセルを投入した場合はその CQE を処理するまでディスパッチを続けてください。各サブスクリプションをドレインしてから、対応する FD を閉じます。リングを停止する前に、投入済みのすべてのサブスクリプションをドレインします。[リスナーの例](./listener_example_test.go) はセットアップから終了処理までを示し、[multishot の例](./examples/multishot_test.go) と [echo の例](./examples/echo_test.go) は接続処理を示します。
 
 ### TCP クライアント
 
@@ -642,7 +651,7 @@ Idle → Active → Stopping → Retiring → Stopped
 - デフォルトの `MultiIssuers=false` は `SINGLE_ISSUER` + `DEFER_TASKRUN` を要求し、共有発行の同期処理を省きます。所有者は `Start` の前に `runtime.LockOSThread` を呼び、`Stop` まで同じ OS スレッドに固定したまま、発行、待機、リサイズ、終了処理を直列化します。発行を共有する場合や OS スレッド間の移動を許す場合は、`MultiIssuers=true`（`COOP_TASKRUN`）を明示的に選択します。
 - `EpollWait` の `timeout` は `0` のままにすること。期限が必要な場合は `LinkTimeout` を使う。
 - リクエストの全完了処理と借用アクセスが終了してから、プールのコンテキストを返却すること。
-- `ListenerOp.Close` はリスナー FD を即座に閉じる。構築中の CQE が未回収の場合は、その CQE を回収してから再度 `Close` を呼び出し、借用中の `ExtSQE` をプールに返却する。
+- `ListenerOp.Close` を呼ぶと `FD()` は `-1` を返す。処理中の `BIND` または `LISTEN` が使うソケットは、その CQE をデコードするまで開いたままになる。保留中のセットアップ CQE を `HandleCQE` で処理してから、再度 `Close` を呼んで借用中の `ExtSQE` をプールに返す。[手動での処理](agents/recipes/listener.md)
 
 ## 対応プラットフォーム
 

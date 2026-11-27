@@ -32,6 +32,36 @@ func TestBundleIteratorFreeConstructorCannotRecycle(t *testing.T) {
 	}
 }
 
+func TestBundleIteratorSelectedEmptySlot(t *testing.T) {
+	const size, entries, id = 64, 4, 3
+	backing := make([]byte, size*entries)
+	for _, result := range []int32{0, -1} {
+		cqe := uring.CQEView{Res: result, Flags: id<<uring.IORING_CQE_BUFFER_SHIFT | uring.IORING_CQE_F_BUFFER | uring.IORING_CQE_F_MORE}
+		it, ok := uring.NewBundleIterator(cqe, backing, size, entries)
+		if !ok || it.Count() != 1 || it.TotalBytes() != 0 || cqe.BundleCount(size) != 0 {
+			t.Fatalf("res=%d iterator=%v slots=%d bytes=%d", result, ok, it.Count(), it.TotalBytes())
+		}
+		visited := 0
+		for slot, buf := range it.AllWithSlotID() {
+			visited++
+			if slot != id || len(buf) != 0 || cap(buf) != 0 {
+				t.Fatalf("slot=%d len=%d cap=%d", slot, len(buf), cap(buf))
+			}
+		}
+		if visited != 1 {
+			t.Fatalf("visited %d slots, want one", visited)
+		}
+		dst := []byte{42}
+		if n := it.CopyTo(dst); n != 0 || dst[0] != 42 {
+			t.Fatalf("copy=%d dst=%v", n, dst)
+		}
+		cqe.Flags |= uring.IORING_CQE_F_BUF_MORE
+		if _, ok := uring.NewBundleIterator(cqe, backing, size, entries); ok {
+			t.Fatal("constructed a whole-slot iterator for a retained buffer")
+		}
+	}
+}
+
 // TestBundleIteratorBasic tests basic bundle iteration.
 func TestBundleIteratorBasic(t *testing.T) {
 	// Create mock buffer backing

@@ -12,19 +12,19 @@ A computation stops at an effect and needs one resumption. Repeated CQEs require
 
 ## Inputs and Preconditions
 
-Choose `Cont` or `Expr`. `Step`/`StepExpr` returns a nil suspension on completion; inspect the suspension because the result may itself be nil. Resume only with the matching operation result.
+Use `Step` for a `Cont` or `StepExpr` for an `Expr`. A nil suspension marks completion, even for a nil result. Share the returned `*kont.Suspension` pointer. Copying the pending struct lets both copies claim the same continuation. Resume with the matched operation result.
 
-Copy needed CQE/context facts before their targets expire; retain payload roots independently. Captures must own their state or contain durable copies. A borrowed `SQEView` cannot support deferred decoding.
+For deferred resumption, copy the fields the continuation needs or keep the borrowed SQE target live and its fields stable through decoding. Retain referenced payloads independently. [Completion retention](../boundary/sqe-cqe.md#completion-retention)
 
 ## Outputs and Ownership
 
 | Operation | Effect |
 |-----------|--------|
-| `Resume` | Consumes the suspension; retain its returned successor |
-| `TryResume` | Reports whether it consumed the suspension |
-| `Discard` | Abandons continuation state; I/O, payload, and cancellation obligations remain |
+| `Resume` | Returns the result or next suspension. Panics if the handle was already claimed. |
+| `TryResume` | A winning claim returns `(value, next, true)`. A lost claim returns `(zero, nil, false)`. |
+| `Discard` | Releases a pending continuation without running it. A call on a claimed handle has no effect. |
 
-The [one-shot recipe](../recipes/oneshot.md) covers step, admission, matching, resumption, and cleanup. Resuming the same suspension for multiple stream events violates affinity.
+The combined call count for these methods must fit in a `uintptr` on each handle. If another resume wins, its callback may still be reading the buffer when `TryResume` loses or `Discard` returns. Reuse the buffer after its last callback use and its kernel release condition. The caller owns cancellation and draining. [Suspension contract](https://github.com/hayabusa-cloud/kont/blob/v0.2.0/step.go#L13-L86) · [One-shot recipe](../recipes/oneshot.md)
 
 ## Cost Obligations
 

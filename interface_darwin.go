@@ -260,21 +260,6 @@ func (ur *Uring) Stop() error {
 	return err
 }
 
-// Wait flushes pending submissions and collects completion events into cqes.
-// On single-issuer rings it is not safe for concurrent use with submit, Wait,
-// WaitDirect, WaitExtended, or Stop; caller must serialize those operations.
-// It returns the number of events received, or `iox.ErrWouldBlock` if the CQ
-// is empty.
-func (ur *Uring) Wait(cqes []CQEView) (n int, err error) {
-	err = ur.ioUring.enter()
-	if err != nil {
-		return 0, err
-	}
-
-	// Use batch retrieval for consistency with Linux implementation
-	return ur.ioUring.waitBatch(cqes)
-}
-
 // ExtSQE borrows a cleared ExtSQE for Extended mode submissions.
 // It returns nil if the context pool is exhausted, independently of SQ capacity.
 // Keep the context until all request completions and borrowed access finish,
@@ -374,7 +359,9 @@ func (ur *Uring) UnregisterFiles() error {
 	return ur.unregisterFiles()
 }
 
-// RegisteredFileCount returns the number of registered files, or 0 if none.
+// RegisteredFileCount returns the table size established by [Uring.RegisterFiles]
+// or [Uring.RegisterFilesSparse], including empty slots. It returns zero when
+// the ring has no such table.
 func (ur *Uring) RegisteredFileCount() int {
 	return len(ur.files)
 }
@@ -657,7 +644,7 @@ func (ur *Uring) SendFD(sqeCtx SQEContext, fd iofd.FD, p []byte, options ...OpOp
 	return ur.send(ctx, ioprio, p, uint64(offset), n)
 }
 
-// Timeout submits a timeout request.
+// Timeout submits a timer. The Darwin simulator completes an admitted request with -ENOSYS.
 func (ur *Uring) Timeout(sqeCtx SQEContext, d time.Duration, options ...OpOptionFunc) error {
 	flags, cnt, timeoutFlags := ur.timeoutOptions(options)
 	ctx := sqeCtx.OrFlags(flags)
@@ -821,9 +808,8 @@ func (ur *Uring) SendMsgHeader(sqeCtx SQEContext, fd iofd.FD, msg *Msghdr, optio
 	return ErrNotSupported
 }
 
-// RecvMsg receives a message through the caller-owned message header.
-// Caller must keep msg and all memory it references valid until the operation
-// completes.
+// RecvMsg submits a receive with a caller-owned message header.
+// The Darwin simulator completes an admitted request with -ENOSYS.
 func (ur *Uring) RecvMsg(sqeCtx SQEContext, pollFD PollFd, msg *Msghdr, options ...OpOptionFunc) error {
 	flags, ioprio := ur.recvmsgOptions(options)
 	ctx := sqeCtx.WithFD(iofd.FD(pollFD.Fd())).OrFlags(flags | ur.readLikeOpFlags)
@@ -867,7 +853,7 @@ func (ur *Uring) PollUpdate(sqeCtx SQEContext, oldUserData, newUserData uint64, 
 	return ErrNotSupported
 }
 
-// TimeoutRemove removes a timeout request.
+// TimeoutRemove submits timeout removal. The Darwin simulator completes an admitted request with -ENOSYS.
 func (ur *Uring) TimeoutRemove(sqeCtx SQEContext, userData uint64, options ...OpOptionFunc) error {
 	flags := ur.operationOptions(options)
 	ctx := sqeCtx.OrFlags(flags)
@@ -934,7 +920,7 @@ func (ur *Uring) SyncFileRange(sqeCtx SQEContext, offset int64, length int, sync
 	return ur.syncFileRange(ctx, uint64(offset), length, syncFlags)
 }
 
-// LinkTimeout creates a linked timeout operation.
+// LinkTimeout submits a linked timeout. The Darwin simulator completes an admitted request with -ENOSYS.
 func (ur *Uring) LinkTimeout(sqeCtx SQEContext, d time.Duration, options ...OpOptionFunc) error {
 	flags := ur.operationOptions(options)
 	ctx := sqeCtx.OrFlags(flags)

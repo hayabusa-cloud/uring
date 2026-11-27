@@ -1,30 +1,69 @@
 # SQE/CQE Boundary
 
-An adapter exposes one kernel-facing action and its observations. Apply the [encoding contract](encoding.md); preserve the independent completion facts below.
-
 ## Submission
 
-Check public and opcode-specific input domains before narrowing, indexing, or writing the SQE. Initialize required fields and clear rejected fields. Retain identity through completion, release, and outstanding [cancellation lookups](resources.md#managed-cancellation).
+Check the opcode's fields and the ring's issuer requirements before submission. [Encoding](encoding.md) · [Ring setup](encoding.md#setup-and-capabilities)
 
-The default single-issuer mode requires one locked OS thread from before `Start` through `Stop`, with serialized ring operations. Select `MultiIssuers=true` for shared submission or OS-thread migration. Goroutine serialization alone does not establish Linux task identity.
+Publishing the SQE admits the request. A full SQ returns `iox.ErrWouldBlock` before publication. For a batch returning `(accepted, err)`, keep the accepted prefix live even on error. Only the unaccepted suffix remains to submit. [Slot reservation and publication](../../submit_state.go) · [Counted multicast](../../multicast_unix.go)
+
+A local operation CQE with `Res == -EAGAIN` reports an admitted attempt. Check the opcode's effects before reissuing accepted work. When release requires a success CQE, choose a submission path and flags that produce it. [Inter-ring file transfers](files.md#inter-ring-file-transfers) · [Resource lifetimes](resources.md#retain-before-submit)
 
 ## Observation
 
-Copy the CQE descriptor before advancing the CQ head. Interpret its fields independently:
+Choose the wait by the contexts that can arrive on the ring. All three waits drive pending submissions on Linux. After a successful enter, a zero-length destination returns `(0, nil)` and consumes no CQEs. Supply a nonempty destination to reap completions. On Linux, each wait copies its records before advancing the CQ head. [Partial-drain test](../../cq_pending_linux_test.go)
+
+| Wait | Incoming CQEs | What the caller receives |
+|------|---------------|--------------------------|
+| [Wait](../../cqe_view_unix.go) | Local contexts, message IDs or Linux resource tags | Raw result, flags and all 64 bits of `user_data`. A local pointer-mode context borrows its target. |
+| [WaitDirect](../../cqe_direct_unix.go) | Direct contexts only | Result, CQE flags, opcode, SQE flags, buffer group and signed descriptor, all copied by value. |
+| [WaitExtended](../../cqe_extended_unix.go) | Extended contexts only | Result, CQE flags and a borrowed `ExtSQE`. Return a pooled context to its originating pool after final use. |
+
+### Completion Origin
+
+On a mixed ring, reserve distinct live IDs for sources that require different actions. Use `Wait` and match `cqe.Context().Raw()` before using request accessors or dispatching to a typed handler. A sender can choose an ID whose mode bits resemble a local context. [Mixed-ring test](../../integration_linux_test.go#L1632)
+
+| Matched source | How to handle the CQE |
+|----------------|-----------------------|
+| Local request | Decode its live submission context, then interpret the operation result or notification below. |
+| `MsgRing` target | Deliver `Res` as the sender's signed value, including negative values. |
+| [`MsgRingFD` target](files.md#inter-ring-file-transfers) | Use the installation result for the selected destination mode. |
+| [Resource retirement tag](files.md#retirement-tags) | Mark the identified registration retired. Its zero result and flags can also occur on a successful NOP. |
+
+### Local Results and Flags
+
+For a matched local request, interpret operation results, notifications and liveness separately.
 
 | Evidence | Meaning |
 |----------|---------|
 | Nonnegative operation `Res` | The observed step succeeded; the value retains its opcode-specific meaning |
-| `Res == -EAGAIN` | `iox.ErrWouldBlock`, even when `MORE` is present |
-| Other negative operation `Res` | The corresponding failure |
+| Operation `Res == -EAGAIN` | `iox.ErrWouldBlock`, even when `MORE` is present |
+| Other negative operation `Res` | Interpret the errno for that opcode. For example, `-ETIME` on a one-shot `Timeout` reports expiry. [Timer results](../recipes/lifecycle.md#timers-and-linked-deadlines) |
 | `IORING_CQE_F_MORE` | Same-request successor evidence; it does not change result classification or prove byte progress |
-| Notification CQE | Release evidence interpreted with the matching request history |
+| SEND_ZC notification (`IORING_CQE_F_NOTIF`) | Release evidence for the matched send. With `IORING_SEND_ZC_REPORT_USAGE`, test `uint32(Res) & IORING_NOTIF_USAGE_ZC_COPIED` for copy fallback or unused zero-copy. [Send buffer lifetime](resources.md#zero-copy-send-and-receive) |
 
-Only an explicit caller contract may translate request liveness into `iox.ErrMore`. Match the current request instance and individual completion; reused `user_data` alone is insufficient.
+Only an explicit caller contract may translate request liveness into `iox.ErrMore`.
+
+### Suppressed Completions
+
+With the default `NotifySucceed=false`, an ordinary stream `SendMsgHeader` soft-linked to an unsuppressed NOP in the same submission can produce just the NOP’s zero CQE. Both a short send and a full send can give that result. To retry the unsent suffix or issue a byte-count receipt, set `NotifySucceed=true` when creating the ring, leave `IOSQE_CQE_SKIP_SUCCESS` clear on the send and use its matched `Res`. [Linux SENDMSG](https://github.com/torvalds/linux/blob/v6.18/io_uring/net.c#L538-L581) · [Full and short send test](../../sendmsg_header_linux_test.go#L335)
+
+If a request carrying `IOSQE_CQE_SKIP_SUCCESS` fails and breaks an `IOSQE_IO_LINK` chain, Linux reports the failure and can omit the canceled successors’ CQEs, including an unsuppressed NOP. A linked timeout follows its own skip flag. On a ring that uses `IOSQE_IO_DRAIN`, keep `IOSQE_CQE_SKIP_SUCCESS` clear on every SQE. Enable `NotifySucceed` if that ring issues ordinary write-like operations. [Link and drain rules](https://github.com/axboe/liburing/blob/liburing-2.13/man/io_uring_enter.2#L1673-L1702) · [Write-like defaults](../../interface_linux.go#L115-L125)
+
+## Request Identity
+
+If two completions require different actions, the caller must be able to tell which submission produced each one. For example, two `FutexWait` requests on different words can produce identical Direct contexts, results and flags. Serialize those requests or give each a distinct live context. CQ order alone cannot distinguish them.
+
+For deferred dispatch, bind the event to its originating request when reaping or preserve the original token binding through delivery. Reuse a token only once late CQEs, notifications and outstanding cancellation lookups can no longer resolve to the new request. Copy borrowed fields while their target is valid. [Completion retention](#completion-retention) · [Managed cancellation](resources.md#managed-cancellation)
+
+### Change a Poll ID
+
+For a multishot poll using Direct contexts, bind a fresh `next` to the poll before calling `ring.PollUpdate(update, old.Raw(), next.Raw(), 0, uring.IORING_POLL_UPDATE_USER_DATA)`. Give `update` its own `IORING_OP_POLL_REMOVE` context. Its zero result acknowledges the change. The rearmed poll uses `next`. CQEs already generated under `old` keep that ID through deferred dispatch. To remove the live poll, target `next.Raw()`. Removal by `old.Raw()` can report `-ENOENT` while the poll is still active. [Go encoding](../../operations_linux.go#L221) · [Linux poll update and rearm](https://github.com/torvalds/linux/blob/v6.18/io_uring/poll.c#L925-L955)
+
+To change only the readiness mask, pass zero for `newUserData` and select `IORING_POLL_UPDATE_EVENTS`. The rearmed poll keeps its ID and multishot mode. A later ID-only update preserves that mask. [Poll update regression](../../integration_linux_test.go#L2291)
 
 ## Completion Retention
 
-`Wait` copies `Res`, `Flags`, and packed `SQEContext`. Retention depends on context mode:
+`Wait` copies `Res`, `Flags`, and `user_data`. For a local request, retention depends on its context mode.
 
 | Mode | Retained submission facts |
 |------|---------------------------|
@@ -36,7 +75,7 @@ Only an explicit caller contract may translate request liveness into `iox.ErrMor
 
 | Change | Retention obligation |
 |--------|----------------------|
-| `WithOp`, `WithFlags`, `WithBufGroup`, `WithFD`, `OrFlags` | These mutate pointer-backed targets; copy needed facts first |
+| `WithOp`, `WithFlags`, `WithBufGroup`, `WithFD`, `OrFlags` | Copy needed facts before these setters mutate a pointer-backed target, even if the next submission is refused |
 | Later submission | Replaces the retained base SQE, even without pool return |
 | Target reuse or release | Copy needed facts before invalidation; a packed context copy shares storage |
 
@@ -44,9 +83,11 @@ Keep a live request's target address, identity, and submitted base-SQE fields st
 
 For example, save a READ's `Off()` before preparing a NOP on the same target. Retaining `cqe.SQE()` preserves neither that offset nor an independent snapshot, for pooled or caller-allocated targets.
 
-Sources: [publication](../../submit_state.go), [context setters](../../ctx.go), [CQE views](../../cqe_view.go), [SQE views](../../sqe_view.go). [Resource lifetimes](resources.md) govern retention.
+[Base entries](../../entries_unix.go) · [Publication](../../submit_state.go) · [Context setters](../../ctx_unix.go) · [CQE views](../../cqe_view_unix.go) · [SQE views](../../sqe_view_unix.go). [Resource lifetimes](resources.md) govern retention.
 
 ## Batch and Hot-Path Obligations
+
+The wait methods consume every entry they return before caller dispatch begins. If dispatch stops at `dst[i]`, keep the action still owed for that entry. Each CQE in `dst[i+1:n]` also needs dispatch or cleanup. An accepted socket in that suffix needs an owner to take or close it. Before reusing `dst`, preserve the fields, live routes and resources needed for deferred dispatch. [Batch copy and head advance](../../io_uring_linux.go) · [Completion retention](#completion-retention) · [Accepted sockets](files.md#accepted-sockets)
 
 A batch reap with capacity and a visible CQE makes positive progress once it claims the copy. Shared consumers claim through CAS and `spin.Wait`, independently of submission locking. Copy before publishing the kernel head; publish before admitting the next consumer. Bound counts before narrowing, handle wrap without skips/repeats, and report overflow at the empty boundary.
 

@@ -340,47 +340,6 @@ func (ur *Uring) releaseRegisteredBufRings() error {
 	return err
 }
 
-// Wait flushes pending submissions, drives deferred task work when needed, and
-// collects completion events into cqes. On single-issuer rings it is not safe
-// for concurrent use with submit, Wait, WaitDirect, WaitExtended, Stop, or
-// ResizeRings; caller must serialize those operations. On IOPOLL rings Wait
-// also performs the nonblocking poll enter needed to make completions visible.
-// It returns the number of events received, ErrCQOverflow when the ring enters
-// CQ overflow and no CQEs are immediately claimable, or `iox.ErrWouldBlock` if
-// the CQ is empty.
-//
-// CQEView provides direct field access to Res and Flags, and methods to access
-// the submission context based on mode (Direct, Indirect, Extended).
-//
-// Example:
-//
-//	cqes := make([]CQEView, 64)
-//	n, err := ring.Wait(cqes)
-//	for i := range n {
-//	    cqe := &cqes[i]
-//	    if err := cqe.Err(); err != nil {
-//	        handleCompletionError(cqe.Op(), err)
-//	        continue
-//	    }
-//	    if cqe.Extended() {
-//	        ext := cqe.ExtSQE()
-//	        ctx := ViewCtx(ext).Vals1()
-//	        seq := ctx.Val1
-//	        handleCompletion(cqe.Res, seq)
-//	    }
-//	}
-//	if err != nil {
-//	    return err
-//	}
-func (ur *Uring) Wait(cqes []CQEView) (n int, err error) {
-	err = ur.ioUring.enter()
-	if err != nil {
-		return 0, err
-	}
-
-	return ur.ioUring.waitBatch(cqes)
-}
-
 // ========================================
 // Context Pool Accessors
 // ========================================
@@ -758,8 +717,8 @@ func (ur *Uring) SubmitReceiveMultishotFD(sqeCtx SQEContext, fd iofd.FD, b []byt
 
 // ReceiveBundle submits a receive that can consume multiple provided buffers
 // in publication order. A nil return means the request was queued.
-// A successful CQE reports the total bytes received; use [Uring.BundleIterator]
-// to visit the consumed buffers.
+// The CQE reports the receive result. Use [Uring.BundleIterator] to visit
+// returned slots, including a selected slot carrying zero bytes.
 func (ur *Uring) ReceiveBundle(sqeCtx SQEContext, pollFD PollFd, options ...OpOptionFunc) error {
 	ctx := sqeCtx.WithFD(iofd.FD(pollFD.Fd()))
 	flags, ioprio, bufSize, bufGroup := ur.receiveWithBufferSelectOptions(pollFD, options)
@@ -780,9 +739,9 @@ func (ur *Uring) SubmitReceiveBundleMultishot(sqeCtx SQEContext, pollFD PollFd, 
 }
 
 // BundleIterator constructs an iterator for one bundle receive CQE from a
-// package-managed buffer group. The group must match the receive's registered
-// group ID. It returns a zero BundleIterator and false if the group is not
-// package-managed or the CQE has no data.
+// package-managed buffer group. Pass the registered group of the matched receive.
+// It requires F_BUFFER and a whole-slot return from that group. At EOF or on
+// error, a returned slot yields one empty slice and still requires Recycle.
 //
 // The returned iterator borrows ring-owned backing memory. Process the buffers
 // before calling Recycle. Call Recycle exactly once across all copies of the
@@ -813,7 +772,8 @@ func (ur *Uring) SendFD(sqeCtx SQEContext, fd iofd.FD, p []byte, options ...OpOp
 	return ur.send(ctx, ioprio, p, uint64(offset), n)
 }
 
-// Timeout submits a timeout request with the specified duration.
+// Timeout submits a timer. The default one-shot timer reports zero after one
+// qualifying completion, or -ETIME on expiry. Use WithCount(0) to wait for time alone.
 func (ur *Uring) Timeout(sqeCtx SQEContext, d time.Duration, options ...OpOptionFunc) error {
 	flags, cnt, timeoutFlags := ur.timeoutOptions(options)
 	ctx := sqeCtx.OrFlags(flags)
@@ -991,8 +951,10 @@ func (ur *Uring) SendMsgHeader(sqeCtx SQEContext, fd iofd.FD, msg *Msghdr, optio
 }
 
 // RecvMsg receives a message through the caller-owned message header.
-// Caller must keep msg and all memory it references valid until the operation
-// completes.
+// Keep the header and its buffers valid at stable addresses through completion.
+// On success, msg.Flags reports payload truncation (MSG_TRUNC) and control-data
+// truncation (MSG_CTRUNC). Namelen can exceed the supplied address capacity.
+// Restore Namelen and Controllen to the offered sizes before reusing the header.
 func (ur *Uring) RecvMsg(sqeCtx SQEContext, pollFD PollFd, msg *Msghdr, options ...OpOptionFunc) error {
 	flags, ioprio := ur.recvmsgOptions(options)
 	ctx := sqeCtx.WithFD(iofd.FD(pollFD.Fd())).OrFlags(flags | ur.readLikeOpFlags)
@@ -1370,28 +1332,20 @@ func (ur *Uring) registerBufferRing(entries int, groupID uint16, flags uint16) (
 // Fixed Files
 // ========================================
 
-// RegisterFiles registers file descriptors for use with IOSQE_FIXED_FILE flag.
-// Registered files bypass per-operation fget/fput kernel calls.
-// fds must have between 1 and 2^32-1 entries.
-// The call is synchronous; fds may be reused after it returns.
+// RegisterFiles registers 1 to 2^32-1 process fds for IOSQE_FIXED_FILE.
+// Use -1 for an empty slot. The slice can be reused on return. An existing
+// table yields ErrExists until [Uring.UnregisterFiles] succeeds.
 //
-// Once registered, use the file index (0-based) instead of the fd in SQEs,
-// and set the IOSQE_FIXED_FILE flag.
-//
-// Returns ErrExists if files are already registered.
-// Use UnregisterFiles before re-registering.
+// A fixed read or poll looks up a zero-based slot in the ring's table, saving
+// a process-fd lookup. A linked request can reach that slot after SQ consumption.
 func (ur *Uring) RegisterFiles(fds []int32) error {
-	return ur.registerFiles(fds)
+	return ur.registerFileTable(len(fds), fds, 0)
 }
 
-// RegisterFilesSparse allocates a sparse file table of the given size.
-// All entries are initially empty (-1) and can be populated dynamically
-// using RegisterFilesUpdate.
-//
-// Sparse registration is useful for applications that manage a dynamic
-// set of file descriptors (e.g., connection pools, file caches).
+// RegisterFilesSparse registers a table of count empty file slots.
+// Use [Uring.RegisterFilesUpdate] to populate slots by index.
 func (ur *Uring) RegisterFilesSparse(count uint32) error {
-	return ur.registerFilesSparse(count)
+	return ur.registerFileTable(int(count), nil, IORING_RSRC_REGISTER_SPARSE)
 }
 
 // RegisterFilesUpdate updates registered files at the specified offset and
@@ -1399,13 +1353,11 @@ func (ur *Uring) RegisterFilesSparse(count uint32) error {
 // Use -1 to clear a slot, or a valid fd to set it.
 // fds must have between 1 and 2^32-1 entries. The update range must fit
 // within the registered file table.
-// The call is synchronous; fds may be reused after it returns.
-// A nil error does not imply full completion: Linux can return a positive
-// partial count after a later descriptor fails. Full completion requires
-// updated == len(fds). When Linux stops after clearing a destination slot,
-// the first entry excluded from updated is empty; this also occurs on a
-// first-entry EBADF or ENOMEM failure. Values below -1 are rejected; the raw
-// IORING_REGISTER_FILES_SKIP sentinel is not part of this method's domain.
+// The call is synchronous. fds may be reused after it returns.
+// Linux can return a positive prefix count with a nil error. Full completion
+// requires updated == len(fds). If Linux clears a slot and encounters EBADF or
+// ENOMEM acquiring the replacement, that slot stays empty even when updated is zero.
+// Values below -1, including IORING_REGISTER_FILES_SKIP, yield ErrInvalidParam.
 //
 // For an asynchronous update, use [Uring.FilesUpdate] and retain fds through
 // its completion.
@@ -1420,9 +1372,11 @@ func (ur *Uring) UnregisterFiles() error {
 	return ur.unregisterFiles()
 }
 
-// RegisteredFileCount returns the number of registered files, or 0 if none.
+// RegisteredFileCount returns the table size established by [Uring.RegisterFiles]
+// or [Uring.RegisterFilesSparse], including empty slots. It returns zero when
+// the ring has no such table.
 func (ur *Uring) RegisteredFileCount() int {
-	return len(ur.files)
+	return ur.fileSlots
 }
 
 // ========================================
@@ -1542,9 +1496,7 @@ func (ur *Uring) UnregisterNAPI() error {
 // be zero. Whole-table cloning requires Linux 6.12+; nonzero offsets or
 // replacement require Linux 6.13+.
 //
-// Preserving destination buffers after a replaced range requires Linux 6.18.3+
-// or a backport of the buffer-cloning fix. Earlier unpatched kernels discard
-// those registrations.
+// Replacing a destination range preserves the registrations outside it.
 func (ur *Uring) CloneBuffers(src *Uring, srcOff, dstOff, count uint32, replace bool) error {
 	return ur.cloneBuffersFrom(src, 0, false, srcOff, dstOff, count, replace)
 }
@@ -1618,7 +1570,7 @@ func (ur *Uring) cloneBuffersFrom(src *Uring, srcRegisteredRingIdx uint32, regis
 // submissions, Wait, WaitDirect, WaitExtended, and Stop.
 //
 // Requirements:
-//   - MultiIssuers must be false so New requests IORING_SETUP_DEFER_TASKRUN
+//   - MultiIssuers and HybridPolling must both be false to retain IORING_SETUP_DEFER_TASKRUN
 //   - The caller must remain locked to one OS thread from before Start through Stop
 //   - The ring must not be in CQ overflow condition
 //
@@ -1628,6 +1580,8 @@ func (ur *Uring) cloneBuffersFrom(src *Uring, srcRegisteredRingIdx uint32, regis
 //
 // Nonzero sizes are rounded up to powers of two and clamped to kernel limits.
 // The resulting CQ size must be at least the resulting SQ size.
+// With IndirectSubmissionQueue, changing CQ capacity may temporarily use an
+// additional ring descriptor.
 // If remapping fails after the kernel commits the resize, the ring is closed.
 // Supported on Linux 6.18+.
 func (ur *Uring) ResizeRings(newSQSize, newCQSize uint32) error {
@@ -1815,9 +1769,11 @@ func (ur *Uring) FilesUpdate(sqeCtx SQEContext, fds []int32, offset int, options
 // Inter-Ring Messaging
 // ========================================
 
-// MsgRing sends a message to another io_uring instance.
-// The sqeCtx.FD() should be the target ring's file descriptor.
-// userData and result are passed to the target ring's CQE.
+// MsgRing sends a message to the ring identified by sqeCtx.FD(), which may be
+// this ring. The source CQE reports the send result. On the target CQE,
+// Context().Raw() contains the bits of userData and Res contains result,
+// including negative values. Use distinct message IDs and local request tokens
+// when both kinds of CQE share a ring.
 func (ur *Uring) MsgRing(sqeCtx SQEContext, userData int64, result int32, options ...OpOptionFunc) error {
 	flags := ur.operationOptions(options)
 	return ur.ioUring.msgRing(sqeCtx.OrFlags(flags), userData, result)

@@ -203,11 +203,11 @@ func errFromErrno(errno uintptr) error {
 	}
 }
 
-// CompletionError decodes a CQE result into the package error model.
-// Non-negative results are successful byte counts or operation values.
-// Negative results are kernel -errno values.
-// EAGAIN maps to iox.ErrWouldBlock. This result-only decoder does not inspect
-// CQE flags or determine whether the request is terminal.
+// CompletionError decodes a matched operation result. Nonnegative values return
+// nil. Negative values encode errno, with EAGAIN mapping to iox.ErrWouldBlock.
+// Classify the CQE before calling this function. A [Uring.MsgRing] target carries
+// the sender's signed value, and a SEND_ZC notification can carry usage flags.
+// Consult the CQE flags separately to determine whether more completions follow.
 func CompletionError(res int32) error {
 	if res >= 0 {
 		return nil
@@ -215,17 +215,17 @@ func CompletionError(res int32) error {
 	return errFromErrno(uintptr(-int64(res)))
 }
 
-// Err decodes c.Res as a completion error, independently of c.Flags.
+// Err applies [CompletionError] to c.Res. Call it on a matched operation result.
 func (c *CQEView) Err() error {
 	return CompletionError(c.Res)
 }
 
-// Err decodes c.Res as a completion error, independently of c.Flags.
+// Err applies [CompletionError] to c.Res. Call it on a matched operation result.
 func (c *DirectCQE) Err() error {
 	return CompletionError(c.Res)
 }
 
-// Err decodes c.Res as a completion error, independently of c.Flags.
+// Err applies [CompletionError] to c.Res. Call it on a matched operation result.
 func (c *ExtCQE) Err() error {
 	return CompletionError(c.Res)
 }

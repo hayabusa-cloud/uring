@@ -16,8 +16,8 @@ import (
 	"code.hybscloud.com/zcall"
 )
 
-// A timeout is an asynchronous request with its own CQE. With the default flags,
-// expiry reports -ETIME; the submission call itself does not wait for the timer.
+// A timeout has its own CQE. WithCount(0) waits for time alone. On expiry
+// the CQE reports -ETIME even when other requests complete on the ring.
 func TestBasicTimeout(t *testing.T) {
 	runtime.LockOSThread()
 	t.Cleanup(runtime.UnlockOSThread)
@@ -41,7 +41,7 @@ func TestBasicTimeout(t *testing.T) {
 		}
 	})
 	ctx := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, 0, 0)
-	if err := ring.Timeout(ctx, 10*time.Millisecond); err != nil {
+	if err := ring.Timeout(ctx, 10*time.Millisecond, uring.WithCount(0)); err != nil {
 		t.Fatal(err)
 	}
 	var cqes [1]uring.CQEView
@@ -96,7 +96,7 @@ func TestMultipleTimeouts(t *testing.T) {
 	})
 	for i, d := range []time.Duration{30, 10, 20} {
 		ctx := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, uint16(i), 0)
-		if err := ring.Timeout(ctx, d*time.Millisecond); err != nil {
+		if err := ring.Timeout(ctx, d*time.Millisecond, uring.WithCount(0)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -175,7 +175,7 @@ func TestPollWithTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 	timeout := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, 0, 0)
-	if err := ring.Timeout(timeout, 10*time.Millisecond); err != nil {
+	if err := ring.Timeout(timeout, 10*time.Millisecond, uring.WithCount(0)); err != nil {
 		t.Fatal(err)
 	}
 	var cqes [1]uring.CQEView

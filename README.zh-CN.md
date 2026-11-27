@@ -11,9 +11,11 @@ Go `io_uring` 内核接口包，面向 Linux 6.18+。
 
 ## 概述
 
-`uring` 是 Linux `io_uring` 的内核侧边界：负责创建并启动 ring、填充 SQE、解码 CQE，借助 `user_data` 传递提交标识，并提供缓冲区注册、multishot 操作及监听器初始化等原语，本身并不充当调度器。
+`uring` 负责创建并启动 Linux `io_uring` 实例，准备提交队列条目（SQE），并复制完成队列条目（CQE）。它通过 `user_data` 传递提交标识，并提供缓冲区注册、multishot 操作和监听套接字初始化功能。
 
-设计原则是明确划分边界：内核侧的机制与可观测的完成事实留在本 API 层面，调度策略与组合逻辑由调用方层负责。调用方运行时代码负责完成路由、路由退役、重试与退避、处理器与会话路由、连接生命周期、安全检查以及终态资源释放。
+`uring` 采用 Proactor 模型。以读取为例，调用方发布 SQE，Linux 执行 I/O，调用方通过 `Wait` 取回 CQE，再根据 `user_data` 找到对应的请求，决定是否重试、取消或推进会话。multishot 订阅持有从池中取得的上下文，直到调用方处理完原请求的终止 CQE 和所有已入队的取消 CQE。
+
+`code.hybscloud.com/iox` 描述非阻塞操作的结果。返回的计数表示已经完成的工作量。`iox.ErrWouldBlock` 表示需要等待资源就绪或出现可用空间才能继续。如果应用层的逻辑操作仍在进行，可以用 `iox.ErrMore` 表示。[结果判读规则](./AGENTS.md#outcome-discipline)
 
 核心类型：
 
@@ -211,7 +213,9 @@ ring.PutExtSQE(ext)
 
 ### 通过 `CQEView` 分发完成事件
 
-没有独立的完成上下文类型。使用 `cqe.Context()` 获取原始提交标识，使用 `cqe.Err()` 获取请求结果，并检查标志以判断缓冲区状态和生命周期。`Wait` 返回的错误描述回收过程，而非单个请求。必须分发返回批次中的每个 CQE，包括失败的请求；提前返回会丢弃已从 ring 中回收的完成记录。
+`Wait` 返回 `iox.ErrWouldBlock` 表示当前没有可收取的 CQE。成功时，分派全部 `n` 个 CQE，包括失败请求的 CQE。对于本地请求，`cqe.Context()` 返回提交时的标识。用 `cqe.Err()` 解析操作结果。零拷贝发送通知的 `Res` 字段可能包含使用情况标志。CQE 标志用于判断请求和缓冲区的生命周期。
+
+发送方和接收方约定将 `messageID` 专用于 `MsgRing`。本例的环上，其余标识都属于本地请求。先匹配 `messageID`，匹配后将发送方传入的有符号值 `Res` 原样交给消息处理函数，包括负值。
 
 ```go
 var cqes [64]uring.CQEView
@@ -219,15 +223,15 @@ n, err := ring.Wait(cqes[:])
 if err != nil {
 	return err
 }
-if n == 0 {
-	return iox.ErrWouldBlock
-}
 
 for i := range n {
 	cqe := cqes[i]
-	// Res < 0 encodes -errno; flags describe buffers and request lifetime.
-	if err := cqe.Err(); err != nil {
-		fmt.Printf("completion failed: op=%d fd=%d: %v\n", cqe.Op(), cqe.FD(), err)
+	if cqe.Context().Raw() == uint64(messageID) {
+		handleMessage(cqe.Res)
+		continue
+	}
+	if !cqe.IsNotification() && cqe.Res < 0 {
+		fmt.Printf("completion failed: op=%d fd=%d: %v\n", cqe.Op(), cqe.FD(), cqe.Err())
 	}
 	if cqe.HasBuffer() {
 		fmt.Printf("buffer id=%d\n", cqe.BufID())
@@ -330,7 +334,7 @@ if cqe.HasBuffer() {
 }
 ```
 
-捆绑接收使用同一套提供缓冲区存储，但一个 CQE 可能消耗多个缓冲区。处理迭代器后，将消耗的槽位回收。在迭代器的所有副本中，`Recycle` 只能调用一次；调用返回后，不得再读取已生成的缓冲区：
+一次批量接收可以在一个 CQE 中返回多个提供缓冲区。下面的示例使用流式套接字。遇到 EOF 或接收错误时，内核仍可能返回一个不含数据的槽位。读完数据后，所有迭代器副本合计只调用一次 `Recycle`，归还已消耗的全部槽位。
 
 ```go
 if err := ring.ReceiveBundle(recvCtx, &socketFD, uring.WithReadBufferSize(uring.BufferSizeSmall)); err != nil {
@@ -338,8 +342,10 @@ if err := ring.ReceiveBundle(recvCtx, &socketFD, uring.WithReadBufferSize(uring.
 }
 
 if it, ok := ring.BundleIterator(cqe, cqe.BufGroup()); ok {
-	for buf := range it.All() {
-		handle(buf)
+	if it.TotalBytes() > 0 {
+		for buf := range it.All() {
+			handle(buf)
+		}
 	}
 	if err := it.Recycle(ring); err != nil {
 		return err
@@ -361,19 +367,15 @@ CQE 路由仍由调用方负责。`ListenerOp.HandleCQE` 推进 SOCKET → BIND 
 
 1. `New` 创建处于禁用状态的内核 ring，构造上下文池，选定缓冲区策略。
 2. `Start` 注册缓冲区并启用 ring（固定 Linux 6.18+ 基线）。
-3. 操作方法通过写入 SQE 表达提交意图。
-4. `Wait` 刷新提交并返回已复制的 CQE 描述符。
-5. 调用方运行时代码负责调度、重试、挂起、连接与会话路由、路由退役、安全检查以及终态资源策略。
+3. 通过提交队列执行的操作会预留一个 SQ 槽位，填充 SQE 后将其发布。
+4. `Wait` 推进待处理的提交，并在释放 CQ 槽位前复制 CQE。
+5. 调用方分派这些 CQE，处理重试，并在调用 `Stop` 前排空在途操作。
 
-如此分工使 `code.hybscloud.com/uring` 专注于内核侧机制，同时在边界上保持清晰的完成语义。
+同步注册调用会在返回时给出结果。例如，`RegisterFilesUpdate` 返回的已处理条目数可能小于请求数，即使错误为 `nil`。
 
 ## 运行时边界
 
-`code.hybscloud.com/uring` 之上的运行时层应将其用作内核后端，而不是调度器。边界是单向的：`code.hybscloud.com/uring` 准备 SQE、回收 CQE、保留 `user_data`、暴露 CQE `res` 与标志，并报告所有权事实；调用方运行时代码将这些观测与自身令牌关联，应用重试与退避，路由处理器与会话，批量提交，退役路由，并释放终态资源。
-
-当抽象执行需要完成事实时，运行时桥接层可以消费 Extended 模式 CQE。连接级运行时也可以在需要 CQE 结果、标志、缓冲区 ID 与编码令牌时直接轮询原始 Extended CQE，然后再将事件归约为处理器回调。
-
-位于该边界之上的上下文层与抽象执行层不会改变 `code.hybscloud.com/uring` 的内核边界职责。
+当同一完成队列接收多种来源的事件时，使用 `Wait`，先根据 `cqe.Context().Raw()` 确认来源，再解释 `Res` 或读取本地请求的上下文。目标 ring 收到的 `MsgRing` CQE 可以携带应用定义的负值。如果队列只接收 Extended 模式的完成事件，`WaitExtended` 会返回结果、标志和借用的 `ExtSQE`。在上下文被复用前，复制后续仍需读取的字段。[完成契约](agents/boundary/sqe-cqe.md#observation)
 
 ## 应用层设计模式
 
@@ -381,60 +383,58 @@ CQE 路由仍由调用方负责。`ListenerOp.HandleCQE` 推进 SOCKET → BIND 
 
 ### Ring 所有者事件循环
 
-默认 ring 的事件循环应由在 `Start` 前绑定到 OS 线程的 goroutine 执行，并保持绑定直到 `Stop`。该循环串行执行 ring 操作、提交待处理工作，在 `Wait` 没有返回可观察进展时使用调用方持有的 `iox.Backoff`，并分发完成事件。
+在 `Start` 前将默认 ring 的所有者 goroutine 锁定到一个 OS 线程，直到 `Stop` 结束后再解锁。提交请求后，所有者调用 `Wait` 收取完成事件。
 
 ```go
-func runLoop(ring *uring.Uring, stop <-chan struct{}) error {
-	cqes := make([]uring.CQEView, 64)
-	var backoff iox.Backoff
-	for {
-		select {
-		case <-stop:
-			// The caller must still cancel and drain live requests before ring.Stop.
-			return nil
-		default:
-		}
+cqes := make([]uring.CQEView, 64)
+var backoff iox.Backoff
+for {
+	select {
+	case <-stop:
+		// 调用方在停止 ring 前取消仍在执行的请求，并收完剩余的 CQE。
+		return nil
+	default:
+	}
 
-		n, err := ring.Wait(cqes)
-		switch iox.Classify(err) {
-		case iox.OutcomeWouldBlock:
-			backoff.Wait()
-			continue
-		case iox.OutcomeFailure:
-			return err
-		}
-		if n == 0 {
-			backoff.Wait()
-			continue
-		}
-
+	n, err := ring.Wait(cqes)
+	switch iox.Classify(err) {
+	case iox.OutcomeOK:
 		backoff.Reset()
 		for i := range n {
 			dispatch(ring, cqes[i])
 		}
+	case iox.OutcomeWouldBlock:
+		backoff.Wait()
+	case iox.OutcomeFailure:
+		return err
 	}
 }
 ```
 
-所有 ring 方法，包括 `Send`、`Receive`、`AcceptMultishot` 和 `Wait`，均在该 goroutine 上执行。来自其他 goroutine 的工作应通过调用方持有的工作邮箱（例如 `code.hybscloud.com/lfq`）进入循环，不可直接调用 ring 方法。`iox.Backoff` 由调用方持有：当 `Wait` 返回的错误被分类为 `iox.OutcomeWouldBlock`，或一次 `Wait` 没有回收到任何 CQE 时，调用 `backoff.Wait()`；回收到 `n > 0` 的 CQE 批次后，调用 `backoff.Reset()`。
+即使 `Wait` 成功，批次中也可能有操作失败的 CQE，因此要分发全部 `n` 个条目。如果还有提交请求需要重试，即使 CQ 为空，也应在两次轮询之间检查这些请求。[重试托管的 accept](agents/recipes/stream.md#rearm-a-managed-accept)
 
 ### Multishot 订阅生命周期
 
 Multishot 操作产生 CQE 流，直到内核发送最终 CQE（不含 `IORING_CQE_F_MORE`）。调用方运行时代码先把每个 CQE 交给返回的订阅，再进入其余分发器。
 
 ```go
+accepting := true
 handler := uring.NewMultishotSubscriber().
 	OnStep(func(step uring.MultishotStep) uring.MultishotAction {
 		if step.Err != nil {
 			return uring.MultishotStop
 		}
 		connFD := iofd.FD(step.CQE.Res)
-		registerConnection(connFD)
+		if accepting {
+			registerConnection(connFD)
+		} else if err := connFD.Close(); err != nil {
+			log.Print(err)
+		}
 		return uring.MultishotContinue
 	}).
 	OnStop(func(err error, cancelled bool) {
-		if !cancelled {
-			resubscribeAccept()
+		if accepting && !cancelled {
+			queueAcceptRetry(err)
 		}
 	})
 
@@ -453,9 +453,13 @@ for i := range n {
 }
 ```
 
+`queueAcceptRetry` 为 ring 所有者记录终止结果。执行 `OnStop` 时，旧订阅可能仍持有最后一个 Extended 上下文。分发完 CQE 后，所有者根据终止结果和监听套接字的状态决定是否再次提交 accept。如果 `AcceptMultishot` 返回 `iox.ErrWouldBlock`，则保留这次重试。[重新提交托管的 accept](agents/recipes/stream.md#rearm-a-managed-accept)
+
 每一次 `OnStep` 回调观察一个 `MultishotStep`：返回 `MultishotContinue` 保持流活跃，或返回 `MultishotStop` 请求取消。如果回调一直保持启用直到终态观察，`OnStop` 至多以最终错误及 `cancelled` 标志触发一次；在步骤自身上，`step.Cancelled` 在边界处把内核的 `-ECANCELED` 判定与其他失败明确区分开。这两个回调分别对应 `MultishotHandler.OnMultishotStep` 和 `MultishotHandler.OnMultishotStop`；也可以直接实现该接口。`HandleCQE` 用于调用方串行化完成循环内的立即 dispatch；若调用方在该循环之后保留复制 CQE，则需维护自己的 route state，并拒绝已退役订阅的观察。在默认的单提交者 ring（`MultiIssuers=false`）上，应从固定于 OS 线程的 ring 所有者调用 `Cancel` / `Unsubscribe`，并将其与提交、`Wait`、`WaitDirect`、`WaitExtended`、`Stop` 以及 `ResizeRings` 串行化。`MultiIssuers=true` 的 ring 通过共享提交路径串行化取消 SQE。
 
 每个已入队的取消 CQE 都应交给同一订阅的 `HandleCQE` 或其扩展处理器，即使已到达 `SubscriptionStopped` 或触发 `OnStop`。提交失败或未执行新提交的调用不会产生新的取消 CQE 处理义务。订阅拥有两个上下文，只有在处理完原请求的终态 CQE、完成取消分派且取消提交过程结束后，才将原上下文归还池。不要手动归还这些上下文。[接收示例](./examples/multishot_test.go)展示了自然完成和由处理器请求的取消。
+
+要停止接收新连接，循环的所有者先设置 `accepting = false`，再调用 `sub.Cancel()`。步骤处理器会关闭随后接受的套接字。调用 `Unsubscribe` 后，若某次成功接受连接的回调受到抑制，相应的套接字由分派器接管。[已接受的套接字](agents/boundary/resources.md#accepted-sockets)
 
 ### 类型化上下文承载连接状态
 
@@ -496,18 +500,20 @@ ring.PutExtSQE(ext)
 
 ### 截止时间组合
 
-`LinkTimeout` 为前一个带 `IOSQE_IO_LINK` 的 SQE 设置期限。在已启动且只有一个所有者的 ring 上，先检查容量，再连续提交两个 SQE，其间不插入其他提交或 `Wait`。下面的返回值记录调用方还需回收多少个请求的完成事件。传入非空的接收缓冲区，并在回收接收 CQE 前保持其地址稳定。
+独立定时器若只需等待时间届满，使用 `ring.Timeout(ctx, d, uring.WithCount(0))`。默认计数为一，因此其他请求的完成可能使定时器提前结束，结果为零。定时器到期时，结果为 `-ETIME`。 [定时器与关联超时](./agents/recipes/lifecycle.md#timers-and-linked-deadlines)
+
+`LinkTimeout` 为前一个带 `IOSQE_IO_LINK` 的 SQE 设置期限。在已启动且只有一个所有者的 ring 上，先检查容量，再连续提交两个 SQE，其间不插入其他提交或 `Wait`。下面的返回值记录调用方还需回收多少个请求的完成事件。传入非空的接收缓冲区，并在回收接收 CQE 前保持其地址稳定。为每组尚未完成的接收和定时器分配不同的 `pairID`。处理完两者的 CQE 以及引用该组的所有控制请求的 CQE 后，才能复用这个 ID。
 
 ```go
-func queueReceiveWithTimeout(ring *uring.Uring, fd iofd.FD, buf []byte, d time.Duration) (int, error) {
+func queueReceiveWithTimeout(ring *uring.Uring, pairID uint16, fd iofd.FD, buf []byte, d time.Duration) (int, error) {
 	if ring.SQAvailable() < 2 {
 		return 0, iox.ErrWouldBlock
 	}
-	recvCtx := uring.PackDirect(uring.IORING_OP_RECV, uring.IOSQE_IO_LINK, 0, int32(fd))
+	recvCtx := uring.PackDirect(uring.IORING_OP_RECV, uring.IOSQE_IO_LINK, pairID, int32(fd))
 	if err := ring.ReceiveFD(recvCtx, fd, buf); err != nil {
 		return 0, err
 	}
-	timeoutCtx := uring.PackDirect(uring.IORING_OP_LINK_TIMEOUT, 0, 0, 0)
+	timeoutCtx := uring.PackDirect(uring.IORING_OP_LINK_TIMEOUT, 0, pairID, 0)
 	if err := ring.LinkTimeout(timeoutCtx, d); err != nil {
 		return 1, err
 	}
@@ -531,12 +537,15 @@ func queueReceiveWithTimeout(ring *uring.Uring, fd iofd.FD, buf []byte, d time.D
 `ListenerManager` 提交最初的 SOCKET 请求。将配置阶段的每个 CQE 交给 `listenerOp.HandleCQE`，即可自动调用回调并提交 BIND 和 LISTEN。如果返回 `iox.ErrWouldBlock`，应先驱动 ring，再通过 `ring.SubmitExtended(uring.PackExtended(listenerOp.Ext()))` 重试已准备好的 SQE；不要重复处理该 CQE。收到 `OnListening` 的成功通知后再开始接受连接。
 
 ```go
-// OnListening has reported successful setup for listenerOp.
 acceptSub, err := listenerOp.AcceptMultishot(acceptHandler)
 if err != nil {
 	return err
 }
+```
 
+由监听器的分发循环保留 `acceptSub`。每次接受连接成功后，连接的所有者将 `iofd.FD(step.CQE.Res)` 保存为 `clientFD`。如果提交接收请求返回 `iox.ErrWouldBlock`，保留该 FD，只重试接收请求。若放弃该连接，则关闭该 FD。
+
+```go
 recvCtx := uring.ForFD(int32(clientFD)).WithBufGroup(readGroup)
 recvSub, err := ring.ReceiveMultishot(recvCtx, recvHandler)
 if err != nil {
@@ -544,7 +553,7 @@ if err != nil {
 }
 ```
 
-停止订阅时调用 `Cancel`，然后继续分发，直到处理完其终端 CQE，以及已提交的取消请求对应的 CQE。两个订阅都必须完成收尾，才能关闭其描述符或停止 ring。[监听器示例](./listener_example_test.go) 展示完整的创建与关闭流程；[multishot 示例](./examples/multishot_test.go) 和 [echo 示例](./examples/echo_test.go) 展示连接处理。
+停止订阅时调用 `Cancel`，然后继续分发，直到处理完其终端 CQE，以及已提交的取消请求对应的 CQE。每个已提交的订阅都必须完成收尾，才能关闭其描述符。停止 ring 前须完成所有订阅的收尾。[监听器示例](./listener_example_test.go) 展示完整的创建与关闭流程；[multishot 示例](./examples/multishot_test.go) 和 [echo 示例](./examples/echo_test.go) 展示连接处理。
 
 ### TCP 客户端
 
@@ -642,7 +651,7 @@ Idle → Active → Stopping → Retiring → Stopped
 - 默认的 `MultiIssuers=false` 请求 `SINGLE_ISSUER` + `DEFER_TASKRUN`，避免共享提交同步。所有者须在 `Start` 前调用 `runtime.LockOSThread`，保持线程绑定直到 `Stop`，并串行执行提交、等待、扩缩容和销毁。需要共享提交或在 OS 线程之间迁移时，显式选择 `MultiIssuers=true`（`COOP_TASKRUN`）。
 - `EpollWait` 要求 `timeout` 为 `0`；如需设置截止时间，使用 `LinkTimeout`。
 - 所有请求完成处理和借用访问结束后，才能归还池化上下文。
-- `ListenerOp.Close` 会立即关闭监听 FD。若仍有设置 CQE 待处理，需先回收该 CQE，再调用 `Close` 将借用的 `ExtSQE` 归还池中。
+- 调用 `ListenerOp.Close` 后，`FD()` 返回 `-1`。待处理的 `BIND` 或 `LISTEN` 会保持套接字打开，直到对应的 CQE 被解码。用 `HandleCQE` 处理待分派的设置 CQE，再次调用 `Close` 将借用的 `ExtSQE` 归还池中。[手动分派](agents/recipes/listener.md)
 
 ## 平台支持
 

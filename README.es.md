@@ -11,9 +11,11 @@ Idioma: [English](./README.md) | [简体中文](./README.zh-CN.md) | **Español*
 
 ## Descripción general
 
-`uring` es el paquete Go que expone la interfaz de `io_uring` frente al kernel de Linux. Crea y arranca rings, prepara SQE, decodifica CQE, transporta la identidad de envío a través de `user_data` y ofrece registro de búferes, operaciones multishot y primitivas de configuración de escuchas, sin convertirse en un planificador.
+`uring` crea y arranca rings de Linux `io_uring`, prepara entradas de la cola de envío (SQE) y copia entradas de la cola de finalización (CQE). Conserva la identidad del envío en `user_data` y permite registrar búferes, usar operaciones multishot y configurar sockets de escucha.
 
-El diseño sigue un principio de frontera explícita: la mecánica orientada al kernel y los hechos observables de completado permanecen en el borde de la API, mientras que la política y la composición quedan en las capas del llamador. El código de ejecución del llamador posee el enrutamiento de finalizaciones, la retirada de rutas, los reintentos y la espera progresiva, el enrutamiento de manejadores y sesiones, las comprobaciones de seguridad, el ciclo de vida de conexiones y la liberación terminal de recursos.
+`uring` sigue el modelo Proactor. Para una lectura, el llamador publica una SQE, Linux realiza la E/S y el llamador recoge la CQE con `Wait`. Identifica la solicitud mediante `user_data` antes de decidir si debe reintentar, cancelar o avanzar la sesión. Una suscripción multishot conserva su contexto del pool hasta que se hayan despachado la CQE terminal de la solicitud original y cualquier CQE de cancelación encolada.
+
+`code.hybscloud.com/iox` describe los resultados de las operaciones no bloqueantes. El recuento indica cuánto trabajo se ha realizado. `iox.ErrWouldBlock` indica que para avanzar hay que esperar a que el recurso esté listo o tenga capacidad disponible. La aplicación puede usar `iox.ErrMore` si su operación lógica sigue activa. [Reglas de los resultados](./AGENTS.md#outcome-discipline)
 
 Las superficies principales son:
 
@@ -211,7 +213,9 @@ ring.PutExtSQE(ext)
 
 ### Despacho de completados con `CQEView`
 
-No existe un tipo separado de contexto de finalización. Use `cqe.Context()` para recuperar el token original, `cqe.Err()` para obtener el resultado de la petición y los indicadores para conocer el estado y la vida útil de los búferes. El error de `Wait` describe la recogida, no las peticiones individuales. Despache todos los CQE del lote, incluidos los fallos: un retorno anticipado descartaría registros ya retirados del ring.
+Si `Wait` devuelve `iox.ErrWouldBlock`, no hay ninguna CQE lista. Si tiene éxito, despache las `n` CQE, incluidas las de solicitudes fallidas. En una solicitud local, `cqe.Context()` devuelve su token de envío. Use `cqe.Err()` para interpretar el resultado de una operación. En una notificación de envío sin copia, `Res` puede contener indicadores de uso. Los indicadores de la CQE describen la vida útil de la solicitud y de los búferes.
+
+El emisor y el receptor reservan `messageID` para `MsgRing`. En el anillo de este ejemplo, todos los demás identificadores corresponden a solicitudes locales. Compruebe primero `messageID` y pase al manejador de mensajes el valor con signo de `Res` que envió el emisor, incluso si es negativo.
 
 ```go
 var cqes [64]uring.CQEView
@@ -219,15 +223,15 @@ n, err := ring.Wait(cqes[:])
 if err != nil {
 	return err
 }
-if n == 0 {
-	return iox.ErrWouldBlock
-}
 
 for i := range n {
 	cqe := cqes[i]
-	// Res < 0 encodes -errno; flags describe buffers and request lifetime.
-	if err := cqe.Err(); err != nil {
-		fmt.Printf("completion failed: op=%d fd=%d: %v\n", cqe.Op(), cqe.FD(), err)
+	if cqe.Context().Raw() == uint64(messageID) {
+		handleMessage(cqe.Res)
+		continue
+	}
+	if !cqe.IsNotification() && cqe.Res < 0 {
+		fmt.Printf("completion failed: op=%d fd=%d: %v\n", cqe.Op(), cqe.FD(), cqe.Err())
 	}
 	if cqe.HasBuffer() {
 		fmt.Printf("buffer id=%d\n", cqe.BufID())
@@ -330,7 +334,7 @@ if cqe.HasBuffer() {
 }
 ```
 
-Las recepciones agrupadas usan el mismo almacenamiento de búferes provistos, pero pueden consumir más de un búfer en un solo CQE. Procese el iterador y después recicle los slots consumidos. Llame a `Recycle` exactamente una vez entre todas las copias de un iterador; después de que retorne, no lea los búferes producidos:
+Una recepción agrupada puede consumir varios búferes provistos en una sola CQE. En un socket de flujo como el de este ejemplo, el kernel puede devolver un slot sin datos al llegar a EOF o producirse un error. Termine de leer la carga útil y llame a `Recycle` una sola vez entre todas las copias del iterador para devolver los slots consumidos.
 
 ```go
 if err := ring.ReceiveBundle(recvCtx, &socketFD, uring.WithReadBufferSize(uring.BufferSizeSmall)); err != nil {
@@ -338,8 +342,10 @@ if err := ring.ReceiveBundle(recvCtx, &socketFD, uring.WithReadBufferSize(uring.
 }
 
 if it, ok := ring.BundleIterator(cqe, cqe.BufGroup()); ok {
-	for buf := range it.All() {
-		handle(buf)
+	if it.TotalBytes() > 0 {
+		for buf := range it.All() {
+			handle(buf)
+		}
 	}
 	if err := it.Recycle(ring); err != nil {
 		return err
@@ -361,19 +367,15 @@ La frontera de implementación se define así:
 
 1. `New` construye un ring del kernel deshabilitado, crea los pools de contexto y elige la estrategia de búferes.
 2. `Start` registra los búferes y habilita el ring para la línea base fija de Linux 6.18+.
-3. Los métodos de operación declaran intención escribiendo SQE.
-4. `Wait` vacía los envíos y devuelve descriptores CQE copiados.
-5. El código de ejecución del llamador decide planificación, reintentos, espera, enrutamiento de conexión/sesión, retirada de rutas, comprobaciones de seguridad y política terminal de recursos.
+3. Las operaciones encoladas reservan una entrada en la SQ, rellenan la SQE y la publican.
+4. `Wait` impulsa los envíos pendientes y copia las CQE antes de liberar sus entradas en la cola.
+5. El llamador despacha esas finalizaciones, gestiona los reintentos y drena las operaciones en curso antes de llamar a `Stop`.
 
-De este modo, `code.hybscloud.com/uring` se mantiene centrado en la mecánica frente al kernel y preserva el significado de los completados a través de la frontera.
+Las llamadas de registro síncronas devuelven el resultado al terminar. Por ejemplo, `RegisterFilesUpdate` puede devolver un recuento inferior al solicitado con un error `nil`.
 
 ## Frontera de ejecución
 
-Las capas de ejecución por encima de `code.hybscloud.com/uring` deben usarlo como backend del kernel, no como planificador. La frontera es unidireccional: `code.hybscloud.com/uring` prepara SQEs, recoge CQEs, preserva `user_data`, expone `res` y marcas de CQE, e informa hechos de propiedad; el código de ejecución del llamador correlaciona esas observaciones con sus propios tokens, aplica reintentos y espera progresiva, enruta manejadores y sesiones, agrupa envíos, retira rutas y libera recursos terminales.
-
-Un puente de ejecución puede consumir CQEs en modo Extended cuando la ejecución abstracta necesita hechos de completado. Un entorno de ejecución por conexión también puede sondear CQEs Extended sin procesar directamente cuando necesita el resultado de CQE, las marcas, el ID de búfer y el token codificado antes de reducir el evento a devoluciones de llamada de manejador.
-
-Las capas de contexto y ejecución abstracta por encima de esta frontera no cambian el rol de `code.hybscloud.com/uring` como frontera del kernel.
+En una cola de finalización con eventos de distintos orígenes, use `Wait` e identifique el origen mediante `cqe.Context().Raw()` antes de interpretar `Res` o leer el contexto de una solicitud local. Una CQE de `MsgRing` en el ring de destino puede contener un valor negativo de la aplicación. En una cola reservada al modo Extended, `WaitExtended` devuelve el resultado, los indicadores y un `ExtSQE` prestado. Copie los campos del contexto que necesite más tarde antes de que se reutilice. [Contratos de finalización](agents/boundary/sqe-cqe.md#observation)
 
 ## Patrones para la capa de aplicación
 
@@ -381,60 +383,58 @@ Las capas de contexto y ejecución abstracta por encima de esta frontera no camb
 
 ### Bucle de eventos propietario del ring
 
-Ejecute el bucle de eventos del ring predeterminado en la goroutine fijada a un hilo antes de `Start`, manteniéndola en ese hilo hasta `Stop`. El bucle serializa las operaciones del ring, envía el trabajo pendiente, aplica un `iox.Backoff` del llamador cuando `Wait` no informa progreso observable y despacha las finalizaciones:
+Fije la goroutine propietaria del ring predeterminado a un hilo del sistema antes de `Start` y manténgala en ese hilo hasta que termine `Stop`. Una vez enviadas las solicitudes, el propietario llama a `Wait` para recoger sus resultados.
 
 ```go
-func runLoop(ring *uring.Uring, stop <-chan struct{}) error {
-	cqes := make([]uring.CQEView, 64)
-	var backoff iox.Backoff
-	for {
-		select {
-		case <-stop:
-			// The caller must still cancel and drain live requests before ring.Stop.
-			return nil
-		default:
-		}
+cqes := make([]uring.CQEView, 64)
+var backoff iox.Backoff
+for {
+	select {
+	case <-stop:
+		// El llamador cancela y drena las solicitudes activas antes de detener el ring.
+		return nil
+	default:
+	}
 
-		n, err := ring.Wait(cqes)
-		switch iox.Classify(err) {
-		case iox.OutcomeWouldBlock:
-			backoff.Wait()
-			continue
-		case iox.OutcomeFailure:
-			return err
-		}
-		if n == 0 {
-			backoff.Wait()
-			continue
-		}
-
+	n, err := ring.Wait(cqes)
+	switch iox.Classify(err) {
+	case iox.OutcomeOK:
 		backoff.Reset()
 		for i := range n {
 			dispatch(ring, cqes[i])
 		}
+	case iox.OutcomeWouldBlock:
+		backoff.Wait()
+	case iox.OutcomeFailure:
+		return err
 	}
 }
 ```
 
-Todos los métodos del ring, incluidos `Send`, `Receive`, `AcceptMultishot` y `Wait`, se ejecutan en esta goroutine. El trabajo procedente de otras goroutines debe entrar en el bucle por un buzón de trabajo propiedad del llamador, como `code.hybscloud.com/lfq`, no mediante llamadas directas a los métodos del ring. `iox.Backoff` sigue siendo propiedad del llamador: use `backoff.Wait()` cuando `Wait` se clasifique como `iox.OutcomeWouldBlock` o no recoja ningún CQE, y `backoff.Reset()` tras cualquier lote con `n > 0`.
+Aunque `Wait` tenga éxito, el lote puede contener un CQE de una operación fallida. Despache los `n` CQE. Si hay solicitudes que reintentar, revíselas entre sondeos, incluso cuando la CQ esté vacía. [Reintentar un accept gestionado](agents/recipes/stream.md#rearm-a-managed-accept)
 
 ### Ciclo de vida de suscripciones multishot
 
 Una operación multishot genera un flujo de CQEs hasta que el kernel envía uno final (sin `IORING_CQE_F_MORE`). El código de ejecución del llamador encamina cada CQE por la suscripción devuelta antes de pasar al resto del despachador:
 
 ```go
+accepting := true
 handler := uring.NewMultishotSubscriber().
 	OnStep(func(step uring.MultishotStep) uring.MultishotAction {
 		if step.Err != nil {
 			return uring.MultishotStop
 		}
 		connFD := iofd.FD(step.CQE.Res)
-		registerConnection(connFD)
+		if accepting {
+			registerConnection(connFD)
+		} else if err := connFD.Close(); err != nil {
+			log.Print(err)
+		}
 		return uring.MultishotContinue
 	}).
 	OnStop(func(err error, cancelled bool) {
-		if !cancelled {
-			resubscribeAccept()
+		if accepting && !cancelled {
+			queueAcceptRetry(err)
 		}
 	})
 
@@ -453,9 +453,13 @@ for i := range n {
 }
 ```
 
+`queueAcceptRetry` registra el resultado final para el propietario del ring. Durante `OnStop`, la suscripción anterior aún puede retener el último contexto Extended. Tras procesar el lote de CQE, el propietario decide si el resultado y el estado del listener justifican otro accept. Si `AcceptMultishot` devuelve `iox.ErrWouldBlock`, el reintento queda pendiente. [Reactivar un accept gestionado](agents/recipes/stream.md#rearm-a-managed-accept)
+
 Cada llamada a `OnStep` observa un `MultishotStep`: devuelva `MultishotContinue` para mantener el flujo activo o `MultishotStop` para solicitar la cancelación. Si las devoluciones de llamada permanecen habilitadas hasta la observación terminal, `OnStop` se ejecuta como máximo una vez con el error final y la bandera `cancelled`; en el propio paso, `step.Cancelled` distingue en el límite el veredicto específico `-ECANCELED` del kernel del resto de fallos. Estas funciones corresponden a `MultishotHandler.OnMultishotStep` y `MultishotHandler.OnMultishotStop`; también puede implementar esa interfaz directamente. `HandleCQE` sirve para el despacho inmediato en el bucle de finalización serializado del llamador; si el código llamador conserva CQE copiadas más allá de ese bucle, debe mantener su propio estado de ruta y rechazar observaciones de suscripciones ya retiradas. En los rings predeterminados de emisor único (`MultiIssuers=false`), llame a `Cancel` / `Unsubscribe` desde el propietario fijado a un hilo del sistema operativo y serialícelos con envío, `Wait`, `WaitDirect`, `WaitExtended`, `Stop` y `ResizeRings`. Los rings con `MultiIssuers=true` serializan los SQE de cancelación mediante la ruta de envío compartida.
 
 Dirija cada CQE de cancelación encolada al `HandleCQE` de la misma suscripción o a su manejador extendido, incluso después de `SubscriptionStopped` o `OnStop`. Un fallo de envío o una llamada sin efecto no crea una nueva obligación de CQE de cancelación. La suscripción posee ambos contextos y devuelve el original a su pool solo tras procesar la CQE terminal original, despachar la cancelación y finalizar su envío. No devuelva estos contextos manualmente. El [ejemplo de recepción](./examples/multishot_test.go) muestra la finalización natural y la cancelación solicitada por el manejador.
+
+Para dejar de admitir conexiones, el propietario del bucle establece `accepting = false` antes de llamar a `sub.Cancel()`. El manejador de pasos cierra los sockets que se acepten después. Tras `Unsubscribe`, el despachador se hace cargo de cada socket aceptado cuya devolución de llamada se haya suprimido. [Sockets aceptados](agents/boundary/resources.md#accepted-sockets)
 
 ### Estado por conexión con contextos tipados
 
@@ -496,18 +500,20 @@ Mantenga las raíces de punteros Go activas accesibles fuera de `UserData`. El G
 
 ### Composición de plazos
 
-`LinkTimeout` aplica un plazo a la SQE anterior marcada con `IOSQE_IO_LINK`. Con un ring ya iniciado y un único propietario, compruebe la capacidad y encole ambas SQE seguidas, antes de cualquier otro envío o llamada a `Wait`. El recuento devuelto indica cuántas solicitudes siguen pendientes de recogida. Use un búfer de recepción no vacío y mantenga estable su dirección hasta recibir la CQE de recepción.
+Para que un temporizador independiente solo termine al vencer el plazo, use `ring.Timeout(ctx, d, uring.WithCount(0))`. El contador predeterminado es uno, por lo que otra operación que se complete puede hacer que el temporizador devuelva cero antes de vencer. Al expirar, devuelve `-ETIME`. [Temporizadores y plazos enlazados](./agents/recipes/lifecycle.md#timers-and-linked-deadlines)
+
+`LinkTimeout` aplica un plazo a la SQE anterior marcada con `IOSQE_IO_LINK`. Con un ring ya iniciado y un único propietario, compruebe la capacidad y encole ambas SQE seguidas, antes de cualquier otro envío o llamada a `Wait`. El recuento devuelto indica cuántas solicitudes siguen pendientes de recogida. Use un búfer de recepción no vacío y mantenga estable su dirección hasta recibir la CQE de recepción. Asigne un `pairID` distinto a cada par pendiente. Reutilícelo después de procesar ambas CQE y las respuestas a las operaciones de control que hagan referencia al par.
 
 ```go
-func queueReceiveWithTimeout(ring *uring.Uring, fd iofd.FD, buf []byte, d time.Duration) (int, error) {
+func queueReceiveWithTimeout(ring *uring.Uring, pairID uint16, fd iofd.FD, buf []byte, d time.Duration) (int, error) {
 	if ring.SQAvailable() < 2 {
 		return 0, iox.ErrWouldBlock
 	}
-	recvCtx := uring.PackDirect(uring.IORING_OP_RECV, uring.IOSQE_IO_LINK, 0, int32(fd))
+	recvCtx := uring.PackDirect(uring.IORING_OP_RECV, uring.IOSQE_IO_LINK, pairID, int32(fd))
 	if err := ring.ReceiveFD(recvCtx, fd, buf); err != nil {
 		return 0, err
 	}
-	timeoutCtx := uring.PackDirect(uring.IORING_OP_LINK_TIMEOUT, 0, 0, 0)
+	timeoutCtx := uring.PackDirect(uring.IORING_OP_LINK_TIMEOUT, 0, pairID, 0)
 	if err := ring.LinkTimeout(timeoutCtx, d); err != nil {
 		return 1, err
 	}
@@ -531,12 +537,15 @@ Los siguientes son los flujos más cortos, pensados para leerse junto con las pr
 `ListenerManager` envía la solicitud SOCKET inicial. Pase cada CQE de configuración a `listenerOp.HandleCQE` para invocar los callbacks y enviar BIND y LISTEN automáticamente. Si devuelve `iox.ErrWouldBlock`, procese el anillo y reintente el SQE preparado con `ring.SubmitExtended(uring.PackExtended(listenerOp.Ext()))`; no vuelva a procesar el CQE. Empiece a aceptar conexiones cuando `OnListening` confirme el éxito.
 
 ```go
-// OnListening has reported successful setup for listenerOp.
 acceptSub, err := listenerOp.AcceptMultishot(acceptHandler)
 if err != nil {
 	return err
 }
+```
 
+Conserve `acceptSub` en el bucle que despacha las CQE del listener. Por cada conexión aceptada, su propietario guarda `iofd.FD(step.CQE.Res)` como `clientFD`. Si el envío de la solicitud de recepción devuelve `iox.ErrWouldBlock`, conserve ese FD y reintente solo la recepción. Ciérrelo si abandona la conexión.
+
+```go
 recvCtx := uring.ForFD(int32(clientFD)).WithBufGroup(readGroup)
 recvSub, err := ring.ReceiveMultishot(recvCtx, recvHandler)
 if err != nil {
@@ -544,7 +553,7 @@ if err != nil {
 }
 ```
 
-Para detener una suscripción, llame a `Cancel` y siga despachando hasta procesar su CQE terminal y la CQE de cancelación, si se envió. Drene ambas suscripciones antes de cerrar sus descriptores o detener el ring. [El ejemplo de escucha](./listener_example_test.go) muestra la configuración y el cierre completos; los [ejemplos multishot](./examples/multishot_test.go) y de [echo](./examples/echo_test.go) cubren el flujo de conexión.
+Para detener una suscripción, llame a `Cancel` y siga despachando hasta procesar su CQE terminal y la CQE de cancelación, si se envió. Drene cada suscripción admitida antes de cerrar su descriptor o detener el ring. [El ejemplo de escucha](./listener_example_test.go) muestra la configuración y el cierre completos; los [ejemplos multishot](./examples/multishot_test.go) y de [echo](./examples/echo_test.go) cubren el flujo de conexión.
 
 ### Cliente TCP
 
@@ -642,7 +651,7 @@ En la raíz del paquete, [listener_example_test.go](./listener_example_test.go) 
 - La configuración predeterminada `MultiIssuers=false` solicita `SINGLE_ISSUER` + `DEFER_TASKRUN` y evita la sincronización de envíos compartidos. El propietario debe llamar a `runtime.LockOSThread` antes de `Start`, permanecer fijado al hilo hasta `Stop` y serializar los envíos, las esperas, el redimensionamiento y la liberación del ring. Seleccione `MultiIssuers=true` (`COOP_TASKRUN`) para compartir los envíos o permitir la migración entre hilos del sistema operativo.
 - `EpollWait` requiere que `timeout` sea `0`; use `LinkTimeout` cuando necesite un plazo.
 - Devuelva los contextos al pool solo cuando hayan terminado todas las finalizaciones de la petición y los accesos prestados.
-- `ListenerOp.Close` cierra el FD del escucha de inmediato. Si aún hay un CQE de configuración pendiente, drene ese CQE y vuelva a llamar a `Close` para devolver el `ExtSQE` prestado al pool.
+- Tras llamar a `ListenerOp.Close`, `FD()` devuelve `-1`. Una operación `BIND` o `LISTEN` pendiente mantiene abierto el socket hasta que se decodifique su CQE. Procese con `HandleCQE` cualquier CQE de configuración pendiente y vuelva a llamar a `Close` para devolver el `ExtSQE` prestado al pool. [Despacho manual](agents/recipes/listener.md)
 
 ## Soporte de plataforma
 

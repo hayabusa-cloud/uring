@@ -14,20 +14,9 @@ import "code.hybscloud.com/iofd"
 //   - error steps stop
 //   - terminal stop is ignored
 //
-// Example:
-//
-//	type myObserver struct {
-//	   uring.NoopMultishotHandler
-//	   connections int
-//	}
-//
-//	func (o *myObserver) OnMultishotStep(step uring.MultishotStep) uring.MultishotAction {
-//	   if step.Err == nil && step.CQE.Res >= 0 {
-//	       o.connections++
-//	       return uring.MultishotContinue
-//	   }
-//	   return o.NoopMultishotHandler.OnMultishotStep(step)
-//	}
+// When a step returns a resource, its caller must arrange for its disposition.
+// For [Uring.AcceptMultishot], transfer or close each successful socket in the
+// step handler or in the caller's serialized completion loop.
 type NoopMultishotHandler struct{}
 
 // OnMultishotStep returns the default action for the observed step.

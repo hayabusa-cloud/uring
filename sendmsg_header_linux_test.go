@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"fmt"
 	"runtime"
+	"slices"
 	"testing"
 	"unsafe"
 
@@ -85,7 +86,7 @@ func TestSendMsgHeaderDatagrams(t *testing.T) {
 					buf [16]byte
 				}
 				var contexts [3]uring.SQEContext
-				payloads := [3]string{"first packet", "", "third packet"}
+				payloads := [3]string{"first packet", "", "third datagram"}
 				want := make(map[uint64]int32)
 				for i := range requests {
 					r := &requests[i]
@@ -117,7 +118,8 @@ func TestSendMsgHeaderDatagrams(t *testing.T) {
 					}
 					delete(want, id)
 				}
-				for _, payload := range payloads {
+				var received [len(payloads)]string
+				for i := range received {
 					var buf [32]byte
 					var peer sock.RawSockaddrAny
 					iov := uring.IoVec{Base: &buf[0], Len: uint64(len(buf))}
@@ -126,13 +128,17 @@ func TestSendMsgHeaderDatagrams(t *testing.T) {
 					if errno != 0 {
 						t.Fatalf("receive datagram: %v", zcall.Errno(errno))
 					}
-					if string(buf[:n]) != payload {
-						t.Fatalf("datagram = %q; want %q", buf[:n], payload)
-					}
+					received[i] = string(buf[:n])
 					sourceRaw, sourceSize := source.Raw()
 					if msg.Namelen != sourceSize || !bytes.Equal(unsafe.Slice(msg.Name, msg.Namelen), unsafe.Slice((*byte)(sourceRaw), sourceSize)) {
 						t.Fatal("datagram source address changed")
 					}
+				}
+				// Independent sends can reach the peer in any order.
+				slices.Sort(received[:])
+				slices.Sort(payloads[:])
+				if received != payloads {
+					t.Fatalf("received datagrams %q, want %q", received, payloads)
 				}
 				if contexts[2].ExtSQE().UserData[0] != 0xa5 {
 					t.Fatal("extended user data changed")
@@ -246,13 +252,7 @@ func TestSendMsgHeaderAncillary(t *testing.T) {
 		t.Fatal(err)
 	}
 	runtime.GC()
-	seen := map[uring.SQEContext]bool{}
-	for _, cqe := range waitForCQEs(t, ring, 2) {
-		if cqe.Res != int32(len(payload)) || seen[cqe.Context()] || cqe.Context() != sendCtx && cqe.Context() != recvCtx {
-			t.Fatalf("message completion: %+v", cqe)
-		}
-		seen[cqe.Context()] = true
-	}
+	requireTerminalResults(t, ring, map[uring.SQEContext]int32{sendCtx: int32(len(payload)), recvCtx: int32(len(payload))})
 	if !bytes.Equal(buf, payload) || recv.Flags != 0 {
 		t.Fatalf("received %q, flags %#x", buf, recv.Flags)
 	}
@@ -333,52 +333,79 @@ func TestSendMsgHeaderNotificationPolicy(t *testing.T) {
 }
 
 func TestSendMsgHeaderShortStream(t *testing.T) {
-	fds, err := newUnixSocketPairForTest()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer closeTestFds(fds)
-	size := int32(4096)
-	if errno := zcall.Setsockopt(uintptr(fds[0]), zcall.SOL_SOCKET, zcall.SO_SNDBUF, unsafe.Pointer(&size), unsafe.Sizeof(size)); errno != 0 {
-		t.Fatal(zcall.Errno(errno))
-	}
-	ring := newTestRing(t, func(o *uring.Options) { o.NotifySucceed = true })
-	payload := bytes.Repeat([]byte("x"), 65536)
-	iov := uring.IoVec{Base: &payload[0], Len: uint64(len(payload))}
-	msg := uring.Msghdr{Iov: &iov, Iovlen: 1, Flags: zcall.MSG_WAITALL}
-	ctx := uring.PackDirect(uring.IORING_OP_SENDMSG, uring.IOSQE_IO_LINK, 1, int32(fds[0]))
-	if err := ring.SendMsgHeader(ctx, fds[0], &msg); err != nil {
-		t.Fatal(err)
-	}
-	if err := ring.Nop(uring.PackDirect(uring.IORING_OP_NOP, 0, 2, 0)); err != nil {
-		t.Fatal(err)
-	}
-	var sent int32
-	seenNop := false
-	for _, cqe := range waitForCQEs(t, ring, 2) {
-		switch cqe.Op() {
-		case uring.IORING_OP_SENDMSG:
-			if cqe.Context() != ctx || cqe.Res <= 0 || cqe.Res >= int32(len(payload)) || sent != 0 {
-				t.Fatalf("expected one short send: %+v", cqe)
+	payload := bytes.Repeat([]byte("send"), 16384)
+	for _, tc := range []struct {
+		name       string
+		sendBuffer int32
+		notify     bool
+		wantShort  bool
+	}{
+		{"short-reported", 4096, true, true},
+		{"short-suppressed", 4096, false, true},
+		{"full-reported", 65536, true, false},
+		{"full-suppressed", 65536, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fds, err := newUnixSocketPairForTest()
+			if err != nil {
+				t.Fatal(err)
 			}
-			sent = cqe.Res
-		case uring.IORING_OP_NOP:
-			if cqe.Res != 0 || seenNop {
-				t.Fatalf("ordinary short send broke its link: %+v", cqe)
+			defer closeTestFds(fds)
+			if errno := zcall.Setsockopt(uintptr(fds[0]), zcall.SOL_SOCKET, zcall.SO_SNDBUF, unsafe.Pointer(&tc.sendBuffer), unsafe.Sizeof(tc.sendBuffer)); errno != 0 {
+				t.Fatal(zcall.Errno(errno))
 			}
-			seenNop = true
-		default:
-			t.Fatalf("unexpected completion: %+v", cqe)
-		}
+			ring := newTestRing(t, func(o *uring.Options) { o.NotifySucceed = tc.notify })
+			iov := uring.IoVec{Base: &payload[0], Len: uint64(len(payload))}
+			msg := uring.Msghdr{Iov: &iov, Iovlen: 1, Flags: zcall.MSG_WAITALL}
+			send := uring.PackDirect(uring.IORING_OP_SENDMSG, uring.IOSQE_IO_LINK, 1, int32(fds[0]))
+			nop := uring.PackDirect(uring.IORING_OP_NOP, 0, 2, 0)
+			if err := ring.SendMsgHeader(send, fds[0], &msg); err != nil {
+				t.Fatal(err)
+			}
+			if err := ring.Nop(nop); err != nil {
+				t.Fatal(err)
+			}
+			wantCQEs := 1
+			if tc.notify {
+				wantCQEs++
+			}
+			reported := int32(-1)
+			seenNop := false
+			for _, cqe := range waitForCQEs(t, ring, wantCQEs) {
+				switch cqe.Context() {
+				case send:
+					if !tc.notify || reported >= 0 || cqe.Res <= 0 {
+						t.Fatalf("unexpected send CQE: %+v", cqe)
+					}
+					reported = cqe.Res
+				case nop:
+					if seenNop || cqe.Res != 0 || cqe.Flags != 0 {
+						t.Fatalf("linked NOP: %+v", cqe)
+					}
+					seenNop = true
+				default:
+					t.Fatalf("unexpected completion: %+v", cqe)
+				}
+			}
+			if !seenNop || ring.CQPending() != 0 {
+				t.Fatal("unexpected completion count for linked send")
+			}
+			// Read through EOF to measure the prefix independently of the send CQE.
+			if errno := zcall.Shutdown(uintptr(fds[0]), zcall.SHUT_WR); errno != 0 {
+				t.Fatal(zcall.Errno(errno))
+			}
+			buf := make([]byte, len(payload)+1)
+			n, errno := zcall.Recvfrom(uintptr(fds[1]), buf, zcall.MSG_WAITALL, nil, nil)
+			if errno != 0 || n == 0 || n > uintptr(len(payload)) || !bytes.Equal(buf[:n], payload[:n]) {
+				t.Fatalf("received prefix: %d bytes, errno %d", n, errno)
+			}
+			if short := n < uintptr(len(payload)); short != tc.wantShort || tc.notify && int32(n) != reported {
+				t.Fatalf("offered %d, peer received %d, send CQE count %d", len(payload), n, reported)
+			}
+			t.Logf("peer received %d of %d bytes, %d CQEs", n, len(payload), wantCQEs)
+			runtime.KeepAlive(&msg)
+		})
 	}
-	if sent == 0 || !seenNop {
-		t.Fatal("missing send or linked completion")
-	}
-	buf := make([]byte, len(payload))
-	if n, errno := zcall.Read(uintptr(fds[1]), buf); errno != 0 || n != uintptr(sent) || !bytes.Equal(buf[:n], payload[:sent]) {
-		t.Fatalf("short send prefix: %d bytes, errno %d; want %d", n, errno, sent)
-	}
-	runtime.KeepAlive(&msg)
 }
 
 func TestSendMsgHeaderDeferredCancellation(t *testing.T) {
@@ -495,6 +522,80 @@ func TestMessageHeaderAllocations(t *testing.T) {
 					runtime.KeepAlive(messages)
 				})
 			}
+		}
+	}
+}
+
+func TestRecvMsgRightsControlLength(t *testing.T) {
+	pair, err := sock.UnixConnPair("unixgram")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		pair[0].Close()
+		pair[1].Close()
+	})
+	tx, rx := pair[0].FD(), pair[1].FD()
+	one := sock.UnixRights(tx.Fd())
+	two := sock.UnixRights(tx.Fd(), tx.Fd())
+	three := sock.UnixRights(tx.Fd(), tx.Fd(), tx.Fd())
+	var send uring.Msghdr
+	control := make([]byte, sock.CmsgSpace(3*4))
+	payload := byte(0xa5)
+	iov := uring.IoVec{Base: &payload, Len: 1}
+	recv := uring.Msghdr{Iov: &iov, Iovlen: 1, Control: &control[0]}
+	var pin runtime.Pinner
+	t.Cleanup(pin.Unpin)
+	for _, p := range []any{&send, &one[0], &two[0], &three[0], &recv, &iov, &payload, &control[0]} {
+		pin.Pin(p)
+	}
+	ring := newTestRing(t, func(o *uring.Options) { o.NotifySucceed = true })
+	sendID := uring.ForFD(tx.Raw()).WithOp(uring.IORING_OP_SENDMSG)
+	recvID := uring.ForFD(rx.Raw()).WithOp(uring.IORING_OP_RECVMSG)
+
+	exact, padded := sock.CmsgLen(4), sock.CmsgSpace(4)
+	for _, tc := range []struct {
+		rights        []byte
+		offered       int
+		wantBytes     int
+		wantFDs       int
+		wantTruncated bool
+	}{
+		{three, len(control), len(control), 3, false},
+		{three, exact, exact, 1, true},
+		{three, padded, padded, 2, true},
+		{one, len(control), padded, 1, false},
+		{two, len(control), padded, 2, false},
+		{three, 0, 0, 0, true},
+		{nil, len(control), 0, 0, false},
+	} {
+		send.Control = unsafe.SliceData(tc.rights)
+		send.Controllen = uint64(len(tc.rights))
+		recv.Controllen = uint64(tc.offered)
+		if err := ring.SendMsgHeader(sendID, *tx, &send); err != nil {
+			t.Fatal(err)
+		}
+		if err := ring.RecvMsg(recvID, rx, &recv); err != nil {
+			t.Fatal(err)
+		}
+		requireTerminalResults(t, ring, map[uring.SQEContext]int32{sendID: 0, recvID: 0})
+
+		installed := sock.ParseUnixRights(control[:recv.Controllen])
+		for _, fd := range installed {
+			if errno := zcall.Close(uintptr(fd)); errno != 0 {
+				t.Errorf("close received fd %d: %v", fd, zcall.Errno(errno))
+			}
+		}
+		if recv.Controllen != uint64(tc.wantBytes) {
+			t.Fatalf("offered %d control bytes: returned %d, want %d", tc.offered, recv.Controllen, tc.wantBytes)
+		}
+		if payload != 0xa5 {
+			t.Fatalf("empty datagram changed the payload byte to %#x", payload)
+		}
+		truncated := recv.Flags&sock.MSG_CTRUNC != 0
+		if len(installed) != tc.wantFDs || truncated != tc.wantTruncated {
+			t.Fatalf("offered %d control bytes: received %d fds, MSG_CTRUNC=%t, want %d fds, MSG_CTRUNC=%t",
+				tc.offered, len(installed), truncated, tc.wantFDs, tc.wantTruncated)
 		}
 	}
 }

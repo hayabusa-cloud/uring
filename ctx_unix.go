@@ -2,7 +2,7 @@
 // Use of this source code is governed by a MIT-style
 // license that can be found in the LICENSE file.
 
-//go:build linux
+//go:build unix
 
 package uring
 
@@ -19,7 +19,8 @@ import (
 // Copying a context does not copy or keep its target alive. Caller must keep
 // pointer targets reachable and address-stable through completion and all
 // borrowed access. Do not change submitted SQE fields, reuse, or release a
-// target while completions for that request remain pending.
+// target while completions for that request remain pending. The Darwin simulator
+// uses the same context encoding.
 type SQEContext uint64
 
 // Context mode constants (bits 62-63).
@@ -132,7 +133,7 @@ func (c SQEContext) BufGroup() uint16 {
 	return c.IndirectSQE().bufIndex
 }
 
-// FD returns the context's raw file descriptor.
+// FD returns the context's fd field, which can hold a registered-file index.
 // Direct mode sign-extends its 30-bit field; pointer modes read the full int32.
 //
 //go:nosplit
@@ -210,7 +211,7 @@ func (c SQEContext) WithBufGroup(bufGroup uint16) SQEContext {
 	return c
 }
 
-// WithFD returns a context with the file descriptor replaced.
+// WithFD replaces the context's fd field with a descriptor or registered-file index.
 // Direct mode returns an updated value; Indirect and Extended modes mutate
 // shared target storage and return c.
 func (c SQEContext) WithFD(fd iofd.FD) SQEContext {
@@ -248,7 +249,7 @@ type IndirectSQE struct {
 }
 
 // Compile-time size assertion.
-var _ [64 - unsafe.Sizeof(IndirectSQE{})]struct{} // IndirectSQE must be 64 bytes
+var _ [64]byte = [unsafe.Sizeof(IndirectSQE{})]byte{}
 
 // PackIndirect encodes sqe's address without copying or keeping it alive.
 // Caller must satisfy the SQEContext target-lifetime contract.
@@ -258,15 +259,6 @@ func PackIndirect(sqe *IndirectSQE) SQEContext {
 		panic("uring: IndirectSQE pointer has bits 62-63 set")
 	}
 	return SQEContext(ptr) | CtxModeIndirect
-}
-
-// IndirectSQE returns the borrowed indirect target.
-// Caller must ensure c.IsIndirect() and that the target remains live.
-//
-//go:nosplit
-//go:nocheckptr
-func (c SQEContext) IndirectSQE() *IndirectSQE {
-	return (*IndirectSQE)(pointerFromTagged(uintptr(c & ctxPtrMask)))
 }
 
 // ExtSQE stores a 64-byte base SQE and 64 bytes of caller data.
@@ -283,7 +275,7 @@ type ExtSQE struct {
 }
 
 // Compile-time size assertion.
-var _ [128 - unsafe.Sizeof(ExtSQE{})]struct{} // ExtSQE must be 128 bytes
+var _ [128]byte = [unsafe.Sizeof(ExtSQE{})]byte{}
 
 // PackExtended encodes sqe's address without copying or keeping it alive.
 // Caller must satisfy the SQEContext target-lifetime contract.
@@ -293,15 +285,6 @@ func PackExtended(sqe *ExtSQE) SQEContext {
 		panic("uring: ExtSQE pointer has bits 62-63 set")
 	}
 	return SQEContext(ptr) | CtxModeExtended
-}
-
-// ExtSQE returns the borrowed extended target.
-// Caller must ensure c.IsExtended() and that the target remains live.
-//
-//go:nosplit
-//go:nocheckptr
-func (c SQEContext) ExtSQE() *ExtSQE {
-	return (*ExtSQE)(pointerFromTagged(uintptr(c & ctxPtrMask)))
 }
 
 // CastUserData returns a borrowed *T over ext.UserData.

@@ -458,40 +458,6 @@ const (
 // ioUringFd represents a file descriptor in io_uring context.
 type ioUringFd int32
 
-// ioUringSqe represents a simulated submission queue entry.
-type ioUringSqe struct {
-	opcode   uint8
-	flags    uint8
-	ioprio   uint16
-	fd       int32
-	off      uint64
-	addr     uint64
-	len      uint32
-	uflags   uint32
-	userData uint64
-
-	bufIndex    uint16
-	personality uint16
-	spliceFdIn  int32
-	pad         [2]uint64
-}
-
-// ioUringCqe represents a simulated completion queue entry.
-type ioUringCqe struct {
-	userData uint64
-	res      int32
-	flags    uint32
-}
-
-// Compile-time size assertions to match Linux kernel structures.
-var _ [64 - unsafe.Sizeof(ioUringSqe{})]struct{} // SQE must be 64 bytes
-var _ [16 - unsafe.Sizeof(ioUringCqe{})]struct{} // CQE must be 16 bytes
-
-// Context returns the packed SQEContext from the CQE's user_data field.
-func (cqe *ioUringCqe) Context() SQEContext {
-	return SQEContextFromRaw(cqe.userData)
-}
-
 // ioUringParams represents simulated io_uring parameters.
 type ioUringParams struct {
 	sqEntries    uint32
@@ -1045,11 +1011,7 @@ func (ur *ioUring) waitBatch(cqes []CQEView) (int, error) {
 		select {
 		case cqe := <-ur.cqChan:
 			if cqe != nil {
-				cqes[n] = CQEView{
-					Res:   cqe.res,
-					Flags: cqe.flags,
-					ctx:   SQEContextFromRaw(cqe.userData),
-				}
+				cqes[n] = cqe.view()
 				n++
 			}
 		default:

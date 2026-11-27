@@ -1,14 +1,15 @@
 # Focused Boundary Proofs
 
-These Lean proofs check models of five `uring` mechanisms. They use only Lean’s standard library. Building `uring` does not require Lean.
+These Lean proofs check models of `uring` mechanisms. They use only Lean’s standard library. Building `uring` does not require Lean.
 
 | Model | Go source | Checked property |
 |-------|-----------|------------------|
 | [ZeroCopy](ZeroCopy.lean) | [zc_tracker.go](../zc_tracker.go) | Completion and release signals occur at most once and require the right evidence |
 | [Cancellation](Cancellation.lean) | [multishot.go](../multishot.go), [cancel_linux.go](../cancel_linux.go) | Publication and pending cancellation retain the original context; pool return occurs at most once |
 | [Incremental](Incremental.lean) | [incremental_linux.go](../incremental_linux.go) | Per-ID offsets, fragment bounds, retention and buffer return |
+| [Bundle](Bundle.lean) | [CQE counts](../cqe_view_unix.go), [iterator and recycling](../bundle_iter.go) | Exact publication prefix for positive receives and slot conservation across receives and returns |
 | [CompletionQueue](CompletionQueue.lean) | [io_uring_linux.go](../io_uring_linux.go) | Exclusive copying yields a contiguous prefix before head publication; bounded counter wrap is sound |
-| [Context](Context.lean) | [ctx.go](../ctx.go) | Direct-field recovery, signed FD bounds, flags replacement and pointer-tag separation |
+| [Context](Context.lean) | [ctx_unix.go](../ctx_unix.go) | Direct-field recovery, signed FD bounds, flags replacement and pointer-tag separation |
 
 ## Check
 
@@ -59,7 +60,7 @@ One trace begins with an admitted original multishot request and its owned conte
 | `cancelSubmit.CompareAndSwap`, active recheck | `acquire`, `recheck` |
 | `cancel.prepare` and submission result | `prepare`, then `accept` or `reject` |
 | Post-submit `tryCancel`, deferred gate release | `returned`, `leave` |
-| Original terminal CQE, including suppressed callbacks | `originalCQE` |
+| `handleCQEView` calls `finish` on the original terminal CQE, with either callback mode | `originalCQE` |
 | Accepted cancellation's CQE | `cancelCQE` |
 | Retirement guard and `ext.Swap(nil)` | `retire`; `owned` and ghost `returns` |
 
@@ -74,6 +75,14 @@ One trace begins with an admitted original multishot request and its owned conte
 `offsets_bounded` covers arbitrary finite histories from zero offsets, including interleaved IDs and rejected metadata. `other_ids_unchanged`, `fragment_bounds`, `selected_offset` and `retained_adjacency` establish isolation, allocation bounds and adjacent retained fragments. `nonpositive_return` and `nonpositive_retained` cover zero/error paths.
 
 The model assumes one ordered dispatch per CQE, matching registration, and arithmetic representable in the Go fields. `entries * size ≤ backing` is explicit in the allocation theorem. Natural-number arithmetic does not verify machine overflow or pointer arithmetic. The source's final slice checks remain necessary. Kernel writes, application reads and republishing are outside the model. See [Linux incremental buffer consumption](https://github.com/torvalds/linux/blob/v6.18/io_uring/kbuf.c).
+
+## Ordinary Receive Bundles
+
+`payloadCount` models `BundleCount`. `slotCount` models the count from `BundleBuffers`. For a positive uniform buffer size and a nonpositive receive result, `empty_slots` gives one slot exactly when `F_BUFFER` is set and `F_BUF_MORE` is clear. `bytes_alone_insufficient` shows why a decoder that sees only the signed result cannot identify both kinds of empty completion.
+
+For a positive receive, suppose Linux fills `f` slots of size `s`, then writes `k` bytes into one final slot, with `1 ≤ k ≤ s`. The reported byte count is `r = f*s + k`. `positive_slots` proves that the decoder’s count `1 + (r - 1) / s` equals `f + 1`, including an exactly full last slot. `positive_prefix` proves that taking that count from publication order recovers the consumed IDs in order, even when their numeric values are nonconsecutive. [Linux segment counting](https://github.com/torvalds/linux/blob/v6.18/io_uring/net.c#L464-L492) · [Reordered-buffer test](../operation_facts_linux_test.go#L27)
+
+`inventory_preserved` proves that published and held IDs together keep their original multiplicities through any finite sequence of positive receives, empty completions and delayed returns. The model follows kernel selection order for one ordinary group. A batched `Recycle` corresponds to successive slot returns in iterator order. Applying the proof assumes each CQE is matched and dispatched once, the iterator follows the selected prefix’s publication links, and the owner returns only held slots after their last borrow. [Publication links](../buffer_rings.go#L291-L315) · [Caller contract](../agents/boundary/resources.md#bundles) · [Empty-receive regression](../bundle_test.go#L541)
 
 ## CQ Claim, Copy and Publication
 
