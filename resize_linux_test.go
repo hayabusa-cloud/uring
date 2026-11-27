@@ -176,22 +176,17 @@ func TestResizeRingsPendingTimeouts(t *testing.T) {
 }
 
 func TestResizeRingsFailurePreservesPending(t *testing.T) {
+	const submitted = 40
 	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-	ring, err := uring.New(testMinimalBufferOptions, func(o *uring.Options) {
+	t.Cleanup(runtime.UnlockOSThread)
+	ring := newTestRing(t, func(o *uring.Options) {
 		o.Entries = 64
 		o.MultiIssuers = false
 		o.NotifySucceed = true
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := ring.Start(); err != nil {
-		t.Fatal(err)
-	}
-	defer ring.Stop()
+	originalCQ := ring.Features.CQEntries
 	want := make(map[uint64]int32)
-	for i := range 40 {
+	for i := range submitted {
 		ctx := uring.PackDirect(uring.IORING_OP_NOP, 0, 0, int32(i+1))
 		if err := ring.Nop(ctx); err != nil {
 			t.Fatal(err)
@@ -199,10 +194,54 @@ func TestResizeRingsFailurePreservesPending(t *testing.T) {
 		want[ctx.Raw()] = 0
 	}
 	if err := ring.ResizeRings(32, 64); err != zcall.EOVERFLOW {
-		t.Errorf("ResizeRings: %v, want EOVERFLOW", err)
+		t.Fatalf("shrink with %d queued SQEs: %v, want EOVERFLOW", submitted, err)
 	}
-	if ring.Features.SQEntries != 64 || ring.SQAvailable() != 24 {
-		t.Error("failed resize changed SQ geometry or pending count")
+	if ring.Features.SQEntries != 64 || ring.SQAvailable() != 64-submitted {
+		t.Fatal("rejected SQ shrink changed SQ capacity or pending count")
+	}
+
+	// Move the original batch to the CQ, then leave one new SQE queued.
+	checkWaitWithoutReaping(t, ring, ring.Wait, submitted)
+	queued := uring.PackDirect(uring.IORING_OP_NOP, 0, 0, submitted+1)
+	if err := ring.Nop(queued); err != nil {
+		t.Fatal(err)
+	}
+	want[queued.Raw()] = 0
+
+	// Requesting 31 CQ entries gives an effective capacity of 32.
+	for _, tc := range []struct {
+		sq      uint32
+		wantErr error
+	}{
+		{0, uring.ErrInvalidParam}, // Keeping the 64-entry SQ requires a larger CQ.
+		{32, zcall.EOVERFLOW},      // The sizes are valid, but 40 unread CQEs exceed 32.
+	} {
+		if err := ring.ResizeRings(tc.sq, 31); err != tc.wantErr {
+			t.Fatalf("ResizeRings(%d, 31) with %d unread CQEs: %v, want %v", tc.sq, submitted, err, tc.wantErr)
+		}
+		if sq, cq := ring.Features.SQEntries, ring.Features.CQEntries; sq != 64 || cq != originalCQ {
+			t.Fatalf("after ResizeRings(%d, 31): capacities %d/%d, want 64/%d", tc.sq, sq, cq, originalCQ)
+		}
+		if sq, cq := ring.SQAvailable(), ring.CQPending(); sq != 63 || cq != submitted {
+			t.Fatalf("after ResizeRings(%d, 31): SQ space %d, unread CQEs %d, want 63/%d", tc.sq, sq, cq, submitted)
+		}
+	}
+
+	// The original request now fits both queues.
+	if err := ring.ResizeRings(32, 64); err != nil {
+		t.Fatalf("retry resize: %v", err)
+	}
+	if sq, cq := ring.Features.SQEntries, ring.Features.CQEntries; sq != 32 || cq != 64 {
+		t.Fatalf("retry resize: capacities %d/%d, want 32/64", sq, cq)
+	}
+	if sq, cq := ring.SQAvailable(), ring.CQPending(); sq != 31 || cq != submitted {
+		t.Fatalf("after resize: SQ space %d, unread CQEs %d, want 31/%d", sq, cq, submitted)
 	}
 	reapResizeResults(t, ring, want)
+	if err := ring.ResizeRings(32, 31); err != nil {
+		t.Fatalf("ResizeRings(32, 31) after reaping: %v", err)
+	}
+	if got := ring.Features.CQEntries; got != 32 {
+		t.Fatalf("rounded CQ capacity = %d, want 32", got)
+	}
 }
