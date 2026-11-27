@@ -90,4 +90,4 @@ When closing a file through `Uring.Close`, leave `IOSQE_CQE_SKIP_SUCCESS` clear.
 
 Use [managed receive](../../examples/multishot_test.go), [poll cancellation](../../examples/poll_test.go), and [zero-copy](../../examples/zerocopy_test.go) cases. Check completion-before-cancel, late cancellation, delayed release, partial admission, failed startup, and repeated finalization only where idempotence is promised. Record feature skips under [verification](../verify.md).
 
-To check overlapping deadlines, arm two receives on the same socket with different `pairID` values. Update the second timer and reap both CQEs for its pair. Then send one byte from the peer. Match the update, both receives and both deadlines by `user_data`.
+To check overlapping deadlines, arm two receives on the same socket with different `pairID` values. Update the second timer and reap both CQEs for its pair. Then send one byte from the peer. Match the update, both receives and both deadlines by `user_data`. [Runnable example](../../examples/receive_deadline_linux_test.go)

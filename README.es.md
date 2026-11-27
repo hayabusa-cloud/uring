@@ -521,7 +521,7 @@ func queueReceiveWithTimeout(ring *uring.Uring, pairID uint16, fd iofd.FD, buf [
 }
 ```
 
-Si recibe `iox.ErrWouldBlock` y no se encoló ninguna solicitud, haga avanzar el ring antes de reintentar el par. Si solo se encoló la recepción, envíela al kernel antes de añadir otro trabajo y conserve `buf` hasta que termine. Si ambas se encolaron, recoja las dos CQE. Al vencer el plazo se intenta cancelar la recepción. El resultado de la recepción consta en su propia CQE. [Ejemplo de plazo enlazado](./examples/timeout_linux_test.go#L259)
+Si recibe `iox.ErrWouldBlock` y no se encoló ninguna solicitud, haga avanzar el ring antes de reintentar el par. Si solo se encoló la recepción, envíela al kernel antes de añadir otro trabajo y conserve `buf` hasta que termine. Si ambas se encolaron, recoja las dos CQE. Al vencer el plazo se intenta cancelar la recepción. El resultado de la recepción consta en su propia CQE. [Dos plazos de recepción en el mismo socket](./examples/receive_deadline_linux_test.go)
 
 ## Patrones de uso en TCP
 

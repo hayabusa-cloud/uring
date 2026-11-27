@@ -521,7 +521,7 @@ func queueReceiveWithTimeout(ring *uring.Uring, pairID uint16, fd iofd.FD, buf [
 }
 ```
 
-On `iox.ErrWouldBlock` with zero admissions, drive the ring before retrying the pair. If only the receive was queued, flush it before submitting other work and retain `buf` through its completion. Once both are queued, reap both CQEs. Expiry attempts cancellation. The receive CQE gives the receive result. [Linked timeout example](./examples/timeout_linux_test.go#L259)
+On `iox.ErrWouldBlock` with zero admissions, drive the ring before retrying the pair. If only the receive was queued, flush it before submitting other work and retain `buf` through its completion. Once both are queued, reap both CQEs. Expiry attempts cancellation. The receive CQE gives the receive result. [Two receive deadlines on one socket](./examples/receive_deadline_linux_test.go)
 
 ## TCP usage patterns
 
