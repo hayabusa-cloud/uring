@@ -1,4 +1,6 @@
-# Encoding and Admission
+# SQE Encoding and Ring Setup
+
+<a id="encoding-and-admission"></a>
 
 Validate the operation's semantic domain and the destination field width before narrowing, indexing, pointer arithmetic or SQE writes. Start from a zeroed SQE or explicitly overwrite every relevant field; slot reuse must not leak another opcode's values. Use the [pinned kernel sources](../references.md#linux-and-liburing) and current wrapper together.
 
@@ -70,7 +72,7 @@ Version strings alone establish no usable capability. ZCRX control/query records
 
 For live resize, leave `MultiIssuers` and `HybridPolling` at their default `false` values. This enables `IORING_SETUP_DEFER_TASKRUN`, which `ResizeRings` requires. [Ring setup](../../interface_linux.go#L162-L183) · [Resize requirements](https://github.com/axboe/liburing/blob/liburing-2.13/man/io_uring_resize_rings.3#L50-L55)
 
-Call `ResizeRings(sq, cq)` from the OS thread that called `Start`. Serialize resize with submission, waits and `Stop`. Resolve any CQ overflow first. Zero `sq` keeps the current SQ size. Zero `cq` requests twice the resulting SQ size. On success, read the effective sizes from `Features.SQEntries` and `Features.CQEntries`. Context pools keep their original capacities. [ResizeRings](../../interface_linux.go#L1566)
+Call `ResizeRings(sq, cq)` from the OS thread that called `Start`. Serialize resize with submission, waits and `Stop`. Resolve any CQ overflow first. Zero `sq` keeps the current SQ size. Zero `cq` requests twice the resulting SQ size. On success, read the effective sizes from `Features.SQEntries` and `Features.CQEntries`. Context pools keep their original capacities. [ResizeRings](../../interface_linux.go#L1567)
 
 A successful resize preserves pending submissions and completions, their entry widths and request identities in both SQ layouts. A shrink rejected because pending entries would no longer fit leaves those entries on the original ring. Continue driving them there. [Pending submissions](../../resize_linux_test.go#L55) · [Pending completions](../../resize_completion_linux_test.go#L14) · [Rejected shrink](../../resize_linux_test.go#L178)
 

@@ -16,8 +16,6 @@ Keep asynchronous storage reachable through typed Go roots, address-stable, and 
 
 ## Registration
 
-Registration methods return results synchronously. Separate the metadata passed to a call from the resources it registers:
-
 | Storage | Retain through |
 |---------|----------------|
 | `RegisterFiles` / `RegisterFilesUpdate` array | Return from the synchronous method |
@@ -50,7 +48,7 @@ For a matched ordinary bundle with `Res > 0`, check that `F_BUFFER` is set and `
 
 `Collect()` allocates the outer slice and borrows the payload bytes. After every borrower finishes, call `it.Recycle(ring)` exactly once across all copies of the managed iterator. Use the originating ring and serialize recycling with its other buffer returns and publication. [Bundle handoff](../recipes/buffers.md#hand-off-a-receive-bundle)
 
-At stream EOF, on an empty datagram, or on a receive error, inspect `F_BUFFER` before leaving the receive path. An empty datagram still delivers a message. An ordinary group can return one slot with zero payload bytes. With `F_BUFFER` set and `F_BUF_MORE` clear, `ring.BundleIterator` gives its ID, `Count() == 1` and `TotalBytes() == 0`. Recycle it once. A clear `F_BUFFER` returns no slot. `CQEView.BundleCount` counts payload segments, so it reports zero in both cases. [Linux buffer selection](https://github.com/gregkh/linux/blob/v6.18.15/io_uring/kbuf.c#L158-L209) · [Receive regression](../../bundle_test.go#L541) · [Slot accounting](../../proofs/README.md#ordinary-receive-bundles)
+At stream EOF, on an empty datagram, or on a receive error, inspect `F_BUFFER` before leaving the receive path. An empty datagram still delivers a message. An ordinary group can return one slot with zero payload bytes. With `F_BUFFER` set and `F_BUF_MORE` clear, `ring.BundleIterator` gives its ID, `Count() == 1` and `TotalBytes() == 0`. Recycle it once. A clear `F_BUFFER` returns no slot. `CQEView.BundleCount` counts payload segments, so it reports zero in both cases. [Linux buffer selection](https://github.com/torvalds/linux/blob/v6.18/io_uring/kbuf.c#L158-L209) · [Receive regression](../../bundle_test.go#L541) · [Slot accounting](../../proofs/README.md#ordinary-receive-bundles)
 
 On Linux, `NewBundleIterator` assumes buffer ID `i` starts at byte `i*bufSize` in the backing slice and IDs were published consecutively modulo the ring size. Calling `Recycle` on that standalone view returns `ErrInvalidParam`. [Iterator contracts](../../bundle_iter.go)
 

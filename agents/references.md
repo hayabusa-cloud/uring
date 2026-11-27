@@ -1,10 +1,10 @@
 # Sources and Evidence
 
-Use primary sources to establish the precise claim under review. Record the revision, relevant symbol or section, assumptions, and what the evidence does and does not establish.
+Use the primary source for the layer the claim concerns. Record its revision, symbol or section and the assumptions needed for the claim. [Evidence requirements](verify.md#evidence)
 
 ## Linux and liburing
 
-The baseline below pins Linux v6.18 and liburing 2.13; the v6.19 ZCRX source is an explicit later comparison. A rolling manual or development tree may describe behavior outside that baseline.
+The guide assumes a maintained stable Linux kernel, version 6.18 or later. The table cites Linux and liburing by release so each contract can be checked at its source.
 
 | Claim | Primary source |
 |-------|----------------|
@@ -37,17 +37,17 @@ For ordering claims, read the [kernel memory-barrier documentation](https://docs
 | Claim | Source |
 |-------|--------|
 | Language semantics | [Go specification](https://go.dev/ref/spec) |
-| Copies and shared storage | [Value representation](https://go.dev/ref/spec#Representation_of_values), [assignment](https://go.dev/ref/spec#Assignments) |
+| Copies and shared storage | [Value representation](https://go.dev/ref/spec#Representation_of_values), [assignment statements](https://go.dev/ref/spec#Assignment_statements) |
 | Synchronization and visibility | [Go memory model](https://go.dev/ref/mem) |
 | Pointer conversion and reachability | [unsafe.Pointer](https://pkg.go.dev/unsafe#Pointer) |
 | Toolchain behavior | [Go source](https://go.googlesource.com/go), [command documentation](https://go.dev/doc/cmd), [release notes](https://go.dev/doc/devel/release) |
 | cgo pointer rules, when applicable | [cgo documentation](https://go.dev/cmd/cgo/) |
-| Package API and implementation | Current source at the module revision used by the task; [package documentation](https://pkg.go.dev/) for navigation |
+| Package API and implementation | Read the source at the selected revision. [Package overview](../doc.go) · [Published uring API](https://pkg.go.dev/code.hybscloud.com/uring) |
 
-Use [integration](boundary/integration.md) to identify the owner package. A guide description is not a substitute for reading the implementation when a change depends on its exact behavior.
+Trace package behavior through the owning implementation and its consumers. [Package ownership](boundary/integration.md) · [Revision requirements](verify.md#read-sources)
 
 ## Proofs
 
 The [proof project](../proofs/README.md) names its model, source mapping, assumptions and checked theorems. Use [Lean's validation guidance](https://lean-lang.org/doc/reference/latest/ValidatingProofs/) for proof checking and axiom review. A checked model needs a separate correspondence argument before it establishes an implementation property.
 
-For each external claim, record the owning layer, source revision/section, relevant [contract](core.md), evidence and remaining assumptions. Specifications, source inspection, tests, proofs and measurements establish different claims. Follow [verification](verify.md).
+Connect the source to the applicable [core contract](core.md) and record any assumptions that still need evidence.

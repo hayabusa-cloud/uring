@@ -4,11 +4,9 @@ Retain storage through every access; return it under its own protocol. [Boundary
 
 ## Retain and Publish
 
-Choose ordinary, registered, provided, incremental, or zero-copy storage. Retain typed roots, stable addresses, and owning descriptors/registrations. SQ consumption can release copied submission metadata while payload access continues. `SendMsgHeader` and `RecvMsg` headers/referenced regions and `FilesUpdate` arrays remain caller-owned through completion; send storage remains immutable.
+Choose ordinary, registered, provided, incremental or zero-copy storage. Keep typed roots, stable addresses and owning descriptors through use. Synchronous registration metadata can be reused on return. For `SendMsgHeader`, `RecvMsg` and asynchronous `FilesUpdate`, keep the caller-supplied storage through completion. [Submission storage](../boundary/resources.md#retain-before-submit) · [Registration lifetimes](../boundary/resources.md#registration)
 
-Synchronous registration borrows metadata only until method return; follow the [registration lifetimes](../boundary/resources.md#registration) for arrays, descriptors, and backing memory.
-
-For provided buffers, `Add` stages; matching `Advance` publishes and transfers ownership. Retain backing from staging through return. Do not mutate or republish kernel-owned storage; returned buffers need not be recycled immediately.
+For provided buffers, stage entries with `BufferRing.Add`, then publish that count with `Advance`. Keep each backing live from staging through return and finish any application borrow before republishing. [Provided buffers](../boundary/resources.md#provided-buffers)
 
 ## Hand Off a Receive Bundle
 
@@ -19,7 +17,7 @@ At stream EOF or on error, recycle any slot returned by `ring.BundleIterator`. F
 
 ## Retained Completions
 
-`Wait` copies CQE descriptors. Direct context is inline; Indirect/Extended targets remain borrowed. Copy needed facts before target mutation, reuse, release, or failed resubmission that prepared the target. A copied `SQEView` is borrowed; a base-SQE copy neither roots payloads nor contains an SQE128 extension.
+Before recycling a context, save the fields the consumer needs. A copied fd, slot or buffer ID retains its numeric value. For later file I/O, preserve the intended file binding. For a retained payload, copy the bytes or hold the returned buffer through the borrow. [Borrowed SQEs](../boundary/sqe-cqe.md#completion-retention) · [Fixed-file lookup](../boundary/files.md#fixed-file-lookup) · [Provided-buffer return](../boundary/resources.md#provided-buffers)
 
 ## Incremental Receive
 

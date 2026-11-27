@@ -1,14 +1,14 @@
 # Boundary Contracts
 
-Concrete obligations for the [core contracts](../core.md).
+Definitions for the [core contracts](../core.md).
 
 | Contract | Scope |
 |----------|-------|
-| [Encoding](encoding.md) | Input domains, SQE fields, setup and registration |
-| [SQE/CQE](sqe-cqe.md) | Encoding, identity, completion, retained context |
+| [Encoding](encoding.md) | Valid inputs, SQE fields, issuer and setup requirements, registration ABI |
+| [SQE/CQE](sqe-cqe.md) | Submission, completion origin and fields, request identity, borrowed SQEs and CQ publication |
 | [Files](files.md) | Registered slot lookup and updates, accept results, Unix socket descriptors and inter-ring transfers |
-| [Resources](resources.md) | Retention, transfer, return, release |
-| [Integration](integration.md) | Package ownership and waiting |
+| [Resources](resources.md) | Metadata and backing lifetimes, buffer return, send notifications and cancellation retirement |
+| [Integration](integration.md) | Package ownership, queue handoff and waiting |
 | [Protocols](protocols.md) | Which observations supply bytes, finish a frame or permit an endpoint action |
 
-Check result, request liveness, and resource release separately. Follow [verification](../verify.md); [focused proofs](../../proofs/README.md) state their models, assumptions and source mappings.
+See the [focused proofs](../../proofs/README.md) for theorem assumptions and source mappings.

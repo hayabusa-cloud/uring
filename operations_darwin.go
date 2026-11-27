@@ -98,7 +98,7 @@ const (
 	IORING_TIMEOUT_BOOTTIME                  // 0x04, use CLOCK_BOOTTIME
 	IORING_TIMEOUT_REALTIME                  // 0x08, use CLOCK_REALTIME
 	IORING_LINK_TIMEOUT_UPDATE               // 0x10, update linked timeout
-	IORING_TIMEOUT_ETIME_SUCCESS             // 0x20, convert -ETIME to success
+	IORING_TIMEOUT_ETIME_SUCCESS             // 0x20, keep soft links on timeout expiry
 	IORING_TIMEOUT_MULTISHOT                 // 0x40, repeat on expiry
 
 	IORING_TIMEOUT_CLOCK_MASK  = IORING_TIMEOUT_BOOTTIME | IORING_TIMEOUT_REALTIME

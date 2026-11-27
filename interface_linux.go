@@ -1496,9 +1496,7 @@ func (ur *Uring) UnregisterNAPI() error {
 // be zero. Whole-table cloning requires Linux 6.12+; nonzero offsets or
 // replacement require Linux 6.13+.
 //
-// Preserving destination buffers after a replaced range requires Linux 6.18.3+
-// or a backport of the buffer-cloning fix. Earlier unpatched kernels discard
-// those registrations.
+// Replacing a destination range preserves the registrations outside it.
 func (ur *Uring) CloneBuffers(src *Uring, srcOff, dstOff, count uint32, replace bool) error {
 	return ur.cloneBuffersFrom(src, 0, false, srcOff, dstOff, count, replace)
 }
@@ -1582,8 +1580,8 @@ func (ur *Uring) cloneBuffersFrom(src *Uring, srcRegisteredRingIdx uint32, regis
 //
 // Nonzero sizes are rounded up to powers of two and clamped to kernel limits.
 // The resulting CQ size must be at least the resulting SQ size.
-// With IndirectSubmissionQueue, changing CQ capacity may require a temporary
-// ring descriptor on kernels that omit the SQ array offset during resize.
+// With IndirectSubmissionQueue, changing CQ capacity may temporarily use an
+// additional ring descriptor.
 // If remapping fails after the kernel commits the resize, the ring is closed.
 // Supported on Linux 6.18+.
 func (ur *Uring) ResizeRings(newSQSize, newCQSize uint32) error {
