@@ -1397,6 +1397,9 @@ func TestControlWrappersEncodeExpectedSQEs(t *testing.T) {
 
 	t.Run("FutexWaitV", func(t *testing.T) {
 		waitWords := [2]uint64{11, 22}
+		var pinner runtime.Pinner
+		pinner.Pin(&waitWords[0])
+		defer pinner.Unpin()
 		waitv := unsafe.Pointer(&waitWords[0])
 		if err := ring.FutexWaitV(PackDirect(0, 0, 0, 0), waitv, 2, 0, WithFlags(IOSQE_ASYNC)); err != nil {
 			t.Fatalf("FutexWaitV: %v", err)

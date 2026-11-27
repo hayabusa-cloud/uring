@@ -1561,73 +1561,68 @@ func TestFixedFdInstall(t *testing.T) {
 	t.Log("FixedFdInstall test passed - both descriptors worked independently")
 }
 
-// TestFutexWakeWait tests the futex wait/wake operations.
 func TestFutexWakeWait(t *testing.T) {
-	ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-		opt.Entries = uring.EntriesSmall
-		opt.NotifySucceed = true
-		opt.MultiIssuers = true
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	mustStartRing(t, ring)
+	for _, tc := range []struct {
+		name      string
+		waitOp    uint8
+		wakeIndex int32
+	}{
+		{"scalar", uring.IORING_OP_FUTEX_WAIT, 0},
+		{"vector_first", uring.IORING_OP_FUTEX_WAITV, 0},
+		{"vector_second", uring.IORING_OP_FUTEX_WAITV, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			words := [2]uint32{11, 22}
+			var pin runtime.Pinner
+			pin.Pin(&words[0])
+			t.Cleanup(pin.Unpin)
+			ring := newTestRing(t, func(o *uring.Options) { o.NotifySucceed = true })
+			word := &words[tc.wakeIndex]
 
-	// Create a futex variable
-	var futex uint32 = 0
-
-	// Submit FutexWait - will wait since futex == 0 (expected value)
-	waitCtx := uring.PackDirect(uring.IORING_OP_FUTEX_WAIT, 0, 0, 0)
-	err = ring.FutexWait(waitCtx, &futex, 0, uring.FUTEX_BITSET_MATCH_ANY, uring.FUTEX2_SIZE_U32)
-	if err != nil {
-		t.Fatalf("FutexWait: %v", err)
-	}
-
-	// Submit FutexWake to wake 1 waiter
-	wakeCtx := uring.PackDirect(uring.IORING_OP_FUTEX_WAKE, 0, 0, 0)
-	err = ring.FutexWake(wakeCtx, &futex, 1, uring.FUTEX_BITSET_MATCH_ANY, uring.FUTEX2_SIZE_U32)
-	if err != nil {
-		t.Fatalf("FutexWake: %v", err)
-	}
-
-	// Wait for completions
-	cqes := make([]uring.CQEView, 16)
-	deadline := time.Now().Add(5 * time.Second)
-	waitCompleted := false
-	wakeCompleted := false
-	b := iox.Backoff{}
-
-	for time.Now().Before(deadline) && (!waitCompleted || !wakeCompleted) {
-		n, err := ring.Wait(cqes)
-		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
-			t.Fatalf("Wait: %v", err)
-		}
-		for i := 0; i < n; i++ {
-			op := cqes[i].Op()
-			res := cqes[i].Res
-
-			switch op {
+			var err error
+			switch tc.waitOp {
 			case uring.IORING_OP_FUTEX_WAIT:
-				if res < 0 {
-					t.Fatalf("FutexWait result: %d", res)
+				err = ring.FutexWait(uring.ForFD(0), word, uint64(*word), uring.FUTEX_BITSET_MATCH_ANY, uring.FUTEX2_SIZE_U32)
+			case uring.IORING_OP_FUTEX_WAITV:
+				// Linux struct futex_waitv, one entry per word.
+				var waiters [len(words)]struct {
+					val   uint64
+					uaddr uint64
+					flags uint32
+					_     uint32
 				}
-				waitCompleted = true
-			case uring.IORING_OP_FUTEX_WAKE:
-				if res < 0 {
-					t.Fatalf("FutexWake result: %d", res)
-				} else {
-					t.Logf("FutexWake woke %d waiters", res)
+				pin.Pin(&waiters[0])
+				for i := range waiters {
+					waiters[i].val = uint64(words[i])
+					waiters[i].uaddr = uint64(uintptr(unsafe.Pointer(&words[i])))
+					waiters[i].flags = uring.FUTEX2_SIZE_U32
 				}
-				wakeCompleted = true
+				err = ring.FutexWaitV(uring.ForFD(0), unsafe.Pointer(&waiters[0]), uint32(len(waiters)), 0)
 			}
-		}
-		b.Wait()
-	}
+			if err != nil {
+				t.Fatalf("submit wait: %v", err)
+			}
+			var early [1]uring.CQEView
+			if n, err := ring.Wait(early[:]); n != 0 || !iox.IsWouldBlock(err) {
+				t.Fatalf("wait before wake: n=%d result=%d err=%v", n, early[0].Res, err)
+			}
+			if err := ring.FutexWake(uring.ForFD(0), word, 1, uring.FUTEX_BITSET_MATCH_ANY, uring.FUTEX2_SIZE_U32); err != nil {
+				t.Fatalf("submit wake: %v", err)
+			}
 
-	if !waitCompleted || !wakeCompleted {
-		t.Fatal("Futex operations did not complete")
+			cqes := waitForCQEs(t, ring, 2)
+			wait, wake := cqes[0], cqes[1]
+			if wait.Op() == uring.IORING_OP_FUTEX_WAKE {
+				wait, wake = wake, wait
+			}
+			if wait.Op() != tc.waitOp || wait.Res != tc.wakeIndex {
+				t.Fatalf("wait CQE: op=%d result=%d, want op=%d result=%d", wait.Op(), wait.Res, tc.waitOp, tc.wakeIndex)
+			}
+			if wake.Op() != uring.IORING_OP_FUTEX_WAKE || wake.Res != 1 {
+				t.Fatalf("wake CQE: op=%d result=%d, want FUTEX_WAKE with one waiter", wake.Op(), wake.Res)
+			}
+		})
 	}
-	t.Log("Futex wait/wake test passed")
 }
 
 // TestMsgRingSelf tests MSG_RING to the same ring (self-messaging).
