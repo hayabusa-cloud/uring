@@ -74,7 +74,9 @@ For live resize, leave `MultiIssuers` and `HybridPolling` at their default `fals
 
 Call `ResizeRings(sq, cq)` from the OS thread that called `Start`. Serialize resize with submission, waits and `Stop`. Resolve any CQ overflow first. Zero `sq` keeps the current SQ size. Zero `cq` requests twice the resulting SQ size. On success, read the effective sizes from `Features.SQEntries` and `Features.CQEntries`. Context pools keep their original capacities. [ResizeRings](../../interface_linux.go#L1567)
 
-A successful resize preserves pending submissions and completions, their entry widths and request identities in both SQ layouts. A shrink rejected because pending entries would no longer fit leaves those entries on the original ring. Continue driving them there. [Pending submissions](../../resize_linux_test.go#L55) · [Pending completions](../../resize_completion_linux_test.go#L14) · [Rejected shrink](../../resize_linux_test.go#L178)
+A convenient time to grow the CQ is between submission batches. When `ring.SQAvailable() == ring.Features.SQEntries`, Linux has consumed every queued SQE. The owner can call `ring.ResizeRings(0, largerCQ)` while earlier requests are in flight or completions await reaping. [SQAvailable](../../interface_linux.go#L422) · [CQ growth with live work](../../integration_linux_test.go#L878)
+
+A successful resize preserves pending submissions and completions, their entry widths and request identities in both SQ layouts. A shrink rejected because pending entries would no longer fit leaves those entries on the original ring. Continue driving them there. [Pending submissions](../../resize_linux_test.go#L55) · [Pending completions](../../resize_completion_linux_test.go) · [Rejected shrink](../../resize_linux_test.go#L178)
 
 If remapping fails after Linux commits the resize, `uring` closes the ring. [Failure handling](../../submit_state_linux_test.go#L1307)
 
