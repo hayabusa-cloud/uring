@@ -60,7 +60,7 @@ One trace begins with an admitted original multishot request and its owned conte
 | `cancelSubmit.CompareAndSwap`, active recheck | `acquire`, `recheck` |
 | `cancel.prepare` and submission result | `prepare`, then `accept` or `reject` |
 | Post-submit `tryCancel`, deferred gate release | `returned`, `leave` |
-| Original terminal CQE, including suppressed callbacks | `originalCQE` |
+| `handleCQEView` calls `finish` on the original terminal CQE, with either callback mode | `originalCQE` |
 | Accepted cancellation's CQE | `cancelCQE` |
 | Retirement guard and `ext.Swap(nil)` | `retire`; `owned` and ghost `returns` |
 

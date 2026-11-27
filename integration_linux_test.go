@@ -277,9 +277,10 @@ func TestUringIntrospection(t *testing.T) {
 	t.Logf("Completed %d operations", completed)
 }
 
-func requireTerminalResults(t *testing.T, ring *uring.Uring, want map[uring.SQEContext]int32) {
+func requireTerminalResults(t *testing.T, ring *uring.Uring, want map[uring.SQEContext]int32) []uring.CQEView {
 	t.Helper()
-	for _, cqe := range waitForCQEs(t, ring, len(want)) {
+	cqes := waitForCQEs(t, ring, len(want))
+	for _, cqe := range cqes {
 		ctx := cqe.Context()
 		res, ok := want[ctx]
 		if !ok || cqe.Res != res || cqe.HasMore() {
@@ -287,6 +288,7 @@ func requireTerminalResults(t *testing.T, ring *uring.Uring, want map[uring.SQEC
 		}
 		delete(want, ctx)
 	}
+	return cqes
 }
 
 func TestUringTimeoutCycle(t *testing.T) {

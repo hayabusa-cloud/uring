@@ -6,10 +6,8 @@
 // `uring` assumes the 6.18+ baseline and carries no fallback branches for older
 // kernels. Its core Linux `io_uring` implementation was refactored from
 // `code.hybscloud.com/sox` into this dedicated package. It prepares SQEs,
-// decodes CQEs, transports submission context through `user_data`, and exposes
-// kernel-boundary facts. Dispatch, retry, completion routing, route retirement,
-// and connection/session orchestration stay in caller-side runtime code outside
-// this boundary.
+// copies CQEs, and carries submission context through `user_data`. The caller
+// drives the ring and routes each completion to its owner.
 //
 // A typical caller starts the ring, submits an operation, and then treats the
 // completion queue as the source of truth for kernel results. This example has
@@ -215,11 +213,12 @@
 // The Multicast zero-copy path and both MulticastZeroCopy paths retain success
 // CQEs regardless of NotifySucceed and reject explicit success suppression.
 //
-// uring is a kernel boundary, not a scheduler. It owns SQE encoding, CQE
-// observation, `user_data` identity, capability exposure, and kernel-facing
-// lifetimes. Runtime policy, completion routing, route retirement, batching,
-// retries, parking, protocol parsing, safety checks, and terminal resource
-// release belong outside this package.
+// Publishing an SQE admits the request. The caller matches each CQE to its
+// source and interprets the result and flags for that operation. The caller
+// decides when to poll, retry, cancel or advance a protocol. For managed
+// operations, dispatching a CQE lets the helper advance its own state.
+// [MultishotSubscription], for example, retains its pooled context through
+// dispatch of the original terminal CQE and any queued cancellation CQE.
 //
 // # Buffer Groups
 //

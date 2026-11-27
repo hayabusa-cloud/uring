@@ -153,7 +153,7 @@ func (s *MultishotSubscription) Cancel() error {
 	if s.State() != SubscriptionActive {
 		return nil
 	}
-	return s.submitCancel()
+	return s.submitCancelUsing(s.ring.asyncCancel)
 }
 
 // Unsubscribe suppresses future step and stop callbacks and makes one
@@ -352,32 +352,20 @@ func (s *MultishotSubscription) handleCQE(cqe *ioUringCqe) {
 }
 
 func (s *MultishotSubscription) handleCQEView(cqe CQEView) {
-	if s.unsubscribed.Load() {
-		s.retireIfTerminal(cqe)
-		return
-	}
-
 	step := MultishotStep{CQE: cqe}
-	if cqe.Res < 0 {
-		step.Err = errFromErrno(uintptr(-cqe.Res))
+	action := MultishotContinue
+	if !s.unsubscribed.Load() {
+		step.Err = cqe.Err()
 		step.Cancelled = cqe.Res == -int32(ECANCELED)
+		action = s.handler.OnMultishotStep(step)
 	}
-	action := s.handler.OnMultishotStep(step)
 	if step.Final() {
 		s.finish(step.Err, step.Cancelled)
 		return
 	}
-	if action == MultishotStop && s.Active() {
-		s.trySubmitCancel()
+	if action == MultishotStop {
+		_ = s.Cancel()
 	}
-}
-
-func (s *MultishotSubscription) trySubmitCancel() {
-	_ = s.submitCancel()
-}
-
-func (s *MultishotSubscription) submitCancel() error {
-	return s.submitCancelUsing(s.ring.asyncCancel)
 }
 
 func (s *MultishotSubscription) submitCancelUsing(submit func(SQEContext, uint64) error) error {
@@ -424,18 +412,5 @@ func (s *MultishotSubscription) finish(err error, cancelled bool) {
 	}
 	if !s.cancelSubmit.Load() && !s.cancel.pending.Load() {
 		s.retireExt()
-	}
-}
-
-// retireIfTerminal records original terminality with callbacks suppressed.
-// The pooled identity stays retained while cancellation is pending or publishing.
-func (s *MultishotSubscription) retireIfTerminal(cqe CQEView) {
-	if !cqe.HasMore() {
-		if SubscriptionState(s.state.Swap(uint32(SubscriptionStopped))) == SubscriptionStopped {
-			return
-		}
-		if !s.cancelSubmit.Load() && !s.cancel.pending.Load() {
-			s.retireExt()
-		}
 	}
 }

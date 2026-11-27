@@ -469,7 +469,8 @@ func TestMultishotFinalErrorDeliversErrorThenStopped(t *testing.T) {
 	bindMultishotTestSubscription(sub, ext)
 	sub.state.Store(uint32(SubscriptionActive))
 
-	sub.handleCQE(&ioUringCqe{userData: sub.userData, res: -int32(EINVAL), flags: 0})
+	const result = -1 << 31
+	sub.handleCQE(&ioUringCqe{userData: sub.userData, res: result})
 
 	if got := len(handler.stepErrs); got != 1 {
 		t.Fatalf("step callbacks: got %d, want 1", got)
@@ -477,11 +478,12 @@ func TestMultishotFinalErrorDeliversErrorThenStopped(t *testing.T) {
 	if got := len(handler.stopErrs); got != 1 {
 		t.Fatalf("stop callbacks: got %d, want 1", got)
 	}
-	if handler.stepErrs[0] == nil {
-		t.Fatal("step callback missing Err")
+	want := CompletionError(result)
+	if !errors.Is(handler.stepErrs[0], want) {
+		t.Fatalf("step error = %v, want %v", handler.stepErrs[0], want)
 	}
-	if handler.stopErrs[0] == nil {
-		t.Fatal("stop callback missing terminal Err")
+	if !errors.Is(handler.stopErrs[0], want) {
+		t.Fatalf("stop error = %v, want %v", handler.stopErrs[0], want)
 	}
 }
 
@@ -714,9 +716,7 @@ func TestMultishotCancelRaceTerminalCQE(t *testing.T) {
 
 	sub, err := ring.ReceiveMultishot(ForFD(serverFD).WithBufGroup(0), handler)
 	if err != nil {
-		t.Logf("ReceiveMultishot returned error (may require buffer ring setup): %v", err)
-		close(releaseStop)
-		return
+		t.Fatal(err)
 	}
 
 	go func() {
@@ -737,34 +737,37 @@ func TestMultishotCancelRaceTerminalCQE(t *testing.T) {
 		close(released)
 	}()
 
-	cqes := make([]CQEView, 16)
+	// Reap one CQE per wait so a terminal receive and its cancel are dispatched separately.
+	var cqes [1]CQEView
+	var terminal, cancel bool
 	deadline := time.Now().Add(5 * time.Second)
 	b := iox.Backoff{}
 
-	for time.Now().Before(deadline) {
-		n, err := ring.Wait(cqes)
+	for !terminal || !cancel {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out draining subscription: terminal=%t cancel=%t", terminal, cancel)
+		}
+		n, err := ring.Wait(cqes[:])
 		if err != nil && !errors.Is(err, iox.ErrWouldBlock) {
 			t.Fatalf("Wait: %v", err)
 		}
-
-		for i := 0; i < n; i++ {
-			view := cqes[i]
-			if !view.Extended() {
-				continue
-			}
-			ext := view.ExtSQE()
-			ctx := CastUserData[multishotCtx](ext)
-			ctx.Fn(ring, &ext.SQE, &ioUringCqe{
-				userData: view.ctx.Raw(),
-				res:      view.Res,
-				flags:    view.Flags,
-			})
+		if n == 0 {
+			b.Wait()
+			continue
 		}
-
-		if handler.stoppedCount.Load() > 0 && sub.State() == SubscriptionStopped {
-			break
+		b.Reset()
+		view := cqes[0]
+		switch view.Context() {
+		case SQEContext(sub.userData):
+			terminal = !view.HasMore()
+		case PackExtended(&sub.cancel.slot.ext):
+			cancel = true
+		default:
+			t.Fatalf("unexpected completion: %+v", view)
 		}
-		b.Wait()
+		ext := view.ExtSQE()
+		ctx := CastUserData[multishotCtx](ext)
+		ctx.Fn(ring, &ext.SQE, &ioUringCqe{userData: view.ctx.Raw(), res: view.Res, flags: view.Flags})
 	}
 
 	<-released
@@ -774,6 +777,9 @@ func TestMultishotCancelRaceTerminalCQE(t *testing.T) {
 	}
 	if got := sub.State(); got != SubscriptionStopped {
 		t.Fatalf("State: got %v, want %v", got, SubscriptionStopped)
+	}
+	if sub.cancel.pending.Load() || sub.ext.Load() != nil {
+		t.Fatal("subscription retained a context after both completions were dispatched")
 	}
 	if got := handler.stoppedCount.Load(); got != 1 {
 		t.Fatalf("stop callbacks: got %d, want 1", got)
