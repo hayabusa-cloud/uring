@@ -13,7 +13,7 @@ Match the completion's origin before choosing a protocol event. Copy the flags, 
 | Release | Which resources may be reused |
 | Protocol | Which transition is permitted |
 
-Peer processing requires evidence from the protocol.
+A successful local send reports what the kernel accepted. A claim that the peer applied a command needs evidence from its protocol, such as a matching application acknowledgment. [Linux send(2)](https://man7.org/linux/man-pages/man2/send.2.html)
 
 ## Stream Framing
 
@@ -29,7 +29,7 @@ An ordinary UDP receive consumes one datagram when receive coalescing (`UDP_GRO`
 
 With `ReceiveMultishot` and ordinary provided buffers, that empty datagram can end the native receive. A matched CQE with `Res == 0` and `F_MORE` clear still delivers one message, even when `F_BUFFER` is clear. Check the buffer flags for any slot to return. `MultishotContinue` applies only while `F_MORE` is set. To keep reading after the final callback, submit a new receive. [Linux multishot RECV](https://github.com/torvalds/linux/blob/v6.18/io_uring/net.c#L1226-L1236) · [Callback actions](../../multishot.go#L22-L28) · [Provided buffers](resources.md#provided-buffers)
 
-When reusing a `RecvMsg` header, set `Namelen` and `Controllen` to the capacities offered for this receive. After completion, `Namelen` reports the source address's actual length, which can exceed the space offered. Read only the bytes that fit. `Controllen` reports the control bytes returned. Reusing a returned zero offers no space for the next packet's metadata, even when the backing array is large enough. Finish using or copy the returned metadata before rearming the header. [RecvMsg](../../interface_linux.go#L955) · [Linux socket copyback](https://github.com/torvalds/linux/blob/v6.18/net/socket.c)
+When reusing a `RecvMsg` header, set `Namelen` and `Controllen` to the capacities offered for this receive. After completion, `Namelen` reports the source address's actual length, which can exceed the space offered. Read only the bytes that fit. `Controllen` reports the control bytes returned. Reusing a returned zero offers no space for the next packet's metadata, even when the backing array is large enough. Finish using or copy the returned metadata before rearming the header. [RecvMsg](../../interface_linux.go#L958) · [Linux socket copyback](https://github.com/torvalds/linux/blob/v6.18/net/socket.c)
 
 ## Handle One Event
 

@@ -24,6 +24,7 @@ Read the [core contracts](core.md). Identify the request, caller decision and re
 | Cancel a request, drain a subscription or stop the ring | [Lifecycle](recipes/lifecycle.md), [managed cancellation](boundary/resources.md#managed-cancellation) |
 | Set a deadline or start, update or remove a timer | [Independent timers and linked deadlines](recipes/lifecycle.md#timers-and-linked-deadlines), [updates and removal](recipes/lifecycle.md#update-or-remove-a-timer) |
 | Use a fixed file, replace its slot or pass it to another ring | [Fixed-file lookup](boundary/files.md#fixed-file-lookup), [slot updates](boundary/files.md#updating-slots), [inter-ring transfers](boundary/files.md#inter-ring-file-transfers) |
+| Pass file descriptors over a Unix socket | [Short sends with rights](boundary/files.md#send-file-descriptors-on-a-unix-stream), [received fds and truncation](boundary/files.md#receive-file-descriptors-on-a-unix-socket), [handoff to a local peer](recipes/protocol.md#hand-off-received-file-descriptors) |
 | Use buffers, registered files, or zero-copy | [Buffers](recipes/buffers.md), [receive-bundle handoff](recipes/buffers.md#hand-off-a-receive-bundle) |
 | Reuse an incremental or zero-copy buffer | [Incremental receive](recipes/buffers.md#incremental-receive), [zero-copy](recipes/buffers.md#zero-copy), [shared send buffers](boundary/resources.md#shared-send-buffers) |
 | Retain completion data | [Retained completions](recipes/buffers.md#retained-completions) |

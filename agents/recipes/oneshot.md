@@ -26,7 +26,7 @@ Drive submission and reap into a nonempty destination. An empty poll leaves defe
 
 Dispatch every entry to its owner. For a matched reply, keep the result and flags. Copy borrowed fields before reusing their target. If delivery requires permission, check the pending suspension with `cove.CheckSuspension`. On refusal, keep the suspension and any resource the completion returned. [Completion origin](../boundary/sqe-cqe.md#completion-origin) · [Completion retention](../boundary/sqe-cqe.md#completion-retention) · [Guarded dispatch](../runtime/cove.md#outputs-and-ownership)
 
-For a positive short stream write, advance by the reported byte count.
+For a positive short stream write, advance by the reported byte count. On a Unix stream, any `SCM_RIGHTS` went with the prefix. Omit them when sending the remaining bytes. [Descriptor passing](../boundary/files.md#send-file-descriptors-on-a-unix-stream)
 
 Deliver success or failure once. If resuming a suspension, keep its successor. Release each resource at its own final use. [One-shot suspension](../runtime/kont.md)
 
@@ -37,3 +37,5 @@ Deliver success or failure once. If resuming a suspension, keep its successor. R
 Check success/failure, pre-admission would-block, partial admission, stale identity, retained completion, and [teardown with accepted work](lifecycle.md).
 
 For a guarded write on a socket pair, offer `PI` and retain `NG`. Revoke after admission and reap the two-byte result. A renewed grant on the original route permits the peer to receive `PING` once. Replacing the generation before retry leaves the peer with `PI`.
+
+On a Unix stream with a small send buffer, pass a pipe writer with a payload large enough to produce a short send. Read the prefix, send the remaining bytes and check that the peer receives the whole payload and exactly one fd.

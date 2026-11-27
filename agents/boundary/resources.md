@@ -9,7 +9,7 @@ Keep asynchronous storage reachable through typed Go roots, address-stable, and 
 | Storage | Retain through |
 |---------|----------------|
 | Submission metadata | Its kernel consumption; payload use may continue |
-| `SendMsgHeader` / `RecvMsg` header and referenced regions | Target completion; send storage remains immutable |
+| `SendMsgHeader` / `RecvMsg` header and referenced regions | Target completion. Keep send storage immutable. Copy any [receive metadata](protocols.md#datagram-receives) needed after header reuse. |
 | Context facts | Copy before target mutation, reuse, or release; see [completion retention](sqe-cqe.md#completion-retention) |
 
 `SendMsgHeader` submits caller-prepared metadata; `SendMsg` builds it from buffers and an address. Enable `NotifySucceed` without explicit success suppression when completion governs reuse. SQ consumption and a cancellation CQE do not release the target's storage.
@@ -34,6 +34,7 @@ With `replace` set, `CloneBuffers` and `CloneBuffersFromRegistered` install the 
 | Resource | Caller action |
 |----------|---------------|
 | <a id="accepted-sockets"></a>[Accepted socket](files.md#accepted-sockets) | Transfer or close every successful accept, including after callback withdrawal. Use the accept mode to identify the process fd or ring slot. |
+| [Unix socket file descriptors](files.md#receive-file-descriptors-on-a-unix-socket) | Account for every fd in the returned control data, including when the caller rejects a truncated message. |
 | <a id="fixed-file-lookup"></a>[Fixed-file slot](files.md#fixed-file-lookup) | Preserve the intended binding until the dependent requests have acquired it or finished. |
 | <a id="inter-ring-file-transfers"></a>[`MsgRingFD` target](files.md#inter-ring-file-transfers) | Account for the installed reference. On a source `-EOVERFLOW`, reconcile the target before retrying. |
 

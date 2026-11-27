@@ -10,12 +10,16 @@ Declare compatible peer actions, payload ownership, choices, recursion, and term
 
 ## Drive One Action
 
-1. Match the request and copy the context fields needed later. For a stream `ReceiveFD` into caller storage, decode the first `Res` bytes of the submitted range when the result is positive. A call with `WithOffset(4)` and `Res == 3` supplies `buf[4:7]`. For a partial stream write, keep the unsent suffix. [Receive shape](../boundary/encoding.md#receive-shape)
+1. Match the request and copy the context fields needed later. For a stream `ReceiveFD` into caller storage, decode the first `Res` bytes of the submitted range when the result is positive. A call with `WithOffset(4)` and `Res == 3` supplies `buf[4:7]`. For a positive short stream write, retain the unsent bytes and omit any Unix rights already queued with the prefix. [Receive shape](../boundary/encoding.md#receive-shape) · [Sending descriptors](../boundary/files.md#send-file-descriptors-on-a-unix-stream)
 2. For [framed input](../boundary/protocols.md#stream-framing), keep one decoder per ordered stream. At each `framer.Decoder.Decode`, advance by `consumed` and handle the returned chunk even on `ErrMore`. Accumulate payload until `Chunk.End` for a whole-message endpoint. Copy borrowed bytes or retain their backing through the last use. [Decoder contract](https://github.com/hayabusa-cloud/framer/blob/v0.1.7/decoder.go#L59-L75)
 3. Before each endpoint attempt, check the route, buffer ownership, descriptor, protocol phase and shutdown state that the action requires. Keep those conditions valid through dispatch.
 4. On local `iox.ErrWouldBlock`, keep the same pending action, payload and unread input suffix. After peer progress, recheck the conditions and retry that action. A successful `sess.Advance` consumes the suspension. Keep any successor and continue with the unread bytes. [Session step](https://github.com/hayabusa-cloud/sess/blob/v0.2.0/step.go#L18-L38)
 
 When a protocol requires checked context transitions or a completed trace, the caller handles refused guards, invalid transitions, exhausted fuel and unfinished traces. [Strict verification pattern](../runtime/cove.md#strict-verification-pattern)
+
+### Hand Off Received File Descriptors
+
+After a Unix-socket `RecvMsg`, account for the fds in the returned control data before checking permission to deliver them. An in-process `sess.Send[[]int]` queues a slice of the existing fd numbers. If the protocol transfers ownership at enqueue, keep the slice intact and the fds open while the send is blocked. Recheck any delivery grant on retry. If delivery ends before enqueue, discard the pending send and close its fds. After enqueue, the peer owns the list and may use or close the fds before `sess.Advance` returns. [Received fds and truncation](../boundary/files.md#receive-file-descriptors-on-a-unix-socket) · [Endpoint visibility](../runtime/sess.md#outputs-and-ownership)
 
 ## Deliver a Write Receipt
 

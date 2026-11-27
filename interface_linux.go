@@ -951,8 +951,10 @@ func (ur *Uring) SendMsgHeader(sqeCtx SQEContext, fd iofd.FD, msg *Msghdr, optio
 }
 
 // RecvMsg receives a message through the caller-owned message header.
-// Caller must keep msg and all memory it references valid until the operation
-// completes.
+// Keep the header and its buffers valid at stable addresses through completion.
+// On success, msg.Flags reports payload truncation (MSG_TRUNC) and control-data
+// truncation (MSG_CTRUNC). Namelen can exceed the supplied address capacity.
+// Restore Namelen and Controllen to the offered sizes before reusing the header.
 func (ur *Uring) RecvMsg(sqeCtx SQEContext, pollFD PollFd, msg *Msghdr, options ...OpOptionFunc) error {
 	flags, ioprio := ur.recvmsgOptions(options)
 	ctx := sqeCtx.WithFD(iofd.FD(pollFD.Fd())).OrFlags(flags | ur.readLikeOpFlags)

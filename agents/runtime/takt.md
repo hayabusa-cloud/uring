@@ -58,7 +58,7 @@ Set `StreamCompletion.More` from request liveness. Stream EOF and a terminal emp
 | `SubscriptionLoop.Poll` | Borrowed until the next `Poll` or `Drain` on that subscription loop |
 | `Loop.Run` | Owned result slice, possibly partial alongside failure |
 
-Copy retained elements before the borrow expires. Copies share any referenced payload. On fatal failure, completed results can precede the stored error. [One-shot poll](https://github.com/hayabusa-cloud/takt/blob/v0.3.0/loop.go#L143-L155) · [Subscription poll](https://github.com/hayabusa-cloud/takt/blob/v0.3.0/subscription.go#L92-L100)
+Copy retained elements before the borrow expires. Copies share any referenced payload. On fatal failure, completed results can precede the stored error. The backend needs an owner for undelivered resources even if `ResumeValue()` never runs. An ordinary accept returns a process fd in `Res`. A Unix-socket `RecvMsg` can deliver fds in the control buffer. [Received descriptors](../boundary/files.md#receive-file-descriptors-on-a-unix-socket) · [One-shot poll](https://github.com/hayabusa-cloud/takt/blob/v0.3.0/loop.go#L143-L155) · [Subscription poll](https://github.com/hayabusa-cloud/takt/blob/v0.3.0/subscription.go#L92-L100)
 
 ### Drain and Ownership
 

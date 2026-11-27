@@ -6,7 +6,7 @@ Concrete obligations for the [core contracts](../core.md).
 |----------|-------|
 | [Encoding](encoding.md) | Input domains, SQE fields, setup and registration |
 | [SQE/CQE](sqe-cqe.md) | Encoding, identity, completion, retained context |
-| [Files](files.md) | Registered file lookup, slot replacement and retirement tags |
+| [Files](files.md) | Registered slot lookup and updates, accept results, Unix socket descriptors and inter-ring transfers |
 | [Resources](resources.md) | Retention, transfer, return, release |
 | [Integration](integration.md) | Package ownership and waiting |
 | [Protocols](protocols.md) | Which observations supply bytes, finish a frame or permit an endpoint action |

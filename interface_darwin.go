@@ -808,9 +808,8 @@ func (ur *Uring) SendMsgHeader(sqeCtx SQEContext, fd iofd.FD, msg *Msghdr, optio
 	return ErrNotSupported
 }
 
-// RecvMsg receives a message through the caller-owned message header.
-// Caller must keep msg and all memory it references valid until the operation
-// completes.
+// RecvMsg submits a receive with a caller-owned message header.
+// The Darwin simulator completes an admitted request with -ENOSYS.
 func (ur *Uring) RecvMsg(sqeCtx SQEContext, pollFD PollFd, msg *Msghdr, options ...OpOptionFunc) error {
 	flags, ioprio := ur.recvmsgOptions(options)
 	ctx := sqeCtx.WithFD(iofd.FD(pollFD.Fd())).OrFlags(flags | ur.readLikeOpFlags)
