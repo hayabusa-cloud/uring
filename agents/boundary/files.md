@@ -42,10 +42,10 @@ A successful `RecvMsg` on a Linux `AF_UNIX` datagram carrying three fds and no p
 
 ## Installing a Process FD
 
-On success, `FixedFdInstall` reports a new process fd for the registered file in `Res`. The fd and the ring slot can be closed independently. To close the slot through `Uring.Close`, pass its index with `IOSQE_FIXED_FILE`. [Installation test](../../integration_linux_test.go#L1493) · [Close encoding](../../operations_linux.go#L430) · [Installation manual](https://github.com/axboe/liburing/blob/liburing-2.13/man/io_uring_prep_fixed_fd_install.3)
+On success, `FixedFdInstall` reports a new process fd for the registered file in `Res`. The fd and the ring slot can be closed independently. To close the slot through `Uring.Close`, pass its index with `IOSQE_FIXED_FILE`. [Installation test](../../integration_linux_test.go#L1500) · [Close encoding](../../operations_linux.go#L430) · [Installation manual](https://github.com/axboe/liburing/blob/liburing-2.13/man/io_uring_prep_fixed_fd_install.3)
 
 ## Inter-Ring File Transfers
 
-`MsgRingFD` keeps the source slot registered and installs a reference in the target ring. For an explicit destination, it replaces that slot and success reports zero. With `IORING_FILE_INDEX_ALLOC`, success reports the allocated target index. Both source and target CQEs carry that result when posted. `skipCQE` suppresses only the target CQE. [Transfer tests](../../integration_linux_test.go#L1800)
+`MsgRingFD` keeps the source slot registered and installs a reference in the target ring. For an explicit destination, it replaces that slot and success reports zero. With `IORING_FILE_INDEX_ALLOC`, success reports the allocated target index. Both source and target CQEs carry that result when posted. `skipCQE` suppresses only the target CQE. [Transfer tests](../../integration_linux_test.go#L1802)
 
 A source CQE with `-EOVERFLOW` means the file was installed but the target notification failed. In allocation mode, the sender also loses the allocated index from the result. Reconcile the target table before retrying. Another transfer can replace a file or allocate a second slot. [Linux message-ring implementation](https://github.com/torvalds/linux/blob/v6.18/io_uring/msg_ring.c#L176-L205)

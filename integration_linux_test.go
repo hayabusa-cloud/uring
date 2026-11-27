@@ -876,10 +876,7 @@ func TestUringPipe(t *testing.T) {
 // =============================================================================
 
 func TestResizeRings(t *testing.T) {
-	if isWSL2() {
-		t.Skip("ResizeRings is not reliable on WSL2 kernels")
-	}
-
+	const wantSQ, wantCQ = 1, 4
 	for _, tt := range []struct {
 		name     string
 		sqe128   bool
@@ -890,11 +887,10 @@ func TestResizeRings(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			runtime.LockOSThread()
-			defer runtime.UnlockOSThread()
+			t.Cleanup(runtime.UnlockOSThread)
 
-			// Resize requires the explicit pinned single-issuer configuration.
 			ring, err := uring.New(testMinimalBufferOptions, func(opt *uring.Options) {
-				opt.Entries = uring.EntriesSmall
+				opt.Entries = wantSQ
 				opt.MultiIssuers = false
 				opt.SQE128 = tt.sqe128
 			})
@@ -904,43 +900,55 @@ func TestResizeRings(t *testing.T) {
 			if err != nil {
 				t.Fatalf("New: %v", err)
 			}
-			if err := ring.Start(); err != nil {
-				t.Fatalf("Start: %v", err)
-			}
-			defer func() {
-				if err := ring.Stop(); err != nil {
-					t.Errorf("Stop: %v", err)
-				}
-			}()
+			mustStartRing(t, ring)
 			if got := ring.Features.SQEBytes; got != tt.sqeBytes {
 				t.Fatalf("SQEBytes = %d, want %d", got, tt.sqeBytes)
 			}
-			logRingDiagnostics(t, t.Name()+"/start", ring)
-
-			if err := ring.ResizeRings(0, 2048); err != nil {
-				logRingDiagnostics(t, t.Name()+"/failure", ring)
-				t.Fatalf("ResizeRings: %v (requested newSQ=%d newCQ=%d)", err, 0, 2048)
+			if got := ring.Features.CQEntries; got != 2 {
+				t.Fatalf("initial CQEntries = %d, want 2", got)
 			}
-			logRingDiagnostics(t, t.Name()+"/after", ring)
+
+			// Leave the NOP completion unread and the time-only timeout in flight.
+			timer := uring.PackDirect(uring.IORING_OP_TIMEOUT, 0, 0, 0)
+			nop := uring.PackDirect(uring.IORING_OP_NOP, 0, 0, 0)
+			if err := ring.Timeout(timer, time.Hour, uring.WithCount(0)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ring.Wait(nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := ring.Nop(nop); err != nil {
+				t.Fatal(err)
+			}
+			checkWaitWithoutReaping(t, ring, ring.Wait, 1)
+
+			if got := ring.SQAvailable(); got != wantSQ {
+				t.Fatalf("SQAvailable before resize = %d, want %d", got, wantSQ)
+			}
+			if err := ring.ResizeRings(0, wantCQ); err != nil {
+				t.Fatalf("ResizeRings: %v", err)
+			}
+			if sq, cq := ring.Features.SQEntries, ring.Features.CQEntries; sq != wantSQ || cq != wantCQ {
+				t.Errorf("resize geometry = %d/%d, want %d/%d", sq, cq, wantSQ, wantCQ)
+			}
 			if got := ring.Features.SQEBytes; got != tt.sqeBytes {
-				t.Fatalf("SQEBytes after resize = %d, want %d", got, tt.sqeBytes)
+				t.Errorf("SQEBytes after resize = %d, want %d", got, tt.sqeBytes)
 			}
 
-			ctx := uring.PackDirect(uring.IORING_OP_NOP, 0, 0, 0)
-			if err := ring.Nop(ctx); err != nil {
-				t.Fatalf("Nop after resize: %v", err)
+			remove := uring.PackDirect(uring.IORING_OP_TIMEOUT_REMOVE, 0, 0, 0)
+			if err := ring.TimeoutRemove(remove, timer.Raw()); err != nil {
+				t.Fatal(err)
 			}
-
-			ev, ok := waitForOp(t, ring, uring.IORING_OP_NOP, time.Second)
-			if !ok {
-				t.Fatal("NOP did not complete after resize")
-			}
-			if ev.Res < 0 {
-				t.Errorf("NOP failed after resize: %d", ev.Res)
-			}
+			// All three completions must be visible together, beyond the old capacity.
+			checkWaitWithoutReaping(t, ring, ring.Wait, 3)
+			requireTerminalResults(t, ring, map[uring.SQEContext]int32{
+				nop:    0,
+				timer:  -int32(zcall.ECANCELED),
+				remove: 0,
+			})
 
 			// Check wide-command admission without requiring a command device.
-			ctx = uring.PackDirect(uring.IORING_OP_URING_CMD, 0, 0, -1)
+			ctx := uring.PackDirect(uring.IORING_OP_URING_CMD, 0, 0, -1)
 			var command [80]byte
 			err = ring.UringCmdInline(ctx, 0, command[:])
 			if !tt.sqe128 {
@@ -951,13 +959,8 @@ func TestResizeRings(t *testing.T) {
 				if err != nil {
 					t.Fatalf("UringCmdInline on SQE128 after resize: %v", err)
 				}
-				ev, ok = waitForOp(t, ring, uring.IORING_OP_URING_CMD, time.Second)
-				if !ok || ev.Res != -int32(zcall.EBADF) {
-					t.Fatalf("inline command after resize: completed=%t result=%d, want EBADF", ok, ev.Res)
-				}
+				requireTerminalResults(t, ring, map[uring.SQEContext]int32{ctx: -int32(zcall.EBADF)})
 			}
-
-			t.Log("ResizeRings succeeded - ring functional after CQ resize to 2048")
 		})
 	}
 }

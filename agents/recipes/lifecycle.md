@@ -12,7 +12,7 @@ Stop accepting new application work. Keep driving accepted prefixes and submit t
 
 Request cancellation where permitted, then keep driving and dispatching. Cancellation races with its target and cannot replace the target's completion. [Cancellation contract](https://github.com/axboe/liburing/blob/liburing-2.13/man/io_uring_prep_cancel.3)
 
-A successful bulk cancellation reports how many requests it matched. Dispatch the cancel reply and each target’s CQEs by their own identities, even after the application route retires. A managed helper owns its cancellation context through dispatch. A helper call that queues nothing adds no reply to await. [Cancellation tests](../../integration_linux_test.go#L2096)
+A successful bulk cancellation reports how many requests it matched. Dispatch the cancel reply and each target’s CQEs by their own identities, even after the application route retires. A managed helper owns its cancellation context through dispatch. A helper call that queues nothing adds no reply to await. [Cancellation tests](../../integration_linux_test.go#L2098)
 
 The example tracks one terminal CQE for a multishot poll with a fixed Direct ID and one for its cancellation. If the poll ID changes, match each CQE to the ID it carries. [Poll ID changes](../boundary/sqe-cqe.md#change-a-poll-id)
 

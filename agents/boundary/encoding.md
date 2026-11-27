@@ -72,9 +72,13 @@ Version strings alone establish no usable capability. ZCRX control/query records
 
 For live resize, leave `MultiIssuers` and `HybridPolling` at their default `false` values. This enables `IORING_SETUP_DEFER_TASKRUN`, which `ResizeRings` requires. [Ring setup](../../interface_linux.go#L162-L183) · [Resize requirements](https://github.com/axboe/liburing/blob/liburing-2.13/man/io_uring_resize_rings.3#L50-L55)
 
-Call `ResizeRings(sq, cq)` from the OS thread that called `Start`. Serialize resize with submission, waits and `Stop`. Resolve any CQ overflow first. Zero `sq` keeps the current SQ size. Zero `cq` requests twice the resulting SQ size. On success, read the effective sizes from `Features.SQEntries` and `Features.CQEntries`. Context pools keep their original capacities. [ResizeRings](../../interface_linux.go#L1567)
+Call `ResizeRings(sq, cq)` from the OS thread that called `Start`. Serialize resize with submission, waits and `Stop`. Resolve any CQ overflow first. Zero `sq` keeps the current SQ size. Zero `cq` requests twice the resulting SQ size. Linux rounds nonzero sizes up to powers of two within kernel limits. On success, read the capacities from `Features.SQEntries` and `Features.CQEntries`. Context pools keep their original capacities. [ResizeRings](../../interface_linux.go#L1567)
 
-A successful resize preserves pending submissions and completions, their entry widths and request identities in both SQ layouts. A shrink rejected because pending entries would no longer fit leaves those entries on the original ring. Continue driving them there. [Pending submissions](../../resize_linux_test.go#L55) · [Pending completions](../../resize_completion_linux_test.go#L14) · [Rejected shrink](../../resize_linux_test.go#L178)
+A successful resize preserves queued submissions and unread completions, including their entry widths and request identities, even when SQ capacity changes in either layout. [Queued submissions](../../resize_linux_test.go#L55) · [Unread completions](../../resize_completion_linux_test.go)
+
+A size rejection leaves the original ring usable. If the effective CQ is smaller than the SQ, `uring.ErrInvalidParam` means the requested sizes must change. If the sizes are valid but either queue holds more entries than will fit, `zcall.EOVERFLOW` means the caller can retry after driving submissions, reaping completions or requesting more space. [Rejected shrink and retry](../../resize_linux_test.go#L178)
+
+For example, grow the CQ between batches with `ring.ResizeRings(0, largerCQ)`. When `ring.SQAvailable() == ring.Features.SQEntries`, Linux has consumed every queued SQE. Earlier requests can still be in flight, and the CQ can hold unread completions. [SQAvailable](../../interface_linux.go#L422) · [CQ growth with live work](../../integration_linux_test.go#L878)
 
 If remapping fails after Linux commits the resize, `uring` closes the ring. [Failure handling](../../submit_state_linux_test.go#L1307)
 

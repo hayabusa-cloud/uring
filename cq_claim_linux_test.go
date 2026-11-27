@@ -15,15 +15,15 @@ import (
 	"code.hybscloud.com/iox"
 )
 
-func awaitVisibleCQ(t *testing.T, ring *Uring, count uint32) {
+func awaitVisibleCQ(t *testing.T, ring *ioUring, count uint32) {
 	t.Helper()
 	var backoff iox.Backoff
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		if err := ring.ioUring.enter(); err != nil {
+		if err := ring.enter(); err != nil {
 			t.Fatal(err)
 		}
-		cq := &ring.ioUring.cq
+		cq := &ring.cq
 		if atomic.LoadUint32(cq.kTail)-atomic.LoadUint32(cq.kHead) >= count {
 			return
 		}
@@ -50,7 +50,7 @@ func TestCQReapIndependentOfSubmitState(t *testing.T) {
 			if err := ring.Nop(ctx); err != nil {
 				t.Fatal(err)
 			}
-			awaitVisibleCQ(t, ring, 1)
+			awaitVisibleCQ(t, ring.ioUring, 1)
 
 			type result struct {
 				n     int
@@ -115,7 +115,7 @@ func TestCQClaimProtectsUncopiedRange(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	awaitVisibleCQ(t, ring, 2)
+	awaitVisibleCQ(t, ring.ioUring, 2)
 	ur := ring.ioUring
 	claim, count, err := ur.claimCQ(1)
 	if err != nil || count != 1 {
